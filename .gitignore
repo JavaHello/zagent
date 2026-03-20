@@ -1,0 +1,6 @@
+# Build artifacts
+zig-out/
+.zig-cache/
+
+# Generated root stub (replaced by our implementation)
+src/root.zig
