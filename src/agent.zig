@@ -106,7 +106,17 @@ pub const Agent = struct {
                 });
 
                 for (tool_calls) |call| {
-                    const result = try self.executeTool(call);
+                    const result = self.executeTool(call) catch |err| blk: {
+                        const error_content = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Tool execution error for {s}: {s}",
+                            .{ call.name, @errorName(err) },
+                        );
+                        break :blk tools.ToolResult{
+                            .content = error_content,
+                            .is_error = true,
+                        };
+                    };
                     defer result.deinit(self.allocator);
 
                     const result_content = try self.allocator.dupe(u8, result.content);
