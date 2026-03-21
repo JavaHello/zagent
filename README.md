@@ -30,7 +30,16 @@ The binary is written to `zig-out/bin/zagent`.
 
 ## Configuration
 
-All configuration is done through environment variables:
+Configuration can be loaded from a config file and/or environment variables. The config file is read from:
+
+- `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
+- `~/.config/zagent` (fallback)
+
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS` (or their `OPENAI_*` equivalents). Environment variables override config file values.
+
+See `zagent.example.conf` for a complete example config file.
+
+All configuration is also supported through environment variables:
 
 | Variable           | Default                          | Description                          |
 |--------------------|----------------------------------|--------------------------------------|
