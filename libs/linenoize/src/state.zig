@@ -176,8 +176,10 @@ pub const LinenoiseState = struct {
 
                     // Restore original buffer into state
                     self.buf.deinit(self.allocator);
-                    var new_buf = ArrayList(u8).fromOwnedSlice(self.allocator, old_buf);
-                    self.buf = new_buf.moveToUnmanaged();
+                    self.buf = .{
+                        .items = old_buf,
+                        .capacity = old_buf.len,
+                    };
                     self.pos = old_pos;
                 } else {
                     // Return to original line

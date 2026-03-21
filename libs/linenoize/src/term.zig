@@ -17,8 +17,16 @@ pub fn isUnsupportedTerm(allocator: std.mem.Allocator) bool {
 }
 
 const w = struct {
-    pub usingnamespace std.os.windows;
+    const windows = std.os.windows;
+    pub const BOOL = windows.BOOL;
+    pub const CONSOLE_SCREEN_BUFFER_INFO = windows.CONSOLE_SCREEN_BUFFER_INFO;
+    pub const DWORD = windows.DWORD;
+    pub const HANDLE = windows.HANDLE;
+    pub const UINT = windows.UINT;
+    pub const WCHAR = windows.WCHAR;
+    pub const WORD = windows.WORD;
     pub const ENABLE_VIRTUAL_TERMINAL_INPUT = @as(c_int, 0x200);
+    pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING = windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     pub const CP_UTF8 = @as(c_int, 65001);
     pub const INPUT_RECORD = extern struct {
         EventType: w.WORD,
@@ -27,7 +35,11 @@ const w = struct {
 };
 
 const k32 = struct {
-    pub usingnamespace std.os.windows.kernel32;
+    const kernel32 = std.os.windows.kernel32;
+    pub const GetConsoleMode = kernel32.GetConsoleMode;
+    pub const GetConsoleScreenBufferInfo = kernel32.GetConsoleScreenBufferInfo;
+    pub const SetConsoleMode = kernel32.SetConsoleMode;
+    pub const SetConsoleOutputCP = kernel32.SetConsoleOutputCP;
     pub extern "kernel32" fn SetConsoleCP(wCodePageID: w.UINT) callconv(.winapi) w.BOOL;
     pub extern "kernel32" fn PeekConsoleInputW(hConsoleInput: w.HANDLE, lpBuffer: [*]w.INPUT_RECORD, nLength: w.DWORD, lpNumberOfEventsRead: ?*w.DWORD) callconv(.winapi) w.BOOL;
     pub extern "kernel32" fn ReadConsoleW(hConsoleInput: w.HANDLE, lpBuffer: [*]u16, nNumberOfCharsToRead: w.DWORD, lpNumberOfCharsRead: ?*w.DWORD, lpReserved: ?*anyopaque) callconv(.winapi) w.BOOL;
@@ -112,13 +124,16 @@ fn getCursorPosition(in: File, out: File) !usize {
 }
 
 fn getColumnsFallback(in: File, out: File) !usize {
-    var writer = out.writer();
+    var write_buf: [256]u8 = undefined;
+    var file_writer = out.writer(&write_buf);
+    const writer = &file_writer.interface;
     const orig_cursor_pos = try getCursorPosition(in, out);
 
     try writer.print("\x1B[999C", .{});
     const cols = try getCursorPosition(in, out);
 
     try writer.print("\x1B[{}D", .{orig_cursor_pos});
+    try writer.flush();
 
     return cols;
 }
