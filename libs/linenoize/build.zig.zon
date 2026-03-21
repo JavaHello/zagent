@@ -1,0 +1,15 @@
+.{
+    .name = .linenoize,
+    .fingerprint = 0xfa03aea2f0cab127,
+    .version = "0.1.0",
+    .dependencies = .{
+        .wcwidth = .{
+            .path = "../wcwidth",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src/",
+    },
+}

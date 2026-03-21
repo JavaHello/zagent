@@ -4,12 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const linenoize = b.dependency("linenoize", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("linenoise");
+
     const exe = b.addExecutable(.{
         .name = "zagent",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "linenoise", .module = linenoize },
+            },
         }),
     });
 
@@ -29,6 +37,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "linenoise", .module = linenoize },
+            },
         }),
     });
     const run_tests = b.addRunArtifact(exe_tests);

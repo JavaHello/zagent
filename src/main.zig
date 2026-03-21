@@ -1,6 +1,7 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const Agent = @import("agent.zig").Agent;
+const Linenoise = @import("linenoise").Linenoise;
 
 // ANSI colour codes
 const RESET = "\x1b[0m";
@@ -30,6 +31,10 @@ const HELP =
     \\  Ctrl+D       Exit zagent
     \\
 ;
+
+// Prompt passed to linenoise. Colour codes are fine here because
+// linenoize's width() implementation correctly ignores ANSI SGR sequences.
+const PROMPT = BOLD ++ GREEN ++ "you" ++ RESET ++ " \xe2\x9d\xaf ";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -72,22 +77,31 @@ fn runRepl(allocator: std.mem.Allocator, agent: *Agent, config: Config) !void {
         try stderr.writeAll(YELLOW ++ "Warning: OPENAI_API_KEY is not set.\n  export OPENAI_API_KEY=your-key\n\n" ++ RESET);
     }
 
-    // Stack buffer for the stdin reader's read-ahead.
-    var stdin_buf: [8192]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&stdin_buf);
-    const reader = &stdin_reader.interface;
+    var ln = Linenoise.init(allocator);
+    defer ln.deinit();
 
     while (true) {
-        try stdout.writeAll(BOLD ++ GREEN ++ "you" ++ RESET ++ " \xe2\x9d\xaf ");
-
-        // Read a line from stdin. Returns null on EOF (Ctrl+D), without delimiter.
-        const raw_line = try reader.takeDelimiter('\n') orelse {
+        // linenoise handles raw-mode input, Unicode width, and multi-byte
+        // character deletion correctly (including Chinese/CJK characters).
+        // Returns null on EOF (Ctrl+D); error.CtrlC on Ctrl+C.
+        const raw_line = (ln.linenoise(PROMPT) catch |err| switch (err) {
+            error.CtrlC => {
+                try stdout.writeAll("\n");
+                break;
+            },
+            else => return err,
+        }) orelse {
             try stdout.writeAll("\n");
             break;
         };
+        defer allocator.free(raw_line);
+
         const line = std.mem.trim(u8, raw_line, " \t\r");
 
         if (line.len == 0) continue;
+
+        // Add non-empty lines to history so the user can navigate with ↑/↓.
+        try ln.history.add(line);
 
         if (std.mem.eql(u8, line, "/quit") or std.mem.eql(u8, line, "/exit")) {
             try stdout.writeAll(DIM ++ "Goodbye!\n" ++ RESET);
@@ -102,10 +116,7 @@ fn runRepl(allocator: std.mem.Allocator, agent: *Agent, config: Config) !void {
             defer allocator.free(msg);
             try stdout.writeAll(msg);
         } else {
-            // Duplicate the line before the next read invalidates the reader's buffer
-            const query = try allocator.dupe(u8, line);
-            defer allocator.free(query);
-            agent.processQuery(query) catch |err| {
+            agent.processQuery(line) catch |err| {
                 const errmsg = try std.fmt.allocPrint(allocator, "\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
                 defer allocator.free(errmsg);
                 try stderr.writeAll(errmsg);
