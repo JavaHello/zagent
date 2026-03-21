@@ -88,6 +88,19 @@ pub const Client = struct {
         const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
         defer self.allocator.free(auth_header);
 
+        return self.performChatWithRetry(chat_url, auth_header, req_json);
+    }
+
+    fn performChatWithRetry(self: *Client, chat_url: []const u8, auth_header: []const u8, req_json: []const u8) !ApiResponse {
+        return self.performChatFetch(chat_url, auth_header, req_json) catch |err| {
+            if (!isRecoverableFetchError(err)) return err;
+
+            self.resetHttpClient();
+            return self.performChatFetch(chat_url, auth_header, req_json);
+        };
+    }
+
+    fn performChatFetch(self: *Client, chat_url: []const u8, auth_header: []const u8, req_json: []const u8) !ApiResponse {
         var aw: std.io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
 
@@ -114,6 +127,11 @@ pub const Client = struct {
         }
 
         return parseResponse(self.allocator, aw.written());
+    }
+
+    fn resetHttpClient(self: *Client) void {
+        self.http_client.deinit();
+        self.http_client = .{ .allocator = self.allocator };
     }
 };
 
@@ -272,6 +290,15 @@ fn tryParseApiErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]co
     return allocator.dupe(u8, msg_val.string) catch null;
 }
 
+fn isRecoverableFetchError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        => true,
+        else => false,
+    };
+}
+
 test "build request json" {
     const allocator = std.testing.allocator;
     const messages = [_]Message{
@@ -300,4 +327,10 @@ test "parse response stop" {
     defer resp.deinit(allocator);
     try std.testing.expectEqualStrings("stop", resp.finish_reason);
     try std.testing.expectEqualStrings("Hello!", resp.content.?);
+}
+
+test "recoverable fetch errors are retried" {
+    try std.testing.expect(isRecoverableFetchError(error.HttpConnectionClosing));
+    try std.testing.expect(isRecoverableFetchError(error.ConnectionResetByPeer));
+    try std.testing.expect(!isRecoverableFetchError(error.ApiError));
 }
