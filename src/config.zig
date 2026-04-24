@@ -161,8 +161,21 @@ pub const Config = struct {
 };
 
 test "config defaults" {
-    const config = try Config.load(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    const config = try Config.load(allocator);
     defer config.deinit();
-    try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
-    try std.testing.expect(config.max_tokens == 4096);
+
+    const expected_model = try envVarOwned(allocator, "OPENAI_MODEL") orelse try allocator.dupe(u8, "gpt-4o-mini");
+    defer allocator.free(expected_model);
+
+    const expected_max_tokens: u32 = blk: {
+        if (try envVarOwned(allocator, "OPENAI_MAX_TOKENS")) |value| {
+            defer allocator.free(value);
+            break :blk std.fmt.parseInt(u32, value, 10) catch 4096;
+        }
+        break :blk 4096;
+    };
+
+    try std.testing.expectEqualStrings(expected_model, config.model);
+    try std.testing.expect(config.max_tokens == expected_max_tokens);
 }

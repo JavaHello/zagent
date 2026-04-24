@@ -111,6 +111,17 @@ export OPENAI_MODEL=your-model
 ./zig-out/bin/zagent
 ```
 
+### Using DeepSeek V4
+
+```bash
+export OPENAI_BASE_URL=https://api.deepseek.com
+export OPENAI_API_KEY=your-deepseek-key
+export OPENAI_MODEL=deepseek-v4-flash
+./zig-out/bin/zagent
+```
+
+`deepseek-v4-pro` is also supported. For backward compatibility, `deepseek-chat` is treated as `deepseek-v4-flash`, and `deepseek-reasoner` is treated as `deepseek-v4-flash` with thinking mode enabled.
+
 ## Run tests
 
 ```bash

@@ -42,6 +42,7 @@ pub const Agent = struct {
         try history.append(allocator, .{
             .role = "system",
             .content = system_content,
+            .reasoning_content = null,
             .tool_calls = null,
             .tool_call_id = null,
         });
@@ -72,6 +73,7 @@ pub const Agent = struct {
         try self.history.append(self.allocator, .{
             .role = "user",
             .content = user_content,
+            .reasoning_content = null,
             .tool_calls = null,
             .tool_call_id = null,
         });
@@ -101,6 +103,7 @@ pub const Agent = struct {
                 try self.history.append(self.allocator, .{
                     .role = "assistant",
                     .content = null,
+                    .reasoning_content = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null,
                     .tool_calls = owned_calls,
                     .tool_call_id = null,
                 });
@@ -127,6 +130,7 @@ pub const Agent = struct {
                     try self.history.append(self.allocator, .{
                         .role = "tool",
                         .content = result_content,
+                        .reasoning_content = null,
                         .tool_calls = null,
                         .tool_call_id = call_id,
                     });
@@ -144,6 +148,7 @@ pub const Agent = struct {
                     try self.history.append(self.allocator, .{
                         .role = "assistant",
                         .content = owned_content,
+                        .reasoning_content = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null,
                         .tool_calls = null,
                         .tool_call_id = null,
                     });

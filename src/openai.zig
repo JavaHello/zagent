@@ -26,11 +26,13 @@ pub const ToolCallData = struct {
 pub const Message = struct {
     role: []const u8,
     content: ?[]const u8,
+    reasoning_content: ?[]const u8,
     tool_calls: ?[]ToolCallData,
     tool_call_id: ?[]const u8,
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         if (self.content) |c| allocator.free(c);
+        if (self.reasoning_content) |c| allocator.free(c);
         if (self.tool_calls) |calls| {
             for (calls) |call| call.deinit(allocator);
             allocator.free(calls);
@@ -41,11 +43,13 @@ pub const Message = struct {
 
 pub const ApiResponse = struct {
     content: ?[]const u8,
+    reasoning_content: ?[]const u8,
     tool_calls: ?[]ToolCallData,
     finish_reason: []const u8,
 
     pub fn deinit(self: ApiResponse, allocator: std.mem.Allocator) void {
         if (self.content) |c| allocator.free(c);
+        if (self.reasoning_content) |c| allocator.free(c);
         if (self.tool_calls) |calls| {
             for (calls) |call| call.deinit(allocator);
             allocator.free(calls);
@@ -142,13 +146,18 @@ pub fn buildRequest(
     messages: []const Message,
     max_tokens: u32,
 ) ![]u8 {
+    const request_options = resolveRequestOptions(model);
+
     var aw: std.io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     const w = &aw.writer;
 
     try w.writeAll("{\"model\":");
-    try std.json.Stringify.encodeJsonString(model, .{}, w);
+    try std.json.Stringify.encodeJsonString(request_options.model, .{}, w);
     try w.print(",\"max_tokens\":{d}", .{max_tokens});
+    if (request_options.deepseek_thinking_enabled) {
+        try w.writeAll(",\"thinking\":{\"type\":\"enabled\"}");
+    }
     try w.writeAll(",\"messages\":[");
     for (messages, 0..) |msg, i| {
         if (i > 0) try w.writeByte(',');
@@ -161,6 +170,41 @@ pub fn buildRequest(
     return aw.toOwnedSlice();
 }
 
+const RequestOptions = struct {
+    model: []const u8,
+    deepseek_thinking_enabled: bool,
+};
+
+fn resolveRequestOptions(model: []const u8) RequestOptions {
+    if (std.mem.eql(u8, model, "deepseek-chat")) {
+        // DeepSeek documents this alias as the non-thinking mode of deepseek-v4-flash.
+        return .{
+            .model = "deepseek-v4-flash",
+            .deepseek_thinking_enabled = false,
+        };
+    }
+
+    if (std.mem.eql(u8, model, "deepseek-reasoner")) {
+        // DeepSeek documents this alias as the thinking mode of deepseek-v4-flash.
+        return .{
+            .model = "deepseek-v4-flash",
+            .deepseek_thinking_enabled = true,
+        };
+    }
+
+    if (std.mem.startsWith(u8, model, "deepseek-v4-")) {
+        return .{
+            .model = model,
+            .deepseek_thinking_enabled = std.mem.eql(u8, model, "deepseek-v4-pro"),
+        };
+    }
+
+    return .{
+        .model = model,
+        .deepseek_thinking_enabled = false,
+    };
+}
+
 fn writeMessageJson(w: *std.io.Writer, msg: Message) !void {
     try w.writeAll("{\"role\":");
     try std.json.Stringify.encodeJsonString(msg.role, .{}, w);
@@ -169,6 +213,10 @@ fn writeMessageJson(w: *std.io.Writer, msg: Message) !void {
         try std.json.Stringify.encodeJsonString(content, .{}, w);
     } else {
         try w.writeAll(",\"content\":null");
+    }
+    if (msg.reasoning_content) |reasoning_content| {
+        try w.writeAll(",\"reasoning_content\":");
+        try std.json.Stringify.encodeJsonString(reasoning_content, .{}, w);
     }
     if (msg.tool_calls) |calls| {
         try w.writeAll(",\"tool_calls\":[");
@@ -229,6 +277,14 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     };
     errdefer if (content) |c| allocator.free(c);
 
+    const reasoning_content: ?[]const u8 = blk: {
+        if (message_val.object.get("reasoning_content")) |rcv| {
+            if (rcv == .string) break :blk try allocator.dupe(u8, rcv.string);
+        }
+        break :blk null;
+    };
+    errdefer if (reasoning_content) |c| allocator.free(c);
+
     const tool_calls: ?[]ToolCallData = blk: {
         const tc_val = message_val.object.get("tool_calls") orelse break :blk null;
         if (tc_val != .array) break :blk null;
@@ -264,6 +320,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
 
     return .{
         .content = content,
+        .reasoning_content = reasoning_content,
         .tool_calls = tool_calls,
         .finish_reason = finish_reason,
     };
@@ -302,13 +359,49 @@ fn isRecoverableFetchError(err: anyerror) bool {
 test "build request json" {
     const allocator = std.testing.allocator;
     const messages = [_]Message{
-        .{ .role = "user", .content = "hello", .tool_calls = null, .tool_call_id = null },
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
     const json = try buildRequest(allocator, "gpt-4o-mini", &messages, 4096);
     defer allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"model\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") != null);
+}
+
+test "build request maps deepseek reasoner to v4 thinking mode" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const json = try buildRequest(allocator, "deepseek-reasoner", &messages, 4096);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-v4-flash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "build request enables thinking for deepseek v4 pro" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const json = try buildRequest(allocator, "deepseek-v4-pro", &messages, 4096);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-v4-pro\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "build request keeps deepseek v4 flash in non-thinking mode" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const json = try buildRequest(allocator, "deepseek-v4-flash", &messages, 4096);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-v4-flash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"enabled\"}") == null);
 }
 
 test "extract string arg" {
@@ -327,6 +420,28 @@ test "parse response stop" {
     defer resp.deinit(allocator);
     try std.testing.expectEqualStrings("stop", resp.finish_reason);
     try std.testing.expectEqualStrings("Hello!", resp.content.?);
+}
+
+test "build request includes reasoning content in assistant messages" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "Answer", .reasoning_content = "Chain of thought summary", .tool_calls = null, .tool_call_id = null },
+    };
+    const json = try buildRequest(allocator, "deepseek-v4-pro", &messages, 4096);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"Chain of thought summary\"") != null);
+}
+
+test "parse response reads reasoning content" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"choices":[{"message":{"role":"assistant","content":"Hello!","reasoning_content":"Need to think first"},"finish_reason":"stop"}]}
+    ;
+    const resp = try parseResponse(allocator, body);
+    defer resp.deinit(allocator);
+
+    try std.testing.expectEqualStrings("Need to think first", resp.reasoning_content.?);
 }
 
 test "recoverable fetch errors are retried" {
