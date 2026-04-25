@@ -35,7 +35,7 @@ Configuration can be loaded from a config file and/or environment variables. The
 - `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
 - `~/.config/zagent` (fallback)
 
-The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS` (or their `OPENAI_*` equivalents). Environment variables override config file values.
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS` (or their `OPENAI_*` equivalents). Environment variables override config file values.
 
 See `zagent.example.conf` for a complete example config file.
 
@@ -47,6 +47,7 @@ All configuration is also supported through environment variables:
 | `OPENAI_BASE_URL`  | `https://api.openai.com/v1`      | API base URL                         |
 | `OPENAI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
 | `OPENAI_MAX_TOKENS`| `4096`                           | Maximum tokens per response          |
+| `OPENAI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
 
 ## Usage
 

@@ -25,13 +25,16 @@ const SYSTEM_PROMPT =
     \\- Use list_dir to explore directories.
     \\- Chain multiple tool calls to accomplish complex tasks step by step.
     \\- Always explain what you are doing when using tools.
-    \\- If an operation fails, analyze the error and try a different approach.
+    \\- If an operation fails, analyze the error and try a different approach, but stop after 3-5 failed attempts and explain what went wrong.
+    \\- If a task seems impossible with available tools (e.g. requires a web browser, authentication, or blocked services), report this to the user instead of retrying endlessly.
+    \\- Do not repeat the same tool call with the same parameters.
 ;
 
 pub const Agent = struct {
     allocator: std.mem.Allocator,
     client: openai.Client,
     history: std.ArrayList(Message),
+    max_iterations: u32,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Agent {
         var history: std.ArrayList(Message) = .empty;
@@ -51,6 +54,7 @@ pub const Agent = struct {
             .allocator = allocator,
             .client = openai.Client.init(allocator, config),
             .history = history,
+            .max_iterations = config.max_iterations,
         };
     }
 
@@ -79,9 +83,8 @@ pub const Agent = struct {
         });
 
         var iteration: usize = 0;
-        const max_iterations = 200;
 
-        while (iteration < max_iterations) : (iteration += 1) {
+        while (iteration < self.max_iterations) : (iteration += 1) {
             const response = self.client.chat(self.history.items) catch |err| {
                 try printFmt(std.fs.File.stderr(), self.allocator, RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
                 return err;
@@ -157,8 +160,8 @@ pub const Agent = struct {
             }
         }
 
-        if (iteration == max_iterations) {
-            try printFmt(std.fs.File.stderr(), self.allocator, RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{max_iterations});
+        if (iteration == self.max_iterations) {
+            try printFmt(std.fs.File.stderr(), self.allocator, RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
         }
     }
 

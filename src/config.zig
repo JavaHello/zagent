@@ -5,6 +5,7 @@ const ConfigFile = struct {
     base_url: ?[]u8 = null,
     model: ?[]u8 = null,
     max_tokens: ?u32 = null,
+    max_iterations: ?u32 = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
         if (self.api_key) |value| allocator.free(value);
@@ -68,6 +69,8 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         try setString(allocator, &config.model, value);
     } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_TOKENS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch 4096;
+    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_ITERATIONS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
+        config.max_iterations = std.fmt.parseInt(u32, value, 10) catch 200;
     }
 }
 
@@ -108,6 +111,7 @@ pub const Config = struct {
     base_url: []const u8,
     model: []const u8,
     max_tokens: u32,
+    max_iterations: u32,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
         var file_config = try loadConfigFile(allocator);
@@ -123,6 +127,7 @@ pub const Config = struct {
         errdefer allocator.free(model);
 
         var max_tokens: u32 = file_config.max_tokens orelse 4096;
+        var max_iterations: u32 = file_config.max_iterations orelse 200;
 
         if (try envVarOwned(allocator, "OPENAI_API_KEY")) |env_api_key| {
             allocator.free(api_key);
@@ -144,12 +149,21 @@ pub const Config = struct {
             max_tokens = std.fmt.parseInt(u32, max_tokens_str, 10) catch 4096;
         }
 
+        if (try envVarOwned(allocator, "OPENAI_MAX_ITERATIONS")) |max_iterations_str| {
+            defer allocator.free(max_iterations_str);
+            max_iterations = std.fmt.parseInt(u32, max_iterations_str, 10) catch 200;
+        } else if (try envVarOwned(allocator, "AI_MAX_ITERATIONS")) |max_iterations_str| {
+            defer allocator.free(max_iterations_str);
+            max_iterations = std.fmt.parseInt(u32, max_iterations_str, 10) catch 200;
+        }
+
         return .{
             .allocator = allocator,
             .api_key = api_key,
             .base_url = base_url,
             .model = model,
             .max_tokens = max_tokens,
+            .max_iterations = max_iterations,
         };
     }
 
@@ -176,6 +190,19 @@ test "config defaults" {
         break :blk 4096;
     };
 
+    const expected_max_iterations: u32 = blk: {
+        if (try envVarOwned(allocator, "OPENAI_MAX_ITERATIONS")) |value| {
+            defer allocator.free(value);
+            break :blk std.fmt.parseInt(u32, value, 10) catch 200;
+        }
+        if (try envVarOwned(allocator, "AI_MAX_ITERATIONS")) |value| {
+            defer allocator.free(value);
+            break :blk std.fmt.parseInt(u32, value, 10) catch 200;
+        }
+        break :blk 200;
+    };
+
     try std.testing.expectEqualStrings(expected_model, config.model);
     try std.testing.expect(config.max_tokens == expected_max_tokens);
+    try std.testing.expect(config.max_iterations == expected_max_iterations);
 }
