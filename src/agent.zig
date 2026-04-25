@@ -79,7 +79,7 @@ pub const Agent = struct {
         });
 
         var iteration: usize = 0;
-        const max_iterations = 20;
+        const max_iterations = 200;
 
         while (iteration < max_iterations) : (iteration += 1) {
             const response = self.client.chat(self.history.items) catch |err| {
