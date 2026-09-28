@@ -105,10 +105,17 @@ pub const Agent = struct {
                     for (owned_calls) |c| c.deinit(self.allocator);
                     self.allocator.free(owned_calls);
                 }
+                // DeepSeek requires the assistant turn to be replayed as it was
+                // received, so keep any content alongside the tool calls.
+                const owned_content = if (response.content) |value| try self.allocator.dupe(u8, value) else null;
+                errdefer if (owned_content) |value| self.allocator.free(value);
+                const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
+                errdefer if (owned_reasoning) |value| self.allocator.free(value);
+
                 try self.history.append(self.allocator, .{
                     .role = "assistant",
-                    .content = null,
-                    .reasoning_content = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null,
+                    .content = owned_content,
+                    .reasoning_content = owned_reasoning,
                     .tool_calls = owned_calls,
                     .tool_call_id = null,
                 });
@@ -151,10 +158,13 @@ pub const Agent = struct {
 
                     const owned_content = try self.allocator.dupe(u8, content);
                     errdefer self.allocator.free(owned_content);
+                    const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
+                    errdefer if (owned_reasoning) |value| self.allocator.free(value);
+
                     try self.history.append(self.allocator, .{
                         .role = "assistant",
                         .content = owned_content,
-                        .reasoning_content = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null,
+                        .reasoning_content = owned_reasoning,
                         .tool_calls = null,
                         .tool_call_id = null,
                     });

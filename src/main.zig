@@ -1,12 +1,14 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const Agent = @import("agent.zig").Agent;
+const provider = @import("provider.zig");
 const Linenoise = @import("linenoise").Linenoise;
 
 // ANSI colour codes
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
+const RED = "\x1b[31m";
 const GREEN = "\x1b[32m";
 const MAGENTA = "\x1b[35m";
 const YELLOW = "\x1b[33m";
@@ -68,7 +70,25 @@ pub fn main(init: std.process.Init) !void {
         args.deinit(allocator);
     }
 
-    const config = try Config.load(allocator, io, env);
+    const config = Config.load(allocator, io, env) catch |err| switch (err) {
+        error.UnknownProvider => {
+            const valid = try std.mem.join(allocator, ", ", provider.Provider.names());
+            defer allocator.free(valid);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                RED ++ "Error: unknown AI_PROVIDER." ++ RESET ++
+                    "\n  Valid values: {s}\n" ++
+                    "  To use another endpoint, unset AI_PROVIDER and set AI_URL and AI_MODEL instead.\n",
+                .{valid},
+            );
+            defer allocator.free(msg);
+            std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+            // Exiting directly rather than returning keeps Zig from printing a
+            // stack trace underneath an error that is already fully explained.
+            std.process.exit(1);
+        },
+        else => return err,
+    };
     defer config.deinit();
 
     var agent = try Agent.init(allocator, io, config);
@@ -97,14 +117,26 @@ fn runRepl(
 
     try stdout.writeStreamingAll(io, MAGENTA ++ BOLD ++ BANNER ++ RESET);
     {
-        const msg = try std.fmt.allocPrint(allocator, DIM ++ "  Model : {s}\n" ++ RESET, .{config.model});
-        defer allocator.free(msg);
-        try stdout.writeStreamingAll(io, msg);
+        const model_line = if (config.provider) |selected|
+            try std.fmt.allocPrint(allocator, DIM ++ "  Model : {s}  ({s})\n" ++ RESET, .{ config.model, @tagName(selected) })
+        else
+            try std.fmt.allocPrint(allocator, DIM ++ "  Model : {s}\n" ++ RESET, .{config.model});
+        defer allocator.free(model_line);
+        try stdout.writeStreamingAll(io, model_line);
     }
     try stdout.writeStreamingAll(io, DIM ++ "  Type /help for commands, Ctrl+D to exit.\n\n" ++ RESET);
 
     if (config.api_key.len == 0) {
-        try stderr.writeStreamingAll(io, YELLOW ++ "Warning: OPENAI_API_KEY is not set.\n  export OPENAI_API_KEY=your-key\n\n" ++ RESET);
+        // Name the variable that actually applies, so a provider user is not
+        // told to export a key for some other service.
+        const key_var = if (config.provider) |selected| selected.spec().api_key_env else "OPENAI_API_KEY";
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            YELLOW ++ "Warning: {s} is not set.\n  export {s}=your-key\n\n" ++ RESET,
+            .{ key_var, key_var },
+        );
+        defer allocator.free(msg);
+        try stderr.writeStreamingAll(io, msg);
     }
 
     var ln = Linenoise.init(allocator, io, env);
@@ -164,11 +196,14 @@ test {
     _ = @import("tools.zig");
     _ = @import("openai.zig");
     _ = @import("config.zig");
+    _ = @import("provider.zig");
 }
 
 test "config loads" {
     const allocator = std.testing.allocator;
-    var env = try std.process.Environ.createMap(std.testing.environ, allocator);
+    // An empty map has no HOME, so no config file is read and the developer's
+    // own environment cannot leak into the test.
+    var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
 
     const config = try Config.load(allocator, std.testing.io, &env);

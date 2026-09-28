@@ -12,6 +12,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `write_file` — create or overwrite files
   - `list_dir` — list directory contents
 - **Multi-turn tool chaining** — the agent loops until the task is complete
+- **Built-in provider presets** — one setting selects `deepseek` or `openai`
 - **OpenAI-compatible** — works with any endpoint that speaks the OpenAI chat-completions protocol (OpenAI, Azure OpenAI, Ollama, LM Studio, …)
 - **ANSI colour output**
 
@@ -35,7 +36,7 @@ Configuration can be loaded from a config file and/or environment variables. The
 - `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
 - `~/.config/zagent` (fallback)
 
-The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS` (or their `OPENAI_*` equivalents). Environment variables override config file values.
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS` (or their `OPENAI_*` equivalents). Environment variables override config file values.
 
 See `zagent.example.conf` for a complete example config file.
 
@@ -43,11 +44,32 @@ All configuration is also supported through environment variables:
 
 | Variable           | Default                          | Description                          |
 |--------------------|----------------------------------|--------------------------------------|
+| `AI_PROVIDER`      | *(unset)*                        | Select a built-in preset: `deepseek` or `openai` |
 | `OPENAI_API_KEY`   | *(required)*                     | Your OpenAI (or compatible) API key  |
 | `OPENAI_BASE_URL`  | `https://api.openai.com/v1`      | API base URL                         |
 | `OPENAI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
 | `OPENAI_MAX_TOKENS`| `4096`                           | Maximum tokens per response          |
 | `OPENAI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
+
+Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`.
+
+## Providers
+
+`AI_PROVIDER` selects a built-in preset that supplies the base URL, the default model, and the name of the environment variable holding the API key:
+
+| Provider   | Base URL                     | Default model    | API key variable   |
+|------------|------------------------------|------------------|--------------------|
+| `openai`   | `https://api.openai.com/v1`  | `gpt-4o-mini`    | `OPENAI_API_KEY`   |
+| `deepseek` | `https://api.deepseek.com`   | `deepseek-flash` | `DEEPSEEK_API_KEY` |
+
+Selecting `openai` is identical to not setting `AI_PROVIDER` at all. To use some other OpenAI-compatible endpoint, leave `AI_PROVIDER` unset and set `AI_URL` / `AI_MODEL` yourself.
+
+Precedence, highest first: an explicit environment variable, then the config file, then the provider preset.
+
+Two deliberate details worth knowing:
+
+- When a provider is selected, only *its* API key variable is consulted. `OPENAI_API_KEY` is ignored under `AI_PROVIDER=deepseek`, so a key exported for other tooling cannot be sent to the wrong endpoint. Use `AI_KEY` if you want one key for every provider.
+- An unknown provider name is a startup error rather than a silent fallback, and the message lists the valid names.
 
 ## Usage
 
@@ -112,16 +134,25 @@ export OPENAI_MODEL=your-model
 ./zig-out/bin/zagent
 ```
 
-### Using DeepSeek V4
+### Using DeepSeek
 
 ```bash
-export OPENAI_BASE_URL=https://api.deepseek.com
-export OPENAI_API_KEY=your-deepseek-key
-export OPENAI_MODEL=deepseek-v4-flash
+export AI_PROVIDER=deepseek
+export DEEPSEEK_API_KEY=your-deepseek-key
 ./zig-out/bin/zagent
 ```
 
-`deepseek-v4-pro` is also supported. For backward compatibility, `deepseek-chat` is treated as `deepseek-v4-flash`, and `deepseek-reasoner` is treated as `deepseek-v4-flash` with thinking mode enabled.
+DeepSeek enables thinking mode by default, and zagent requests it explicitly rather than relying on that default. The recognised model names are:
+
+| `AI_MODEL`          | Sent to the API      | Thinking mode |
+|---------------------|----------------------|---------------|
+| `deepseek-flash`    | `deepseek-flash`     | enabled       |
+| `deepseek-v4-pro`   | `deepseek-v4-pro`    | enabled       |
+| `deepseek-chat`     | `deepseek-flash`     | disabled      |
+| `deepseek-reasoner` | `deepseek-flash`     | enabled       |
+| `deepseek-v4-flash` | `deepseek-flash`     | disabled      |
+
+Any other model name is sent through unchanged with no `thinking` field. For the fastest and cheapest replies, use `AI_MODEL=deepseek-chat`, which turns thinking off.
 
 ## Run tests
 
@@ -133,9 +164,10 @@ zig build test
 
 ```
 src/
-  main.zig    — CLI entry point, REPL loop
-  config.zig  — Configuration loading from environment variables
-  openai.zig  — OpenAI-compatible HTTP client and JSON serialisation
+  main.zig     — CLI entry point, REPL loop
+  config.zig   — Configuration loading from the config file and environment
+  provider.zig — Built-in provider presets
+  openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
   tools.zig   — Tool implementations (shell, read_file, write_file, list_dir)
   agent.zig   — Agent loop: call API → execute tools → repeat
 build.zig     — Zig build script

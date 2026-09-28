@@ -1,6 +1,13 @@
 const std = @import("std");
+const provider = @import("provider.zig");
+
+const Provider = provider.Provider;
+
+const default_max_tokens: u32 = 4096;
+const default_max_iterations: u32 = 200;
 
 const ConfigFile = struct {
+    provider: ?[]u8 = null,
     api_key: ?[]u8 = null,
     base_url: ?[]u8 = null,
     model: ?[]u8 = null,
@@ -8,6 +15,7 @@ const ConfigFile = struct {
     max_iterations: ?u32 = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
+        if (self.provider) |value| allocator.free(value);
         if (self.api_key) |value| allocator.free(value);
         if (self.base_url) |value| allocator.free(value);
         if (self.model) |value| allocator.free(value);
@@ -18,6 +26,23 @@ const ConfigFile = struct {
 fn envVarOwned(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8) !?[]u8 {
     const value = env.get(name) orelse return null;
     return try allocator.dupe(u8, value);
+}
+
+/// Return the first of `names` that is set to a non-empty value.
+fn firstEnv(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    names: []const []const u8,
+) !?[]u8 {
+    for (names) |name| {
+        const value = try envVarOwned(allocator, env, name) orelse continue;
+        if (value.len == 0) {
+            allocator.free(value);
+            continue;
+        }
+        return value;
+    }
+    return null;
 }
 
 fn configBasePath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
@@ -59,16 +84,18 @@ fn setString(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !voi
 }
 
 fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []const u8, value: []const u8) !void {
-    if (std.ascii.eqlIgnoreCase(key, "OPENAI_API_KEY") or std.ascii.eqlIgnoreCase(key, "AI_KEY")) {
+    if (std.ascii.eqlIgnoreCase(key, "AI_PROVIDER") or std.ascii.eqlIgnoreCase(key, "PROVIDER")) {
+        try setString(allocator, &config.provider, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_API_KEY") or std.ascii.eqlIgnoreCase(key, "AI_KEY")) {
         try setString(allocator, &config.api_key, value);
     } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_BASE_URL") or std.ascii.eqlIgnoreCase(key, "AI_URL")) {
         try setString(allocator, &config.base_url, value);
     } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MODEL") or std.ascii.eqlIgnoreCase(key, "AI_MODEL")) {
         try setString(allocator, &config.model, value);
     } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_TOKENS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
-        config.max_tokens = std.fmt.parseInt(u32, value, 10) catch 4096;
+        config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
     } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_ITERATIONS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
-        config.max_iterations = std.fmt.parseInt(u32, value, 10) catch 200;
+        config.max_iterations = std.fmt.parseInt(u32, value, 10) catch default_max_iterations;
     }
 }
 
@@ -110,6 +137,147 @@ fn takeOwnedString(field: *?[]u8) ?[]u8 {
     return value;
 }
 
+/// Parse a provider name, mapping the empty name to "no provider".
+fn parseProviderName(name: []const u8) !?Provider {
+    if (std.mem.trim(u8, name, " \t\r\n").len == 0) return null;
+    return Provider.fromName(name) orelse error.UnknownProvider;
+}
+
+fn resolveProvider(
+    allocator: std.mem.Allocator,
+    file_config: *ConfigFile,
+    env: *const std.process.Environ.Map,
+) !?Provider {
+    // An exported AI_PROVIDER wins over the config file. Exporting it blank
+    // cancels a provider set in the file, which gives a one-off escape hatch.
+    if (try envVarOwned(allocator, env, "AI_PROVIDER")) |name| {
+        defer allocator.free(name);
+        if (file_config.provider) |file_name| {
+            allocator.free(file_name);
+            file_config.provider = null;
+        }
+        return parseProviderName(name);
+    }
+
+    const name = takeOwnedString(&file_config.provider) orelse return null;
+    defer allocator.free(name);
+    return parseProviderName(name);
+}
+
+/// Resolve one string setting: environment, then config file, then the
+/// fallback supplied by the provider preset. Takes ownership of `file_value`.
+fn resolveSetting(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    env_names: []const []const u8,
+    file_value: *?[]u8,
+    fallback: []const u8,
+) ![]u8 {
+    if (try firstEnv(allocator, env, env_names)) |value| return value;
+    if (takeOwnedString(file_value)) |value| return value;
+    return allocator.dupe(u8, fallback);
+}
+
+fn resolveU32(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    env_names: []const []const u8,
+    file_value: ?u32,
+    fallback: u32,
+) !u32 {
+    for (env_names) |name| {
+        const raw = try envVarOwned(allocator, env, name) orelse continue;
+        defer allocator.free(raw);
+        if (raw.len == 0) continue;
+        return std.fmt.parseInt(u32, raw, 10) catch fallback;
+    }
+    return file_value orelse fallback;
+}
+
+/// `openai.zig` appends "/chat/completions" to the base URL, so a trailing
+/// slash here would produce a doubled separator. Takes ownership of `url`.
+fn trimTrailingSlashes(allocator: std.mem.Allocator, url: []u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, url, "/");
+    if (trimmed.len == url.len) return url;
+    const shortened = try allocator.dupe(u8, trimmed);
+    allocator.free(url);
+    return shortened;
+}
+
+/// Turn a parsed config file plus the environment into the effective settings.
+/// Takes ownership of the strings held by `file_config`.
+fn resolve(
+    allocator: std.mem.Allocator,
+    file_config: *ConfigFile,
+    env: *const std.process.Environ.Map,
+) !Config {
+    const selected_provider = try resolveProvider(allocator, file_config, env);
+
+    // With no provider selected the fallback is the openai preset, which is
+    // byte-identical to the historical built-in defaults.
+    const spec = if (selected_provider) |p| p.spec() else Provider.openai.spec();
+
+    var base_url = try resolveSetting(
+        allocator,
+        env,
+        &.{ "OPENAI_BASE_URL", "AI_URL" },
+        &file_config.base_url,
+        spec.base_url,
+    );
+    errdefer allocator.free(base_url);
+    base_url = try trimTrailingSlashes(allocator, base_url);
+
+    const model = try resolveSetting(
+        allocator,
+        env,
+        &.{ "OPENAI_MODEL", "AI_MODEL" },
+        &file_config.model,
+        spec.model,
+    );
+    errdefer allocator.free(model);
+
+    const api_key = blk: {
+        // AI_KEY is the provider-agnostic spelling and wins outright.
+        if (try firstEnv(allocator, env, &.{"AI_KEY"})) |value| break :blk value;
+
+        // Otherwise consult the selected provider's own variable. The legacy
+        // OPENAI_API_KEY is deliberately not consulted for another provider, so
+        // a key exported for unrelated tooling cannot be sent to the wrong
+        // endpoint and produce an opaque 401.
+        const key_env_name = if (selected_provider) |p| p.spec().api_key_env else "OPENAI_API_KEY";
+        if (try firstEnv(allocator, env, &.{key_env_name})) |value| break :blk value;
+
+        if (takeOwnedString(&file_config.api_key)) |value| break :blk value;
+        break :blk try allocator.dupe(u8, "");
+    };
+    errdefer allocator.free(api_key);
+
+    const max_tokens = try resolveU32(
+        allocator,
+        env,
+        &.{ "OPENAI_MAX_TOKENS", "AI_MAX_TOKENS" },
+        file_config.max_tokens,
+        default_max_tokens,
+    );
+    const max_iterations = try resolveU32(
+        allocator,
+        env,
+        &.{ "OPENAI_MAX_ITERATIONS", "AI_MAX_ITERATIONS" },
+        file_config.max_iterations,
+        default_max_iterations,
+    );
+
+    return .{
+        .allocator = allocator,
+        .api_key = api_key,
+        .base_url = base_url,
+        .model = model,
+        .max_tokens = max_tokens,
+        .max_iterations = max_iterations,
+        .provider = selected_provider,
+    };
+}
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     api_key: []const u8,
@@ -117,59 +285,14 @@ pub const Config = struct {
     model: []const u8,
     max_tokens: u32,
     max_iterations: u32,
+    /// The built-in preset that supplied the defaults, if one was selected.
+    provider: ?Provider,
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Config {
         var file_config = try loadConfigFile(io, allocator, env);
         defer file_config.deinit(allocator);
 
-        var api_key = takeOwnedString(&file_config.api_key) orelse try allocator.dupe(u8, "");
-        errdefer allocator.free(api_key);
-
-        var base_url = takeOwnedString(&file_config.base_url) orelse try allocator.dupe(u8, "https://api.openai.com/v1");
-        errdefer allocator.free(base_url);
-
-        var model = takeOwnedString(&file_config.model) orelse try allocator.dupe(u8, "gpt-4o-mini");
-        errdefer allocator.free(model);
-
-        var max_tokens: u32 = file_config.max_tokens orelse 4096;
-        var max_iterations: u32 = file_config.max_iterations orelse 200;
-
-        if (try envVarOwned(allocator, env, "OPENAI_API_KEY")) |env_api_key| {
-            allocator.free(api_key);
-            api_key = env_api_key;
-        }
-
-        if (try envVarOwned(allocator, env, "OPENAI_BASE_URL")) |env_base_url| {
-            allocator.free(base_url);
-            base_url = env_base_url;
-        }
-
-        if (try envVarOwned(allocator, env, "OPENAI_MODEL")) |env_model| {
-            allocator.free(model);
-            model = env_model;
-        }
-
-        if (try envVarOwned(allocator, env, "OPENAI_MAX_TOKENS")) |max_tokens_str| {
-            defer allocator.free(max_tokens_str);
-            max_tokens = std.fmt.parseInt(u32, max_tokens_str, 10) catch 4096;
-        }
-
-        if (try envVarOwned(allocator, env, "OPENAI_MAX_ITERATIONS")) |max_iterations_str| {
-            defer allocator.free(max_iterations_str);
-            max_iterations = std.fmt.parseInt(u32, max_iterations_str, 10) catch 200;
-        } else if (try envVarOwned(allocator, env, "AI_MAX_ITERATIONS")) |max_iterations_str| {
-            defer allocator.free(max_iterations_str);
-            max_iterations = std.fmt.parseInt(u32, max_iterations_str, 10) catch 200;
-        }
-
-        return .{
-            .allocator = allocator,
-            .api_key = api_key,
-            .base_url = base_url,
-            .model = model,
-            .max_tokens = max_tokens,
-            .max_iterations = max_iterations,
-        };
+        return resolve(allocator, &file_config, env);
     }
 
     pub fn deinit(self: Config) void {
@@ -179,38 +302,245 @@ pub const Config = struct {
     }
 };
 
+/// Build a hermetic environment map so tests never observe the developer's
+/// shell, and never read a real config file (no HOME means no config path).
+fn testEnv(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !std.process.Environ.Map {
+    var env = std.process.Environ.Map.init(allocator);
+    errdefer env.deinit();
+    for (pairs) |pair| try env.put(pair[0], pair[1]);
+    return env;
+}
+
+fn testFile(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !ConfigFile {
+    var file_config = ConfigFile{};
+    errdefer file_config.deinit(allocator);
+    for (pairs) |pair| try applyConfigValue(allocator, &file_config, pair[0], pair[1]);
+    return file_config;
+}
+
 test "config defaults" {
     const allocator = std.testing.allocator;
-    var env = try std.process.Environ.createMap(std.testing.environ, allocator);
+    var env = try testEnv(allocator, &.{});
     defer env.deinit();
 
-    const config = try Config.load(allocator, std.testing.io, &env);
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
     defer config.deinit();
 
-    const expected_model = try envVarOwned(allocator, &env, "OPENAI_MODEL") orelse try allocator.dupe(u8, "gpt-4o-mini");
-    defer allocator.free(expected_model);
+    try std.testing.expectEqual(@as(?Provider, null), config.provider);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", config.base_url);
+    try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
+    try std.testing.expectEqualStrings("", config.api_key);
+    try std.testing.expectEqual(@as(u32, 4096), config.max_tokens);
+    try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
+}
 
-    const expected_max_tokens: u32 = blk: {
-        if (try envVarOwned(allocator, &env, "OPENAI_MAX_TOKENS")) |value| {
-            defer allocator.free(value);
-            break :blk std.fmt.parseInt(u32, value, 10) catch 4096;
-        }
-        break :blk 4096;
-    };
+test "provider preset supplies defaults" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "AI_PROVIDER", "deepseek" }});
+    defer env.deinit();
 
-    const expected_max_iterations: u32 = blk: {
-        if (try envVarOwned(allocator, &env, "OPENAI_MAX_ITERATIONS")) |value| {
-            defer allocator.free(value);
-            break :blk std.fmt.parseInt(u32, value, 10) catch 200;
-        }
-        if (try envVarOwned(allocator, &env, "AI_MAX_ITERATIONS")) |value| {
-            defer allocator.free(value);
-            break :blk std.fmt.parseInt(u32, value, 10) catch 200;
-        }
-        break :blk 200;
-    };
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
 
-    try std.testing.expectEqualStrings(expected_model, config.model);
-    try std.testing.expect(config.max_tokens == expected_max_tokens);
-    try std.testing.expect(config.max_iterations == expected_max_iterations);
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, Provider.deepseek), config.provider);
+    try std.testing.expectEqualStrings("https://api.deepseek.com", config.base_url);
+    try std.testing.expectEqualStrings("deepseek-flash", config.model);
+    try std.testing.expectEqualStrings("", config.api_key);
+}
+
+test "openai preset matches the built-in defaults" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "AI_PROVIDER", "openai" }});
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", config.base_url);
+    try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
+}
+
+test "provider key comes from the provider's own variable" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "AI_PROVIDER", "deepseek" },
+        .{ "DEEPSEEK_API_KEY", "sk-deepseek" },
+        .{ "OPENAI_API_KEY", "sk-openai" },
+    });
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqualStrings("sk-deepseek", config.api_key);
+}
+
+test "legacy openai key is ignored when another provider is selected" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "AI_PROVIDER", "deepseek" },
+        .{ "OPENAI_API_KEY", "sk-openai" },
+    });
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    // Falling back would send the OpenAI key to api.deepseek.com.
+    try std.testing.expectEqualStrings("", config.api_key);
+}
+
+test "ai key overrides the provider variable" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "AI_PROVIDER", "deepseek" },
+        .{ "AI_KEY", "sk-generic" },
+        .{ "DEEPSEEK_API_KEY", "sk-deepseek" },
+    });
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqualStrings("sk-generic", config.api_key);
+}
+
+test "explicit environment beats the preset" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "AI_PROVIDER", "deepseek" },
+        .{ "OPENAI_BASE_URL", "https://proxy.example/v1/" },
+        .{ "OPENAI_MODEL", "deepseek-v4-pro" },
+    });
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    // The trailing slash is trimmed so the request path is not doubled.
+    try std.testing.expectEqualStrings("https://proxy.example/v1", config.base_url);
+    try std.testing.expectEqualStrings("deepseek-v4-pro", config.model);
+}
+
+test "config file beats the preset and loses to the environment" {
+    const allocator = std.testing.allocator;
+
+    {
+        var env = try testEnv(allocator, &.{.{ "AI_PROVIDER", "deepseek" }});
+        defer env.deinit();
+
+        var file_config = try testFile(allocator, &.{
+            .{ "AI_PROVIDER", "deepseek" },
+            .{ "AI_MODEL", "deepseek-v4-pro" },
+            .{ "AI_URL", "https://from-file/v1" },
+            .{ "AI_KEY", "sk-file" },
+        });
+        defer file_config.deinit(allocator);
+
+        const config = try resolve(allocator, &file_config, &env);
+        defer config.deinit();
+
+        try std.testing.expectEqualStrings("deepseek-v4-pro", config.model);
+        try std.testing.expectEqualStrings("https://from-file/v1", config.base_url);
+        try std.testing.expectEqualStrings("sk-file", config.api_key);
+    }
+
+    {
+        var env = try testEnv(allocator, &.{
+            .{ "AI_PROVIDER", "deepseek" },
+            .{ "AI_MODEL", "from-env" },
+        });
+        defer env.deinit();
+
+        var file_config = try testFile(allocator, &.{
+            .{ "AI_MODEL", "deepseek-v4-pro" },
+            .{ "AI_URL", "https://from-file/v1" },
+        });
+        defer file_config.deinit(allocator);
+
+        const config = try resolve(allocator, &file_config, &env);
+        defer config.deinit();
+
+        try std.testing.expectEqualStrings("from-env", config.model);
+        try std.testing.expectEqualStrings("https://from-file/v1", config.base_url);
+    }
+}
+
+test "provider name is matched case insensitively" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "AI_PROVIDER", "DeepSeek" }});
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, Provider.deepseek), config.provider);
+}
+
+test "blank environment provider cancels the file provider" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "AI_PROVIDER", "" }});
+    defer env.deinit();
+
+    var file_config = try testFile(allocator, &.{.{ "AI_PROVIDER", "deepseek" }});
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, null), config.provider);
+    try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
+}
+
+test "unknown provider is an error" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "AI_PROVIDER", "deepsek" }});
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    try std.testing.expectError(error.UnknownProvider, resolve(allocator, &file_config, &env));
+}
+
+test "max tokens and iterations prefer the environment" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "AI_MAX_TOKENS", "1234" }});
+    defer env.deinit();
+
+    var file_config = try testFile(allocator, &.{
+        .{ "AI_MAX_TOKENS", "77" },
+        .{ "AI_MAX_ITERATIONS", "5" },
+    });
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1234), config.max_tokens);
+    try std.testing.expectEqual(@as(u32, 5), config.max_iterations);
 }

@@ -157,8 +157,10 @@ pub fn buildRequest(
     try w.writeAll("{\"model\":");
     try std.json.Stringify.encodeJsonString(request_options.model, .{}, w);
     try w.print(",\"max_tokens\":{d}", .{max_tokens});
-    if (request_options.deepseek_thinking_enabled) {
-        try w.writeAll(",\"thinking\":{\"type\":\"enabled\"}");
+    switch (request_options.thinking) {
+        .omit => {},
+        .enabled => try w.writeAll(",\"thinking\":{\"type\":\"enabled\"}"),
+        .disabled => try w.writeAll(",\"thinking\":{\"type\":\"disabled\"}"),
     }
     try w.writeAll(",\"messages\":[");
     for (messages, 0..) |msg, i| {
@@ -172,39 +174,49 @@ pub fn buildRequest(
     return aw.toOwnedSlice();
 }
 
+/// Whether to send DeepSeek's `thinking` field, and with what value.
+///
+/// DeepSeek enables thinking by default, so "non-thinking" has to be asked for
+/// explicitly: omitting the field leaves thinking on. The field is also
+/// DeepSeek-specific, hence the `omit` case for every other model.
+const ThinkingMode = enum { omit, enabled, disabled };
+
 const RequestOptions = struct {
     model: []const u8,
-    deepseek_thinking_enabled: bool,
+    thinking: ThinkingMode,
+};
+
+const ModelRule = struct {
+    /// Name accepted from AI_MODEL.
+    name: []const u8,
+    /// Name actually sent to the API.
+    canonical: []const u8,
+    thinking: ThinkingMode,
+};
+
+const MODEL_RULES = [_]ModelRule{
+    // Current names. Thinking is the documented default, so state it rather
+    // than relying on a server-side default we do not control.
+    .{ .name = "deepseek-flash", .canonical = "deepseek-flash", .thinking = .enabled },
+    .{ .name = "deepseek-v4-pro", .canonical = "deepseek-v4-pro", .thinking = .enabled },
+    // Retired, but still accepted and routed to DeepSeek-V4.1-Flash. This name
+    // has always meant "the cheap, non-thinking one", so keep that meaning.
+    .{ .name = "deepseek-v4-flash", .canonical = "deepseek-flash", .thinking = .disabled },
+    // Legacy aliases: the same model, non-thinking and thinking respectively.
+    .{ .name = "deepseek-chat", .canonical = "deepseek-flash", .thinking = .disabled },
+    .{ .name = "deepseek-reasoner", .canonical = "deepseek-flash", .thinking = .enabled },
 };
 
 fn resolveRequestOptions(model: []const u8) RequestOptions {
-    if (std.mem.eql(u8, model, "deepseek-chat")) {
-        // DeepSeek documents this alias as the non-thinking mode of deepseek-v4-flash.
-        return .{
-            .model = "deepseek-v4-flash",
-            .deepseek_thinking_enabled = false,
-        };
+    for (MODEL_RULES) |rule| {
+        if (std.mem.eql(u8, model, rule.name)) {
+            return .{ .model = rule.canonical, .thinking = rule.thinking };
+        }
     }
 
-    if (std.mem.eql(u8, model, "deepseek-reasoner")) {
-        // DeepSeek documents this alias as the thinking mode of deepseek-v4-flash.
-        return .{
-            .model = "deepseek-v4-flash",
-            .deepseek_thinking_enabled = true,
-        };
-    }
-
-    if (std.mem.startsWith(u8, model, "deepseek-v4-")) {
-        return .{
-            .model = model,
-            .deepseek_thinking_enabled = std.mem.eql(u8, model, "deepseek-v4-pro"),
-        };
-    }
-
-    return .{
-        .model = model,
-        .deepseek_thinking_enabled = false,
-    };
+    // Unlisted models are passed through untouched with no thinking field, so
+    // a future DeepSeek model still gets the server's own default.
+    return .{ .model = model, .thinking = .omit };
 }
 
 fn writeMessageJson(w: *std.Io.Writer, msg: Message) !void {
@@ -370,7 +382,7 @@ test "build request json" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") != null);
 }
 
-test "build request maps deepseek reasoner to v4 thinking mode" {
+test "build request maps deepseek reasoner to the thinking mode of deepseek-flash" {
     const allocator = std.testing.allocator;
     const messages = [_]Message{
         .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
@@ -378,8 +390,43 @@ test "build request maps deepseek reasoner to v4 thinking mode" {
     const json = try buildRequest(allocator, "deepseek-reasoner", &messages, 4096);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-v4-flash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-flash\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "build request maps deepseek chat to non-thinking deepseek-flash" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const json = try buildRequest(allocator, "deepseek-chat", &messages, 4096);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-flash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"disabled\"}") != null);
+}
+
+test "build request asks for thinking on deepseek flash explicitly" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const json = try buildRequest(allocator, "deepseek-flash", &messages, 4096);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-flash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"enabled\"}") != null);
+}
+
+test "build request omits the thinking field for other models" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const json = try buildRequest(allocator, "gpt-4o-mini", &messages, 4096);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "thinking") == null);
 }
 
 test "build request enables thinking for deepseek v4 pro" {
@@ -402,8 +449,8 @@ test "build request keeps deepseek v4 flash in non-thinking mode" {
     const json = try buildRequest(allocator, "deepseek-v4-flash", &messages, 4096);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-v4-flash\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"enabled\"}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-flash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":{\"type\":\"disabled\"}") != null);
 }
 
 test "extract string arg" {
