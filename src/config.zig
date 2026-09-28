@@ -15,38 +15,36 @@ const ConfigFile = struct {
     }
 };
 
-fn envVarOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => return err,
-    };
+fn envVarOwned(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8) !?[]u8 {
+    const value = env.get(name) orelse return null;
+    return try allocator.dupe(u8, value);
 }
 
-fn configBasePath(allocator: std.mem.Allocator) !?[]u8 {
-    if (try envVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg_dir| {
+fn configBasePath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
+    if (try envVarOwned(allocator, env, "XDG_CONFIG_HOME")) |xdg_dir| {
         defer allocator.free(xdg_dir);
         return try std.fmt.allocPrint(allocator, "{s}/zagent", .{xdg_dir});
     }
-    if (try envVarOwned(allocator, "HOME")) |home_dir| {
+    if (try envVarOwned(allocator, env, "HOME")) |home_dir| {
         defer allocator.free(home_dir);
         return try std.fmt.allocPrint(allocator, "{s}/.config/zagent", .{home_dir});
     }
     return null;
 }
 
-fn openConfigFile(allocator: std.mem.Allocator) !?std.fs.File {
-    const base_path = (try configBasePath(allocator)) orelse return null;
+fn openConfigFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?std.Io.File {
+    const base_path = (try configBasePath(allocator, env)) orelse return null;
     defer allocator.free(base_path);
 
-    const cwd = std.fs.cwd();
-    if (cwd.openFile(base_path, .{})) |file| {
+    const cwd = std.Io.Dir.cwd();
+    if (cwd.openFile(io, base_path, .{})) |file| {
         return file;
     } else |err| switch (err) {
         error.FileNotFound => return null,
         error.IsDir => {
             const config_path = try std.fmt.allocPrint(allocator, "{s}/config", .{base_path});
             defer allocator.free(config_path);
-            return cwd.openFile(config_path, .{}) catch |open_err| switch (open_err) {
+            return cwd.openFile(io, config_path, .{}) catch |open_err| switch (open_err) {
                 error.FileNotFound => return null,
                 else => return open_err,
             };
@@ -74,12 +72,19 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
     }
 }
 
-fn loadConfigFile(allocator: std.mem.Allocator) !ConfigFile {
-    var config = ConfigFile{};
-    var file = (try openConfigFile(allocator)) orelse return config;
-    defer file.close();
+/// Read a whole file through a `std.Io.File.Reader`, growing the buffer as needed.
+fn readFileAlloc(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, max_bytes: usize) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &buf);
+    return file_reader.interface.allocRemaining(allocator, .limited(max_bytes));
+}
 
-    const contents = try file.readToEndAlloc(allocator, 64 * 1024);
+fn loadConfigFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !ConfigFile {
+    var config = ConfigFile{};
+    var file = (try openConfigFile(io, allocator, env)) orelse return config;
+    defer file.close(io);
+
+    const contents = try readFileAlloc(io, allocator, file, 64 * 1024);
     defer allocator.free(contents);
 
     var lines = std.mem.splitScalar(u8, contents, '\n');
@@ -113,8 +118,8 @@ pub const Config = struct {
     max_tokens: u32,
     max_iterations: u32,
 
-    pub fn load(allocator: std.mem.Allocator) !Config {
-        var file_config = try loadConfigFile(allocator);
+    pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Config {
+        var file_config = try loadConfigFile(io, allocator, env);
         defer file_config.deinit(allocator);
 
         var api_key = takeOwnedString(&file_config.api_key) orelse try allocator.dupe(u8, "");
@@ -129,30 +134,30 @@ pub const Config = struct {
         var max_tokens: u32 = file_config.max_tokens orelse 4096;
         var max_iterations: u32 = file_config.max_iterations orelse 200;
 
-        if (try envVarOwned(allocator, "OPENAI_API_KEY")) |env_api_key| {
+        if (try envVarOwned(allocator, env, "OPENAI_API_KEY")) |env_api_key| {
             allocator.free(api_key);
             api_key = env_api_key;
         }
 
-        if (try envVarOwned(allocator, "OPENAI_BASE_URL")) |env_base_url| {
+        if (try envVarOwned(allocator, env, "OPENAI_BASE_URL")) |env_base_url| {
             allocator.free(base_url);
             base_url = env_base_url;
         }
 
-        if (try envVarOwned(allocator, "OPENAI_MODEL")) |env_model| {
+        if (try envVarOwned(allocator, env, "OPENAI_MODEL")) |env_model| {
             allocator.free(model);
             model = env_model;
         }
 
-        if (try envVarOwned(allocator, "OPENAI_MAX_TOKENS")) |max_tokens_str| {
+        if (try envVarOwned(allocator, env, "OPENAI_MAX_TOKENS")) |max_tokens_str| {
             defer allocator.free(max_tokens_str);
             max_tokens = std.fmt.parseInt(u32, max_tokens_str, 10) catch 4096;
         }
 
-        if (try envVarOwned(allocator, "OPENAI_MAX_ITERATIONS")) |max_iterations_str| {
+        if (try envVarOwned(allocator, env, "OPENAI_MAX_ITERATIONS")) |max_iterations_str| {
             defer allocator.free(max_iterations_str);
             max_iterations = std.fmt.parseInt(u32, max_iterations_str, 10) catch 200;
-        } else if (try envVarOwned(allocator, "AI_MAX_ITERATIONS")) |max_iterations_str| {
+        } else if (try envVarOwned(allocator, env, "AI_MAX_ITERATIONS")) |max_iterations_str| {
             defer allocator.free(max_iterations_str);
             max_iterations = std.fmt.parseInt(u32, max_iterations_str, 10) catch 200;
         }
@@ -176,14 +181,17 @@ pub const Config = struct {
 
 test "config defaults" {
     const allocator = std.testing.allocator;
-    const config = try Config.load(allocator);
+    var env = try std.process.Environ.createMap(std.testing.environ, allocator);
+    defer env.deinit();
+
+    const config = try Config.load(allocator, std.testing.io, &env);
     defer config.deinit();
 
-    const expected_model = try envVarOwned(allocator, "OPENAI_MODEL") orelse try allocator.dupe(u8, "gpt-4o-mini");
+    const expected_model = try envVarOwned(allocator, &env, "OPENAI_MODEL") orelse try allocator.dupe(u8, "gpt-4o-mini");
     defer allocator.free(expected_model);
 
     const expected_max_tokens: u32 = blk: {
-        if (try envVarOwned(allocator, "OPENAI_MAX_TOKENS")) |value| {
+        if (try envVarOwned(allocator, &env, "OPENAI_MAX_TOKENS")) |value| {
             defer allocator.free(value);
             break :blk std.fmt.parseInt(u32, value, 10) catch 4096;
         }
@@ -191,11 +199,11 @@ test "config defaults" {
     };
 
     const expected_max_iterations: u32 = blk: {
-        if (try envVarOwned(allocator, "OPENAI_MAX_ITERATIONS")) |value| {
+        if (try envVarOwned(allocator, &env, "OPENAI_MAX_ITERATIONS")) |value| {
             defer allocator.free(value);
             break :blk std.fmt.parseInt(u32, value, 10) catch 200;
         }
-        if (try envVarOwned(allocator, "AI_MAX_ITERATIONS")) |value| {
+        if (try envVarOwned(allocator, &env, "AI_MAX_ITERATIONS")) |value| {
             defer allocator.free(value);
             break :blk std.fmt.parseInt(u32, value, 10) catch 200;
         }

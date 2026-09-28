@@ -60,16 +60,18 @@ pub const ApiResponse = struct {
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     http_client: std.http.Client,
     api_key: []const u8,
     base_url: []const u8,
     model: []const u8,
     max_tokens: u32,
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) Client {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Client {
         return .{
             .allocator = allocator,
-            .http_client = std.http.Client{ .allocator = allocator },
+            .io = io,
+            .http_client = .{ .allocator = allocator, .io = io },
             .api_key = config.api_key,
             .base_url = config.base_url,
             .model = config.model,
@@ -105,7 +107,7 @@ pub const Client = struct {
     }
 
     fn performChatFetch(self: *Client, chat_url: []const u8, auth_header: []const u8, req_json: []const u8) !ApiResponse {
-        var aw: std.io.Writer.Allocating = .init(self.allocator);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
 
         const fetch_result = self.http_client.fetch(.{
@@ -135,7 +137,7 @@ pub const Client = struct {
 
     fn resetHttpClient(self: *Client) void {
         self.http_client.deinit();
-        self.http_client = .{ .allocator = self.allocator };
+        self.http_client = .{ .allocator = self.allocator, .io = self.io };
     }
 };
 
@@ -148,7 +150,7 @@ pub fn buildRequest(
 ) ![]u8 {
     const request_options = resolveRequestOptions(model);
 
-    var aw: std.io.Writer.Allocating = .init(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     const w = &aw.writer;
 
@@ -205,7 +207,7 @@ fn resolveRequestOptions(model: []const u8) RequestOptions {
     };
 }
 
-fn writeMessageJson(w: *std.io.Writer, msg: Message) !void {
+fn writeMessageJson(w: *std.Io.Writer, msg: Message) !void {
     try w.writeAll("{\"role\":");
     try std.json.Stringify.encodeJsonString(msg.role, .{}, w);
     if (msg.content) |content| {

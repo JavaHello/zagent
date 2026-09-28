@@ -1,15 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const File = std.fs.File;
+const Io = std.Io;
+const File = std.Io.File;
 
 const unsupported_term = [_][]const u8{ "dumb", "cons25", "emacs" };
 
 const is_windows = builtin.os.tag == .windows;
 const termios = if (!is_windows) std.posix.termios else struct { inMode: w.DWORD, outMode: w.DWORD };
 
-pub fn isUnsupportedTerm(allocator: std.mem.Allocator) bool {
-    const env_var = std.process.getEnvVarOwned(allocator, "TERM") catch return false;
-    defer allocator.free(env_var);
+pub fn isUnsupportedTerm(env: *const std.process.Environ.Map) bool {
+    const env_var = env.get("TERM") orelse return false;
     return for (unsupported_term) |t| {
         if (std.ascii.eqlIgnoreCase(env_var, t))
             break true;
@@ -100,17 +100,41 @@ pub fn disableRawMode(in: File, out: File, orig: termios) void {
     }
 }
 
-fn getCursorPosition(in: File, out: File) !usize {
-    var buf: [32]u8 = undefined;
-    // Use deprecatedReader() for Zig 0.15 compatibility (File.reader() now requires a buffer arg).
-    var reader = in.deprecatedReader();
+/// Reads one `\n`-terminated line into a freshly allocated slice, growing as
+/// needed. Returns `null` once the stream is exhausted. `max_len` bounds the
+/// result the way the old `readUntilDelimiterAlloc` limit did.
+///
+/// Bytes are consumed one at a time on purpose. A buffered `File.Reader` cannot
+/// be used here: it outlives the call that creates it in nobody's hands, so
+/// anything it read past the newline would be silently dropped. Reading the fd
+/// directly also keeps consecutive calls consistent, since the seek position
+/// lives on the descriptor rather than in a per-call buffer.
+pub fn readLineAlloc(io: Io, allocator: std.mem.Allocator, file: File, max_len: usize) !?[]u8 {
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(allocator);
+
+    var byte_buf: [1]u8 = undefined;
+    while (true) {
+        const n = try read(io, file, &byte_buf);
+        if (n == 0) return if (line.items.len == 0) null else try line.toOwnedSlice(allocator);
+        if (byte_buf[0] == '\n') return try line.toOwnedSlice(allocator);
+        if (line.items.len >= max_len) return error.StreamTooLong;
+        try line.append(allocator, byte_buf[0]);
+    }
+}
+
+fn getCursorPosition(io: Io, in: File, out: File) !usize {
+    var file_buffer: [256]u8 = undefined;
+    var file_reader = in.reader(io, &file_buffer);
 
     // Tell terminal to report cursor to in
-    try out.writeAll("\x1B[6n");
+    try out.writeStreamingAll(io, "\x1B[6n");
 
     // Read answer
-    const answer = (try reader.readUntilDelimiterOrEof(&buf, 'R')) orelse
-        return error.CursorPos;
+    const answer = file_reader.interface.takeDelimiterExclusive('R') catch |err| switch (err) {
+        error.EndOfStream, error.StreamTooLong => return error.CursorPos,
+        else => return err,
+    };
 
     // Parse answer
     if (!std.mem.startsWith(u8, "\x1B[", answer))
@@ -123,14 +147,14 @@ fn getCursorPosition(in: File, out: File) !usize {
     return try std.fmt.parseInt(usize, x, 10);
 }
 
-fn getColumnsFallback(in: File, out: File) !usize {
+fn getColumnsFallback(io: Io, in: File, out: File) !usize {
     var write_buf: [256]u8 = undefined;
-    var file_writer = out.writer(&write_buf);
+    var file_writer = out.writer(io, &write_buf);
     const writer = &file_writer.interface;
-    const orig_cursor_pos = try getCursorPosition(in, out);
+    const orig_cursor_pos = try getCursorPosition(io, in, out);
 
     try writer.print("\x1B[999C", .{});
-    const cols = try getCursorPosition(in, out);
+    const cols = try getCursorPosition(io, in, out);
 
     try writer.print("\x1B[{}D", .{orig_cursor_pos});
     try writer.flush();
@@ -138,7 +162,7 @@ fn getColumnsFallback(in: File, out: File) !usize {
     return cols;
 }
 
-pub fn getColumns(in: File, out: File) !usize {
+pub fn getColumns(io: Io, in: File, out: File) !usize {
     switch (builtin.os.tag) {
         .windows => {
             var csbi: w.CONSOLE_SCREEN_BUFFER_INFO = undefined;
@@ -157,27 +181,26 @@ pub fn getColumns(in: File, out: File) !usize {
             if (std.posix.errno(err) == .SUCCESS) {
                 return winsize.col;
             } else {
-                return try getColumnsFallback(in, out);
+                return try getColumnsFallback(io, in, out);
             }
         },
     }
 }
 
-pub fn clearScreen() !void {
-    const stdout = std.fs.File.stderr();
-    try stdout.writeAll("\x1b[H\x1b[2J");
+pub fn clearScreen(io: Io) !void {
+    try File.stderr().writeStreamingAll(io, "\x1b[H\x1b[2J");
 }
 
-pub fn beep() !void {
-    const stderr = std.fs.File.stderr();
-    try stderr.writeAll("\x07");
+pub fn beep(io: Io) !void {
+    try File.stderr().writeStreamingAll(io, "\x07");
 }
 
 var utf8ConsoleBuffer = [_]u8{0} ** 10;
 var utf8ConsoleReadBytes: usize = 0;
 
 // this is needed due to a bug in win32 console: https://github.com/microsoft/terminal/issues/4551
-fn readWin32Console(self: File, buffer: []u8) !usize {
+fn readWin32Console(io: Io, file: File, buffer: []u8) !usize {
+    _ = io;
     var toRead = buffer.len;
     while (toRead > 0) {
         if (utf8ConsoleReadBytes > 0) {
@@ -191,13 +214,13 @@ fn readWin32Console(self: File, buffer: []u8) !usize {
         }
         var charsRead: w.DWORD = 0;
         var wideBuf: [2]w.WCHAR = undefined;
-        if (k32.ReadConsoleW(self.handle, &wideBuf, 1, &charsRead, null) == 0)
+        if (k32.ReadConsoleW(file.handle, &wideBuf, 1, &charsRead, null) == 0)
             return 0;
         if (charsRead == 0)
             break;
         const wideBufLen: u8 = if (wideBuf[0] >= 0xD800 and wideBuf[0] <= 0xDBFF) _: {
             // read surrogate
-            if (k32.ReadConsoleW(self.handle, wideBuf[1..], 1, &charsRead, null) == 0)
+            if (k32.ReadConsoleW(file.handle, wideBuf[1..], 1, &charsRead, null) == 0)
                 return 0;
             if (charsRead == 0)
                 break;
@@ -209,4 +232,13 @@ fn readWin32Console(self: File, buffer: []u8) !usize {
     return buffer.len - toRead;
 }
 
-pub const read = if (is_windows) readWin32Console else File.read;
+/// Like the old `File.read`, this reports end-of-stream as a 0 return so that
+/// callers can keep testing `read(...) < 1`.
+fn readPosix(io: Io, file: File, buffer: []u8) !usize {
+    return File.readStreaming(file, io, &[_][]u8{buffer}) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        else => return err,
+    };
+}
+
+pub const read = if (is_windows) readWin32Console else readPosix;

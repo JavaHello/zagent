@@ -32,11 +32,12 @@ const SYSTEM_PROMPT =
 
 pub const Agent = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     client: openai.Client,
     history: std.ArrayList(Message),
     max_iterations: u32,
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Agent {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) !Agent {
         var history: std.ArrayList(Message) = .empty;
         errdefer history.deinit(allocator);
 
@@ -52,7 +53,8 @@ pub const Agent = struct {
 
         return .{
             .allocator = allocator,
-            .client = openai.Client.init(allocator, config),
+            .io = io,
+            .client = openai.Client.init(allocator, io, config),
             .history = history,
             .max_iterations = config.max_iterations,
         };
@@ -86,14 +88,14 @@ pub const Agent = struct {
 
         while (iteration < self.max_iterations) : (iteration += 1) {
             const response = self.client.chat(self.history.items) catch |err| {
-                try printFmt(std.fs.File.stderr(), self.allocator, RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
                 return err;
             };
             defer response.deinit(self.allocator);
 
             if (std.mem.eql(u8, response.finish_reason, "tool_calls")) {
                 const tool_calls = response.tool_calls orelse {
-                    try printFmt(std.fs.File.stderr(), self.allocator, RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});
+                    try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});
                     return error.InvalidResponse;
                 };
 
@@ -142,9 +144,10 @@ pub const Agent = struct {
             } else {
                 // Final answer
                 if (response.content) |content| {
-                    try std.fs.File.stdout().writeAll("\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
-                    try std.fs.File.stdout().writeAll(content);
-                    try std.fs.File.stdout().writeAll("\n");
+                    const stdout = std.Io.File.stdout();
+                    try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+                    try stdout.writeStreamingAll(self.io, content);
+                    try stdout.writeStreamingAll(self.io, "\n");
 
                     const owned_content = try self.allocator.dupe(u8, content);
                     errdefer self.allocator.free(owned_content);
@@ -161,12 +164,12 @@ pub const Agent = struct {
         }
 
         if (iteration == self.max_iterations) {
-            try printFmt(std.fs.File.stderr(), self.allocator, RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
         }
     }
 
     fn executeTool(self: *Agent, call: ToolCallData) !tools.ToolResult {
-        try printFmt(std.fs.File.stderr(), self.allocator, YELLOW ++ "  ⚙ {s}" ++ RESET ++ " {s}\n", .{ call.name, call.arguments });
+        try printFmt(std.Io.File.stderr(), self.io, self.allocator, YELLOW ++ "  ⚙ {s}" ++ RESET ++ " {s}\n", .{ call.name, call.arguments });
 
         const result: tools.ToolResult = blk: {
             if (std.mem.eql(u8, call.name, "shell")) {
@@ -177,7 +180,7 @@ pub const Agent = struct {
                     };
                 };
                 defer self.allocator.free(command);
-                break :blk try tools.executeShell(self.allocator, command);
+                break :blk try tools.executeShell(self.io, self.allocator, command);
             } else if (std.mem.eql(u8, call.name, "read_file")) {
                 const path = openai.extractStringArg(self.allocator, call.arguments, "path") catch {
                     break :blk .{
@@ -186,7 +189,7 @@ pub const Agent = struct {
                     };
                 };
                 defer self.allocator.free(path);
-                break :blk try tools.readFile(self.allocator, path);
+                break :blk try tools.readFile(self.io, self.allocator, path);
             } else if (std.mem.eql(u8, call.name, "write_file")) {
                 const path = openai.extractStringArg(self.allocator, call.arguments, "path") catch {
                     break :blk .{
@@ -202,7 +205,7 @@ pub const Agent = struct {
                     };
                 };
                 defer self.allocator.free(content);
-                break :blk try tools.writeFile(self.allocator, path, content);
+                break :blk try tools.writeFile(self.io, self.allocator, path, content);
             } else if (std.mem.eql(u8, call.name, "list_dir")) {
                 const path = openai.extractStringArg(self.allocator, call.arguments, "path") catch {
                     break :blk .{
@@ -211,7 +214,7 @@ pub const Agent = struct {
                     };
                 };
                 defer self.allocator.free(path);
-                break :blk try tools.listDir(self.allocator, path);
+                break :blk try tools.listDir(self.io, self.allocator, path);
             } else {
                 break :blk .{
                     .content = try std.fmt.allocPrint(self.allocator, "Unknown tool: {s}", .{call.name}),
@@ -224,11 +227,11 @@ pub const Agent = struct {
         const preview_len = @min(result.content.len, 200);
         const truncated = result.content.len > preview_len;
         if (result.is_error) {
-            try printFmt(std.fs.File.stderr(), self.allocator, RED ++ "  ✗ {s}\n" ++ RESET, .{result.content});
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "  ✗ {s}\n" ++ RESET, .{result.content});
         } else if (truncated) {
-            try printFmt(std.fs.File.stderr(), self.allocator, DIM ++ "  ✓ {s}...\n" ++ RESET, .{result.content[0..preview_len]});
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ✓ {s}...\n" ++ RESET, .{result.content[0..preview_len]});
         } else {
-            try printFmt(std.fs.File.stderr(), self.allocator, DIM ++ "  ✓ {s}\n" ++ RESET, .{result.content});
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ✓ {s}\n" ++ RESET, .{result.content});
         }
 
         return result;
@@ -253,8 +256,8 @@ fn cloneToolCalls(allocator: std.mem.Allocator, calls: []const ToolCallData) ![]
     return result;
 }
 
-fn printFmt(file: std.fs.File, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
     const text = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(text);
-    try file.writeAll(text);
+    try file.writeStreamingAll(io, text);
 }

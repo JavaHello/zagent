@@ -17,7 +17,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 
 ## Requirements
 
-- Zig 0.15.2 or later
+- Zig 0.16.0 or later
 - An OpenAI-compatible API key
 
 ## Build

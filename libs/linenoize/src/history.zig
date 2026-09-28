@@ -1,12 +1,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ArrayListUnmanaged = std.ArrayListUnmanaged;
+const ArrayList = std.ArrayList;
+
+const term = @import("term.zig");
 
 const max_line_len = 4096;
 
 pub const History = struct {
     allocator: Allocator,
-    hist: ArrayListUnmanaged([]const u8) = .{},
+    hist: ArrayList([]const u8) = .empty,
     max_len: usize = 100,
     current: usize = 0,
 
@@ -54,33 +56,33 @@ pub const History = struct {
     }
 
     /// Loads the history from a file
-    pub fn load(self: *Self, path: []const u8) !void {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+    pub fn load(self: *Self, io: std.Io, path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
 
-        // Use deprecatedReader() for Zig 0.15 compatibility (File.reader() now requires a buffer arg).
-        const reader = file.deprecatedReader();
-        while (reader.readUntilDelimiterAlloc(self.allocator, '\n', max_line_len)) |line| {
+        while (try term.readLineAlloc(io, self.allocator, file, max_line_len)) |line| {
+            errdefer self.allocator.free(line);
             try self.hist.append(self.allocator, line);
-        } else |err| {
-            switch (err) {
-                error.EndOfStream => return,
-                else => return err,
-            }
         }
 
         self.truncate();
     }
 
     /// Saves the history to a file
-    pub fn save(self: *Self, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+    pub fn save(self: *Self, io: std.Io, path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+
+        var write_buf: [4096]u8 = undefined;
+        var file_writer = file.writer(io, &write_buf);
+        const writer = &file_writer.interface;
 
         for (self.hist.items) |line| {
-            try file.writeAll(line);
-            try file.writeAll("\n");
+            try writer.writeAll(line);
+            try writer.writeAll("\n");
         }
+
+        try writer.flush();
     }
 
     /// Sets the maximum number of history items. If more history

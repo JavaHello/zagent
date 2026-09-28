@@ -1,7 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const ArrayList = std.ArrayList;
-const File = std.fs.File;
+const File = std.Io.File;
 
 const LinenoiseState = @import("state.zig").LinenoiseState;
 pub const History = @import("history.zig").History;
@@ -44,7 +45,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
 
     while (true) {
         var input_buf: [1]u8 = undefined;
-        if ((try term.read(in, &input_buf)) < 1) return null;
+        if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
         var c = input_buf[0];
 
         // Browse completions before editing
@@ -71,7 +72,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             key_ctrl_f => try state.editMoveRight(),
             key_ctrl_k => try state.editKillLineForward(),
             key_ctrl_l => {
-                try term.clearScreen();
+                try term.clearScreen(ln.io);
                 try state.refreshLine();
             },
             key_enter => {
@@ -84,15 +85,15 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             key_ctrl_u => try state.editKillLineBackward(),
             key_ctrl_w => try state.editDeletePrevWord(),
             key_esc => {
-                if ((try term.read(in, &input_buf)) < 1) return null;
+                if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
                 switch (input_buf[0]) {
                     'b' => try state.editMoveWordStart(),
                     'f' => try state.editMoveWordEnd(),
                     '[' => {
-                        if ((try term.read(in, &input_buf)) < 1) return null;
+                        if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
                         switch (input_buf[0]) {
                             '0'...'9' => |num| {
-                                if ((try in.read(&input_buf)) < 1) return null;
+                                if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
                                 switch (input_buf[0]) {
                                     '~' => switch (num) {
                                         '1', '7' => try state.editMoveHome(),
@@ -114,7 +115,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                         }
                     },
                     '0' => {
-                        if ((try term.read(in, &input_buf)) < 1) return null;
+                        if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
                         switch (input_buf[0]) {
                             'H' => try state.editMoveHome(),
                             'F' => try state.editMoveEnd(),
@@ -130,7 +131,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                 const utf8_len = std.unicode.utf8ByteSequenceLength(c) catch continue;
 
                 utf8_buf[0] = c;
-                if (utf8_len > 1 and (try term.read(in, utf8_buf[1..utf8_len])) < utf8_len - 1) return null;
+                if (utf8_len > 1 and (try term.read(ln.io, in, utf8_buf[1..utf8_len])) < utf8_len - 1) return null;
 
                 try state.editInsert(utf8_buf[0..utf8_len]);
             },
@@ -141,7 +142,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
 /// Read a line with custom line editing mechanics. This includes hints,
 /// completions and history
 fn linenoiseRaw(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]const u8 {
-    defer out.writeAll("\n") catch {};
+    defer out.writeStreamingAll(ln.io, "\n") catch {};
 
     const orig = try enableRawMode(in, out);
     defer disableRawMode(in, out, orig);
@@ -150,18 +151,17 @@ fn linenoiseRaw(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]con
 }
 
 /// Read a line with no special features (no hints, no completions, no history)
-fn linenoiseNoTTY(allocator: Allocator, stdin: File) !?[]const u8 {
-    // Use deprecatedReader() for Zig 0.15 compatibility (File.reader() now requires a buffer arg).
-    var reader = stdin.deprecatedReader();
+fn linenoiseNoTTY(io: Io, allocator: Allocator, stdin: File) !?[]const u8 {
     const max_line_len = std.math.maxInt(usize);
-    return reader.readUntilDelimiterAlloc(allocator, '\n', max_line_len) catch |e| switch (e) {
-        error.EndOfStream => return null,
-        else => return e,
-    };
+    return term.readLineAlloc(io, allocator, stdin, max_line_len);
 }
 
 pub const Linenoise = struct {
     allocator: Allocator,
+    io: Io,
+    /// Used only to detect terminals that cannot do line editing (`TERM=dumb`
+    /// and friends).
+    env: *const std.process.Environ.Map,
     history: History,
     multiline_mode: bool = false,
     mask_mode: bool = false,
@@ -173,9 +173,11 @@ pub const Linenoise = struct {
     const Self = @This();
 
     /// Initialize a linenoise struct
-    pub fn init(allocator: Allocator) Self {
+    pub fn init(allocator: Allocator, io: Io, env: *const std.process.Environ.Map) Self {
         var self = Self{
             .allocator = allocator,
+            .io = io,
+            .env = env,
             .history = History.empty(allocator),
         };
         self.examineStdIo();
@@ -191,24 +193,24 @@ pub const Linenoise = struct {
     /// check if line editing and prompt printing should be
     /// enabled or not.
     pub fn examineStdIo(self: *Self) void {
-        const stdin_file = std.fs.File.stdin();
-        self.is_tty = stdin_file.isTty();
-        self.term_supported = !isUnsupportedTerm(self.allocator);
+        const stdin_file = File.stdin();
+        self.is_tty = stdin_file.isTty(self.io) catch false;
+        self.term_supported = !isUnsupportedTerm(self.env);
     }
 
     /// Reads a line from the terminal. Caller owns returned memory
     pub fn linenoise(self: *Self, prompt: []const u8) !?[]const u8 {
-        const stdin_file = std.fs.File.stdin();
-        const stdout_file = std.fs.File.stdout();
+        const stdin_file = File.stdin();
+        const stdout_file = File.stdout();
 
         if (self.is_tty and !self.term_supported) {
-            try stdout_file.writeAll(prompt);
+            try stdout_file.writeStreamingAll(self.io, prompt);
         }
 
         return if (self.is_tty and self.term_supported)
             try linenoiseRaw(self, stdin_file, stdout_file, prompt)
         else
-            try linenoiseNoTTY(self.allocator, stdin_file);
+            try linenoiseNoTTY(self.io, self.allocator, stdin_file);
     }
 };
 

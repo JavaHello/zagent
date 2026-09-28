@@ -9,21 +9,21 @@ pub const ToolResult = struct {
     }
 };
 
-pub fn executeShell(allocator: std.mem.Allocator, command: []const u8) !ToolResult {
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
+pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
+    const result = try std.process.run(allocator, io, .{
         .argv = &[_][]const u8{ "sh", "-c", command },
-        .max_output_bytes = 64 * 1024,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
     });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     const exit_code: u8 = switch (result.term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 1,
     };
 
-    var aw: std.io.Writer.Allocating = .init(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
 
     if (result.stdout.len > 0) {
@@ -51,17 +51,19 @@ pub fn executeShell(allocator: std.mem.Allocator, command: []const u8) !ToolResu
     };
 }
 
-pub fn readFile(allocator: std.mem.Allocator, path: []const u8) !ToolResult {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) }),
             .is_error = true,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
     const max_size = 1 * 1024 * 1024;
-    const content = file.readToEndAlloc(allocator, max_size) catch |err| {
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    const content = file_reader.interface.allocRemaining(allocator, .limited(max_size)) catch |err| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "Error reading '{s}': {s}", .{ path, @errorName(err) }),
             .is_error = true,
@@ -73,20 +75,20 @@ pub fn readFile(allocator: std.mem.Allocator, path: []const u8) !ToolResult {
     return .{ .content = normalized, .is_error = false };
 }
 
-pub fn writeFile(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !ToolResult {
-    if (std.fs.path.dirname(path)) |dir_path| {
-        std.fs.cwd().makePath(dir_path) catch {};
+pub fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, content: []const u8) !ToolResult {
+    if (std.Io.Dir.path.dirname(path)) |dir_path| {
+        std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
     }
 
-    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "Error creating '{s}': {s}", .{ path, @errorName(err) }),
             .is_error = true,
         };
     };
-    defer file.close();
+    defer file.close(io);
 
-    file.writeAll(content) catch |err| {
+    file.writeStreamingAll(io, content) catch |err| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "Error writing '{s}': {s}", .{ path, @errorName(err) }),
             .is_error = true,
@@ -99,20 +101,20 @@ pub fn writeFile(allocator: std.mem.Allocator, path: []const u8, content: []cons
     };
 }
 
-pub fn listDir(allocator: std.mem.Allocator, path: []const u8) !ToolResult {
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) }),
             .is_error = true,
         };
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    var aw: std.io.Writer.Allocating = .init(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         const kind_char: u8 = switch (entry.kind) {
             .directory => 'd',
             .file => 'f',
@@ -130,20 +132,20 @@ pub fn listDir(allocator: std.mem.Allocator, path: []const u8) !ToolResult {
 }
 
 test "shell echo" {
-    const result = try executeShell(std.testing.allocator, "echo hello");
+    const result = try executeShell(std.testing.io, std.testing.allocator, "echo hello");
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "hello") != null);
 }
 
 test "shell exit code" {
-    const result = try executeShell(std.testing.allocator, "exit 1");
+    const result = try executeShell(std.testing.io, std.testing.allocator, "exit 1");
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
 }
 
 test "read missing file" {
-    const result = try readFile(std.testing.allocator, "/nonexistent/path/file.txt");
+    const result = try readFile(std.testing.io, std.testing.allocator, "/nonexistent/path/file.txt");
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
 }
@@ -187,13 +189,15 @@ fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
             continue;
         }
 
+        var escape_buf: [4]u8 = undefined;
+
         const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
-            try out.writer(allocator).print("\\x{X:0>2}", .{byte});
+            try out.appendSlice(allocator, escapeByte(&escape_buf, byte));
             i += 1;
             continue;
         };
         if (i + seq_len > raw.len or !std.unicode.utf8ValidateSlice(raw[i .. i + seq_len])) {
-            try out.writer(allocator).print("\\x{X:0>2}", .{byte});
+            try out.appendSlice(allocator, escapeByte(&escape_buf, byte));
             i += 1;
             continue;
         }
@@ -207,6 +211,13 @@ fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Render a stray byte as a `\xNN` escape into `buf`, which must be 4 bytes.
+fn escapeByte(buf: *[4]u8, byte: u8) []const u8 {
+    const hex = "0123456789ABCDEF";
+    buf.* = .{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] };
+    return buf;
 }
 
 fn skipAnsiEscape(raw: []const u8, start: usize) usize {

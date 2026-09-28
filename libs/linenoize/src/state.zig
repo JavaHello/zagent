@@ -1,8 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const ArrayListUnmanaged = std.ArrayListUnmanaged;
-const File = std.fs.File;
+const File = std.Io.File;
 const math = std.math;
 
 const Linenoise = @import("main.zig").Linenoise;
@@ -87,7 +86,7 @@ fn calculateStartOrEnd(
 ) !usize {
     // Create a mapping from unicode codepoint indices to buf
     // indices
-    var map = try std.ArrayListUnmanaged(usize).initCapacity(allocator, buf.len);
+    var map = try ArrayList(usize).initCapacity(allocator, buf.len);
     defer map.deinit(allocator);
 
     var utf8 = (try std.unicode.Utf8View.init(buf)).iterator();
@@ -122,7 +121,7 @@ pub const LinenoiseState = struct {
 
     stdin: File,
     stdout: File,
-    buf: ArrayListUnmanaged(u8) = .{},
+    buf: ArrayList(u8) = .empty,
     prompt: []const u8,
     pos: usize = 0,
     old_pos: usize = 0,
@@ -139,7 +138,7 @@ pub const LinenoiseState = struct {
             .stdin = in,
             .stdout = out,
             .prompt = prompt,
-            .cols = getColumns(in, out) catch 80,
+            .cols = getColumns(ln.io, in, out) catch 80,
         };
     }
 
@@ -155,7 +154,7 @@ pub const LinenoiseState = struct {
         }
 
         if (completions.len == 0) {
-            try term.beep();
+            try term.beep(self.ln.io);
         } else {
             var finished = false;
             var i: usize = 0;
@@ -168,7 +167,7 @@ pub const LinenoiseState = struct {
                     const old_pos = self.pos;
 
                     // Show suggested completion
-                    self.buf = .{};
+                    self.buf = .empty;
                     try self.buf.appendSlice(self.allocator, completions[i]);
                     self.pos = self.buf.items.len;
 
@@ -187,14 +186,14 @@ pub const LinenoiseState = struct {
                 }
 
                 // Read next key
-                const nread = try self.stdin.read(&input_buf);
+                const nread = try term.read(self.ln.io, self.stdin, &input_buf);
                 c = if (nread == 1) input_buf[0] else return error.NothingRead;
 
                 switch (c.?) {
                     key_tab => {
                         // Next completion
                         i = (i + 1) % (completions.len + 1);
-                        if (i == completions.len) try term.beep();
+                        if (i == completions.len) try term.beep(self.ln.io);
                     },
                     key_esc => {
                         // Stop browsing completions, return to buffer displayed
@@ -209,7 +208,7 @@ pub const LinenoiseState = struct {
                             // Replace buffer with text in the selected
                             // completion
                             self.buf.deinit(self.allocator);
-                            self.buf = .{};
+                            self.buf = .empty;
                             try self.buf.appendSlice(self.allocator, completions[i]);
 
                             self.pos = self.buf.items.len;
@@ -232,9 +231,10 @@ pub const LinenoiseState = struct {
     }
 
     fn refreshSingleLine(self: *Self) !void {
-        // Zig 0.15: File.writer() requires an explicit buffer; use .interface for the Io.Writer API.
+        // File.writer() needs an explicit buffer and hands back a File.Writer;
+        // the Io.Writer API lives on its `interface` field.
         var write_buf: [4096]u8 = undefined;
-        var file_writer = self.stdout.writer(&write_buf);
+        var file_writer = self.stdout.writer(self.ln.io, &write_buf);
         const writer = &file_writer.interface;
 
         const hint = try self.getHint();
@@ -315,9 +315,10 @@ pub const LinenoiseState = struct {
     }
 
     fn refreshMultiLine(self: *Self) !void {
-        // Zig 0.15: File.writer() requires an explicit buffer; use .interface for the Io.Writer API.
+        // File.writer() needs an explicit buffer and hands back a File.Writer;
+        // the Io.Writer API lives on its `interface` field.
         var write_buf: [4096]u8 = undefined;
-        var file_writer = self.stdout.writer(&write_buf);
+        var file_writer = self.stdout.writer(self.ln.io, &write_buf);
         const writer = &file_writer.interface;
 
         const hint = try self.getHint();
@@ -508,7 +509,7 @@ pub const LinenoiseState = struct {
 
             // Copy history entry to the current line buffer
             self.buf.deinit(self.allocator);
-            self.buf = .{};
+            self.buf = .empty;
             try self.buf.appendSlice(self.allocator, self.ln.history.hist.items[new_index]);
             self.pos = self.buf.items.len;
 

@@ -36,48 +36,78 @@ const HELP =
 // linenoize's width() implementation correctly ignores ANSI SGR sequences.
 const PROMPT = BOLD ++ GREEN ++ "you" ++ RESET ++ " \xe2\x9d\xaf ";
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+/// Process arguments are borrowed from the OS (or from an iterator's internal
+/// buffer), so copy the ones we keep around for the lifetime of `main`.
+fn collectArgs(allocator: std.mem.Allocator, args: std.process.Args) !std.ArrayList([]const u8) {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |arg| allocator.free(arg);
+        list.deinit(allocator);
+    }
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var iter = try std.process.Args.Iterator.initAllocator(args, allocator);
+    defer iter.deinit();
+    while (iter.next()) |arg| {
+        try list.append(allocator, try allocator.dupe(u8, arg));
+    }
+    return list;
+}
 
-    const config = try Config.load(allocator);
+fn freeArgs(allocator: std.mem.Allocator, args: []const []const u8) void {
+    for (args) |arg| allocator.free(arg);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const env = init.environ_map;
+
+    var args = try collectArgs(allocator, init.minimal.args);
+    defer {
+        freeArgs(allocator, args.items);
+        args.deinit(allocator);
+    }
+
+    const config = try Config.load(allocator, io, env);
     defer config.deinit();
 
-    var agent = try Agent.init(allocator, config);
+    var agent = try Agent.init(allocator, io, config);
     defer agent.deinit();
 
-    if (args.len > 1) {
+    if (args.items.len > 1) {
         // Single-query mode: join remaining args as the query
-        const query = try std.mem.join(allocator, " ", args[1..]);
+        const query = try std.mem.join(allocator, " ", args.items[1..]);
         defer allocator.free(query);
         try agent.processQuery(query);
     } else {
         // Interactive REPL mode
-        try runRepl(allocator, &agent, config);
+        try runRepl(allocator, io, env, &agent, config);
     }
 }
 
-fn runRepl(allocator: std.mem.Allocator, agent: *Agent, config: Config) !void {
-    const stdout = std.fs.File.stdout();
-    const stderr = std.fs.File.stderr();
+fn runRepl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    agent: *Agent,
+    config: Config,
+) !void {
+    const stdout = std.Io.File.stdout();
+    const stderr = std.Io.File.stderr();
 
-    try stdout.writeAll(MAGENTA ++ BOLD ++ BANNER ++ RESET);
+    try stdout.writeStreamingAll(io, MAGENTA ++ BOLD ++ BANNER ++ RESET);
     {
         const msg = try std.fmt.allocPrint(allocator, DIM ++ "  Model : {s}\n" ++ RESET, .{config.model});
         defer allocator.free(msg);
-        try stdout.writeAll(msg);
+        try stdout.writeStreamingAll(io, msg);
     }
-    try stdout.writeAll(DIM ++ "  Type /help for commands, Ctrl+D to exit.\n\n" ++ RESET);
+    try stdout.writeStreamingAll(io, DIM ++ "  Type /help for commands, Ctrl+D to exit.\n\n" ++ RESET);
 
     if (config.api_key.len == 0) {
-        try stderr.writeAll(YELLOW ++ "Warning: OPENAI_API_KEY is not set.\n  export OPENAI_API_KEY=your-key\n\n" ++ RESET);
+        try stderr.writeStreamingAll(io, YELLOW ++ "Warning: OPENAI_API_KEY is not set.\n  export OPENAI_API_KEY=your-key\n\n" ++ RESET);
     }
 
-    var ln = Linenoise.init(allocator);
+    var ln = Linenoise.init(allocator, io, env);
     defer ln.deinit();
 
     while (true) {
@@ -86,12 +116,12 @@ fn runRepl(allocator: std.mem.Allocator, agent: *Agent, config: Config) !void {
         // Returns null on EOF (Ctrl+D); error.CtrlC on Ctrl+C.
         const raw_line = (ln.linenoise(PROMPT) catch |err| switch (err) {
             error.CtrlC => {
-                try stdout.writeAll("\n");
+                try stdout.writeStreamingAll(io, "\n");
                 break;
             },
             else => return err,
         }) orelse {
-            try stdout.writeAll("\n");
+            try stdout.writeStreamingAll(io, "\n");
             break;
         };
         defer allocator.free(raw_line);
@@ -104,31 +134,44 @@ fn runRepl(allocator: std.mem.Allocator, agent: *Agent, config: Config) !void {
         try ln.history.add(line);
 
         if (std.mem.eql(u8, line, "/quit") or std.mem.eql(u8, line, "/exit")) {
-            try stdout.writeAll(DIM ++ "Goodbye!\n" ++ RESET);
+            try stdout.writeStreamingAll(io, DIM ++ "Goodbye!\n" ++ RESET);
             break;
         } else if (std.mem.eql(u8, line, "/help")) {
-            try stdout.writeAll(HELP);
+            try stdout.writeStreamingAll(io, HELP);
         } else if (std.mem.eql(u8, line, "/clear")) {
             agent.clearHistory();
-            try stdout.writeAll(DIM ++ "Conversation history cleared.\n" ++ RESET);
+            try stdout.writeStreamingAll(io, DIM ++ "Conversation history cleared.\n" ++ RESET);
         } else if (std.mem.eql(u8, line, "/model")) {
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\n", .{config.model});
             defer allocator.free(msg);
-            try stdout.writeAll(msg);
+            try stdout.writeStreamingAll(io, msg);
         } else {
             agent.processQuery(line) catch |err| {
                 const errmsg = try std.fmt.allocPrint(allocator, "\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
                 defer allocator.free(errmsg);
-                try stderr.writeAll(errmsg);
+                try stderr.writeStreamingAll(io, errmsg);
             };
         }
 
-        try stdout.writeAll("\n");
+        try stdout.writeStreamingAll(io, "\n");
     }
 }
 
+// The other modules are only reachable from `main`, which a test build never
+// analyzes, so their tests would otherwise be dropped from `zig build test`.
+test {
+    _ = @import("agent.zig");
+    _ = @import("tools.zig");
+    _ = @import("openai.zig");
+    _ = @import("config.zig");
+}
+
 test "config loads" {
-    const config = try Config.load(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    var env = try std.process.Environ.createMap(std.testing.environ, allocator);
+    defer env.deinit();
+
+    const config = try Config.load(allocator, std.testing.io, &env);
     defer config.deinit();
     try std.testing.expect(config.max_tokens > 0);
 }
