@@ -31,6 +31,7 @@ const SYSTEM_PROMPT =
     \\Guidelines:
     \\- Be concise and direct in your responses.
     \\- Use the shell tool to run commands, install packages, or perform system operations.
+    \\- Use http_request for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
     \\- Use read_file / write_file for file operations.
     \\- Use list_dir to explore directories.
     \\- Chain multiple tool calls to accomplish complex tasks step by step.
@@ -416,6 +417,19 @@ pub const Agent = struct {
                 };
                 defer self.allocator.free(path);
                 break :blk try tools.listDir(self.io, self.allocator, path);
+            } else if (std.mem.eql(u8, call.name, "http_request")) {
+                const request = tools.parseHttpRequest(self.allocator, call.arguments) catch |err| {
+                    break :blk .{
+                        .content = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Error: http_request arguments are unusable ({s}); it needs a 'url', and a 'method', 'headers', 'body', and 'save_to' it can use",
+                            .{@errorName(err)},
+                        ),
+                        .is_error = true,
+                    };
+                };
+                defer request.deinit(self.allocator);
+                break :blk try tools.httpRequest(self.io, self.allocator, request);
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
             } else {

@@ -11,6 +11,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `read_file` — read file contents
   - `write_file` — create or overwrite files
   - `list_dir` — list directory contents
+  - `http_request` — fetch a URL or call an API, without shelling out to `curl`
   - `ask_user` — put a question to you as a numbered list of options
 - **Multi-turn tool chaining** — the agent loops until the task is complete
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
@@ -175,6 +176,46 @@ when it decides the work is blocked on a decision, it returns the options
 itself and you get the same menu. With no terminal to type at (piped input,
 single-query mode) the recommended option is taken and the agent says so.
 
+### HTTP requests
+
+`http_request` fetches a URL or calls an API without going through `curl`,
+returning the status line, the response headers, and the body:
+
+```
+you ❯ fetch https://httpbin.org/json and tell me the content type
+  ⚙ http_request {"url":"https://httpbin.org/json"}
+  ✓ HTTP/1.1 200 OK
+    Date: Mon, 28 Sep 2026 06:21:24 GMT
+    Content-Type: application/json
+    Content-Length: 429
+    ...
+
+    {"slideshow": {"title": "Sample Slide Show", ...}}
+```
+
+| Argument  | Required | Description                                                          |
+|-----------|----------|----------------------------------------------------------------------|
+| `url`     | yes      | The full URL, including the scheme                                    |
+| `method`  | no       | `GET` (the default), `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` |
+| `headers` | no       | Request headers as name/value pairs                                   |
+| `body`    | no       | Request body, for a method that takes one                             |
+| `save_to` | no       | Write the body to this file instead of returning it                   |
+
+No `Content-Type` is invented for you: set it in `headers` when you send a JSON
+body. Four behaviours are worth knowing:
+
+- **Downloads.** `save_to` streams the body straight into the file, so a large or
+  binary response is written intact rather than mangled by the text path — the
+  response text replaces the body with `Saved N bytes to 'path'`.
+- **Redirects.** A request that sends no body follows up to five of them. `POST`,
+  `PUT`, and `PATCH` cannot be replayed once their body is on the wire, so a
+  redirect to one of those comes back as-is for the agent to follow.
+- **Failures.** A connection, TLS, or URL failure is a tool error. An HTTP status
+  never is — a `404` is an answer, and the status line says so.
+- **Limits.** The response text is capped at 32 KB, and `std.http` offers no
+  timeout setting, so a server that accepts a connection and then never answers
+  hangs the request the way `curl` without `--max-time` does.
+
 ### REPL commands
 
 | Command       | Description                      |
@@ -238,7 +279,8 @@ src/
   config.zig   — Configuration loading from the config file and environment
   provider.zig — Built-in provider presets
   openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
-  tools.zig   — Tool implementations (shell, read_file, write_file, list_dir)
+  tools.zig   — Tool implementations (shell, read_file, write_file, list_dir,
+                http_request)
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
   menu.zig    — Option parsing, choice menus, and reading the user's answer
   verifier.zig — Completion judge: prompt, turn summary, verdict parsing

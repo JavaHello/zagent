@@ -8,6 +8,7 @@ pub const TOOLS_JSON =
     \\  {"type":"function","function":{"name":"read_file","description":"Read the contents of a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}}},
     \\  {"type":"function","function":{"name":"write_file","description":"Write content to a file, creating or overwriting it","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}}},
     \\  {"type":"function","function":{"name":"list_dir","description":"List the contents of a directory","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}}},
+    \\  {"type":"function","function":{"name":"http_request","description":"Make an HTTP request and return its status line, response headers, and body. Use this instead of curl for fetching URLs and calling APIs. Set Content-Type yourself when you send a body; use save_to to download the body to a file instead of returning it.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"The full URL, including the scheme"},"method":{"type":"string","description":"HTTP method: GET, HEAD, POST, PUT, PATCH, DELETE, or OPTIONS. Defaults to GET"},"headers":{"type":"object","description":"Request headers as name/value pairs","additionalProperties":{"type":"string"}},"body":{"type":"string","description":"Request body, for a method that takes one"},"save_to":{"type":"string","description":"Write the response body to this file path instead of returning it"}},"required":["url"]}}},
     \\  {"type":"function","function":{"name":"ask_user","description":"Ask the user to choose between concrete options when the request is ambiguous, or when a decision only the user can make blocks progress. Not for confirming routine steps.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}}}
     \\]
 ;
@@ -419,7 +420,7 @@ test "tools json parses and lists every tool" {
 
     // The schema is hand-written JSON, so a typo in it would only surface as a
     // server-side error on the first request of every session.
-    const expected = [_][]const u8{ "shell", "read_file", "write_file", "list_dir", "ask_user" };
+    const expected = [_][]const u8{ "shell", "read_file", "write_file", "list_dir", "http_request", "ask_user" };
     for (expected) |wanted| {
         var found = false;
         for (parsed.value.array.items) |entry| {
