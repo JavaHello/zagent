@@ -45,6 +45,24 @@ fn firstEnv(
     return null;
 }
 
+/// True when `name` is exported with a non-empty value.
+fn envHasValue(env: *const std.process.Environ.Map, name: []const u8) bool {
+    const value = env.get(name) orelse return false;
+    return value.len > 0;
+}
+
+/// The provider whose API key variable the environment exports, if any.
+///
+/// `Provider` is declared in preference order, which is what makes openai win
+/// when a shell exports both keys. Only the presence of a key is read here; the
+/// value is resolved with everything else by `resolve`.
+fn autodetectProvider(env: *const std.process.Environ.Map) ?Provider {
+    for (std.enums.values(Provider)) |candidate| {
+        if (envHasValue(env, candidate.spec().api_key_env)) return candidate;
+    }
+    return null;
+}
+
 fn configBasePath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
     if (try envVarOwned(allocator, env, "XDG_CONFIG_HOME")) |xdg_dir| {
         defer allocator.free(xdg_dir);
@@ -159,9 +177,17 @@ fn resolveProvider(
         return parseProviderName(name);
     }
 
-    const name = takeOwnedString(&file_config.provider) orelse return null;
-    defer allocator.free(name);
-    return parseProviderName(name);
+    if (takeOwnedString(&file_config.provider)) |name| {
+        defer allocator.free(name);
+        return parseProviderName(name);
+    }
+
+    // Nothing selected a provider, so fall back to whichever API key the
+    // environment already exports. A key in the config file suppresses that:
+    // such a user has already chosen their credentials, and an unrelated
+    // exported variable must not move the endpoint out from under their key.
+    if (file_config.api_key != null) return null;
+    return autodetectProvider(env);
 }
 
 /// Resolve one string setting: environment, then config file, then the
@@ -213,8 +239,9 @@ fn resolve(
 ) !Config {
     const selected_provider = try resolveProvider(allocator, file_config, env);
 
-    // With no provider selected the fallback is the openai preset, which is
-    // byte-identical to the historical built-in defaults.
+    // With nothing selected — no preset, and no API key to autodetect one from
+    // — the fallback is the openai preset, which is byte-identical to the
+    // historical built-in defaults.
     const spec = if (selected_provider) |p| p.spec() else Provider.openai.spec();
 
     var base_url = try resolveSetting(
@@ -525,6 +552,134 @@ test "unknown provider is an error" {
     defer file_config.deinit(allocator);
 
     try std.testing.expectError(error.UnknownProvider, resolve(allocator, &file_config, &env));
+}
+
+test "autodetection selects the provider whose key is exported" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "DEEPSEEK_API_KEY", "sk-deepseek" }});
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, Provider.deepseek), config.provider);
+    try std.testing.expectEqualStrings("https://api.deepseek.com", config.base_url);
+    try std.testing.expectEqualStrings("deepseek-flash", config.model);
+    try std.testing.expectEqualStrings("sk-deepseek", config.api_key);
+}
+
+test "autodetection prefers openai when both keys are exported" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "OPENAI_API_KEY", "sk-openai" },
+        .{ "DEEPSEEK_API_KEY", "sk-deepseek" },
+    });
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    // Both keys work, but the legacy default has to keep winning so an existing
+    // shell does not silently switch endpoints.
+    try std.testing.expectEqual(@as(?Provider, Provider.openai), config.provider);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", config.base_url);
+    try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
+    try std.testing.expectEqualStrings("sk-openai", config.api_key);
+}
+
+test "blank api keys do not trigger autodetection" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "OPENAI_API_KEY", "" },
+        .{ "DEEPSEEK_API_KEY", "" },
+    });
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, null), config.provider);
+    try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
+}
+
+test "a provider-agnostic key cannot autodetect a provider" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "AI_KEY", "sk-generic" }});
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    // AI_KEY names no host, so the endpoint stays the openai default.
+    try std.testing.expectEqual(@as(?Provider, null), config.provider);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", config.base_url);
+    try std.testing.expectEqualStrings("sk-generic", config.api_key);
+}
+
+test "an explicit provider wins over autodetection" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "AI_PROVIDER", "openai" },
+        .{ "DEEPSEEK_API_KEY", "sk-deepseek" },
+    });
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, Provider.openai), config.provider);
+    // And the deepseek key is not sent to the endpoint that was asked for.
+    try std.testing.expectEqualStrings("", config.api_key);
+}
+
+test "a config file provider wins over autodetection" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "OPENAI_API_KEY", "sk-openai" }});
+    defer env.deinit();
+
+    var file_config = try testFile(allocator, &.{.{ "AI_PROVIDER", "deepseek" }});
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, Provider.deepseek), config.provider);
+    try std.testing.expectEqualStrings("https://api.deepseek.com", config.base_url);
+    try std.testing.expectEqualStrings("", config.api_key);
+}
+
+test "a config file key disables autodetection" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "DEEPSEEK_API_KEY", "sk-deepseek" }});
+    defer env.deinit();
+
+    var file_config = try testFile(allocator, &.{.{ "AI_KEY", "sk-file" }});
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    // The configured key has to stay paired with the endpoint it was written
+    // for, so the exported deepseek key does not get to move it.
+    try std.testing.expectEqual(@as(?Provider, null), config.provider);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", config.base_url);
+    try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
+    try std.testing.expectEqualStrings("sk-file", config.api_key);
 }
 
 test "max tokens and iterations prefer the environment" {

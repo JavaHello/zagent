@@ -14,6 +14,11 @@ pub const Spec = struct {
     api_key_env: []const u8,
 };
 
+/// Declaration order is autodetection order: when nothing selects a provider,
+/// `config.zig` takes the first one, in this order, whose `api_key_env` the
+/// environment exports. `openai` has to stay first — it is the historical
+/// default, so a shell that already exports `OPENAI_API_KEY` keeps resolving
+/// to it.
 pub const Provider = enum {
     openai,
     deepseek,

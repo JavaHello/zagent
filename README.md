@@ -12,7 +12,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `write_file` — create or overwrite files
   - `list_dir` — list directory contents
 - **Multi-turn tool chaining** — the agent loops until the task is complete
-- **Built-in provider presets** — one setting selects `deepseek` or `openai`
+- **Built-in provider presets** — one setting selects `deepseek` or `openai`, autodetected from `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` when unset
 - **OpenAI-compatible** — works with any endpoint that speaks the OpenAI chat-completions protocol (OpenAI, Azure OpenAI, Ollama, LM Studio, …)
 - **ANSI colour output**
 
@@ -44,8 +44,8 @@ All configuration is also supported through environment variables:
 
 | Variable           | Default                          | Description                          |
 |--------------------|----------------------------------|--------------------------------------|
-| `AI_PROVIDER`      | *(unset)*                        | Select a built-in preset: `deepseek` or `openai` |
-| `OPENAI_API_KEY`   | *(required)*                     | Your OpenAI (or compatible) API key  |
+| `AI_PROVIDER`      | *(autodetected)*                 | Select a built-in preset: `deepseek` or `openai` |
+| `OPENAI_API_KEY`   | *(required for OpenAI)*          | Your OpenAI (or compatible) API key  |
 | `OPENAI_BASE_URL`  | `https://api.openai.com/v1`      | API base URL                         |
 | `OPENAI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
 | `OPENAI_MAX_TOKENS`| `4096`                           | Maximum tokens per response          |
@@ -62,13 +62,29 @@ Every one of these also has a shorter `AI_`-prefixed spelling that works in both
 | `openai`   | `https://api.openai.com/v1`  | `gpt-4o-mini`    | `OPENAI_API_KEY`   |
 | `deepseek` | `https://api.deepseek.com`   | `deepseek-flash` | `DEEPSEEK_API_KEY` |
 
-Selecting `openai` is identical to not setting `AI_PROVIDER` at all. To use some other OpenAI-compatible endpoint, leave `AI_PROVIDER` unset and set `AI_URL` / `AI_MODEL` yourself.
+To use some other OpenAI-compatible endpoint, leave `AI_PROVIDER` unset and set `AI_URL` / `AI_MODEL` yourself.
 
 Precedence, highest first: an explicit environment variable, then the config file, then the provider preset.
 
-Two deliberate details worth knowing:
+### Autodetection
+
+With no `AI_PROVIDER` in the environment or in the config file, zagent picks a provider from whichever API key your shell already exports:
+
+| Exported               | Selected                                                       |
+|------------------------|----------------------------------------------------------------|
+| `OPENAI_API_KEY`       | `openai`                                                       |
+| `DEEPSEEK_API_KEY`     | `deepseek`                                                     |
+| both                   | `openai`                                                       |
+| neither                | no provider — the OpenAI defaults apply and startup warns about the missing key |
+
+So `export DEEPSEEK_API_KEY=...` on its own is enough to talk to DeepSeek, and a shell that has exported `OPENAI_API_KEY` resolves exactly as it did before autodetection existed.
+
+A key set in the *config file* turns autodetection off: that key is paired with the configured (or default OpenAI) endpoint, and an unrelated exported variable must not move the endpoint out from under it.
+
+Three deliberate details worth knowing:
 
 - When a provider is selected, only *its* API key variable is consulted. `OPENAI_API_KEY` is ignored under `AI_PROVIDER=deepseek`, so a key exported for other tooling cannot be sent to the wrong endpoint. Use `AI_KEY` if you want one key for every provider.
+- `AI_KEY` alone never selects a provider, because it names no host. The endpoint stays the OpenAI default.
 - An unknown provider name is a startup error rather than a silent fallback, and the message lists the valid names.
 
 ## Usage
@@ -137,10 +153,11 @@ export OPENAI_MODEL=your-model
 ### Using DeepSeek
 
 ```bash
-export AI_PROVIDER=deepseek
 export DEEPSEEK_API_KEY=your-deepseek-key
 ./zig-out/bin/zagent
 ```
+
+The key alone selects the `deepseek` preset, as described under [Autodetection](#autodetection). Set `AI_PROVIDER=deepseek` as well if you want the choice to be explicit, or if a key in your config file would otherwise turn autodetection off.
 
 DeepSeek enables thinking mode by default, and zagent requests it explicitly rather than relying on that default. The recognised model names are:
 
