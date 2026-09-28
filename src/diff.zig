@@ -688,6 +688,18 @@ fn parseFile(
         // The next file's header, which the caller's loop reads.
         if (std.mem.startsWith(u8, line, "--- ")) break;
         if (!std.mem.startsWith(u8, line, "@@")) {
+            // A hunk line here means the hunk before this one read its counts as
+            // complete while lines of its own were still coming, which is the
+            // '@@' under-counting what follows it — a fault of the counts, not
+            // a line that belongs to nothing, and it is named as one.
+            if (hunks.items.len > 0 and isHunkLine(line)) {
+                const previous = hunks.items[hunks.items.len - 1];
+                diag.say(
+                    "line {d} reads as a hunk line, but the hunk header on line {d} accounts for {d} old and {d} new lines, and the lines before this one already fill it. Count the lines under that '@@' again and raise the counts to match",
+                    .{ cursor.number(), previous.patch_line, previous.header.old_count, previous.header.new_count },
+                );
+                return error.BadPatch;
+            }
             diag.say("line {d} is not part of the hunk before it: \"{s}\" starts with none of the space, '-' or '+' a hunk line starts with", .{ cursor.number(), line });
             return error.BadPatch;
         }
@@ -800,6 +812,12 @@ fn countKind(lines: []const Line, kind: Kind) usize {
         if (line.kind == kind) count += 1;
     }
     return count;
+}
+
+/// Whether a line reads as one of a hunk's: the space, '-' or '+' every line
+/// under a '@@' starts with.
+fn isHunkLine(line: []const u8) bool {
+    return line.len > 0 and (line[0] == ' ' or line[0] == '-' or line[0] == '+');
 }
 
 /// Lines that carry nothing about what to change: the blank line between two
@@ -1237,6 +1255,26 @@ test "a hunk whose counts do not match its lines is refused" {
     const message = try applyRefused(allocator, patch);
     defer allocator.free(message);
     try testing.expect(std.mem.indexOf(u8, message, "accounts for 3 old and 3 new lines, and the hunk carries 2 and 2") != null);
+}
+
+test "a line the '@@' counts left out is refused as counts that are too low" {
+    const allocator = testing.allocator;
+    // The two lines the header accounts for are there, so the hunk reads as
+    // complete before its last line — and that line is a hunk line, so the
+    // complaint has to be about the counts rather than about that line.
+    const patch =
+        \\--- a/note.txt
+        \\+++ b/note.txt
+        \\@@ -1,2 +1,2 @@
+        \\ one
+        \\ two
+        \\ three
+    ;
+    const message = try applyRefused(allocator, patch);
+    defer allocator.free(message);
+    try testing.expect(std.mem.indexOf(u8, message, "line 6 reads as a hunk line") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "accounts for 2 old and 2 new lines") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "none of the space") == null);
 }
 
 test "a git path loses its a/ or b/ prefix, and a timestamp is not part of it" {
