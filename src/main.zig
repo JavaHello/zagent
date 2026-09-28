@@ -29,6 +29,7 @@ const HELP =
     \\Commands:
     \\  /help        Show this help message
     \\  /clear       Clear conversation history
+    \\  /new         Start a new conversation (same as /clear)
     \\  /model       Show current model
     \\  /quit, /exit Exit zagent
     \\  Ctrl+D       Exit zagent
@@ -204,7 +205,7 @@ fn runRepl(
             break;
         } else if (std.mem.eql(u8, line, "/help")) {
             try stdout.writeStreamingAll(io, HELP);
-        } else if (std.mem.eql(u8, line, "/clear")) {
+        } else if (std.mem.eql(u8, line, "/clear") or std.mem.eql(u8, line, "/new")) {
             agent.clearHistory();
             try stdout.writeStreamingAll(io, DIM ++ "Conversation history cleared.\n" ++ RESET);
         } else if (std.mem.eql(u8, line, "/model")) {

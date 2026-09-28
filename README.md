@@ -239,6 +239,7 @@ body. Four behaviours are worth knowing:
 |---------------|----------------------------------|
 | `/help`       | Show help                        |
 | `/clear`      | Clear conversation history       |
+| `/new`        | Start a new conversation (same as `/clear`) |
 | `/model`      | Show the current model           |
 | `/quit`       | Exit                             |
 | `Ctrl+D`      | Exit                             |
