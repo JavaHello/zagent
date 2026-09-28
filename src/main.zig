@@ -2,6 +2,7 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 const Agent = @import("agent.zig").Agent;
 const provider = @import("provider.zig");
+const history = @import("history.zig");
 const Linenoise = @import("linenoise").Linenoise;
 
 // ANSI colour codes
@@ -59,6 +60,29 @@ fn freeArgs(allocator: std.mem.Allocator, args: []const []const u8) void {
     for (args) |arg| allocator.free(arg);
 }
 
+/// Recall the prompts typed in earlier runs and hand back the file to save
+/// them to, or null when they cannot be kept: no home directory to put them
+/// in, or no terminal whose history would be worth keeping. Lines read from a
+/// pipe are not the user's own history, so a non-interactive stdin is left
+/// alone.
+fn openHistory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    ln: *Linenoise,
+) !?[]u8 {
+    if (!ln.is_tty) return null;
+
+    const path = (try history.statePath(allocator, env)) orelse return null;
+    errdefer allocator.free(path);
+
+    if (!history.load(io, ln, path)) {
+        allocator.free(path);
+        return null;
+    }
+    return path;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -96,6 +120,9 @@ pub fn main(init: std.process.Init) !void {
     var ln = Linenoise.init(allocator, io, env);
     defer ln.deinit();
 
+    const history_path = try openHistory(allocator, io, env, &ln);
+    defer if (history_path) |path| allocator.free(path);
+
     var agent = try Agent.init(allocator, io, config, &ln);
     defer agent.deinit();
 
@@ -106,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
         try agent.processQuery(query);
     } else {
         // Interactive REPL mode
-        try runRepl(allocator, io, &agent, config, &ln);
+        try runRepl(allocator, io, &agent, config, &ln, history_path);
     }
 }
 
@@ -116,6 +143,7 @@ fn runRepl(
     agent: *Agent,
     config: Config,
     ln: *Linenoise,
+    history_path: ?[]const u8,
 ) !void {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
@@ -165,7 +193,11 @@ fn runRepl(
         if (line.len == 0) continue;
 
         // Add non-empty lines to history so the user can navigate with ↑/↓.
+        // The file, when there is one, makes that outlive the process; it is
+        // written before the query runs, so an interrupt part-way through an
+        // answer cannot lose the question that asked for it.
         try ln.history.add(line);
+        if (history_path) |path| history.save(io, ln, path);
 
         if (std.mem.eql(u8, line, "/quit") or std.mem.eql(u8, line, "/exit")) {
             try stdout.writeStreamingAll(io, DIM ++ "Goodbye!\n" ++ RESET);
@@ -195,6 +227,7 @@ fn runRepl(
 // analyzes, so their tests would otherwise be dropped from `zig build test`.
 test {
     _ = @import("agent.zig");
+    _ = @import("history.zig");
     _ = @import("tools.zig");
     _ = @import("openai.zig");
     _ = @import("config.zig");

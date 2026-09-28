@@ -1,9 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
+const File = std.Io.File;
 
 const term = @import("term.zig");
 
+const is_windows = builtin.os.tag == .windows;
+
+/// The longest entry that is stored between runs. A line this long is not
+/// something a prompt can usefully recall, and leaving entries unbounded would
+/// let a single pasted blob grow the file that every new entry rewrites.
 const max_line_len = 4096;
 
 pub const History = struct {
@@ -55,12 +62,27 @@ pub const History = struct {
         self.allocator.free(self.hist.pop().?);
     }
 
-    /// Loads the history from a file
+    /// Loads the history from a file. The path may be absolute; a file that is
+    /// not there is reported as `error.FileNotFound`.
     pub fn load(self: *Self, io: std.Io, path: []const u8) !void {
-        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        const file = try openFile(io, path);
         defer file.close(io);
 
-        while (try term.readLineAlloc(io, self.allocator, file, max_line_len)) |line| {
+        while (true) {
+            const line = term.readLineAlloc(io, self.allocator, file, max_line_len) catch |err| switch (err) {
+                // Skipping an over-long line instead of failing keeps one bad
+                // entry from costing every entry stored after it.
+                error.StreamTooLong => {
+                    try skipLine(io, file);
+                    continue;
+                },
+                else => |e| return e,
+            } orelse break;
+
+            if (line.len == 0) {
+                self.allocator.free(line);
+                continue;
+            }
             errdefer self.allocator.free(line);
             try self.hist.append(self.allocator, line);
         }
@@ -68,16 +90,25 @@ pub const History = struct {
         self.truncate();
     }
 
-    /// Saves the history to a file
+    /// Saves the history to a file. The path may be absolute.
     pub fn save(self: *Self, io: std.Io, path: []const u8) !void {
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        const file = try createFile(io, path);
         defer file.close(io);
+
+        // A history holds whatever was typed at the prompt — a pasted key, a
+        // private path — so it is not left readable by other users on the
+        // machine. A new file's mode is filtered by the umask, hence the
+        // explicit chmod.
+        if (!is_windows) file.setPermissions(io, File.Permissions.fromMode(0o600)) catch {};
 
         var write_buf: [4096]u8 = undefined;
         var file_writer = file.writer(io, &write_buf);
         const writer = &file_writer.interface;
 
         for (self.hist.items) |line| {
+            // Only what `load` can read back is written, so that an entry too
+            // long to be stored cannot take the tail of the file with it.
+            if (line.len > max_line_len) continue;
             try writer.writeAll(line);
             try writer.writeAll("\n");
         }
@@ -93,6 +124,33 @@ pub const History = struct {
         self.truncate();
     }
 };
+
+/// Reads the history from `path`, which the caller may spell either absolutely
+/// or relative to the working directory.
+fn openFile(io: std.Io, path: []const u8) !File {
+    return if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        std.Io.Dir.cwd().openFile(io, path, .{});
+}
+
+/// Creates (or truncates) the history at `path`.
+fn createFile(io: std.Io, path: []const u8) !File {
+    return if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.createFileAbsolute(io, path, .{})
+    else
+        std.Io.Dir.cwd().createFile(io, path, .{});
+}
+
+/// Consumes the rest of an over-long line, so that reading resumes at the
+/// start of the next one.
+fn skipLine(io: std.Io, file: File) !void {
+    var byte_buf: [1]u8 = undefined;
+    while (true) {
+        if ((try term.read(io, file, &byte_buf)) < 1) return;
+        if (byte_buf[0] == '\n') return;
+    }
+}
 
 test "history" {
     var hist = History.empty(std.testing.allocator);

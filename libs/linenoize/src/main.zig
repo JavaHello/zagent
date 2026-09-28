@@ -59,7 +59,14 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             key_null, key_tab => {},
             key_ctrl_a => try state.editMoveHome(),
             key_ctrl_b => try state.editMoveLeft(),
-            key_ctrl_c => return error.CtrlC,
+            key_ctrl_c => {
+                // The empty entry added below stands in for the line being
+                // edited; it is not history until Enter accepts it. Dropping it
+                // here mirrors Ctrl+D, and keeps an abandoned line out of a
+                // history that is saved to disk.
+                state.ln.history.pop();
+                return error.CtrlC;
+            },
             key_ctrl_d => {
                 if (state.buf.items.len > 0) {
                     try state.editDelete();

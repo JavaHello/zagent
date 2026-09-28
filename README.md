@@ -4,7 +4,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 
 ## Features
 
-- **Interactive REPL** — conversational chat loop with history
+- **Interactive REPL** — conversational chat loop, with a prompt history that ↑/↓ recall across runs
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use (function calling)** — the agent can execute tools to help you:
   - `shell` — run shell commands
@@ -129,6 +129,15 @@ Here are all the .zig files in the current directory: ...
   ⟳ checking completion…
   ✓ completion check passed
 ```
+
+### Prompt history
+
+↑ and ↓ walk back and forward through the prompts of this session and earlier ones. The history is read at startup and rewritten after every accepted prompt, from:
+
+- `$XDG_STATE_HOME/zagent/history` (if `XDG_STATE_HOME` is set)
+- `~/.local/state/zagent/history` (fallback)
+
+It holds the last 100 entries, and is created with mode `0600`: a prompt can contain anything you were willing to type at it. Entries longer than 4 KB are still recalled in the session that typed them, but are not written, so one pasted blob cannot push everything else out of the file. Lines piped in on stdin are not history and are never stored, and if the file cannot be written the session carries on without it.
 
 ### Single-query mode
 
@@ -284,6 +293,7 @@ zig build test
 src/
   main.zig     — CLI entry point, REPL loop
   config.zig   — Configuration loading from the config file and environment
+  history.zig  — Prompt history: where it is stored, and when it is saved
   provider.zig — Built-in provider presets
   openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
   tools.zig   — Tool implementations (shell, read_file, write_file, list_dir,
