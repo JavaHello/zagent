@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "Example MCP servers for zagent.",
+    "Copy this file to one of these places, then delete this member:",
+    "  $XDG_CONFIG_HOME/zagent/mcp.json",
+    "  ~/.config/zagent/mcp.json",
+    "(JSON has no comments of its own, so this one is a member the loader",
+    "ignores.)",
+    "",
+    "Each entry under mcpServers is one server. Its name may hold letters,",
+    "digits, '_' and '-' only, and it becomes part of every tool name the model",
+    "sees: a tool called 'read_file' on the server 'filesystem' is offered as",
+    "mcp__filesystem__read_file.",
+    "",
+    "  command  start this program and speak MCP over its standard streams",
+    "  args     the arguments for that program",
+    "  env      variables added to the server's copy of the environment",
+    "  url      a Streamable HTTP endpoint, instead of a command",
+    "  headers  sent with every HTTP request; where a token goes",
+    "  timeoutMs  how long a request waits for an answer, default 60000.",
+    "           Subprocess servers only: std.http has no read timeout, so an",
+    "           HTTP server that never answers holds the agent",
+    "  disabled   keep this entry, but do not start it"
+  ],
+
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..." },
+      "timeoutMs": 120000
+    },
+
+    "remote": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ..." },
+      "disabled": true
+    }
+  }
+}

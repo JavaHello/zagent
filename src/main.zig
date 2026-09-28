@@ -4,6 +4,7 @@ const Agent = @import("agent.zig").Agent;
 const provider = @import("provider.zig");
 const history = @import("history.zig");
 const commands = @import("commands.zig");
+const mcp = @import("mcp.zig");
 const Linenoise = @import("linenoise").Linenoise;
 
 // ANSI colour codes
@@ -32,6 +33,7 @@ const HELP =
     \\  /clear       Clear conversation history
     \\  /new         Start a new conversation (same as /clear)
     \\  /model       Show current model
+    \\  /mcp         List the MCP servers and their tools
     \\  /quit, /exit Exit zagent
     \\  Tab          Complete a /command (a description appears as you type)
     \\  Ctrl+D       Exit zagent
@@ -131,7 +133,42 @@ pub fn main(init: std.process.Init) !void {
     const history_path = try openHistory(allocator, io, env, &ln);
     defer if (history_path) |path| allocator.free(path);
 
-    var agent = try Agent.init(allocator, io, config, &ln, env);
+    // The MCP servers are started before the first question, because the tools
+    // they bring are part of what the question is asked with. Everything about
+    // them is written to stderr: stdout belongs to the answer, and
+    // `zagent "..." > notes.md` must stay clean.
+    var problems: std.ArrayList([]u8) = .empty;
+    defer {
+        for (problems.items) |problem| allocator.free(problem);
+        problems.deinit(allocator);
+    }
+    const stderr = std.Io.File.stderr();
+    var watcher = McpProgress{ .io = io, .allocator = allocator };
+    var registry = mcp.Registry.connect(allocator, io, env, &problems, .{
+        .context = &watcher,
+        .started = McpProgress.started,
+    }) catch |err| failed: {
+        try printToStderr(allocator, io, YELLOW ++ "  ⚠ mcp: no servers were read: {s}\n" ++ RESET, .{@errorName(err)});
+        break :failed mcp.Registry.empty(allocator, io);
+    };
+    // Declared before the agent, because the agent borrows it and the defers
+    // run in reverse: the agent has to be gone before this one is freed.
+    defer registry.deinit();
+    {
+        var buf: [4096]u8 = undefined;
+        var file_writer = stderr.writerStreaming(io, &buf);
+        for (problems.items) |problem| {
+            try file_writer.interface.print(YELLOW ++ "  ⚠ {s}\n" ++ RESET, .{problem});
+        }
+        try registry.writeStartup(&file_writer.interface);
+        try file_writer.interface.flush();
+        if (registry.functionJson().len > 0) {
+            try file_writer.interface.writeAll(DIM ++ "\n" ++ RESET);
+            try file_writer.interface.flush();
+        }
+    }
+
+    var agent = try Agent.init(allocator, io, config, &ln, env, &registry);
     defer agent.deinit();
 
     if (args.items.len > 1) {
@@ -141,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
         try agent.processQuery(query);
     } else {
         // Interactive REPL mode
-        try runRepl(allocator, io, &agent, config, &ln, history_path);
+        try runRepl(allocator, io, &agent, config, &ln, history_path, &registry);
     }
 }
 
@@ -152,6 +189,7 @@ fn runRepl(
     config: Config,
     ln: *Linenoise,
     history_path: ?[]const u8,
+    registry: *const mcp.Registry,
 ) !void {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
@@ -219,6 +257,11 @@ fn runRepl(
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\n", .{config.model});
             defer allocator.free(msg);
             try stdout.writeStreamingAll(io, msg);
+        } else if (std.mem.eql(u8, line, "/mcp")) {
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try registry.writeStatus(&aw.writer);
+            try stdout.writeStreamingAll(io, aw.written());
         } else {
             agent.processQuery(line) catch |err| {
                 const errmsg = try std.fmt.allocPrint(allocator, "\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
@@ -229,6 +272,35 @@ fn runRepl(
 
         try stdout.writeStreamingAll(io, "\n");
     }
+}
+
+/// Says what is being waited for before each server is started. Written to
+/// stderr, where the rest of the progress already goes.
+const McpProgress = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+
+    fn started(context: *anyopaque, name: []const u8) void {
+        const self: *McpProgress = @ptrCast(@alignCast(context));
+        const line = std.fmt.allocPrint(
+            self.allocator,
+            DIM ++ "  ⚙ mcp: starting \"{s}\"…\n" ++ RESET,
+            .{name},
+        ) catch return;
+        defer self.allocator.free(line);
+        std.Io.File.stderr().writeStreamingAll(self.io, line) catch {};
+    }
+};
+
+fn printToStderr(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(message);
+    try std.Io.File.stderr().writeStreamingAll(io, message);
 }
 
 // The other modules are only reachable from `main`, which a test build never
@@ -249,6 +321,8 @@ test {
     _ = @import("text.zig");
     _ = @import("render.zig");
     _ = @import("spinner.zig");
+    _ = @import("mcp.zig");
+    _ = @import("mcp_transport.zig");
 }
 
 test "config loads" {

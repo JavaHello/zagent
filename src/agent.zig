@@ -5,6 +5,7 @@ const diff = @import("diff.zig");
 const text = @import("text.zig");
 const menu = @import("menu.zig");
 const verifier = @import("verifier.zig");
+const mcp = @import("mcp.zig");
 const render = @import("render.zig");
 const term = @import("term.zig");
 const spinner = @import("spinner.zig");
@@ -50,6 +51,30 @@ const SYSTEM_PROMPT =
     \\- After every turn that used tools, an automatic completion check reviews your work. If it reports unfinished work, act on it instead of restating your answer.
 ;
 
+/// The system prompt as the model is given it: the constant above, plus what
+/// the MCP servers contribute — a sentence naming their tools, when there are
+/// any, and whatever each server says about using it.
+fn buildSystemPrompt(allocator: std.mem.Allocator, registry: *const mcp.Registry) ![]u8 {
+    if (registry.functionJson().len == 0) return allocator.dupe(u8, SYSTEM_PROMPT);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+
+    try aw.writer.writeAll(SYSTEM_PROMPT);
+    try aw.writer.writeAll(
+        "\n- Tools whose name starts with mcp__ come from an MCP server that is connected;" ++
+            " call one exactly as you would any other tool.\n",
+    );
+
+    if (try registry.instructions(allocator)) |notes| {
+        defer allocator.free(notes);
+        try aw.writer.writeAll(notes);
+        try aw.writer.writeByte('\n');
+    }
+
+    return aw.toOwnedSlice();
+}
+
 pub const Agent = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -73,6 +98,10 @@ pub const Agent = struct {
     /// and neither is one where stdout is a file or a pager: the animation
     /// takes a line of the terminal, and it must be the only writer to it.
     animate_progress: bool,
+    /// The MCP servers and the tools they brought. Borrowed rather than owned:
+    /// whoever started the agent outlives it, and the agent only reads this and
+    /// calls through it.
+    mcp_registry: *mcp.Registry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -80,11 +109,12 @@ pub const Agent = struct {
         config: Config,
         linenoise: *Linenoise,
         env: *const std.process.Environ.Map,
+        mcp_registry: *mcp.Registry,
     ) !Agent {
         var history: std.ArrayList(Message) = .empty;
         errdefer history.deinit(allocator);
 
-        const system_content = try allocator.dupe(u8, SYSTEM_PROMPT);
+        const system_content = try buildSystemPrompt(allocator, mcp_registry);
         errdefer allocator.free(system_content);
         try history.append(allocator, .{
             .role = "system",
@@ -115,6 +145,7 @@ pub const Agent = struct {
             .animate_progress = linenoise.term_supported and
                 (std.Io.File.stdout().isTty(io) catch false) and
                 (std.Io.File.stderr().isTty(io) catch false),
+            .mcp_registry = mcp_registry,
         };
     }
 
@@ -200,7 +231,7 @@ pub const Agent = struct {
             .enabled = self.animate_progress,
         });
         defer spin.stop();
-        return self.client.chat(messages) catch |err| {
+        return self.client.chat(messages, self.mcp_registry.functionJson()) catch |err| {
             spin.stop();
             try self.reportHttpError();
             return err;
@@ -517,8 +548,12 @@ pub const Agent = struct {
             // the model calls do. The `defer` covers the dispatch and nothing
             // else: below this block the result is previewed, and that has to
             // land on a line the animation has already given back.
-            var spin = if (tools.progressLabel(call.name)) |label|
-                spinner.Spinner.start(self.io, std.Io.File.stderr(), label, .{ .enabled = self.animate_progress })
+            // A tool from an MCP server has a label too, built when the tool
+            // was listed: it names the server the call is going to, and it is
+            // this process's own string rather than one a server wrote.
+            const label = tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
+            var spin = if (label) |caption|
+                spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, .{ .enabled = self.animate_progress })
             else
                 spinner.Spinner.disabled(self.io);
             defer spin.stop();
@@ -616,6 +651,10 @@ pub const Agent = struct {
                 break :blk try tools.httpRequest(self.io, self.allocator, request);
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
+            } else if (std.mem.startsWith(u8, call.name, mcp.tool_prefix)) {
+                // A tool of a connected MCP server: the registry knows which
+                // server it belongs to and what the server calls it.
+                break :blk try self.mcp_registry.call(self.allocator, call.name, call.arguments);
             } else {
                 break :blk .{
                     .content = try std.fmt.allocPrint(self.allocator, "Unknown tool: {s}", .{call.name}),

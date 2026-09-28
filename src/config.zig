@@ -67,7 +67,11 @@ fn autodetectProvider(env: *const std.process.Environ.Map) ?Provider {
     return null;
 }
 
-fn configBasePath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
+/// Where zagent's configuration lives: `$XDG_CONFIG_HOME/zagent`, or
+/// `~/.config/zagent`. The path may be a file — that is one of the shapes the
+/// config file itself is read from — or a directory, which is also where
+/// `mcp.json` is looked for.
+pub fn configBasePath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
     if (try envVarOwned(allocator, env, "XDG_CONFIG_HOME")) |xdg_dir| {
         defer allocator.free(xdg_dir);
         return try std.fmt.allocPrint(allocator, "{s}/zagent", .{xdg_dir});
@@ -79,25 +83,43 @@ fn configBasePath(allocator: std.mem.Allocator, env: *const std.process.Environ.
     return null;
 }
 
+/// Open the configuration, which is either the path itself or a file named
+/// `config` inside it.
+///
+/// Which of the two it is has to be asked for rather than inferred: on POSIX
+/// `openFile` succeeds on a directory, and it is the read that follows that
+/// would fail — as a `ReadFailed` with nothing to say about the directory the
+/// user actually meant.
 fn openConfigFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?std.Io.File {
     const base_path = (try configBasePath(allocator, env)) orelse return null;
     defer allocator.free(base_path);
 
     const cwd = std.Io.Dir.cwd();
-    if (cwd.openFile(io, base_path, .{})) |file| {
-        return file;
-    } else |err| switch (err) {
-        error.FileNotFound => return null,
-        error.IsDir => {
-            const config_path = try std.fmt.allocPrint(allocator, "{s}/config", .{base_path});
-            defer allocator.free(config_path);
-            return cwd.openFile(io, config_path, .{}) catch |open_err| switch (open_err) {
-                error.FileNotFound => return null,
-                else => return open_err,
-            };
-        },
-        else => return err,
+    if (try isDirectory(io, base_path)) {
+        const config_path = try std.fmt.allocPrint(allocator, "{s}/config", .{base_path});
+        defer allocator.free(config_path);
+        // A directory there too would be opened and then fail to read, so it is
+        // the same question one level down.
+        if (try isDirectory(io, config_path)) return null;
+        return cwd.openFile(io, config_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => err,
+        };
     }
+
+    return cwd.openFile(io, base_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+/// Whether a path is a directory. A path that is not there is not one.
+fn isDirectory(io: std.Io, path: []const u8) !bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return stat.kind == .directory;
 }
 
 fn setString(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
@@ -842,4 +864,47 @@ test "max tokens and iterations prefer the environment" {
 
     try std.testing.expectEqual(@as(u32, 1234), config.max_tokens);
     try std.testing.expectEqual(@as(u32, 5), config.max_iterations);
+}
+
+test "the config is read from the path itself or from a config file inside it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const home = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", home);
+
+    // Nothing there at all: no config, and no complaint about it.
+    try std.testing.expectEqual(@as(?std.Io.File, null), try openConfigFile(io, allocator, &env));
+
+    // The path is the file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "zagent", .data = "AI_MODEL=from-the-path\n" });
+    {
+        var file = (try openConfigFile(io, allocator, &env)).?;
+        defer file.close(io);
+        const contents = try readFileAlloc(io, allocator, file, 4096);
+        defer allocator.free(contents);
+        try std.testing.expect(std.mem.indexOf(u8, contents, "from-the-path") != null);
+    }
+
+    // The path is a directory holding one named `config`. Reading a directory
+    // is what a plain `openFile` would have led to, so the kind is checked.
+    try tmp.dir.deleteFile(io, "zagent");
+    try tmp.dir.createDir(io, "zagent", std.Io.File.Permissions.default_dir);
+    try std.testing.expectEqual(@as(?std.Io.File, null), try openConfigFile(io, allocator, &env));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "zagent/config", .data = "AI_MODEL=from-the-directory\n" });
+    {
+        var file = (try openConfigFile(io, allocator, &env)).?;
+        defer file.close(io);
+        const contents = try readFileAlloc(io, allocator, file, 4096);
+        defer allocator.free(contents);
+        try std.testing.expect(std.mem.indexOf(u8, contents, "from-the-directory") != null);
+    }
 }

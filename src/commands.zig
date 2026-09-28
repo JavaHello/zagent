@@ -21,6 +21,7 @@ pub const all = [_]Command{
     .{ .name = "/clear", .description = "Clear conversation history" },
     .{ .name = "/new", .description = "Start a new conversation (same as /clear)" },
     .{ .name = "/model", .description = "Show current model" },
+    .{ .name = "/mcp", .description = "List the MCP servers and their tools" },
     .{ .name = "/quit", .description = "Exit zagent" },
     .{ .name = "/exit", .description = "Exit zagent" },
 };

@@ -1172,7 +1172,10 @@ fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return finalizeToolContentLimited(allocator, raw, 8192);
 }
 
-fn finalizeToolContentLimited(allocator: std.mem.Allocator, raw: []const u8, max_len: usize) ![]u8 {
+/// Turn text that came from outside this program into what the model is shown:
+/// sanitized, then capped on a UTF-8 boundary. Shared with the MCP client,
+/// whose results are as untrusted as a tool's output and are read the same way.
+pub fn finalizeToolContentLimited(allocator: std.mem.Allocator, raw: []const u8, max_len: usize) ![]u8 {
     const normalized = try normalizeToolText(allocator, raw);
     defer allocator.free(normalized);
 

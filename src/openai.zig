@@ -2,19 +2,25 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 
 // JSON schema for the tools exposed to the model.
-pub const TOOLS_JSON =
-    \\[
-    \\  {"type":"function","function":{"name":"shell","description":"Execute a shell command and return its output. Use this to run programs, inspect the system, manage files, and more.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"}},"required":["command"]}}},
-    \\  {"type":"function","function":{"name":"read_file","description":"Read the contents of a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}}},
-    \\  {"type":"function","function":{"name":"write_file","description":"Write content to a file, creating or overwriting it","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}}},
-    \\  {"type":"function","function":{"name":"apply_patch","description":"Change existing files by applying a unified diff. This is how an edit is made instead of writing the whole file back. The patch is a standard unified diff: a header line '--- a/path' and a '+++ b/path' line, then one or more hunks. Each hunk starts with '@@ -<start>,<count> +<start>,<count> @@' giving the line numbers in the file before and after the change, followed by the hunk's lines, each prefixed with a single space (unchanged context), '-' (removed) or '+' (added). Copy the context lines from the file exactly as they are, indentation included: the patch is refused rather than guessed at if they do not match. Keep the counts in the '@@' line equal to the number of lines below it. Send a new file as '--- /dev/null' with a hunk that adds every line, and delete one with '+++ /dev/null' and a hunk that removes every line. Several files may be patched in one call by putting one '---'/'+++' pair after another.","parameters":{"type":"object","properties":{"patch":{"type":"string","description":"The unified diff to apply, with its newlines"}},"required":["patch"]}}},
-    \\  {"type":"function","function":{"name":"list_dir","description":"List the contents of a directory","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}}},
-    \\  {"type":"function","function":{"name":"grep","description":"Search file contents with a regular expression and return the matching lines with their file and line number. Prefer this over running grep or rg through the shell. Binary files are skipped.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File or directory to search, defaults to the current directory"},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"}},"required":["pattern"]}}},
-    \\  {"type":"function","function":{"name":"find","description":"Find files and directories whose name matches a glob and return their paths. Prefer this over running find or fd through the shell.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob the name must match, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search in, defaults to the current directory"}},"required":["pattern"]}}},
-    \\  {"type":"function","function":{"name":"http_request","description":"Make an HTTP request and return its status line, response headers, and body. Use this instead of curl for fetching URLs and calling APIs. Set Content-Type yourself when you send a body; use save_to to download the body to a file instead of returning it.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"The full URL, including the scheme"},"method":{"type":"string","description":"HTTP method: GET, HEAD, POST, PUT, PATCH, DELETE, or OPTIONS. Defaults to GET"},"headers":{"type":"object","description":"Request headers as name/value pairs","additionalProperties":{"type":"string"}},"body":{"type":"string","description":"Request body, for a method that takes one"},"save_to":{"type":"string","description":"Write the response body to this file path instead of returning it"}},"required":["url"]}}},
-    \\  {"type":"function","function":{"name":"ask_user","description":"Ask the user to choose between concrete options when the request is ambiguous, or when a decision only the user can make blocks progress. Not for confirming routine steps.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}}}
-    \\]
+///
+/// The built-in tools, one JSON function object per line, commas included:
+/// this is the body of a request's `tools` array rather than a finished one,
+/// so that the tools of the MCP servers connected at the moment can follow it.
+const builtin_tools =
+    \\{"type":"function","function":{"name":"shell","description":"Execute a shell command and return its output. Use this to run programs, inspect the system, manage files, and more.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"}},"required":["command"]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read the contents of a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"write_file","description":"Write content to a file, creating or overwriting it","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}}},
+    \\{"type":"function","function":{"name":"apply_patch","description":"Change existing files by applying a unified diff. This is how an edit is made instead of writing the whole file back. The patch is a standard unified diff: a header line '--- a/path' and a '+++ b/path' line, then one or more hunks. Each hunk starts with '@@ -<start>,<count> +<start>,<count> @@' giving the line numbers in the file before and after the change, followed by the hunk's lines, each prefixed with a single space (unchanged context), '-' (removed) or '+' (added). Copy the context lines from the file exactly as they are, indentation included: the patch is refused rather than guessed at if they do not match. Keep the counts in the '@@' line equal to the number of lines below it. Send a new file as '--- /dev/null' with a hunk that adds every line, and delete one with '+++ /dev/null' and a hunk that removes every line. Several files may be patched in one call by putting one '---'/'+++' pair after another.","parameters":{"type":"object","properties":{"patch":{"type":"string","description":"The unified diff to apply, with its newlines"}},"required":["patch"]}}},
+    \\{"type":"function","function":{"name":"list_dir","description":"List the contents of a directory","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regular expression and return the matching lines with their file and line number. Prefer this over running grep or rg through the shell. Binary files are skipped.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File or directory to search, defaults to the current directory"},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"}},"required":["pattern"]}}},
+    \\{"type":"function","function":{"name":"find","description":"Find files and directories whose name matches a glob and return their paths. Prefer this over running find or fd through the shell.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob the name must match, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search in, defaults to the current directory"}},"required":["pattern"]}}},
+    \\{"type":"function","function":{"name":"http_request","description":"Make an HTTP request and return its status line, response headers, and body. Use this instead of curl for fetching URLs and calling APIs. Set Content-Type yourself when you send a body; use save_to to download the body to a file instead of returning it.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"The full URL, including the scheme"},"method":{"type":"string","description":"HTTP method: GET, HEAD, POST, PUT, PATCH, DELETE, or OPTIONS. Defaults to GET"},"headers":{"type":"object","description":"Request headers as name/value pairs","additionalProperties":{"type":"string"}},"body":{"type":"string","description":"Request body, for a method that takes one"},"save_to":{"type":"string","description":"Write the response body to this file path instead of returning it"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"ask_user","description":"Ask the user to choose between concrete options when the request is ambiguous, or when a decision only the user can make blocks progress. Not for confirming routine steps.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}}}
 ;
+
+/// The built-in tools as a whole `tools` member, for the request that has
+/// nothing of its own to add to them.
+pub const TOOLS_JSON = "[" ++ builtin_tools ++ "]";
 
 pub const ToolCallData = struct {
     id: []const u8,
@@ -104,17 +110,34 @@ pub const Client = struct {
     }
 
     /// Send a chat/completions request and return the parsed response.
-    pub fn chat(self: *Client, messages: []const Message) !ApiResponse {
-        return self.chatWith(messages, .included);
+    ///
+    /// `extra_tools` are the tools that are not built in — one JSON function
+    /// object each, from the MCP servers that are connected. They are offered
+    /// beside the built-in ones, so the model can call either.
+    pub fn chat(self: *Client, messages: []const Message, extra_tools: []const []const u8) !ApiResponse {
+        return self.chatWith(messages, .included, extra_tools);
     }
 
-    /// Send a request that advertises no tools, for the completion judge.
+    /// Send a request that advertises no tools, for the completion judge. It
+    /// must not be able to answer with a tool call, MCP ones included.
     pub fn chatWithoutTools(self: *Client, messages: []const Message) !ApiResponse {
-        return self.chatWith(messages, .omitted);
+        return self.chatWith(messages, .omitted, &.{});
     }
 
-    fn chatWith(self: *Client, messages: []const Message, tools: Tools) !ApiResponse {
-        const req_json = try buildRequest(self.allocator, self.model, messages, self.max_tokens, tools);
+    fn chatWith(
+        self: *Client,
+        messages: []const Message,
+        tools: Tools,
+        extra_tools: []const []const u8,
+    ) !ApiResponse {
+        const req_json = try buildRequestWithTools(
+            self.allocator,
+            self.model,
+            messages,
+            self.max_tokens,
+            tools,
+            extra_tools,
+        );
         defer self.allocator.free(req_json);
 
         const chat_url = try std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.base_url});
@@ -203,6 +226,19 @@ pub fn buildRequest(
     max_tokens: u32,
     tools: Tools,
 ) ![]u8 {
+    return buildRequestWithTools(allocator, model, messages, max_tokens, tools, &.{});
+}
+
+/// As `buildRequest`, with tools from outside this program appended to the
+/// built-in ones. Each entry of `extra_tools` is a whole JSON function object.
+pub fn buildRequestWithTools(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    messages: []const Message,
+    max_tokens: u32,
+    tools: Tools,
+    extra_tools: []const []const u8,
+) ![]u8 {
     const request_options = resolveRequestOptions(model);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -224,8 +260,13 @@ pub fn buildRequest(
     }
     try w.writeByte(']');
     if (tools == .included) {
-        try w.writeAll(",\"tools\":");
-        try w.writeAll(TOOLS_JSON);
+        try w.writeAll(",\"tools\":[");
+        try w.writeAll(builtin_tools);
+        for (extra_tools) |entry| {
+            try w.writeByte(',');
+            try w.writeAll(entry);
+        }
+        try w.writeByte(']');
     }
     try w.writeByte('}');
 
@@ -452,22 +493,47 @@ test "build request omits the tools when asked" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"messages\"") != null);
 }
 
-test "tools json parses and lists every tool" {
+test "the tools a request advertises parse, built in and borrowed alike" {
     const allocator = std.testing.allocator;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, TOOLS_JSON, .{});
-    defer parsed.deinit();
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const borrowed = [_][]const u8{
+        \\{"type":"function","function":{"name":"mcp__filesystem__read","description":"server: read","parameters":{"type":"object"}}}
+    };
+
+    const json = try buildRequestWithTools(allocator, "gpt-4o-mini", &messages, 4096, .included, &borrowed);
+    defer allocator.free(json);
 
     // The schema is hand-written JSON, so a typo in it would only surface as a
     // server-side error on the first request of every session.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const advertised = parsed.value.object.get("tools").?.array;
     const expected = [_][]const u8{ "shell", "read_file", "write_file", "apply_patch", "list_dir", "grep", "find", "http_request", "ask_user" };
     for (expected) |wanted| {
         var found = false;
-        for (parsed.value.array.items) |entry| {
+        for (advertised.items) |entry| {
             const name = entry.object.get("function").?.object.get("name").?.string;
             if (std.mem.eql(u8, name, wanted)) found = true;
         }
         try std.testing.expect(found);
     }
+
+    // And the borrowed tool came through as it was written, schema and all.
+    const last = advertised.items[advertised.items.len - 1];
+    try std.testing.expectEqualStrings(
+        "mcp__filesystem__read",
+        last.object.get("function").?.object.get("name").?.string,
+    );
+    const parameters = try std.json.Stringify.valueAlloc(
+        allocator,
+        last.object.get("function").?.object.get("parameters").?,
+        .{},
+    );
+    defer allocator.free(parameters);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", parameters);
 }
 
 test "build request maps deepseek reasoner to the thinking mode of deepseek-flash" {

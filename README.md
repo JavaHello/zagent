@@ -16,6 +16,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `find` — find files by name, using `fd` where it is installed
   - `http_request` — fetch a URL or call an API, without shelling out to `curl`
   - `ask_user` — put a question to you as a numbered list of options
+- **MCP servers** — start servers described in `mcp.json` and give the tools they offer to the model beside the built-in ones
 - **Multi-turn tool chaining** — the agent loops until the task is complete
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
 - **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
@@ -46,7 +47,8 @@ Configuration can be loaded from a config file and/or environment variables. The
 
 The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS`, `AI_MARKDOWN` (or their `OPENAI_*` equivalents). Environment variables override config file values.
 
-See `zagent.example.conf` for a complete example config file.
+See `zagent.example.conf` for a complete example config file, and
+`mcp.example.json` for the MCP servers zagent can be given.
 
 All configuration is also supported through environment variables:
 
@@ -329,6 +331,79 @@ Five behaviours are worth knowing:
 - **Renames are refused rather than inferred.** A patch naming two different
   files is an error; delete and create in two steps instead.
 
+### MCP servers
+
+zagent is an MCP client. Servers described in `mcp.json` are started at
+startup, their tools are listed, and the model is offered them beside the
+built-in ones — a tool called `read_file` on a server called `filesystem` is
+offered as `mcp__filesystem__read_file`. The file lives next to the config
+file, and `mcp.example.json` shows every member it takes:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "linear": {
+      "url": "https://mcp.linear.app/mcp",
+      "headers": { "Authorization": "Bearer ..." }
+    }
+  }
+}
+```
+
+An entry with `command` is started as a subprocess and spoken to over its
+standard streams; an entry with `url` is a Streamable HTTP endpoint. `env` adds
+variables to the subprocess's copy of the environment, `headers` are sent with
+every HTTP request, `timeoutMs` says how long a request waits for an answer
+(default 60000), and `disabled` keeps an entry without starting it.
+
+```
+  ⚙ mcp: starting "filesystem"…
+  ✓ mcp: filesystem — 11 tools, 2025-06-18
+
+you ❯ what is in /tmp?
+  ⚙ mcp__filesystem__list_directory {"path":"/tmp"}
+  ✓ [FILE] notes.md
+    [DIR] projects
+```
+
+`/mcp` lists the servers, their transport, the revision each one settled on,
+and what each brought. Seven behaviours are worth knowing:
+
+- **Revisions.** zagent speaks the current MCP revision, `2026-07-28`, in which
+  every request carries the protocol version and the client's capabilities and
+  nothing is negotiated up front. Servers written for the revision before it
+  are opened the old way, with an `initialize` handshake: the client asks the
+  current question first, and falls back when the answer is a server that has
+  never heard of it. `/mcp` shows which revision each server ended up on.
+- **Naming.** A tool name outside letters, digits, `_` and `-` — or over 64
+  characters, which is what an OpenAI-compatible endpoint accepts — is fitted to
+  what the endpoint takes; a name that has to be cut keeps a hash of the whole
+  thing, so two long tools do not quietly become one. Two tools that would
+  still collide are reported, and the second is not offered.
+- **Where the file lives.** Only the user-level `mcp.json` is read, never one
+  from the directory zagent happens to be running in: a server entry is a
+  command, and no repository should get to run one just by being entered.
+- **A server that fails is a line, not a funeral.** It is reported on stderr
+  with what went wrong, the session carries on with the tools of the servers
+  that did start, and every other entry is still read.
+- **Timeouts.** A subprocess server is read with a deadline, and a request that
+  runs out of time is reported to the model as a failed call. `std.http` has no
+  read timeout, so an HTTP server that takes a request and never answers holds
+  the agent until it is interrupted — the same limitation `http_request` has.
+- **Not implemented.** Servers may ask the client for something mid-call
+  (elicitation, sampling, a root list); zagent reports that as a failed call
+  saying so. The tool list is also a snapshot from startup: a server that
+  changes its tools later is not re-read.
+- **Results.** Up to 32 KB of text comes back to the model, sanitised the way
+  any tool result is. Images and audio are named rather than carried — `[image:
+  image/png, 48213 bytes]` — because the bytes would cost more of the context
+  than they could ever repay, and a result the server marks as an error stays an
+  error, so the model can correct itself.
+
 ### REPL commands
 
 | Command       | Description                      |
@@ -337,6 +412,7 @@ Five behaviours are worth knowing:
 | `/clear`      | Clear conversation history       |
 | `/new`        | Start a new conversation (same as `/clear`) |
 | `/model`      | Show the current model           |
+| `/mcp`        | List the MCP servers and their tools |
 | `/quit`       | Exit                             |
 | `Tab`         | Complete a `/command`            |
 | `Ctrl+D`      | Exit                             |
