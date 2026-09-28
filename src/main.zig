@@ -238,6 +238,7 @@ test {
     _ = @import("term.zig");
     _ = @import("text.zig");
     _ = @import("render.zig");
+    _ = @import("spinner.zig");
 }
 
 test "config loads" {

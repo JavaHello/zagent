@@ -5,6 +5,7 @@ const menu = @import("menu.zig");
 const verifier = @import("verifier.zig");
 const render = @import("render.zig");
 const term = @import("term.zig");
+const spinner = @import("spinner.zig");
 const Config = @import("config.zig").Config;
 const Linenoise = @import("linenoise").Linenoise;
 
@@ -58,6 +59,12 @@ pub const Agent = struct {
     /// Whether to render the model's markdown for a terminal. Decided once, in
     /// `init`, so the answer path never has to ask the operating system.
     render_markdown: bool,
+    /// Whether the progress line for a wait may be animated. Decided once, in
+    /// `init`, next to `render_markdown` and by the same test — a terminal that
+    /// cannot do line editing is no place for a carriage return and an erase,
+    /// and neither is one where stdout is a file or a pager: the animation
+    /// takes a line of the terminal, and it must be the only writer to it.
+    animate_progress: bool,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config, linenoise: *Linenoise) !Agent {
         var history: std.ArrayList(Message) = .empty;
@@ -87,6 +94,12 @@ pub const Agent = struct {
             .render_markdown = config.markdown and
                 linenoise.term_supported and
                 (std.Io.File.stdout().isTty(io) catch false),
+            // stderr as well as stdout, unlike the renderer: the animation is
+            // written to stderr, and a run whose stdout is a file or a pager is
+            // one where the terminal belongs to something else.
+            .animate_progress = linenoise.term_supported and
+                (std.Io.File.stdout().isTty(io) catch false) and
+                (std.Io.File.stderr().isTty(io) catch false),
         };
     }
 
@@ -129,8 +142,8 @@ pub const Agent = struct {
             }
             verifications += 1;
 
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ checking completion…\n" ++ RESET, .{});
-
+            // The check announces itself from inside `judgeAnimated`, where it
+            // can be animated for as long as the judge is thinking.
             const verdict = (try self.judgeTurn(turn_start)) orelse return;
             defer verdict.deinit(self.allocator);
 
@@ -160,6 +173,52 @@ pub const Agent = struct {
         }
     }
 
+    /// Send the conversation and wait, with the progress line animated for the
+    /// length of the wait.
+    ///
+    /// The spinner lives in these helpers rather than in the loop that calls
+    /// them: a `defer` in the loop body would still be in force while the tool
+    /// results are printed, and the next frame of the animation would erase
+    /// what was just printed. Here it ends before the caller writes a byte.
+    fn chatAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
+        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "thinking…", .{
+            .enabled = self.animate_progress,
+        });
+        defer spin.stop();
+        return self.client.chat(messages) catch |err| {
+            spin.stop();
+            try self.reportHttpError();
+            return err;
+        };
+    }
+
+    /// Ask the completion judge, animated the same way. Without a terminal to
+    /// animate, the plain line it replaces is printed instead, so a redirected
+    /// run still records that the check happened.
+    fn judgeAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
+        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking completion…", .{
+            .enabled = self.animate_progress,
+        });
+        if (!spin.animating()) {
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ checking completion…\n" ++ RESET, .{});
+        }
+        defer spin.stop();
+        return self.client.chatWithoutTools(messages) catch |err| {
+            spin.stop();
+            try self.reportHttpError();
+            return err;
+        };
+    }
+
+    /// Report what the server said about a request that failed. The client
+    /// keeps it instead of printing it, so that it can be said here — after
+    /// the animation has given the line back.
+    fn reportHttpError(self: *Agent) !void {
+        const message = self.client.takeHttpError() orelse return;
+        defer self.allocator.free(message);
+        try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "  ✗ {s}\n" ++ RESET, .{message});
+    }
+
     const Turn = struct {
         /// How many tool calls the model made before its final answer.
         tool_calls: usize,
@@ -174,7 +233,7 @@ pub const Agent = struct {
         var iteration: usize = 0;
 
         while (iteration < self.max_iterations) : (iteration += 1) {
-            const response = self.client.chat(self.history.items) catch |err| {
+            const response = self.chatAnimated(self.history.items) catch |err| {
                 try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
                 return err;
             };
@@ -286,7 +345,7 @@ pub const Agent = struct {
             .{ .role = "user", .content = prompt, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
         };
 
-        const response = self.client.chatWithoutTools(&messages) catch |err| {
+        const response = self.judgeAnimated(&messages) catch |err| {
             try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
             return null;
         };
@@ -385,6 +444,16 @@ pub const Agent = struct {
         try printFmt(std.Io.File.stderr(), self.io, self.allocator, YELLOW ++ "  ⚙ {s}" ++ RESET ++ " {s}\n", .{ call.name, call.arguments });
 
         const result: tools.ToolResult = blk: {
+            // A tool can run for minutes, so the wait gets the same animation
+            // the model calls do. The `defer` covers the dispatch and nothing
+            // else: below this block the result is previewed, and that has to
+            // land on a line the animation has already given back.
+            var spin = if (tools.progressLabel(call.name)) |label|
+                spinner.Spinner.start(self.io, std.Io.File.stderr(), label, .{ .enabled = self.animate_progress })
+            else
+                spinner.Spinner.disabled(self.io);
+            defer spin.stop();
+
             if (std.mem.eql(u8, call.name, "shell")) {
                 const command = openai.extractStringArg(self.allocator, call.arguments, "command") catch {
                     break :blk .{

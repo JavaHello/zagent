@@ -68,6 +68,11 @@ pub const Client = struct {
     base_url: []const u8,
     model: []const u8,
     max_tokens: u32,
+    /// The last HTTP-level failure, kept rather than printed when it happens.
+    /// A request runs while the progress animation owns the terminal's line:
+    /// a message written from in here would be glued onto a frame and then
+    /// erased by the next one. Whoever stops the animation reports it instead.
+    http_error: ?[]u8,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Client {
         return .{
@@ -78,11 +83,21 @@ pub const Client = struct {
             .base_url = config.base_url,
             .model = config.model,
             .max_tokens = config.max_tokens,
+            .http_error = null,
         };
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.http_error) |message| self.allocator.free(message);
         self.http_client.deinit();
+    }
+
+    /// Take the failure recorded for the last request, if there was one, and
+    /// with it the ownership of the message.
+    pub fn takeHttpError(self: *Client) ?[]u8 {
+        const message = self.http_error;
+        self.http_error = null;
+        return message;
     }
 
     /// Send a chat/completions request and return the parsed response.
@@ -133,13 +148,7 @@ pub const Client = struct {
         }) catch |err| return err;
 
         if (fetch_result.status != .ok) {
-            const body = aw.written();
-            if (tryParseApiErrorMessage(self.allocator, body)) |err_msg| {
-                defer self.allocator.free(err_msg);
-                std.debug.print("API error (HTTP {d}): {s}\n", .{ @intFromEnum(fetch_result.status), err_msg });
-            } else {
-                std.debug.print("HTTP error: {d}\n", .{@intFromEnum(fetch_result.status)});
-            }
+            self.recordHttpError(fetch_result.status, aw.written());
             return error.ApiError;
         }
 
@@ -149,6 +158,33 @@ pub const Client = struct {
     fn resetHttpClient(self: *Client) void {
         self.http_client.deinit();
         self.http_client = .{ .allocator = self.allocator, .io = self.io };
+    }
+
+    /// Keep what the server said, for the caller to report once no animation is
+    /// using the terminal's line. The message is the server's own text when
+    /// there is one, since "HTTP error: 429" alone is less useful than
+    /// "rate limit reached".
+    fn recordHttpError(self: *Client, status: std.http.Status, body: []const u8) void {
+        // A failure overwrites the one before it: only the newest request's
+        // outcome is being reported.
+        if (self.http_error) |previous| self.allocator.free(previous);
+        self.http_error = null;
+
+        const detail = tryParseApiErrorMessage(self.allocator, body);
+        defer if (detail) |message| self.allocator.free(message);
+
+        self.http_error = if (detail) |message|
+            std.fmt.allocPrint(
+                self.allocator,
+                "API error (HTTP {d}): {s}",
+                .{ @intFromEnum(status), message },
+            ) catch null
+        else
+            std.fmt.allocPrint(
+                self.allocator,
+                "HTTP error: {d}",
+                .{@intFromEnum(status)},
+            ) catch null;
     }
 };
 
@@ -546,4 +582,34 @@ test "recoverable fetch errors are retried" {
     try std.testing.expect(isRecoverableFetchError(error.HttpConnectionClosing));
     try std.testing.expect(isRecoverableFetchError(error.ConnectionResetByPeer));
     try std.testing.expect(!isRecoverableFetchError(error.ApiError));
+}
+
+test "an http failure is kept until the caller asks for it" {
+    const allocator = std.testing.allocator;
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const config = try Config.load(allocator, std.testing.io, &env);
+    defer config.deinit();
+
+    var client = Client.init(allocator, std.testing.io, config);
+    defer client.deinit();
+
+    try std.testing.expectEqual(@as(?[]u8, null), client.takeHttpError());
+
+    client.recordHttpError(.too_many_requests, "{\"error\":{\"message\":\"rate limit reached\"}}");
+    // Recording a second failure drops the one before it rather than stacking:
+    // only the newest request's outcome is worth reporting.
+    client.recordHttpError(.internal_server_error, "{}");
+    const reported = client.takeHttpError() orelse return error.TestUnexpectedResult;
+    defer allocator.free(reported);
+    try std.testing.expectEqualStrings("HTTP error: 500", reported);
+    // Taking it clears it, so one failure is reported once.
+    try std.testing.expectEqual(@as(?[]u8, null), client.takeHttpError());
+
+    // The server's own words are what makes a failure actionable.
+    client.recordHttpError(.too_many_requests, "{\"error\":{\"message\":\"rate limit reached\"}}");
+    const message = client.takeHttpError() orelse return error.TestUnexpectedResult;
+    defer allocator.free(message);
+    try std.testing.expectEqualStrings("API error (HTTP 429): rate limit reached", message);
 }

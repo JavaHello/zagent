@@ -16,6 +16,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Multi-turn tool chaining** — the agent loops until the task is complete
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
 - **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
+- **Live progress** — waiting for the model, and running a tool, each get one animated line (`⠋ shell… 8s`) with the time so far, so a long wait never looks like a hang. Off unless both stdout and stderr are a terminal, where the line can be taken and given back
 - **Built-in provider presets** — one setting selects `deepseek` or `openai`, autodetected from `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` when unset
 - **OpenAI-compatible** — works with any endpoint that speaks the OpenAI chat-completions protocol (OpenAI, Azure OpenAI, Ollama, LM Studio, …)
 - **ANSI colour output**

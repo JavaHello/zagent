@@ -10,6 +10,28 @@ pub const ToolResult = struct {
     }
 };
 
+/// A label for the animation shown while `name` runs, or null for a tool that
+/// must not have one.
+///
+/// The names are written out rather than taken from the call: a tool name is
+/// model output, and a name carrying escape sequences would be written straight
+/// into the terminal (see `text.zig`). `ask_user` is deliberately absent — it
+/// asks a question on the terminal and reads the answer from it, so it needs
+/// the line to itself.
+pub fn progressLabel(name: []const u8) ?[]const u8 {
+    const labels = [_]struct { name: []const u8, label: []const u8 }{
+        .{ .name = "shell", .label = "shell…" },
+        .{ .name = "read_file", .label = "read_file…" },
+        .{ .name = "write_file", .label = "write_file…" },
+        .{ .name = "list_dir", .label = "list_dir…" },
+        .{ .name = "http_request", .label = "http_request…" },
+    };
+    for (labels) |entry| {
+        if (std.mem.eql(u8, name, entry.name)) return entry.label;
+    }
+    return null;
+}
+
 pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
     const result = try std.process.run(allocator, io, .{
         .argv = &[_][]const u8{ "sh", "-c", command },
@@ -797,4 +819,22 @@ test "finalize tool content truncates on utf8 boundary" {
     defer allocator.free(finalized);
     try std.testing.expect(std.mem.endsWith(u8, finalized, "\n... (truncated)"));
     try std.testing.expect(std.unicode.utf8ValidateSlice(finalized));
+}
+
+test "every tool that waits has a progress label, ask_user does not" {
+    const labelled = [_][]const u8{ "shell", "read_file", "write_file", "list_dir", "http_request" };
+    for (labelled) |name| {
+        const label = progressLabel(name) orelse return error.TestUnexpectedResult;
+        // The label names the tool, so a user watching the line knows what is
+        // taking the time.
+        try std.testing.expect(std.mem.startsWith(u8, label, name));
+    }
+
+    // ask_user puts a question on the terminal and reads the answer from it:
+    // an animation over that line would fight the prompt.
+    try std.testing.expectEqual(@as(?[]const u8, null), progressLabel("ask_user"));
+    // A name the model made up runs nothing and waits for nothing; it is not
+    // written to the terminal either.
+    try std.testing.expectEqual(@as(?[]const u8, null), progressLabel("rm -rf /"));
+    try std.testing.expectEqual(@as(?[]const u8, null), progressLabel("shell\x1b[31m"));
 }
