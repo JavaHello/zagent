@@ -24,6 +24,8 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
         .{ .name = "read_file", .label = "read_file…" },
         .{ .name = "write_file", .label = "write_file…" },
         .{ .name = "list_dir", .label = "list_dir…" },
+        .{ .name = "grep", .label = "grep…" },
+        .{ .name = "find", .label = "find…" },
         .{ .name = "http_request", .label = "http_request…" },
     };
     for (labels) |entry| {
@@ -152,6 +154,289 @@ pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Tool
     }
 
     return .{ .content = try aw.toOwnedSlice(), .is_error = false };
+}
+
+/// Which search programs are installed. Decided once, in `Agent.init`, so a
+/// search never has to ask the filesystem mid-answer — the same reasoning that
+/// keeps `render_markdown` out of the answer path.
+pub const SearchBackends = struct {
+    /// Search file contents with ripgrep rather than grep.
+    rg: bool = false,
+    /// Look for files with fd rather than find.
+    fd: bool = false,
+};
+
+/// Look for `rg` and `fd` on the PATH `env` carries.
+///
+/// Zig has no `which` to call: there is no `std.process.findExecutable`, and no
+/// `std.posix.getenv` to hand one a path. The directories are walked here
+/// instead, over the same PATH a spawned program will be resolved with.
+pub fn detectSearchBackends(io: std.Io, env: *const std.process.Environ.Map) SearchBackends {
+    const path = env.get("PATH") orelse return .{};
+    return .{
+        .rg = isOnPath(io, path, "rg"),
+        .fd = isOnPath(io, path, "fd"),
+    };
+}
+
+/// Whether an executable file named `name` sits in one of the `path` directories.
+fn isOnPath(io: std.Io, path: []const u8, name: []const u8) bool {
+    var dirs = std.mem.tokenizeScalar(u8, path, ':');
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    while (dirs.next()) |dir| {
+        // An empty entry means the working directory. It is skipped rather than
+        // searched: picking up a search program from whatever directory the
+        // agent happens to be sitting in is not something a `which` needs to do.
+        if (dir.len == 0) continue;
+        const candidate = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch continue;
+        if (isExecutableFile(io, candidate)) return true;
+    }
+    return false;
+}
+
+fn isExecutableFile(io: std.Io, path: []const u8) bool {
+    // `statFile` follows symlinks, which is what makes a Homebrew install
+    // (/opt/homebrew/bin/rg -> ../Cellar/ripgrep/.../rg) count as present.
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    if (stat.kind != .file) return false;
+    if (comptime std.Io.File.Permissions.has_executable_bit) {
+        if (stat.permissions.toMode() & 0o111 == 0) return false;
+    }
+    return true;
+}
+
+/// A grep tool call as the model described it. Owns its strings.
+pub const GrepArgs = struct {
+    /// A regular expression, in the extended flavour both backends are asked
+    /// for (see `grepArgv`).
+    pattern: []const u8,
+    /// The file or directory to search.
+    path: []const u8,
+    /// Only search files whose names match this glob.
+    glob: ?[]const u8,
+    ignore_case: bool,
+
+    pub fn deinit(self: GrepArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.pattern);
+        allocator.free(self.path);
+        if (self.glob) |glob| allocator.free(glob);
+    }
+};
+
+/// Parse a grep tool call's arguments.
+pub fn parseGrepArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !GrepArgs {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+    const arguments = parsed.value.object;
+
+    // A search with no pattern is not a wide search, it is a missing argument:
+    // every line of every file is what an empty pattern would match, and that
+    // answer is worth neither the wait nor the tool result.
+    const pattern_value = arguments.get("pattern") orelse return error.MissingPattern;
+    if (pattern_value != .string or pattern_value.string.len == 0) return error.MissingPattern;
+    const pattern = try allocator.dupe(u8, pattern_value.string);
+    errdefer allocator.free(pattern);
+
+    const path = (try optionalString(allocator, arguments.get("path"))) orelse try allocator.dupe(u8, ".");
+    errdefer allocator.free(path);
+    const glob = try optionalString(allocator, arguments.get("glob"));
+    errdefer if (glob) |value| allocator.free(value);
+
+    return .{
+        .pattern = pattern,
+        .path = path,
+        .glob = glob,
+        .ignore_case = try optionalBool(arguments.get("ignore_case")),
+    };
+}
+
+/// A find tool call as the model described it. Owns its strings.
+pub const FindArgs = struct {
+    /// A glob the name has to match, e.g. `*.zig`. Not a regular expression.
+    pattern: []const u8,
+    path: []const u8,
+
+    pub fn deinit(self: FindArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.pattern);
+        allocator.free(self.path);
+    }
+};
+
+/// Parse a find tool call's arguments.
+pub fn parseFindArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !FindArgs {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+    const arguments = parsed.value.object;
+
+    const pattern_value = arguments.get("pattern") orelse return error.MissingPattern;
+    if (pattern_value != .string or pattern_value.string.len == 0) return error.MissingPattern;
+    const pattern = try allocator.dupe(u8, pattern_value.string);
+    errdefer allocator.free(pattern);
+
+    const path = (try optionalString(allocator, arguments.get("path"))) orelse try allocator.dupe(u8, ".");
+    errdefer allocator.free(path);
+
+    return .{ .pattern = pattern, .path = path };
+}
+
+/// A boolean argument that may be absent, in which case it is false. Anything
+/// that is not a JSON boolean is refused rather than guessed at.
+fn optionalBool(value: ?std.json.Value) !bool {
+    const field = value orelse return false;
+    return switch (field) {
+        .bool => |flag| flag,
+        else => error.InvalidArguments,
+    };
+}
+
+/// Build the argv for one grep call.
+///
+/// The returned slice borrows `args` and string literals, so it stays valid for
+/// exactly as long as `args` does; only the slice itself is freed.
+pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs, backends: SearchBackends) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(allocator);
+
+    if (backends.rg) {
+        // The flags are passed even though ripgrep prints this shape by itself
+        // when it is not writing to a terminal: a RIPGREP_CONFIG_PATH file can
+        // change the defaults, and the model should read the same output on
+        // every machine. `--color=never` is for that same file: the result is
+        // stripped of escapes before the model sees it, but that is no reason
+        // to pay for them.
+        try argv.appendSlice(allocator, &.{ "rg", "--line-number", "--no-heading", "--color=never" });
+        if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--glob", glob });
+        if (args.ignore_case) try argv.append(allocator, "--ignore-case");
+        // `--` keeps a pattern that starts with a dash from being read as a flag.
+        try argv.appendSlice(allocator, &.{ "--", args.pattern, args.path });
+    } else {
+        // `-E` is what makes the fallback mean the same thing as ripgrep: a plain
+        // grep reads a basic regular expression, where `+`, `?`, `|` and `()`
+        // are literals until they are escaped.
+        // Everything else is short options plus `--include` and `--exclude-dir`,
+        // which the grep macOS ships also accepts.
+        // `-I` drops binary files, as ripgrep does by default, and `.git` is
+        // skipped by hand because this grep does not read .gitignore and would
+        // otherwise work through every object the repository has ever stored.
+        try argv.appendSlice(allocator, &.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git" });
+        if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--include", glob });
+        if (args.ignore_case) try argv.append(allocator, "-i");
+        // `-e` rather than a bare pattern, for the same reason as `--` above.
+        try argv.appendSlice(allocator, &.{ "-e", args.pattern, args.path });
+    }
+
+    return argv.toOwnedSlice(allocator);
+}
+
+/// Build the argv for one find call, under the same borrow rule as `grepArgv`.
+pub fn findArgv(allocator: std.mem.Allocator, args: FindArgs, backends: SearchBackends) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(allocator);
+
+    if (backends.fd) {
+        // fd's defaults are the ones this tool wants: hidden files and anything
+        // .gitignore leaves out are skipped, so the answer is the tree a
+        // developer would have searched by hand.
+        try argv.appendSlice(allocator, &.{ "fd", "--color=never", "--glob", "--", args.pattern, args.path });
+    } else {
+        // find reads no ignore file of its own, so `.git` is pruned by hand —
+        // without it, a search for a name would walk every object in the
+        // repository. The `-print` on the second branch cannot be left out:
+        // the `-o` alone would make find print nothing at all.
+        try argv.appendSlice(allocator, &.{ "find", args.path, "-name", ".git", "-prune", "-o", "-name", args.pattern, "-print" });
+    }
+
+    return argv.toOwnedSlice(allocator);
+}
+
+/// Longest search output read back before the search is given up on. Much
+/// larger than the 8 KB a result is finally cut to, so that an ordinary search
+/// over a large repository comes back truncated rather than refused.
+const search_max_output: usize = 256 * 1024;
+
+/// Run a search program and shape its output into a tool result.
+///
+/// `exit_one_is_no_match` is the one way the two search tools differ. grep and
+/// rg report a search that matched nothing with exit code 1, which is an answer
+/// and not a failure; fd and find report it with a zero exit and no output, and
+/// keep every nonzero code for an error — fd also uses 1 for a path it could
+/// not search. A program killed by a signal is never an answer, whichever tool
+/// asked for it.
+fn runSearch(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    exit_one_is_no_match: bool,
+) !ToolResult {
+    const result = std.process.run(allocator, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(search_max_output),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| switch (err) {
+        // std refuses the whole result once the limit is passed, so there is
+        // nothing of it worth showing; the model is told what to do instead.
+        error.StreamTooLong => return toolError(
+            allocator,
+            "Error: the search matched more output than the tool reads. Narrow it with a 'glob' or a more specific 'pattern'.",
+            .{},
+        ),
+        // A program that could not be started at all is reported rather than
+        // failing the turn over, so the model can fall back to the shell.
+        else => return toolError(allocator, "Error: could not run '{s}': {s}", .{ argv[0], @errorName(err) }),
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    // A program that died from a signal is not an answer, whatever the code it
+    // would have carried means: `null` marks it as a failure below.
+    const exit_code: ?u8 = switch (result.term) {
+        .exited => |code| code,
+        else => null,
+    };
+    const no_matches = exit_one_is_no_match and exit_code != null and exit_code.? == 1;
+    const is_error = exit_code == null or (exit_code.? != 0 and !no_matches);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    if (result.stdout.len > 0) {
+        const normalized = try normalizeToolText(allocator, result.stdout);
+        defer allocator.free(normalized);
+        try aw.writer.writeAll(normalized);
+    }
+    if (result.stderr.len > 0) {
+        if (aw.written().len > 0) try aw.writer.writeAll("\n");
+        try aw.writer.writeAll("stderr: ");
+        const normalized = try normalizeToolText(allocator, result.stderr);
+        defer allocator.free(normalized);
+        try aw.writer.writeAll(normalized);
+    }
+    if (aw.written().len == 0) {
+        // A search that matched nothing is the one thing this tool answers with
+        // no output at all. Any other silent exit is a failure, and says that.
+        try aw.writer.writeAll(if (is_error) "(no output)" else "(no matches)");
+    }
+
+    return .{
+        .content = try finalizeToolContent(allocator, aw.written()),
+        .is_error = is_error,
+    };
+}
+
+/// The grep tool: search file contents with a regular expression.
+pub fn grep(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, args: GrepArgs) !ToolResult {
+    const argv = try grepArgv(allocator, args, backends);
+    defer allocator.free(argv);
+    return runSearch(io, allocator, argv, true);
+}
+
+/// The find tool: find files and directories by name.
+pub fn find(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, args: FindArgs) !ToolResult {
+    const argv = try findArgv(allocator, args, backends);
+    defer allocator.free(argv);
+    return runSearch(io, allocator, argv, false);
 }
 
 /// Longest response text the model is shown. Larger than the cap the other
@@ -559,6 +844,224 @@ test "read missing file" {
     try std.testing.expect(result.is_error);
 }
 
+/// The absolute path of a test's fixture directory.
+fn fixturePath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+    return buf[0..try tmp.dir.realPath(std.testing.io, buf)];
+}
+
+/// Assert the argv a search tool would run, element by element. Comparing the
+/// two slices directly would compare pointers rather than the text.
+fn expectArgv(expected: []const []const u8, argv: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, argv.len);
+    for (expected, argv) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "a search program is only found where one can be run" {
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // An executable `rg`, a plain file `fd`, and a directory named `grep`:
+    // only the first is something the tool could run.
+    var rg = try tmp.dir.createFile(io, "rg", .{ .permissions = std.Io.File.Permissions.fromMode(0o755) });
+    rg.close(io);
+    var fd_file = try tmp.dir.createFile(io, "fd", .{ .permissions = std.Io.File.Permissions.fromMode(0o644) });
+    fd_file.close(io);
+    try tmp.dir.createDir(io, "grep", std.Io.File.Permissions.default_dir);
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    try std.testing.expect(isOnPath(io, dir, "rg"));
+    // A file that is not executable, and a directory that shares the name, are
+    // both things a shell would refuse to run.
+    try std.testing.expect(!isOnPath(io, dir, "fd"));
+    try std.testing.expect(!isOnPath(io, dir, "grep"));
+    try std.testing.expect(!isOnPath(io, dir, "definitely-not-here"));
+    // An empty entry means the working directory, which is not searched.
+    try std.testing.expect(!isOnPath(io, ":", "rg"));
+}
+
+test "grep argv picks ripgrep when it is installed" {
+    const allocator = std.testing.allocator;
+    const args = GrepArgs{ .pattern = "fn main", .path = "src", .glob = "*.zig", .ignore_case = true };
+
+    const argv = try grepArgv(allocator, args, .{ .rg = true });
+    defer allocator.free(argv);
+
+    try expectArgv(
+        &.{ "rg", "--line-number", "--no-heading", "--color=never", "--glob", "*.zig", "--ignore-case", "--", "fn main", "src" },
+        argv,
+    );
+}
+
+test "grep argv falls back to grep" {
+    const allocator = std.testing.allocator;
+    const args = GrepArgs{ .pattern = "fn main", .path = "src", .glob = "*.zig", .ignore_case = true };
+
+    const argv = try grepArgv(allocator, args, .{});
+    defer allocator.free(argv);
+
+    // `-E` is what makes the fallback read the same regular expressions as
+    // ripgrep; without it `|`, `+` and `()` would be literals.
+    try expectArgv(
+        &.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git", "--include", "*.zig", "-i", "-e", "fn main", "src" },
+        argv,
+    );
+
+    const plain = try grepArgv(allocator, .{ .pattern = "needle", .path = ".", .glob = null, .ignore_case = false }, .{});
+    defer allocator.free(plain);
+    try expectArgv(&.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git", "-e", "needle", "." }, plain);
+}
+
+test "find argv picks fd when it is installed" {
+    const allocator = std.testing.allocator;
+    const args = FindArgs{ .pattern = "*.zig", .path = "src" };
+
+    const argv = try findArgv(allocator, args, .{ .fd = true });
+    defer allocator.free(argv);
+
+    try expectArgv(&.{ "fd", "--color=never", "--glob", "--", "*.zig", "src" }, argv);
+}
+
+test "find argv falls back to find" {
+    const allocator = std.testing.allocator;
+    const args = FindArgs{ .pattern = "*.zig", .path = "src" };
+
+    const argv = try findArgv(allocator, args, .{});
+    defer allocator.free(argv);
+
+    // The `-print` is load-bearing: `-prune -o -name …` with nothing after it
+    // would make find print nothing at all.
+    try expectArgv(&.{ "find", "src", "-name", ".git", "-prune", "-o", "-name", "*.zig", "-print" }, argv);
+}
+
+test "parse grep args defaults to the current directory" {
+    const allocator = std.testing.allocator;
+    const args = try parseGrepArgs(allocator, "{\"pattern\":\"needle\"}");
+    defer args.deinit(allocator);
+
+    try std.testing.expectEqualStrings("needle", args.pattern);
+    try std.testing.expectEqualStrings(".", args.path);
+    try std.testing.expect(args.glob == null);
+    try std.testing.expect(!args.ignore_case);
+}
+
+test "parse a search rejects the arguments it cannot use" {
+    const allocator = std.testing.allocator;
+
+    // An empty pattern matches every line of every file, which is a missing
+    // argument rather than a wide search.
+    try std.testing.expectError(error.MissingPattern, parseGrepArgs(allocator, "{}"));
+    try std.testing.expectError(error.MissingPattern, parseGrepArgs(allocator, "{\"pattern\":\"\"}"));
+    try std.testing.expectError(error.MissingPattern, parseGrepArgs(allocator, "{\"pattern\":7}"));
+    try std.testing.expectError(error.MissingPattern, parseFindArgs(allocator, "{}"));
+    try std.testing.expectError(error.InvalidArguments, parseGrepArgs(allocator, "[]"));
+    try std.testing.expectError(error.InvalidArguments, parseFindArgs(allocator, "[]"));
+    // A flag sent as a string is not a flag: the arguments are typed, and
+    // guessing here would let the model write the command line after all.
+    try std.testing.expectError(error.InvalidArguments, parseGrepArgs(allocator, "{\"pattern\":\"x\",\"ignore_case\":\"yes\"}"));
+}
+
+test "grep finds a line and the file it is in" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "first line\nthe needle is here\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    // The fallback backend is asked for by name: whether the machine running
+    // the tests has ripgrep installed must not change what they assert.
+    const result = try grep(io, allocator, .{}, .{ .pattern = "needle", .path = dir, .glob = null, .ignore_case = false });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "note.txt:2:the needle is here") != null);
+}
+
+test "a search that matched nothing is an answer" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "first line\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    // grep exits 1 when it matched nothing. Reading that as a failure would
+    // send the model off to retry a search that has already answered.
+    const searched = try grep(io, allocator, .{}, .{ .pattern = "nowhere", .path = dir, .glob = null, .ignore_case = false });
+    defer searched.deinit(allocator);
+    try std.testing.expect(!searched.is_error);
+    try std.testing.expectEqualStrings("(no matches)", searched.content);
+
+    // find reports the same nothing with a zero exit and no output at all.
+    const looked = try find(io, allocator, .{}, .{ .pattern = "*.nope", .path = dir });
+    defer looked.deinit(allocator);
+    try std.testing.expect(!looked.is_error);
+    try std.testing.expectEqualStrings("(no matches)", looked.content);
+}
+
+test "find returns the paths whose name matches" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "wanted.zig", .data = "pub fn main() void {}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.txt", .data = "not this one\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    const result = try find(io, allocator, .{}, .{ .pattern = "*.zig", .path = dir });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "wanted.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "other.txt") == null);
+}
+
+test "a search that failed is an error, not an empty answer" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    // A pattern the program cannot compile comes back on stderr with the code
+    // that means failure — 2 for both greps, unlike the 1 for "no match".
+    const result = try grep(io, allocator, .{}, .{ .pattern = "[", .path = ".", .glob = null, .ignore_case = false });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "stderr:") != null);
+
+    // A path that does not exist is a failure for find too, even though fd
+    // reports it with the exit code the content searches use for "no match".
+    const missing = try find(io, allocator, .{}, .{ .pattern = "*.zig", .path = "/nonexistent-path-for-zagent-tests" });
+    defer missing.deinit(allocator);
+    try std.testing.expect(missing.is_error);
+}
+
+test "a search that outruns the limit is refused with advice" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    // `yes` writes without end, which is the shape of output this tool cannot
+    // read at all: std refuses the whole result once the cap is passed rather
+    // than handing back the beginning of it.
+    const result = try runSearch(io, allocator, &.{"yes"}, true);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Narrow it") != null);
+}
+
 fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return finalizeToolContentLimited(allocator, raw, 8192);
 }
@@ -822,7 +1325,7 @@ test "finalize tool content truncates on utf8 boundary" {
 }
 
 test "every tool that waits has a progress label, ask_user does not" {
-    const labelled = [_][]const u8{ "shell", "read_file", "write_file", "list_dir", "http_request" };
+    const labelled = [_][]const u8{ "shell", "read_file", "write_file", "list_dir", "grep", "find", "http_request" };
     for (labelled) |name| {
         const label = progressLabel(name) orelse return error.TestUnexpectedResult;
         // The label names the tool, so a user watching the line knows what is

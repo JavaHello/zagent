@@ -37,6 +37,7 @@ const SYSTEM_PROMPT =
     \\- Use http_request for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
     \\- Use read_file / write_file for file operations.
     \\- Use list_dir to explore directories.
+    \\- Use grep to search file contents, and find to locate files by name, instead of shelling out: they use ripgrep and fd where those are installed.
     \\- Chain multiple tool calls to accomplish complex tasks step by step.
     \\- Always explain what you are doing when using tools.
     \\- If an operation fails, analyze the error and try a different approach, but stop after 3-5 failed attempts and explain what went wrong.
@@ -56,6 +57,10 @@ pub const Agent = struct {
     max_verifications: u32,
     /// The terminal ask_user and the choice menus read from.
     linenoise: *Linenoise,
+    /// Which search programs the machine has. Decided once, in `init`, for the
+    /// same reason as `render_markdown`: a search should not have to ask the
+    /// filesystem a question whose answer cannot change while the agent runs.
+    search: tools.SearchBackends,
     /// Whether to render the model's markdown for a terminal. Decided once, in
     /// `init`, so the answer path never has to ask the operating system.
     render_markdown: bool,
@@ -66,7 +71,13 @@ pub const Agent = struct {
     /// takes a line of the terminal, and it must be the only writer to it.
     animate_progress: bool,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config, linenoise: *Linenoise) !Agent {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        config: Config,
+        linenoise: *Linenoise,
+        env: *const std.process.Environ.Map,
+    ) !Agent {
         var history: std.ArrayList(Message) = .empty;
         errdefer history.deinit(allocator);
 
@@ -88,6 +99,7 @@ pub const Agent = struct {
             .max_iterations = config.max_iterations,
             .max_verifications = config.max_verifications,
             .linenoise = linenoise,
+            .search = tools.detectSearchBackends(io, env),
             // The check is on stdout rather than on `linenoise.is_tty`, which
             // describes stdin: `zagent "q" < file` with a terminal on stdout
             // should still render, and `zagent "q" | less` must not.
@@ -497,6 +509,32 @@ pub const Agent = struct {
                 };
                 defer self.allocator.free(path);
                 break :blk try tools.listDir(self.io, self.allocator, path);
+            } else if (std.mem.eql(u8, call.name, "grep")) {
+                const args = tools.parseGrepArgs(self.allocator, call.arguments) catch |err| {
+                    break :blk .{
+                        .content = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Error: grep arguments are unusable ({s}); it needs a non-empty 'pattern' holding a regular expression, and a 'path', 'glob', and 'ignore_case' it can use",
+                            .{@errorName(err)},
+                        ),
+                        .is_error = true,
+                    };
+                };
+                defer args.deinit(self.allocator);
+                break :blk try tools.grep(self.io, self.allocator, self.search, args);
+            } else if (std.mem.eql(u8, call.name, "find")) {
+                const args = tools.parseFindArgs(self.allocator, call.arguments) catch |err| {
+                    break :blk .{
+                        .content = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Error: find arguments are unusable ({s}); it needs a non-empty 'pattern' holding a glob, and a 'path' it can use",
+                            .{@errorName(err)},
+                        ),
+                        .is_error = true,
+                    };
+                };
+                defer args.deinit(self.allocator);
+                break :blk try tools.find(self.io, self.allocator, self.search, args);
             } else if (std.mem.eql(u8, call.name, "http_request")) {
                 const request = tools.parseHttpRequest(self.allocator, call.arguments) catch |err| {
                     break :blk .{

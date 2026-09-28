@@ -124,7 +124,7 @@ pub fn main(init: std.process.Init) !void {
     const history_path = try openHistory(allocator, io, env, &ln);
     defer if (history_path) |path| allocator.free(path);
 
-    var agent = try Agent.init(allocator, io, config, &ln);
+    var agent = try Agent.init(allocator, io, config, &ln, env);
     defer agent.deinit();
 
     if (args.items.len > 1) {

@@ -11,6 +11,8 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `read_file` — read file contents
   - `write_file` — create or overwrite files
   - `list_dir` — list directory contents
+  - `grep` — search file contents, using `rg` where it is installed
+  - `find` — find files by name, using `fd` where it is installed
   - `http_request` — fetch a URL or call an API, without shelling out to `curl`
   - `ask_user` — put a question to you as a numbered list of options
 - **Multi-turn tool chaining** — the agent loops until the task is complete
@@ -233,6 +235,46 @@ body. Four behaviours are worth knowing:
   timeout setting, so a server that accepts a connection and then never answers
   hangs the request the way `curl` without `--max-time` does.
 
+### Searching
+
+`grep` searches file contents and `find` finds files and directories by name:
+
+```
+you ❯ where is progressLabel defined?
+  ⚙ grep {"pattern":"fn progressLabel"}
+  ✓ ./src/tools.zig:21:pub fn progressLabel(name: []const u8) ?[]const u8 {
+    ./src/tools.zig:1330:        const label = progressLabel(name) orelse return error.TestUnexpectedResult;
+```
+
+| Argument      | Required | Description                                                     |
+|---------------|----------|-----------------------------------------------------------------|
+| `pattern`     | yes      | `grep`: a regular expression. `find`: a glob on the name |
+| `path`        | no       | File or directory to search, defaults to `.` |
+| `glob`        | no       | `grep` only: search only files whose name matches, e.g. `*.zig` |
+| `ignore_case` | no       | `grep` only: match case-insensitively |
+
+Which program runs is decided once, at startup, from `PATH`, and never by the
+agent: `grep` uses `rg` where it is installed and the system `grep` otherwise,
+`find` uses `fd` where it is installed and the system `find` otherwise. The
+arguments mean the same thing on either side, and neither tool accepts free-form
+flags — a command line of your own belongs in `shell`.
+
+Four behaviours are worth knowing:
+
+- **No matches.** A search that found nothing is an answer, not a failure: it
+  reports `(no matches)`. A search that *failed* — a pattern the program cannot
+  parse, a path that does not exist — comes back as an error carrying the
+  program's own message.
+- **The backends see different trees.** `rg` and `fd` skip what `.gitignore`
+  excludes and what is hidden, which the fallbacks do not. All four skip `.git`
+  itself, and none of them leaves the `path` it was given.
+- **Limits.** A search that returns more than 256 KB is refused rather than cut
+  short, and the message says how to narrow it. What does come back is shown up
+  to 8 KB, marked `... (truncated)` beyond that.
+- **Regex flavour.** `grep`'s pattern is an extended regular expression —
+  `+`, `?`, `|` and `()` stand for themselves, as they do in `rg` — so the same
+  pattern selects the same lines whichever backend runs it.
+
 ### REPL commands
 
 | Command       | Description                      |
@@ -299,7 +341,7 @@ src/
   provider.zig — Built-in provider presets
   openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
   tools.zig   — Tool implementations (shell, read_file, write_file, list_dir,
-                http_request)
+                grep, find, http_request)
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
   menu.zig    — Option parsing, choice menus, and reading the user's answer
   verifier.zig — Completion judge: prompt, turn summary, verdict parsing
