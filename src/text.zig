@@ -50,6 +50,77 @@ pub fn isControl(byte: u8) bool {
     return byte < 0x20 or byte == 0x7f;
 }
 
+/// Write `raw` with everything a terminal would act on removed or escaped:
+/// escape sequences are dropped, other control bytes become spaces, and bytes
+/// that are not valid UTF-8 are rendered as `\xNN`.
+///
+/// Newline, carriage return and tab are the exceptions, and pass through:
+/// callers' own line and column handling is built on them, and tool output that
+/// draws a progress bar with a carriage return is text the user asked to see.
+/// A caller for which a carriage return *is* a line ending rather than content
+/// — the diff drawing is one — takes it off the line first. Everything else is
+/// taken out rather than escaped, so a caller can draw styled output from text
+/// it does not trust without a stray ESC ending the styling early.
+pub fn writeSanitized(w: *std.Io.Writer, raw: []const u8) !void {
+    var i: usize = 0;
+    while (i < raw.len) {
+        const byte = raw[i];
+
+        if (byte == 0x1b) {
+            i = skipAnsiEscape(raw, i);
+            continue;
+        }
+
+        if (byte < 0x80) {
+            const printable = byte == '\n' or byte == '\r' or byte == '\t' or byte >= 0x20;
+            try w.writeByte(if (printable) byte else ' ');
+            i += 1;
+            continue;
+        }
+
+        var escape_buf: [4]u8 = undefined;
+
+        const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            try w.writeAll(escapeByte(&escape_buf, byte));
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > raw.len or !std.unicode.utf8ValidateSlice(raw[i .. i + seq_len])) {
+            try w.writeAll(escapeByte(&escape_buf, byte));
+            i += 1;
+            continue;
+        }
+
+        try w.writeAll(raw[i .. i + seq_len]);
+        i += seq_len;
+    }
+}
+
+test "writeSanitized strips escapes and keeps the text around them" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeSanitized(&aw.writer, "\x1b[32mgreen\x1b[0m");
+    try expectEqualStrings("green", aw.written());
+}
+
+test "writeSanitized escapes what is not text and keeps what is" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeSanitized(&aw.writer, "ok \xff \x07 \xe4\xbd\xa0\xe5\xa5\xbd\ttail");
+    // The invalid byte and the bell are escaped and replaced; the CJK text and
+    // the tab are not touched, because a tab cannot act on the terminal.
+    try expectEqualStrings("ok \\xFF   \xe4\xbd\xa0\xe5\xa5\xbd\ttail", aw.written());
+}
+
+test "writeSanitized drops an escape that would restyle the caller's output" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    // The point of dropping rather than escaping: a caller that has already
+    // written its own colour must not have it cancelled from inside the text.
+    try writeSanitized(&aw.writer, "before\x1b[0mafter");
+    try expectEqualStrings("beforeafter", aw.written());
+}
+
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;

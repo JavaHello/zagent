@@ -1,5 +1,6 @@
 const std = @import("std");
 const text = @import("text.zig");
+const diff = @import("diff.zig");
 
 pub const ToolResult = struct {
     content: []const u8,
@@ -23,6 +24,7 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
         .{ .name = "shell", .label = "shell…" },
         .{ .name = "read_file", .label = "read_file…" },
         .{ .name = "write_file", .label = "write_file…" },
+        .{ .name = "apply_patch", .label = "apply_patch…" },
         .{ .name = "list_dir", .label = "list_dir…" },
         .{ .name = "grep", .label = "grep…" },
         .{ .name = "find", .label = "find…" },
@@ -124,6 +126,45 @@ pub fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, con
         .content = try std.fmt.allocPrint(allocator, "Successfully wrote {d} bytes to '{s}'", .{ content.len, path }),
         .is_error = false,
     };
+}
+
+/// The apply_patch tool: change files by applying a unified diff to them.
+///
+/// The result is a summary rather than the patch back again: the model wrote
+/// the patch, so what it does not already have is what became of it — which
+/// files were written, and, when one could not be, why it did not fit.
+pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const u8) !ToolResult {
+    const outcome = try diff.apply(allocator, io, patch_text);
+    defer outcome.deinit(allocator);
+
+    switch (outcome) {
+        // The explanation is written by whoever gave up, so it is passed on
+        // as it is: it names the file, the line and the text it wanted, which
+        // is what the next patch has to be built from.
+        .failed => |message| {
+            const content = try std.fmt.allocPrint(allocator, "Error: {s}", .{message});
+            defer allocator.free(content);
+            // Sanitised like any other result: the message quotes lines of the
+            // patch, which the model wrote.
+            return .{ .content = try finalizeToolContent(allocator, content), .is_error = true };
+        },
+        .applied => |stats| {
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try aw.writer.print("Applied {d} file{s}", .{ stats.len, if (stats.len == 1) @as([]const u8, "") else "s" });
+            for (stats, 0..) |stat, i| {
+                try aw.writer.writeAll(if (i == 0) ": " else ", ");
+                try aw.writer.print("{s} (", .{stat.path});
+                switch (stat.action) {
+                    .modified => try aw.writer.print("+{d} -{d}", .{ stat.added, stat.removed }),
+                    .created => try aw.writer.print("new, +{d}", .{stat.added}),
+                    .deleted => try aw.writer.print("deleted, -{d}", .{stat.removed}),
+                }
+                try aw.writer.writeByte(')');
+            }
+            return .{ .content = try finalizeToolContent(allocator, aw.written()), .is_error = false };
+        },
+    }
 }
 
 pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
@@ -1048,6 +1089,71 @@ test "a search that failed is an error, not an empty answer" {
     try std.testing.expect(missing.is_error);
 }
 
+test "apply patch changes the file and says what it changed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "one\ntwo\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    const patch = try std.fmt.allocPrint(allocator,
+        \\--- {s}/note.txt
+        \\+++ {s}/note.txt
+        \\@@ -1,2 +1,2 @@
+        \\ one
+        \\-two
+        \\+TWO
+    , .{ dir, dir });
+    defer allocator.free(patch);
+
+    const result = try applyPatch(io, allocator, patch);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "Applied 1 file: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "note.txt (+1 -1)") != null);
+}
+
+test "a patch that does not fit is an error the model can act on" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "one\ntwo\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    // The context is from some other version of the file. The message has to
+    // carry the file, the line and the text, or the next attempt is a guess.
+    const patch = try std.fmt.allocPrint(allocator,
+        \\--- {s}/note.txt
+        \\+++ {s}/note.txt
+        \\@@ -1,2 +1,2 @@
+        \\ one
+        \\-nowhere
+        \\+anywhere
+    , .{ dir, dir });
+    defer allocator.free(patch);
+
+    const result = try applyPatch(io, allocator, patch);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.startsWith(u8, result.content, "Error: "));
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "note.txt") != null);
+
+    // And nothing was written: the file is exactly as it was.
+    const content = try tmp.dir.readFileAlloc(io, "note.txt", allocator, .limited(1024));
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("one\ntwo\n", content);
+}
+
 test "a search that outruns the limit is refused with advice" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -1080,52 +1186,19 @@ fn finalizeToolContentLimited(allocator: std.mem.Allocator, raw: []const u8, max
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ normalized[0..cut], suffix });
 }
 
+/// Strip what a terminal would act on out of tool output, and escape the rest
+/// of what is not text. The rule itself lives in `text.zig`, which is where the
+/// renderer and the diff drawing get it from too.
 fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    try text.writeSanitized(&aw.writer, raw);
 
-    var i: usize = 0;
-    while (i < raw.len) {
-        const byte = raw[i];
-
-        // Strip common ANSI escape sequences used by terminal-oriented tools.
-        if (byte == 0x1b) {
-            i = text.skipAnsiEscape(raw, i);
-            continue;
-        }
-
-        if (byte < 0x80) {
-            if (byte == '\n' or byte == '\r' or byte == '\t' or byte >= 0x20) {
-                try out.append(allocator, byte);
-            } else {
-                try out.append(allocator, ' ');
-            }
-            i += 1;
-            continue;
-        }
-
-        var escape_buf: [4]u8 = undefined;
-
-        const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
-            try out.appendSlice(allocator, text.escapeByte(&escape_buf, byte));
-            i += 1;
-            continue;
-        };
-        if (i + seq_len > raw.len or !std.unicode.utf8ValidateSlice(raw[i .. i + seq_len])) {
-            try out.appendSlice(allocator, text.escapeByte(&escape_buf, byte));
-            i += 1;
-            continue;
-        }
-
-        try out.appendSlice(allocator, raw[i .. i + seq_len]);
-        i += seq_len;
+    if (aw.written().len == 0) {
+        try aw.writer.writeAll("(no output)");
     }
 
-    if (out.items.len == 0) {
-        try out.appendSlice(allocator, "(no output)");
-    }
-
-    return out.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 test "normalize tool text strips ansi sequences" {
@@ -1325,7 +1398,7 @@ test "finalize tool content truncates on utf8 boundary" {
 }
 
 test "every tool that waits has a progress label, ask_user does not" {
-    const labelled = [_][]const u8{ "shell", "read_file", "write_file", "list_dir", "grep", "find", "http_request" };
+    const labelled = [_][]const u8{ "shell", "read_file", "write_file", "apply_patch", "list_dir", "grep", "find", "http_request" };
     for (labelled) |name| {
         const label = progressLabel(name) orelse return error.TestUnexpectedResult;
         // The label names the tool, so a user watching the line knows what is

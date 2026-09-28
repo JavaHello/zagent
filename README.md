@@ -9,7 +9,8 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Tool use (function calling)** — the agent can execute tools to help you:
   - `shell` — run shell commands
   - `read_file` — read file contents
-  - `write_file` — create or overwrite files
+  - `apply_patch` — change a file by applying a unified diff, which is then shown to you as a coloured diff
+  - `write_file` — create or overwrite a whole file
   - `list_dir` — list directory contents
   - `grep` — search file contents, using `rg` where it is installed
   - `find` — find files by name, using `fd` where it is installed
@@ -275,6 +276,59 @@ Four behaviours are worth knowing:
   `+`, `?`, `|` and `()` stand for themselves, as they do in `rg` — so the same
   pattern selects the same lines whichever backend runs it.
 
+### Patching code
+
+`apply_patch` is how the agent changes a file. It takes a unified diff — the
+format `git diff` and `diff -u` produce — applies it to the working tree, and
+prints the change as it goes, in the terminal's own red and green:
+
+```
+you ❯ rename the greeting in greet.txt to hello
+  ⚙ apply_patch
+  --- a/greet.txt
+  +++ b/greet.txt
+  @@ -1,3 +1,3 @@
+   alpha
+  -beta
+  +hello
+   gamma
+  ✓ Applied 1 file: greet.txt (+1 -1)
+```
+
+| Argument | Required | Description                                        |
+|----------|----------|----------------------------------------------------|
+| `patch`  | yes      | The unified diff to apply, with its newlines        |
+
+Added lines are green, removed lines are red held back to a faint shade, hunk
+headers are cyan and file headers bold. Context lines are left alone, so what
+changed is what stands out.
+
+A patch is a header pair (`--- a/path`, `+++ b/path`) and one or more hunks
+(`@@ -1,3 +1,3 @@`, then lines marked with a leading space, `-` or `+`). A new
+file is sent with `--- /dev/null` and a hunk that adds every line; a deletion
+with `+++ /dev/null` and a hunk that removes them. Git's `a/` and `b/` prefixes
+are stripped, and everything else `git diff` writes around a diff is ignored, so
+its output applies as it comes.
+
+Five behaviours are worth knowing:
+
+- **All or nothing.** Every hunk of every file is matched before anything is
+  written, so a patch whose third hunk fails leaves the tree exactly as it was.
+- **The text decides, not the numbers.** A hunk is applied where the patch says
+  it goes, and, when its line numbers are stale, where its context matches — but
+  only when that is the one place it matches. Two matches is a coin flip that
+  produces a file that compiles and does the wrong thing, so it comes back as an
+  error asking for a line of context instead.
+- **A mismatch is an error, not a guess.** The agent is told the file, the line,
+  the text the patch expected and the text the file has. When a patch is getting
+  nowhere, the file has usually changed since it was written: read it again and
+  send a fresh patch rather than the same one a second time.
+- **Line endings and final newlines are preserved.** A patch that touches one
+  line of a CRLF file does not rewrite every other line, and a file that did not
+  end with a newline does not gain one unless a line is added at the end.
+- **Renames are refused rather than inferred.** A patch naming two different
+  files is an error; delete and create in two steps instead.
+
 ### REPL commands
 
 | Command       | Description                      |
@@ -340,8 +394,9 @@ src/
   history.zig  — Prompt history: where it is stored, and when it is saved
   provider.zig — Built-in provider presets
   openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
-  tools.zig   — Tool implementations (shell, read_file, write_file, list_dir,
-                grep, find, http_request)
+  tools.zig   — Tool implementations (shell, read_file, write_file,
+                apply_patch, list_dir, grep, find, http_request)
+  diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
   menu.zig    — Option parsing, choice menus, and reading the user's answer
   verifier.zig — Completion judge: prompt, turn summary, verdict parsing

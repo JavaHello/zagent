@@ -230,6 +230,7 @@ test {
     _ = @import("agent.zig");
     _ = @import("history.zig");
     _ = @import("tools.zig");
+    _ = @import("diff.zig");
     _ = @import("openai.zig");
     _ = @import("config.zig");
     _ = @import("provider.zig");

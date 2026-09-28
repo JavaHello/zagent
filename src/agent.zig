@@ -1,6 +1,8 @@
 const std = @import("std");
 const openai = @import("openai.zig");
 const tools = @import("tools.zig");
+const diff = @import("diff.zig");
+const text = @import("text.zig");
 const menu = @import("menu.zig");
 const verifier = @import("verifier.zig");
 const render = @import("render.zig");
@@ -35,7 +37,8 @@ const SYSTEM_PROMPT =
     \\- Be concise and direct in your responses.
     \\- Use the shell tool to run commands, install packages, or perform system operations.
     \\- Use http_request for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
-    \\- Use read_file / write_file for file operations.
+    \\- Use read_file to read a file. Use apply_patch to change one that exists: send a unified diff of just the lines that change, with enough context to place them. Do not write a whole file back through write_file to change part of it, and do not edit files through the shell.
+    \\- Use write_file only for a file that does not exist yet, or when the entire contents are being replaced. A file that does not exist can also be created with apply_patch and a '--- /dev/null' header.
     \\- Use list_dir to explore directories.
     \\- Use grep to search file contents, and find to locate files by name, instead of shelling out: they use ripgrep and fd where those are installed.
     \\- Chain multiple tool calls to accomplish complex tasks step by step.
@@ -439,9 +442,9 @@ pub const Agent = struct {
         };
     }
 
-    /// Append a user-role message, taking a copy of `text`.
-    fn appendUserMessage(self: *Agent, text: []const u8) !void {
-        const owned = try self.allocator.dupe(u8, text);
+    /// Append a user-role message, taking a copy of `message`.
+    fn appendUserMessage(self: *Agent, message: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(owned);
         try self.history.append(self.allocator, .{
             .role = "user",
@@ -452,8 +455,51 @@ pub const Agent = struct {
         });
     }
 
+    /// Announce a tool call on the line above whatever it prints.
+    ///
+    /// Most tools are one line of name and arguments. `apply_patch` is the
+    /// exception: its argument is the diff itself, and a JSON-escaped diff tells
+    /// nobody anything — so it is drawn instead, line by line, in the colours
+    /// the change would be read in.
+    fn announceToolCall(self: *Agent, call: ToolCallData) !void {
+        const stderr = std.Io.File.stderr();
+
+        // Written through a fixed buffer rather than built up in memory first:
+        // a patch is read as it is drawn, and a long one never has to be held
+        // whole to be shown.
+        var buf: [4096]u8 = undefined;
+        var file_writer = stderr.writerStreaming(self.io, &buf);
+        const w = &file_writer.interface;
+
+        if (!std.mem.eql(u8, call.name, "apply_patch")) {
+            try w.writeAll(YELLOW ++ "  ⚙ ");
+            // A tool name and its arguments are model output like any other, so
+            // they are sanitised like any other: a call carrying an escape
+            // sequence gets to be read, not to repaint the line it is on.
+            try text.writeSanitized(w, call.name);
+            try w.writeAll(RESET ++ " ");
+            try text.writeSanitized(w, call.arguments);
+            try w.writeByte('\n');
+            return file_writer.interface.flush();
+        }
+
+        const patch_text = openai.extractStringArg(self.allocator, call.arguments, "patch") catch {
+            // Nothing to draw. What the model actually sent still goes up, so
+            // the call is visible; the dispatch reports what was wrong with it.
+            try w.writeAll(YELLOW ++ "  ⚙ apply_patch" ++ RESET ++ " ");
+            try text.writeSanitized(w, call.arguments);
+            try w.writeByte('\n');
+            return file_writer.interface.flush();
+        };
+        defer self.allocator.free(patch_text);
+
+        try w.writeAll(YELLOW ++ "  ⚙ apply_patch\n" ++ RESET);
+        try diff.render(w, patch_text);
+        try file_writer.interface.flush();
+    }
+
     fn executeTool(self: *Agent, call: ToolCallData) !tools.ToolResult {
-        try printFmt(std.Io.File.stderr(), self.io, self.allocator, YELLOW ++ "  ⚙ {s}" ++ RESET ++ " {s}\n", .{ call.name, call.arguments });
+        try self.announceToolCall(call);
 
         const result: tools.ToolResult = blk: {
             // A tool can run for minutes, so the wait gets the same animation
@@ -500,6 +546,15 @@ pub const Agent = struct {
                 };
                 defer self.allocator.free(content);
                 break :blk try tools.writeFile(self.io, self.allocator, path, content);
+            } else if (std.mem.eql(u8, call.name, "apply_patch")) {
+                const patch_text = openai.extractStringArg(self.allocator, call.arguments, "patch") catch {
+                    break :blk .{
+                        .content = try self.allocator.dupe(u8, "Error: missing 'patch' argument; it has to hold a unified diff"),
+                        .is_error = true,
+                    };
+                };
+                defer self.allocator.free(patch_text);
+                break :blk try tools.applyPatch(self.io, self.allocator, patch_text);
             } else if (std.mem.eql(u8, call.name, "list_dir")) {
                 const path = openai.extractStringArg(self.allocator, call.arguments, "path") catch {
                     break :blk .{
@@ -615,7 +670,7 @@ fn cloneToolCalls(allocator: std.mem.Allocator, calls: []const ToolCallData) ![]
 }
 
 fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
-    const text = try std.fmt.allocPrint(allocator, fmt, args);
-    defer allocator.free(text);
-    try file.writeStreamingAll(io, text);
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(message);
+    try file.writeStreamingAll(io, message);
 }
