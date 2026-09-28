@@ -7,7 +7,8 @@ pub const TOOLS_JSON =
     \\  {"type":"function","function":{"name":"shell","description":"Execute a shell command and return its output. Use this to run programs, inspect the system, manage files, and more.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"}},"required":["command"]}}},
     \\  {"type":"function","function":{"name":"read_file","description":"Read the contents of a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}}},
     \\  {"type":"function","function":{"name":"write_file","description":"Write content to a file, creating or overwriting it","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}}},
-    \\  {"type":"function","function":{"name":"list_dir","description":"List the contents of a directory","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}}}
+    \\  {"type":"function","function":{"name":"list_dir","description":"List the contents of a directory","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}}},
+    \\  {"type":"function","function":{"name":"ask_user","description":"Ask the user to choose between concrete options when the request is ambiguous, or when a decision only the user can make blocks progress. Not for confirming routine steps.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}}}
     \\]
 ;
 
@@ -85,7 +86,16 @@ pub const Client = struct {
 
     /// Send a chat/completions request and return the parsed response.
     pub fn chat(self: *Client, messages: []const Message) !ApiResponse {
-        const req_json = try buildRequest(self.allocator, self.model, messages, self.max_tokens);
+        return self.chatWith(messages, .included);
+    }
+
+    /// Send a request that advertises no tools, for the completion judge.
+    pub fn chatWithoutTools(self: *Client, messages: []const Message) !ApiResponse {
+        return self.chatWith(messages, .omitted);
+    }
+
+    fn chatWith(self: *Client, messages: []const Message, tools: Tools) !ApiResponse {
+        const req_json = try buildRequest(self.allocator, self.model, messages, self.max_tokens, tools);
         defer self.allocator.free(req_json);
 
         const chat_url = try std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.base_url});
@@ -141,12 +151,17 @@ pub const Client = struct {
     }
 };
 
+/// Whether a request advertises the tools. The completion judge must not, or
+/// the model can answer it with a tool call instead of a verdict.
+pub const Tools = enum { included, omitted };
+
 /// Build the JSON body for a chat/completions POST request.
 pub fn buildRequest(
     allocator: std.mem.Allocator,
     model: []const u8,
     messages: []const Message,
     max_tokens: u32,
+    tools: Tools,
 ) ![]u8 {
     const request_options = resolveRequestOptions(model);
 
@@ -167,8 +182,11 @@ pub fn buildRequest(
         if (i > 0) try w.writeByte(',');
         try writeMessageJson(w, msg);
     }
-    try w.writeAll("],\"tools\":");
-    try w.writeAll(TOOLS_JSON);
+    try w.writeByte(']');
+    if (tools == .included) {
+        try w.writeAll(",\"tools\":");
+        try w.writeAll(TOOLS_JSON);
+    }
     try w.writeByte('}');
 
     return aw.toOwnedSlice();
@@ -375,11 +393,41 @@ test "build request json" {
     const messages = [_]Message{
         .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    const json = try buildRequest(allocator, "gpt-4o-mini", &messages, 4096);
+    const json = try buildRequest(allocator, "gpt-4o-mini", &messages, 4096, .included);
     defer allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"model\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") != null);
+}
+
+test "build request omits the tools when asked" {
+    const allocator = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const json = try buildRequest(allocator, "gpt-4o-mini", &messages, 4096, .omitted);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"messages\"") != null);
+}
+
+test "tools json parses and lists every tool" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, TOOLS_JSON, .{});
+    defer parsed.deinit();
+
+    // The schema is hand-written JSON, so a typo in it would only surface as a
+    // server-side error on the first request of every session.
+    const expected = [_][]const u8{ "shell", "read_file", "write_file", "list_dir", "ask_user" };
+    for (expected) |wanted| {
+        var found = false;
+        for (parsed.value.array.items) |entry| {
+            const name = entry.object.get("function").?.object.get("name").?.string;
+            if (std.mem.eql(u8, name, wanted)) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "build request maps deepseek reasoner to the thinking mode of deepseek-flash" {
@@ -387,7 +435,7 @@ test "build request maps deepseek reasoner to the thinking mode of deepseek-flas
     const messages = [_]Message{
         .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    const json = try buildRequest(allocator, "deepseek-reasoner", &messages, 4096);
+    const json = try buildRequest(allocator, "deepseek-reasoner", &messages, 4096, .included);
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-flash\"") != null);
@@ -399,7 +447,7 @@ test "build request maps deepseek chat to non-thinking deepseek-flash" {
     const messages = [_]Message{
         .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    const json = try buildRequest(allocator, "deepseek-chat", &messages, 4096);
+    const json = try buildRequest(allocator, "deepseek-chat", &messages, 4096, .included);
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-flash\"") != null);
@@ -411,7 +459,7 @@ test "build request asks for thinking on deepseek flash explicitly" {
     const messages = [_]Message{
         .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    const json = try buildRequest(allocator, "deepseek-flash", &messages, 4096);
+    const json = try buildRequest(allocator, "deepseek-flash", &messages, 4096, .included);
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-flash\"") != null);
@@ -423,7 +471,7 @@ test "build request omits the thinking field for other models" {
     const messages = [_]Message{
         .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    const json = try buildRequest(allocator, "gpt-4o-mini", &messages, 4096);
+    const json = try buildRequest(allocator, "gpt-4o-mini", &messages, 4096, .included);
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "thinking") == null);
@@ -434,7 +482,7 @@ test "build request enables thinking for deepseek v4 pro" {
     const messages = [_]Message{
         .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    const json = try buildRequest(allocator, "deepseek-v4-pro", &messages, 4096);
+    const json = try buildRequest(allocator, "deepseek-v4-pro", &messages, 4096, .included);
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-v4-pro\"") != null);
@@ -446,7 +494,7 @@ test "build request keeps deepseek v4 flash in non-thinking mode" {
     const messages = [_]Message{
         .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    const json = try buildRequest(allocator, "deepseek-v4-flash", &messages, 4096);
+    const json = try buildRequest(allocator, "deepseek-v4-flash", &messages, 4096, .included);
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":\"deepseek-flash\"") != null);
@@ -476,7 +524,7 @@ test "build request includes reasoning content in assistant messages" {
     const messages = [_]Message{
         .{ .role = "assistant", .content = "Answer", .reasoning_content = "Chain of thought summary", .tool_calls = null, .tool_call_id = null },
     };
-    const json = try buildRequest(allocator, "deepseek-v4-pro", &messages, 4096);
+    const json = try buildRequest(allocator, "deepseek-v4-pro", &messages, 4096, .included);
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"Chain of thought summary\"") != null);

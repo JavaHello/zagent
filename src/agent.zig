@@ -1,7 +1,10 @@
 const std = @import("std");
 const openai = @import("openai.zig");
 const tools = @import("tools.zig");
+const menu = @import("menu.zig");
+const verifier = @import("verifier.zig");
 const Config = @import("config.zig").Config;
+const Linenoise = @import("linenoise").Linenoise;
 
 const Message = openai.Message;
 const ToolCallData = openai.ToolCallData;
@@ -13,6 +16,13 @@ const DIM = "\x1b[2m";
 const CYAN = "\x1b[36m";
 const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
+
+/// Longest transcript the completion judge is shown.
+const summary_max_bytes = 8000;
+
+// Prompt for the choice menu. Colour codes are fine here because linenoize's
+// width() implementation correctly ignores ANSI SGR sequences.
+const CHOICE_PROMPT = BOLD ++ YELLOW ++ "choice" ++ RESET ++ " \xe2\x9d\xaf ";
 
 const SYSTEM_PROMPT =
     \\You are zagent, a powerful command-line AI assistant built with Zig.
@@ -28,6 +38,8 @@ const SYSTEM_PROMPT =
     \\- If an operation fails, analyze the error and try a different approach, but stop after 3-5 failed attempts and explain what went wrong.
     \\- If a task seems impossible with available tools (e.g. requires a web browser, authentication, or blocked services), report this to the user instead of retrying endlessly.
     \\- Do not repeat the same tool call with the same parameters.
+    \\- When the request is ambiguous, or when a decision only the user can make is blocking you, call ask_user with two to four concrete options and mark the one you recommend. Ask only when the answer changes what you do next; decide routine details yourself.
+    \\- After every turn that used tools, an automatic completion check reviews your work. If it reports unfinished work, act on it instead of restating your answer.
 ;
 
 pub const Agent = struct {
@@ -36,8 +48,12 @@ pub const Agent = struct {
     client: openai.Client,
     history: std.ArrayList(Message),
     max_iterations: u32,
+    /// How many completion checks one user query may cost.
+    max_verifications: u32,
+    /// The terminal ask_user and the choice menus read from.
+    linenoise: *Linenoise,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) !Agent {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config, linenoise: *Linenoise) !Agent {
         var history: std.ArrayList(Message) = .empty;
         errdefer history.deinit(allocator);
 
@@ -57,6 +73,8 @@ pub const Agent = struct {
             .client = openai.Client.init(allocator, io, config),
             .history = history,
             .max_iterations = config.max_iterations,
+            .max_verifications = config.max_verifications,
+            .linenoise = linenoise,
         };
     }
 
@@ -72,18 +90,75 @@ pub const Agent = struct {
         self.history.shrinkRetainingCapacity(1);
     }
 
-    /// Process a single user query through the agent loop.
+    /// Process a single user query: work on it until the model answers and the
+    /// completion check agrees that the request is done.
     pub fn processQuery(self: *Agent, query: []const u8) !void {
-        const user_content = try self.allocator.dupe(u8, query);
-        errdefer self.allocator.free(user_content);
-        try self.history.append(self.allocator, .{
-            .role = "user",
-            .content = user_content,
-            .reasoning_content = null,
-            .tool_calls = null,
-            .tool_call_id = null,
-        });
+        try self.appendUserMessage(query);
+        // The judge is shown only what this turn produced, so remember where
+        // the request it is checking starts.
+        const turn_start = self.history.items.len;
 
+        var verifications: u32 = 0;
+        var worked = false;
+
+        while (true) {
+            const turn = try self.runToolLoop();
+            if (!turn.completed) return;
+            // Counted across the whole query, not per round: a round that only
+            // claims the work is finished still has to pass the check.
+            worked = worked or turn.tool_calls > 0;
+            // A query that never touched a tool is a conversation, not a task.
+            if (!worked) return;
+            if (self.max_verifications == 0) return;
+
+            if (verifications == self.max_verifications) {
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ completion check budget ({d}) spent; ending the turn unchecked\n" ++ RESET, .{self.max_verifications});
+                return;
+            }
+            verifications += 1;
+
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ checking completion…\n" ++ RESET, .{});
+
+            const verdict = (try self.judgeTurn(turn_start)) orelse return;
+            defer verdict.deinit(self.allocator);
+
+            if (verdict.complete) {
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ✓ completion check passed\n" ++ RESET, .{});
+                return;
+            }
+
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, YELLOW ++ "  ↻ not done: {s}\n" ++ RESET, .{verdict.reason});
+
+            // The judge can hand the open question back as a menu of its own
+            // making, for the turns the model never got around to asking about.
+            if (verdict.options.items.len > 0) {
+                const question = verdict.question orelse "How should I proceed?";
+                const answer = (try self.askChoice(question, verdict.options.items)) orelse {
+                    try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  stopped without an answer\n" ++ RESET, .{});
+                    return;
+                };
+                defer self.allocator.free(answer);
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  → {s}\n" ++ RESET, .{answer});
+                try self.appendUserMessage(answer);
+            } else {
+                const follow_up = try verifier.buildFollowUp(self.allocator, verdict);
+                defer self.allocator.free(follow_up);
+                try self.appendUserMessage(follow_up);
+            }
+        }
+    }
+
+    const Turn = struct {
+        /// How many tool calls the model made before its final answer.
+        tool_calls: usize,
+        /// False when the iteration budget ran out before an answer.
+        completed: bool,
+    };
+
+    /// Run the tool-call loop until the model answers or the iteration budget
+    /// runs out. The answer is printed and kept in the history.
+    fn runToolLoop(self: *Agent) !Turn {
+        var turn: Turn = .{ .tool_calls = 0, .completed = false };
         var iteration: usize = 0;
 
         while (iteration < self.max_iterations) : (iteration += 1) {
@@ -147,6 +222,7 @@ pub const Agent = struct {
                         .tool_call_id = call_id,
                     });
                 }
+                turn.tool_calls += tool_calls.len;
                 // Continue: call API again with tool results
             } else {
                 // Final answer
@@ -169,6 +245,7 @@ pub const Agent = struct {
                         .tool_call_id = null,
                     });
                 }
+                turn.completed = true;
                 break;
             }
         }
@@ -176,6 +253,120 @@ pub const Agent = struct {
         if (iteration == self.max_iterations) {
             try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
         }
+
+        return turn;
+    }
+
+    /// Ask the judge whether the turn that started at `turn_start` finished the
+    /// user's request. Returns null when the judge could not be consulted or
+    /// its reply could not be read: an unjudgeable turn keeps the answer it
+    /// already printed rather than looping on a check that cannot pass.
+    fn judgeTurn(self: *Agent, turn_start: usize) !?verifier.Verdict {
+        const request = self.history.items[turn_start - 1].content orelse "";
+        const summary = try verifier.summarize(self.allocator, self.history.items[turn_start..], summary_max_bytes);
+        defer self.allocator.free(summary);
+        const prompt = try verifier.buildPrompt(self.allocator, request, summary);
+        defer self.allocator.free(prompt);
+
+        // The request only serialises these, so borrowed content is enough.
+        const messages = [_]Message{
+            .{ .role = "system", .content = verifier.SYSTEM_PROMPT, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+            .{ .role = "user", .content = prompt, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        };
+
+        const response = self.client.chatWithoutTools(&messages) catch |err| {
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
+            return null;
+        };
+        defer response.deinit(self.allocator);
+
+        const content = response.content orelse {
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: the reply was empty\n" ++ RESET, .{});
+            return null;
+        };
+
+        return verifier.parseVerdict(self.allocator, content) catch |err| {
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
+            return null;
+        };
+    }
+
+    /// Show the offered options and return one line describing what the user
+    /// chose. Returns null when the question was dismissed and the model has
+    /// to decide on its own.
+    fn askChoice(self: *Agent, question: []const u8, options: []const menu.Option) !?[]u8 {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try menu.writeMenu(&aw.writer, question, options);
+        try std.Io.File.stdout().writeStreamingAll(self.io, aw.written());
+
+        const recommended = menu.recommendedIndex(options);
+
+        if (!self.linenoise.is_tty or !self.linenoise.term_supported) {
+            // Nothing to read a choice from. Taking the recommendation keeps a
+            // piped or single-query run moving instead of stalling it.
+            if (recommended) |index| {
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  no terminal to read an answer from; taking the recommended option\n" ++ RESET, .{});
+                return try menu.describeAnswer(self.allocator, .{ .option = index }, options);
+            }
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  no terminal to read an answer from\n" ++ RESET, .{});
+            return null;
+        }
+
+        const hint = if (recommended) |index|
+            try std.fmt.allocPrint(self.allocator, "  Enter takes option {d}; type a number, or your own answer.\n", .{index + 1})
+        else
+            try self.allocator.dupe(u8, "  Type the number of your choice.\n");
+        defer self.allocator.free(hint);
+        try printFmt(std.Io.File.stdout(), self.io, self.allocator, DIM ++ "{s}" ++ RESET, .{hint});
+
+        const raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {
+            error.CtrlC => return null,
+            else => return err,
+        };
+
+        const line = raw_line orelse {
+            // End of input: fall back to the recommendation, if any.
+            if (recommended) |index| return try menu.describeAnswer(self.allocator, .{ .option = index }, options);
+            return null;
+        };
+        defer self.allocator.free(line);
+
+        return try menu.describeAnswer(self.allocator, menu.parseAnswer(line, options, recommended), options);
+    }
+
+    /// The ask_user tool: put the model's question to the user and hand the
+    /// answer back as the tool result.
+    fn askUser(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        const question = menu.parseAskUser(self.allocator, arguments) catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: ask_user needs a 'question' and a non-empty 'options' array"),
+                .is_error = true,
+            };
+        };
+        defer question.deinit(self.allocator);
+
+        if (try self.askChoice(question.text, question.options.items)) |answer| {
+            return .{ .content = answer, .is_error = false };
+        }
+
+        return .{
+            .content = try self.allocator.dupe(u8, "The question was dismissed without an answer. If you can, decide yourself; otherwise explain what you need and stop."),
+            .is_error = true,
+        };
+    }
+
+    /// Append a user-role message, taking a copy of `text`.
+    fn appendUserMessage(self: *Agent, text: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(owned);
+        try self.history.append(self.allocator, .{
+            .role = "user",
+            .content = owned,
+            .reasoning_content = null,
+            .tool_calls = null,
+            .tool_call_id = null,
+        });
     }
 
     fn executeTool(self: *Agent, call: ToolCallData) !tools.ToolResult {
@@ -225,6 +416,8 @@ pub const Agent = struct {
                 };
                 defer self.allocator.free(path);
                 break :blk try tools.listDir(self.io, self.allocator, path);
+            } else if (std.mem.eql(u8, call.name, "ask_user")) {
+                break :blk try self.askUser(call.arguments);
             } else {
                 break :blk .{
                     .content = try std.fmt.allocPrint(self.allocator, "Unknown tool: {s}", .{call.name}),

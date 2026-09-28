@@ -91,7 +91,12 @@ pub fn main(init: std.process.Init) !void {
     };
     defer config.deinit();
 
-    var agent = try Agent.init(allocator, io, config);
+    // The terminal is created here rather than inside the REPL so that the
+    // ask_user menu also works in single-query mode.
+    var ln = Linenoise.init(allocator, io, env);
+    defer ln.deinit();
+
+    var agent = try Agent.init(allocator, io, config, &ln);
     defer agent.deinit();
 
     if (args.items.len > 1) {
@@ -101,16 +106,16 @@ pub fn main(init: std.process.Init) !void {
         try agent.processQuery(query);
     } else {
         // Interactive REPL mode
-        try runRepl(allocator, io, env, &agent, config);
+        try runRepl(allocator, io, &agent, config, &ln);
     }
 }
 
 fn runRepl(
     allocator: std.mem.Allocator,
     io: std.Io,
-    env: *const std.process.Environ.Map,
     agent: *Agent,
     config: Config,
+    ln: *Linenoise,
 ) !void {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
@@ -138,9 +143,6 @@ fn runRepl(
         defer allocator.free(msg);
         try stderr.writeStreamingAll(io, msg);
     }
-
-    var ln = Linenoise.init(allocator, io, env);
-    defer ln.deinit();
 
     while (true) {
         // linenoise handles raw-mode input, Unicode width, and multi-byte
@@ -197,6 +199,8 @@ test {
     _ = @import("openai.zig");
     _ = @import("config.zig");
     _ = @import("provider.zig");
+    _ = @import("menu.zig");
+    _ = @import("verifier.zig");
 }
 
 test "config loads" {

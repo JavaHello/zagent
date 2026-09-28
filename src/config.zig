@@ -5,6 +5,7 @@ const Provider = provider.Provider;
 
 const default_max_tokens: u32 = 4096;
 const default_max_iterations: u32 = 200;
+const default_max_verifications: u32 = 3;
 
 const ConfigFile = struct {
     provider: ?[]u8 = null,
@@ -13,6 +14,7 @@ const ConfigFile = struct {
     model: ?[]u8 = null,
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
+    max_verifications: ?u32 = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
         if (self.provider) |value| allocator.free(value);
@@ -114,6 +116,8 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
     } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_ITERATIONS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
         config.max_iterations = std.fmt.parseInt(u32, value, 10) catch default_max_iterations;
+    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_VERIFICATIONS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_VERIFICATIONS")) {
+        config.max_verifications = std.fmt.parseInt(u32, value, 10) catch default_max_verifications;
     }
 }
 
@@ -293,6 +297,13 @@ fn resolve(
         file_config.max_iterations,
         default_max_iterations,
     );
+    const max_verifications = try resolveU32(
+        allocator,
+        env,
+        &.{ "OPENAI_MAX_VERIFICATIONS", "AI_MAX_VERIFICATIONS" },
+        file_config.max_verifications,
+        default_max_verifications,
+    );
 
     return .{
         .allocator = allocator,
@@ -301,6 +312,7 @@ fn resolve(
         .model = model,
         .max_tokens = max_tokens,
         .max_iterations = max_iterations,
+        .max_verifications = max_verifications,
         .provider = selected_provider,
     };
 }
@@ -312,6 +324,9 @@ pub const Config = struct {
     model: []const u8,
     max_tokens: u32,
     max_iterations: u32,
+    /// How many completion checks one user query may cost. 0 turns the check
+    /// off entirely.
+    max_verifications: u32,
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
 
@@ -362,6 +377,39 @@ test "config defaults" {
     try std.testing.expectEqualStrings("", config.api_key);
     try std.testing.expectEqual(@as(u32, 4096), config.max_tokens);
     try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
+    try std.testing.expectEqual(@as(u32, 3), config.max_verifications);
+}
+
+test "verification budget prefers the environment and keeps zero" {
+    const allocator = std.testing.allocator;
+
+    {
+        var env = try testEnv(allocator, &.{.{ "AI_MAX_VERIFICATIONS", "0" }});
+        defer env.deinit();
+
+        var file_config = try testFile(allocator, &.{.{ "AI_MAX_VERIFICATIONS", "5" }});
+        defer file_config.deinit(allocator);
+
+        const config = try resolve(allocator, &file_config, &env);
+        defer config.deinit();
+
+        // A configured zero is a value, not a missing setting — it has to
+        // survive as a way to switch the completion check off.
+        try std.testing.expectEqual(@as(u32, 0), config.max_verifications);
+    }
+
+    {
+        var env = try testEnv(allocator, &.{});
+        defer env.deinit();
+
+        var file_config = try testFile(allocator, &.{.{ "OPENAI_MAX_VERIFICATIONS", "2" }});
+        defer file_config.deinit(allocator);
+
+        const config = try resolve(allocator, &file_config, &env);
+        defer config.deinit();
+
+        try std.testing.expectEqual(@as(u32, 2), config.max_verifications);
+    }
 }
 
 test "provider preset supplies defaults" {

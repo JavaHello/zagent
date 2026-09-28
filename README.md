@@ -11,7 +11,10 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `read_file` — read file contents
   - `write_file` — create or overwrite files
   - `list_dir` — list directory contents
+  - `ask_user` — put a question to you as a numbered list of options
 - **Multi-turn tool chaining** — the agent loops until the task is complete
+- **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
+- **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
 - **Built-in provider presets** — one setting selects `deepseek` or `openai`, autodetected from `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` when unset
 - **OpenAI-compatible** — works with any endpoint that speaks the OpenAI chat-completions protocol (OpenAI, Azure OpenAI, Ollama, LM Studio, …)
 - **ANSI colour output**
@@ -36,7 +39,7 @@ Configuration can be loaded from a config file and/or environment variables. The
 - `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
 - `~/.config/zagent` (fallback)
 
-The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS` (or their `OPENAI_*` equivalents). Environment variables override config file values.
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS` (or their `OPENAI_*` equivalents). Environment variables override config file values.
 
 See `zagent.example.conf` for a complete example config file.
 
@@ -50,6 +53,7 @@ All configuration is also supported through environment variables:
 | `OPENAI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
 | `OPENAI_MAX_TOKENS`| `4096`                           | Maximum tokens per response          |
 | `OPENAI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
+| `OPENAI_MAX_VERIFICATIONS` | `3`                     | Completion checks per query; `0` disables the check |
 
 Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`.
 
@@ -113,6 +117,9 @@ you ❯ list all .zig files in the current directory
 
 Assistant
 Here are all the .zig files in the current directory: ...
+
+  ⟳ checking completion…
+  ✓ completion check passed
 ```
 
 ### Single-query mode
@@ -121,6 +128,52 @@ Here are all the .zig files in the current directory: ...
 export OPENAI_API_KEY=sk-...
 ./zig-out/bin/zagent "what is the current date and time?"
 ```
+
+### Completion check
+
+A turn ends when the model stops calling tools and prints an answer — which is
+only the model's own opinion that the work is done. zagent asks a second,
+independent question about it: after every turn that used at least one tool, it
+sends the user's request plus a summary of the work (tool calls, short tool
+results, the final answer) to the model with no tools advertised, and expects
+
+```json
+{"complete": false, "reason": "The tests were never run.", "next_step": "Run zig build test."}
+```
+
+An unfinished verdict is printed and fed back into the conversation, and the
+agent keeps working. Up to `AI_MAX_VERIFICATIONS` checks are made per query
+(3 by default); the budget is printed when it runs out, and `AI_MAX_VERIFICATIONS=0`
+turns the check off. A turn that used no tools is never checked, and neither is
+a turn whose answer reports a genuine blocker — a missing credential or an
+unreachable service is a finished turn, not a reason to loop.
+
+Two things worth knowing:
+
+- The check costs one extra request per tool-using turn, and it re-sends a
+  summary of that turn rather than the whole history.
+- If the judge request fails or its reply cannot be read, the turn keeps the
+  answer it already printed. A broken checker must not trap the agent in a loop
+  that can never pass.
+
+### Choices
+
+When a request is ambiguous — several reasonable approaches, unclear scope, a
+decision only you can make — the agent calls `ask_user` and you get a menu:
+
+```
+  Which approach should I use?
+    1) Rewrite in place  Keeps the history intact. (recommended)
+    2) New file  Leaves the original alone.
+  Enter takes option 1; type a number, or your own answer.
+choice ❯
+```
+
+Enter accepts the recommended option, a number picks another one, and anything
+else is passed to the agent as your own words. The judge can ask the same way:
+when it decides the work is blocked on a decision, it returns the options
+itself and you get the same menu. With no terminal to type at (piped input,
+single-query mode) the recommended option is taken and the agent says so.
 
 ### REPL commands
 
@@ -186,6 +239,8 @@ src/
   provider.zig — Built-in provider presets
   openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
   tools.zig   — Tool implementations (shell, read_file, write_file, list_dir)
-  agent.zig   — Agent loop: call API → execute tools → repeat
+  agent.zig   — Agent loop: call API → execute tools → repeat → check completion
+  menu.zig    — Option parsing, choice menus, and reading the user's answer
+  verifier.zig — Completion judge: prompt, turn summary, verdict parsing
 build.zig     — Zig build script
 ```
