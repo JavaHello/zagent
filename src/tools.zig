@@ -1,4 +1,5 @@
 const std = @import("std");
+const text = @import("text.zig");
 
 pub const ToolResult = struct {
     content: []const u8,
@@ -564,7 +565,7 @@ fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
         // Strip common ANSI escape sequences used by terminal-oriented tools.
         if (byte == 0x1b) {
-            i = skipAnsiEscape(raw, i);
+            i = text.skipAnsiEscape(raw, i);
             continue;
         }
 
@@ -581,12 +582,12 @@ fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
         var escape_buf: [4]u8 = undefined;
 
         const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
-            try out.appendSlice(allocator, escapeByte(&escape_buf, byte));
+            try out.appendSlice(allocator, text.escapeByte(&escape_buf, byte));
             i += 1;
             continue;
         };
         if (i + seq_len > raw.len or !std.unicode.utf8ValidateSlice(raw[i .. i + seq_len])) {
-            try out.appendSlice(allocator, escapeByte(&escape_buf, byte));
+            try out.appendSlice(allocator, text.escapeByte(&escape_buf, byte));
             i += 1;
             continue;
         }
@@ -600,38 +601,6 @@ fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     }
 
     return out.toOwnedSlice(allocator);
-}
-
-/// Render a stray byte as a `\xNN` escape into `buf`, which must be 4 bytes.
-fn escapeByte(buf: *[4]u8, byte: u8) []const u8 {
-    const hex = "0123456789ABCDEF";
-    buf.* = .{ '\\', 'x', hex[byte >> 4], hex[byte & 0x0f] };
-    return buf;
-}
-
-fn skipAnsiEscape(raw: []const u8, start: usize) usize {
-    var i = start + 1;
-    if (i >= raw.len) return i;
-
-    switch (raw[i]) {
-        '[' => {
-            i += 1;
-            while (i < raw.len) : (i += 1) {
-                const ch = raw[i];
-                if (ch >= 0x40 and ch <= 0x7e) return i + 1;
-            }
-            return i;
-        },
-        ']' => {
-            i += 1;
-            while (i < raw.len) : (i += 1) {
-                if (raw[i] == 0x07) return i + 1;
-                if (raw[i] == 0x1b and i + 1 < raw.len and raw[i + 1] == '\\') return i + 2;
-            }
-            return i;
-        },
-        else => return @min(i + 1, raw.len),
-    }
 }
 
 test "normalize tool text strips ansi sequences" {

@@ -3,6 +3,8 @@ const openai = @import("openai.zig");
 const tools = @import("tools.zig");
 const menu = @import("menu.zig");
 const verifier = @import("verifier.zig");
+const render = @import("render.zig");
+const term = @import("term.zig");
 const Config = @import("config.zig").Config;
 const Linenoise = @import("linenoise").Linenoise;
 
@@ -53,6 +55,9 @@ pub const Agent = struct {
     max_verifications: u32,
     /// The terminal ask_user and the choice menus read from.
     linenoise: *Linenoise,
+    /// Whether to render the model's markdown for a terminal. Decided once, in
+    /// `init`, so the answer path never has to ask the operating system.
+    render_markdown: bool,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config, linenoise: *Linenoise) !Agent {
         var history: std.ArrayList(Message) = .empty;
@@ -76,6 +81,12 @@ pub const Agent = struct {
             .max_iterations = config.max_iterations,
             .max_verifications = config.max_verifications,
             .linenoise = linenoise,
+            // The check is on stdout rather than on `linenoise.is_tty`, which
+            // describes stdin: `zagent "q" < file` with a terminal on stdout
+            // should still render, and `zagent "q" | less` must not.
+            .render_markdown = config.markdown and
+                linenoise.term_supported and
+                (std.Io.File.stdout().isTty(io) catch false),
         };
     }
 
@@ -230,7 +241,7 @@ pub const Agent = struct {
                 if (response.content) |content| {
                     const stdout = std.Io.File.stdout();
                     try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
-                    try stdout.writeStreamingAll(self.io, content);
+                    try self.writeAnswer(content);
                     try stdout.writeStreamingAll(self.io, "\n");
 
                     const owned_content = try self.allocator.dupe(u8, content);
@@ -452,6 +463,29 @@ pub const Agent = struct {
         }
 
         return result;
+    }
+
+    /// Print the model's answer: rendered for a terminal, raw otherwise.
+    ///
+    /// The raw path matters as much as the rendered one. When stdout is a pipe
+    /// or a file the consumer is another program, and markdown is both the most
+    /// faithful representation and the one that loses nothing — stripping
+    /// markers would quietly cost a `| tee answer.md` user their structure.
+    fn writeAnswer(self: *Agent, content: []const u8) !void {
+        const stdout = std.Io.File.stdout();
+        if (!self.render_markdown) return stdout.writeStreamingAll(self.io, content);
+
+        // A fixed buffer rather than `Writer.Allocating`: for a long answer the
+        // latter would hold the entire styled document in memory before
+        // printing a byte of it. This buffer is the renderer's only memory,
+        // whatever the size of the document.
+        var buf: [8192]u8 = undefined;
+        var file_writer = stdout.writerStreaming(self.io, &buf);
+
+        try render.render(&file_writer.interface, content, .{
+            .width = term.usableWidth(term.columns(stdout)),
+        });
+        try file_writer.interface.flush();
     }
 };
 

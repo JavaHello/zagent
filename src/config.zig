@@ -6,6 +6,7 @@ const Provider = provider.Provider;
 const default_max_tokens: u32 = 4096;
 const default_max_iterations: u32 = 200;
 const default_max_verifications: u32 = 3;
+const default_markdown = true;
 
 const ConfigFile = struct {
     provider: ?[]u8 = null,
@@ -15,6 +16,7 @@ const ConfigFile = struct {
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
     max_verifications: ?u32 = null,
+    markdown: ?bool = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
         if (self.provider) |value| allocator.free(value);
@@ -118,6 +120,8 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         config.max_iterations = std.fmt.parseInt(u32, value, 10) catch default_max_iterations;
     } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_VERIFICATIONS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_VERIFICATIONS")) {
         config.max_verifications = std.fmt.parseInt(u32, value, 10) catch default_max_verifications;
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_MARKDOWN")) {
+        config.markdown = parseBool(value);
     }
 }
 
@@ -224,6 +228,39 @@ fn resolveU32(
     return file_value orelse fallback;
 }
 
+const truthy = [_][]const u8{ "1", "true", "yes", "on", "y", "t" };
+const falsy = [_][]const u8{ "0", "false", "no", "off", "n", "f" };
+
+/// Parse a boolean setting. Anything unrecognised reads as "unset", so a typo
+/// leaves the default in place rather than silently flipping a feature off.
+fn parseBool(raw: []const u8) ?bool {
+    const value = std.mem.trim(u8, raw, " \t");
+    for (truthy) |candidate| {
+        if (std.ascii.eqlIgnoreCase(value, candidate)) return true;
+    }
+    for (falsy) |candidate| {
+        if (std.ascii.eqlIgnoreCase(value, candidate)) return false;
+    }
+    return null;
+}
+
+fn resolveBool(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    env_names: []const []const u8,
+    file_value: ?bool,
+    fallback: bool,
+) !bool {
+    for (env_names) |name| {
+        const raw = try envVarOwned(allocator, env, name) orelse continue;
+        defer allocator.free(raw);
+        // An empty value means "not set", matching `firstEnv`.
+        if (raw.len == 0) continue;
+        return parseBool(raw) orelse fallback;
+    }
+    return file_value orelse fallback;
+}
+
 /// `openai.zig` appends "/chat/completions" to the base URL, so a trailing
 /// slash here would produce a doubled separator. Takes ownership of `url`.
 fn trimTrailingSlashes(allocator: std.mem.Allocator, url: []u8) ![]u8 {
@@ -304,6 +341,13 @@ fn resolve(
         file_config.max_verifications,
         default_max_verifications,
     );
+    const markdown = try resolveBool(
+        allocator,
+        env,
+        &.{"AI_MARKDOWN"},
+        file_config.markdown,
+        default_markdown,
+    );
 
     return .{
         .allocator = allocator,
@@ -313,6 +357,7 @@ fn resolve(
         .max_tokens = max_tokens,
         .max_iterations = max_iterations,
         .max_verifications = max_verifications,
+        .markdown = markdown,
         .provider = selected_provider,
     };
 }
@@ -327,6 +372,9 @@ pub const Config = struct {
     /// How many completion checks one user query may cost. 0 turns the check
     /// off entirely.
     max_verifications: u32,
+    /// Render assistant markdown for a terminal instead of printing it raw.
+    /// A stdout that is not a terminal always prints raw, whatever this says.
+    markdown: bool,
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
 
@@ -378,6 +426,54 @@ test "config defaults" {
     try std.testing.expectEqual(@as(u32, 4096), config.max_tokens);
     try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
     try std.testing.expectEqual(@as(u32, 3), config.max_verifications);
+    try std.testing.expect(config.markdown);
+}
+
+fn markdownSetting(
+    allocator: std.mem.Allocator,
+    env_pairs: []const [2][]const u8,
+    file_value: ?bool,
+) !bool {
+    var env = try testEnv(allocator, env_pairs);
+    defer env.deinit();
+
+    var file_config = ConfigFile{ .markdown = file_value };
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+    return config.markdown;
+}
+
+test "AI_MARKDOWN reads booleans from either source" {
+    const allocator = std.testing.allocator;
+
+    // The environment wins over the file.
+    try std.testing.expect(!try markdownSetting(allocator, &.{.{ "AI_MARKDOWN", "false" }}, true));
+    try std.testing.expect(try markdownSetting(allocator, &.{.{ "AI_MARKDOWN", "true" }}, false));
+
+    // The file alone is honoured, in any of the accepted spellings.
+    try std.testing.expect(!try markdownSetting(allocator, &.{}, false));
+    try std.testing.expect(try markdownSetting(allocator, &.{}, true));
+}
+
+test "an unusable AI_MARKDOWN value leaves the default in place" {
+    const allocator = std.testing.allocator;
+
+    // A typo must not silently turn the feature off.
+    try std.testing.expect(try markdownSetting(allocator, &.{.{ "AI_MARKDOWN", "maybe" }}, null));
+    // An empty value means "not set", as it does for every other setting.
+    try std.testing.expect(try markdownSetting(allocator, &.{.{ "AI_MARKDOWN", "" }}, null));
+}
+
+test "parseBool accepts the documented spellings" {
+    try std.testing.expectEqual(@as(?bool, true), parseBool("true"));
+    try std.testing.expectEqual(@as(?bool, true), parseBool("ON"));
+    try std.testing.expectEqual(@as(?bool, true), parseBool(" 1 "));
+    try std.testing.expectEqual(@as(?bool, false), parseBool("No"));
+    try std.testing.expectEqual(@as(?bool, false), parseBool("off"));
+    try std.testing.expectEqual(@as(?bool, null), parseBool("yep"));
+    try std.testing.expectEqual(@as(?bool, null), parseBool("2"));
 }
 
 test "verification budget prefers the environment and keeps zero" {

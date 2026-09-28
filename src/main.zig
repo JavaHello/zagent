@@ -201,6 +201,10 @@ test {
     _ = @import("provider.zig");
     _ = @import("menu.zig");
     _ = @import("verifier.zig");
+    _ = @import("style.zig");
+    _ = @import("term.zig");
+    _ = @import("text.zig");
+    _ = @import("render.zig");
 }
 
 test "config loads" {

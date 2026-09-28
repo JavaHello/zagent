@@ -9,6 +9,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("linenoise");
 
+    const wcwidth = b.dependency("wcwidth", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("wcwidth");
+
     const exe = b.addExecutable(.{
         .name = "zagent",
         .root_module = b.createModule(.{
@@ -17,6 +22,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "linenoise", .module = linenoize },
+                .{ .name = "wcwidth", .module = wcwidth },
             },
         }),
     });
@@ -39,6 +45,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "linenoise", .module = linenoize },
+                .{ .name = "wcwidth", .module = wcwidth },
             },
         }),
     });

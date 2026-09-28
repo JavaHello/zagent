@@ -40,7 +40,7 @@ Configuration can be loaded from a config file and/or environment variables. The
 - `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
 - `~/.config/zagent` (fallback)
 
-The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS` (or their `OPENAI_*` equivalents). Environment variables override config file values.
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS`, `AI_MARKDOWN` (or their `OPENAI_*` equivalents). Environment variables override config file values.
 
 See `zagent.example.conf` for a complete example config file.
 
@@ -55,8 +55,15 @@ All configuration is also supported through environment variables:
 | `OPENAI_MAX_TOKENS`| `4096`                           | Maximum tokens per response          |
 | `OPENAI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
 | `OPENAI_MAX_VERIFICATIONS` | `3`                     | Completion checks per query; `0` disables the check |
+| `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
 
-Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`.
+Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`. `AI_MARKDOWN` is the exception: it is not a provider setting and has no `OPENAI_` spelling.
+
+## Rendering
+
+Replies are markdown, and in a terminal they are rendered rather than printed as literal markers: headings, emphasis, inline code and fenced blocks get styling, lists and quotes get a prefix, and lines that carry a prefix wrap with a hanging indent so continuation lines never fall back to the left margin. Tables are laid out in columns, with `:---`, `:---:` and `---:` honoured and cells wrapped inside their column when the table is wider than the terminal. Plain paragraphs are left to the terminal's own soft-wrap.
+
+Output that is not a terminal — piped, redirected, or under `TERM=dumb` — gets the raw markdown instead, so `zagent "..." > notes.md` and `zagent "..." | grep` see exactly what the model wrote. Set `AI_MARKDOWN=0` to turn rendering off in a terminal as well.
 
 ## Providers
 
