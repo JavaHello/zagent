@@ -406,6 +406,17 @@ pub const Agent = struct {
         defer self.allocator.free(hint);
         try printFmt(std.Io.File.stdout(), self.io, self.allocator, DIM ++ "{s}" ++ RESET, .{hint});
 
+        // A menu answer is free text, not a slash command, so completion and
+        // hints are switched off for this read and restored afterwards.
+        const saved_completions = self.linenoise.completions_callback;
+        const saved_hints = self.linenoise.hints_callback;
+        self.linenoise.completions_callback = null;
+        self.linenoise.hints_callback = null;
+        defer {
+            self.linenoise.completions_callback = saved_completions;
+            self.linenoise.hints_callback = saved_hints;
+        }
+
         const raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {
             error.CtrlC => return null,
             else => return err,

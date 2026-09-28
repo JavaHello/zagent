@@ -3,6 +3,7 @@ const Config = @import("config.zig").Config;
 const Agent = @import("agent.zig").Agent;
 const provider = @import("provider.zig");
 const history = @import("history.zig");
+const commands = @import("commands.zig");
 const Linenoise = @import("linenoise").Linenoise;
 
 // ANSI colour codes
@@ -32,6 +33,7 @@ const HELP =
     \\  /new         Start a new conversation (same as /clear)
     \\  /model       Show current model
     \\  /quit, /exit Exit zagent
+    \\  Tab          Complete a /command (a description appears as you type)
     \\  Ctrl+D       Exit zagent
     \\
 ;
@@ -120,6 +122,11 @@ pub fn main(init: std.process.Init) !void {
     // ask_user menu also works in single-query mode.
     var ln = Linenoise.init(allocator, io, env);
     defer ln.deinit();
+    // Slash commands complete on Tab and are described by dim ghost text as
+    // they are typed. The ask_user menu clears these around its own reads, so
+    // an answer there is never treated as a command.
+    ln.completions_callback = commands.complete;
+    ln.hints_callback = commands.hint;
 
     const history_path = try openHistory(allocator, io, env, &ln);
     defer if (history_path) |path| allocator.free(path);
@@ -235,6 +242,7 @@ test {
     _ = @import("config.zig");
     _ = @import("provider.zig");
     _ = @import("menu.zig");
+    _ = @import("commands.zig");
     _ = @import("verifier.zig");
     _ = @import("style.zig");
     _ = @import("term.zig");

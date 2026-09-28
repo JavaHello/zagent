@@ -338,7 +338,12 @@ Five behaviours are worth knowing:
 | `/new`        | Start a new conversation (same as `/clear`) |
 | `/model`      | Show the current model           |
 | `/quit`       | Exit                             |
+| `Tab`         | Complete a `/command`            |
 | `Ctrl+D`      | Exit                             |
+
+Typing a `/command` shows its description as dim ghost text after the line,
+and `Tab` cycles through the commands that match what you have typed so far.
+(These hints apply to the REPL prompt only, not to `ask_user` menu answers.)
 
 ### Using a local model (Ollama)
 
