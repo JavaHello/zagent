@@ -25,6 +25,7 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
         .{ .name = "read_file", .label = "read_file…" },
         .{ .name = "write_file", .label = "write_file…" },
         .{ .name = "apply_patch", .label = "apply_patch…" },
+        .{ .name = "edit_file", .label = "edit_file…" },
         .{ .name = "list_dir", .label = "list_dir…" },
         .{ .name = "grep", .label = "grep…" },
         .{ .name = "find", .label = "find…" },
@@ -37,8 +38,13 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
 }
 
 pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
+    return executeShellWithEnv(io, allocator, command, null);
+}
+
+pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []const u8, env: ?*const std.process.Environ.Map) !ToolResult {
     const result = try std.process.run(allocator, io, .{
         .argv = &[_][]const u8{ "sh", "-c", command },
+        .environ_map = env,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
     });
@@ -128,13 +134,33 @@ pub fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, con
     };
 }
 
+/// Replace one exact, unique text block without requiring hunk line counts.
+pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_text: []const u8, new_text: []const u8) !ToolResult {
+    if (old_text.len == 0) return toolError(allocator, "Error: old_text must be non-empty; use write_file for a new file.", .{});
+    const cwd = std.Io.Dir.cwd();
+    const target = cwd.realPathFileAlloc(io, path, allocator) catch |err| return toolError(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) });
+    defer allocator.free(target);
+    const original = cwd.readFileAlloc(io, target, allocator, .limited(1024 * 1024)) catch |err| return toolError(allocator, "Error reading '{s}': {s}", .{ path, @errorName(err) });
+    defer allocator.free(original);
+    const position = std.mem.indexOf(u8, original, old_text) orelse return toolError(allocator, "Error: old_text was not found in '{s}'; read the current file and copy its exact text.", .{path});
+    if (std.mem.indexOfPos(u8, original, position + 1, old_text) != null) return toolError(allocator, "Error: old_text occurs more than once in '{s}'; include more surrounding context.", .{path});
+    const updated = try std.mem.concat(allocator, u8, &.{ original[0..position], new_text, original[position + old_text.len ..] });
+    defer allocator.free(updated);
+    const stat = try cwd.statFile(io, target, .{});
+    var atomic = try cwd.createFileAtomic(io, target, .{ .replace = true, .permissions = stat.permissions });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, updated);
+    try atomic.replace(io);
+    return .{ .content = try std.fmt.allocPrint(allocator, "Replaced one exact text block in '{s}' ({d} -> {d} bytes)", .{ path, original.len, updated.len }), .is_error = false };
+}
+
 /// The apply_patch tool: change files by applying a unified diff to them.
 ///
 /// The result is a summary rather than the patch back again: the model wrote
 /// the patch, so what it does not already have is what became of it — which
 /// files were written, and, when one could not be, why it did not fit.
 pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const u8) !ToolResult {
-    const outcome = try diff.apply(allocator, io, patch_text);
+    const outcome = try diff.apply(allocator, io, normalizePatchEnvelope(patch_text));
     defer outcome.deinit(allocator);
 
     switch (outcome) {
@@ -165,6 +191,23 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
             return .{ .content = try finalizeToolContent(allocator, aw.written()), .is_error = false };
         },
     }
+}
+
+/// Models sometimes put their unified diff inside apply_patch sentinels.
+/// Strip only those exact outer lines; keep hunk counts/context strict.
+fn normalizePatchEnvelope(patch: []const u8) []const u8 {
+    var value = std.mem.trim(u8, patch, "\r\n");
+    if (std.mem.startsWith(u8, value, "*** Begin Patch\n")) value = value["*** Begin Patch\n".len..];
+    if (std.mem.startsWith(u8, value, "*** Begin Patch\r\n")) value = value["*** Begin Patch\r\n".len..];
+    if (std.mem.endsWith(u8, value, "\n*** End Patch")) value = value[0 .. value.len - "\n*** End Patch".len];
+    return value;
+}
+
+test "patch envelopes do not change hunk content" {
+    const patch = "--- a/a\n+++ b/a\n@@ -1 +1 @@\n-before\n+after";
+    try std.testing.expectEqualStrings(patch, normalizePatchEnvelope("*** Begin Patch\n" ++ patch ++ "\n*** End Patch\n"));
+    try std.testing.expectEqualStrings(patch, normalizePatchEnvelope(patch));
+    try std.testing.expectEqualStrings("+*** End Patch", normalizePatchEnvelope("+*** End Patch"));
 }
 
 pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
@@ -771,9 +814,9 @@ fn writeResponseHead(
     // servers are free to phrase it themselves.
     const reason = if (server_reason.len > 0) server_reason else status.phrase() orelse "";
     if (reason.len > 0) {
-        try w.print("{s} {d} {s}\n", .{ @tagName(version), @intFromEnum(status), reason });
+        try w.print("{s} {d} {s}\n", .{ @tagName(version), @backingInt(status), reason });
     } else {
-        try w.print("{s} {d}\n", .{ @tagName(version), @intFromEnum(status) });
+        try w.print("{s} {d}\n", .{ @tagName(version), @backingInt(status) });
     }
 
     var headers = iterator;
@@ -1401,7 +1444,7 @@ test "finalize tool content truncates on utf8 boundary" {
 }
 
 test "every tool that waits has a progress label, ask_user does not" {
-    const labelled = [_][]const u8{ "shell", "read_file", "write_file", "apply_patch", "list_dir", "grep", "find", "http_request" };
+    const labelled = [_][]const u8{ "shell", "read_file", "write_file", "apply_patch", "edit_file", "list_dir", "grep", "find", "http_request" };
     for (labelled) |name| {
         const label = progressLabel(name) orelse return error.TestUnexpectedResult;
         // The label names the tool, so a user watching the line knows what is
@@ -1416,4 +1459,30 @@ test "every tool that waits has a progress label, ask_user does not" {
     // written to the terminal either.
     try std.testing.expectEqual(@as(?[]const u8, null), progressLabel("rm -rf /"));
     try std.testing.expectEqual(@as(?[]const u8, null), progressLabel("shell\x1b[31m"));
+}
+
+test "exact edits reject ambiguous text and preserve permissions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "script", .{ .permissions = .fromMode(0o755) });
+    try file.writeStreamingAll(io, "alpha alpha\n");
+    file.close(io);
+    const path = try tmp.dir.realPathFileAlloc(io, "script", allocator);
+    defer allocator.free(path);
+    const rejected = try editFile(io, allocator, path, "alpha", "changed");
+    defer rejected.deinit(allocator);
+    try std.testing.expect(rejected.is_error);
+    const unchanged = try tmp.dir.readFileAlloc(io, "script", allocator, .limited(1024));
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings("alpha alpha\n", unchanged);
+    const edited = try editFile(io, allocator, path, "alpha alpha", "beta");
+    defer edited.deinit(allocator);
+    try std.testing.expect(!edited.is_error);
+    const content = try tmp.dir.readFileAlloc(io, "script", allocator, .limited(1024));
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("beta\n", content);
+    const stat = try tmp.dir.statFile(io, "script", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), stat.permissions.toMode() & 0o7777);
 }

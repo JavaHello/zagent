@@ -7,7 +7,7 @@ const std = @import("std");
 /// names are the legacy spelling of "the default endpoint" rather than a
 /// naming convention for new providers to extend.
 pub const Spec = struct {
-    /// Sent alongside "/chat/completions", so it must not end in a slash.
+    /// Sent alongside "/responses", so it must not end in a slash.
     base_url: []const u8,
     model: []const u8,
     /// Environment variable conventionally holding this provider's API key.
@@ -89,7 +89,7 @@ test "provider specs" {
 
 test "every provider is listed once in names" {
     const names = Provider.names();
-    try std.testing.expectEqual(@typeInfo(Provider).@"enum".fields.len, names.len);
+    try std.testing.expectEqual(@typeInfo(Provider).@"enum".field_names.len, names.len);
     for (names) |name| {
         try std.testing.expect(Provider.fromName(name) != null);
     }

@@ -4,3 +4,9 @@ zig-out/
 
 # Generated root stub (replaced by our implementation)
 src/root.zig
+
+# Private task transcripts and session checkpoints
+.runs/
+
+# Python integration-test cache
+__pycache__/

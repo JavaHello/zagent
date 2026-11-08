@@ -99,6 +99,45 @@ pub fn main(init: std.process.Init) !void {
         args.deinit(allocator);
     }
 
+    if (args.items.len == 4 and std.mem.eql(u8, args.items[1], "--tool-worker")) {
+        // The worker is mounted at this private path by sandbox.zig. Calling
+        // the internal dispatch flag on the host must not bypass the sandbox.
+        const executable = try std.process.executablePathAlloc(io, allocator);
+        defer allocator.free(executable);
+        const deleted = " (deleted)";
+        const worker_path = if (std.mem.endsWith(u8, executable, deleted)) executable[0 .. executable.len - deleted.len] else executable;
+        if (!std.mem.eql(u8, worker_path, "/zagent-worker")) return error.WorkerRequiresSandbox;
+        const result = @import("tool_worker.zig").execute(io, allocator, env, args.items[2], args.items[3]) catch |err| tools_error: {
+            break :tools_error @import("tools.zig").ToolResult{
+                .content = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}),
+                .is_error = true,
+            };
+        };
+        defer result.deinit(allocator);
+        const encoded = try std.json.Stringify.valueAlloc(allocator, result, .{});
+        defer allocator.free(encoded);
+        try std.Io.File.stdout().writeStreamingAll(io, encoded);
+        return;
+    }
+
+    if (args.items.len == 2 and (std.mem.eql(u8, args.items[1], "--help") or std.mem.eql(u8, args.items[1], "-h"))) {
+        try std.Io.File.stdout().writeStreamingAll(io, "Usage: zagent [query ...]\n" ++
+            "With no query, start an interactive conversation.\n\n" ++
+            "  --help, -h          Show this help\n" ++
+            "  --version           Show version\n\n" ++
+            "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
+            "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
+            "AI_SESSION_FILE       Save and resume this workspace's conversation\n" ++
+            "AI_TOOL_NETWORK=1     Enable tool network access (default: off)\n\n" ++
+            "Tools require Linux, bubblewrap and GNU timeout. Only the current\n" ++
+            "workspace is writable. Build with Zig 0.17.0.\n");
+        return;
+    }
+    if (args.items.len == 2 and std.mem.eql(u8, args.items[1], "--version")) {
+        try std.Io.File.stdout().writeStreamingAll(io, "zagent 0.1.0 (Zig 0.17)\n");
+        return;
+    }
+
     const config = Config.load(allocator, io, env) catch |err| switch (err) {
         error.UnknownProvider => {
             const valid = try std.mem.join(allocator, ", ", provider.Provider.names());
@@ -307,6 +346,9 @@ fn printToStderr(
 // analyzes, so their tests would otherwise be dropped from `zig build test`.
 test {
     _ = @import("agent.zig");
+    _ = @import("sandbox.zig");
+    _ = @import("session.zig");
+    _ = @import("tool_worker.zig");
     _ = @import("history.zig");
     _ = @import("tools.zig");
     _ = @import("diff.zig");

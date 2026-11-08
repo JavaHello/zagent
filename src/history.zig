@@ -5,7 +5,6 @@ const Linenoise = @import("linenoise").Linenoise;
 /// earlier session and not just in this one. None of this is required for a
 /// session to work: every failure here is swallowed, because a REPL that
 /// cannot write its history file still has to be usable.
-
 /// Resolve the file that remembers prompts between runs:
 /// `$XDG_STATE_HOME/zagent/history`, or `~/.local/state/zagent/history` when
 /// `XDG_STATE_HOME` is not set. Null when the environment names no home

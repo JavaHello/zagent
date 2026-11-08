@@ -1845,9 +1845,9 @@ test "an alias fits what an endpoint accepts" {
 
     // A name too long for an endpoint is cut short and given a hash of what it
     // was, so two long names do not quietly become one name.
-    const long_a = try aliasFor(allocator, "server", "a" ** 120);
+    const long_a = try aliasFor(allocator, "server", @import("text.zig").repeat("a", 120));
     defer allocator.free(long_a);
-    const long_b = try aliasFor(allocator, "server", "a" ** 119 ++ "b");
+    const long_b = try aliasFor(allocator, "server", @import("text.zig").repeat("a", 119) ++ "b");
     defer allocator.free(long_b);
 
     try std.testing.expectEqual(@as(usize, max_tool_name), long_a.len);
@@ -1963,7 +1963,7 @@ test "mcp.json is read into servers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(io, "zagent", std.Io.File.Permissions.default_dir);
-    try tmp.dir.writeFile(io, .{ .sub_path = "zagent/mcp.json", .data = 
+    try tmp.dir.writeFile(io, .{ .sub_path = "zagent/mcp.json", .data =
         \\{
         \\  "mcpServers": {
         \\    "filesystem": {
@@ -2081,9 +2081,9 @@ test "a modern server is met without a handshake" {
     const allocator = std.testing.allocator;
 
     var connection = scriptedConnection(allocator, &.{
-        .{ .result = 
-            \\{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},
-            \\ "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fake","version":"1"}}}
+        .{ .result =
+        \\{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},
+        \\ "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fake","version":"1"}}}
         },
     });
     defer connection.deinit();
@@ -2337,8 +2337,7 @@ test "over http the era is read from a refusal" {
         var connection = scriptedConnection(allocator, &.{});
         defer connection.deinit();
 
-        try std.testing.expectEqual(Connection.Settlement.settled, try connection.judgeRefusal(
-            400,
+        try std.testing.expectEqual(Connection.Settlement.settled, try connection.judgeRefusal(400,
             \\{"jsonrpc":"2.0","error":{"code":-32022,"message":"Unsupported protocol version",
             \\ "data":{"supported":["2026-07-28","2025-11-25"]}}}
         ));

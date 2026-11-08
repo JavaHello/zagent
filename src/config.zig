@@ -283,7 +283,7 @@ fn resolveBool(
     return file_value orelse fallback;
 }
 
-/// `openai.zig` appends "/chat/completions" to the base URL, so a trailing
+/// `openai.zig` appends "/responses" to the base URL, so a trailing
 /// slash here would produce a doubled separator. Takes ownership of `url`.
 fn trimTrailingSlashes(allocator: std.mem.Allocator, url: []u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, url, "/");

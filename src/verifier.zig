@@ -18,10 +18,10 @@ pub const SYSTEM_PROMPT =
     \\{"complete": true, "reason": "<one sentence>"}
     \\{"complete": false, "reason": "<one sentence>", "next_step": "<one concrete action>"}
     \\
-    \\Set "complete" to true when the request was carried out or when the answer
-    \\explains a genuine blocker — a missing credential, an unreachable service,
-    \\a command that failed after reasonable retries. A blocker that is reported
-    \\to the user is a finished turn, not a reason to try again.
+    \\Set "complete" to true only when the requested work is finished and
+    \\the available evidence supports that. A reported blocker, a plan, a
+    \\partial implementation or passing narrow tests does not prove completion.
+    \\When blocked, report complete=false and describe the missing prerequisite.
     \\
     \\When work is still outstanding, name the single most important missing
     \\step in "next_step". When the only remaining step is a decision the user
@@ -315,7 +315,7 @@ test "extract json object ignores braces inside strings" {
 
 test "the summary lists tool calls and shortens long results" {
     const allocator = std.testing.allocator;
-    const long_result = "x" ** (max_result_bytes * 2);
+    const long_result = @import("text.zig").repeat("x", (max_result_bytes * 2));
     var calls = [_]openai.ToolCallData{
         .{ .id = "1", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
     };
@@ -334,15 +334,15 @@ test "the summary lists tool calls and shortens long results" {
     // A follow-up carries what the user answered at a menu, which is what
     // stops the judge from asking for the same decision again.
     try std.testing.expect(std.mem.indexOf(u8, summary, "follow-up: [automatic self-check]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "x" ** max_result_bytes) != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "x" ** (max_result_bytes + 1)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, @import("text.zig").repeat("x", max_result_bytes)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, @import("text.zig").repeat("x", (max_result_bytes + 1))) == null);
 }
 
 test "the summary stops at its size limit" {
     const allocator = std.testing.allocator;
     const messages = [_]openai.Message{
-        .{ .role = "assistant", .content = "a" ** 200, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
-        .{ .role = "assistant", .content = "b" ** 200, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = @import("text.zig").repeat("a", 200), .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = @import("text.zig").repeat("b", 200), .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
 
     const summary = try summarize(allocator, &messages, 250);

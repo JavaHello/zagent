@@ -22,7 +22,7 @@ const term = @import("term.zig");
 const text = @import("text.zig");
 
 /// Beyond this, an unmatched marker is treated as literal text. Without a cap,
-/// scanning for a closer is quadratic: `"*" ** 100_000` would compare ~10^10
+/// scanning for a closer is quadratic: `@import("text.zig").repeat("*", 100_000)` would compare ~10^10
 /// bytes on a 100 KB reply.
 const max_span_scan: usize = 2048;
 /// Nesting caps. A prefix wider than the terminal would leave no room for
@@ -959,7 +959,7 @@ pub const Renderer = struct {
         if (table.full or table.count < 2) return self.tableProse(table);
 
         var cells: [max_table_columns][]const u8 = undefined;
-        var aligns = [_]Alignment{.left} ** max_table_columns;
+        var aligns: [max_table_columns]Alignment = @splat(.left);
         const declared = splitRow(table.rows[1], &cells) orelse return self.tableProse(table);
         for (cells[0..declared], 0..) |cell, i| {
             // Every cell of the delimiter row has to be a delimiter, or this
@@ -985,7 +985,7 @@ pub const Renderer = struct {
     ) !void {
         var cells: [max_table_columns][]const u8 = undefined;
         var cols = declared;
-        var widths = [_]usize{0} ** max_table_columns;
+        var widths: [max_table_columns]usize = @splat(0);
 
         // Every cell is measured before anything is written: the widest one in
         // a column decides that column's width. Row 1 is the delimiter row —
@@ -1024,7 +1024,7 @@ pub const Renderer = struct {
         const count = splitRow(row, &cells) orelse return;
 
         var bufs: [max_table_columns][cell_buffer_size]u8 = undefined;
-        var used = [_]usize{0} ** max_table_columns;
+        var used: [max_table_columns]usize = @splat(0);
         var lines: usize = 1;
 
         for (0..cols) |c| {
@@ -1572,12 +1572,12 @@ test "headings and rules are recognised" {
 
     const rule = try renderWith(testing.allocator, "---", 20, false);
     defer testing.allocator.free(rule);
-    try testing.expectEqualStrings("\xe2\x94\x80" ** 20 ++ "\n", rule);
+    try testing.expectEqualStrings(@import("text.zig").repeat("\xe2\x94\x80", 20) ++ "\n", rule);
 
     // The spaced form is a rule as well.
     const spaced = try renderWith(testing.allocator, "- - -", 10, false);
     defer testing.allocator.free(spaced);
-    try testing.expectEqualStrings("\xe2\x94\x80" ** 10 ++ "\n", spaced);
+    try testing.expectEqualStrings(@import("text.zig").repeat("\xe2\x94\x80", 10) ++ "\n", spaced);
 }
 
 test "a line without a marker is a paragraph, not a list item" {
@@ -1668,7 +1668,7 @@ test "deeply nested quotes do not run away" {
 }
 
 test "a pathological run of unmatched markers terminates" {
-    const input = try std.fmt.allocPrint(testing.allocator, "*{s}", .{"*" ** 5000});
+    const input = try std.fmt.allocPrint(testing.allocator, "*{s}", .{@import("text.zig").repeat("*", 5000)});
     defer testing.allocator.free(input);
     const out = try renderWith(testing.allocator, input, 40, false);
     defer testing.allocator.free(out);
@@ -1716,9 +1716,9 @@ const vbar = "\xe2\x94\x82";
 test "a table renders with a header rule and aligned columns" {
     try expectPlain(
         "  名称  说明\n" ++
-        "  " ++ dash ++ dash ++ dash ++ dash ++ "  " ++ dash ** 6 ++ "\n" ++
-        "  foo   第一个\n" ++
-        "  bar   第二个\n",
+            "  " ++ dash ++ dash ++ dash ++ dash ++ "  " ++ @import("text.zig").repeat(dash, 6) ++ "\n" ++
+            "  foo   第一个\n" ++
+            "  bar   第二个\n",
         "| 名称 | 说明 |\n| --- | --- |\n| foo | 第一个 |\n| bar | 第二个 |",
         80,
     );
@@ -1729,8 +1729,8 @@ test "the delimiter row does not widen the columns it stands under" {
     // one-character cells stays one character wide whatever the delimiter says.
     try expectPlain(
         "  a  b\n" ++
-        "  " ++ dash ++ "  " ++ dash ++ "\n" ++
-        "  1  2\n",
+            "  " ++ dash ++ "  " ++ dash ++ "\n" ++
+            "  1  2\n",
         "a | b\n--- | ---\n1 | 2",
         80,
     );
@@ -1739,8 +1739,8 @@ test "the delimiter row does not widen the columns it stands under" {
 test "a row without a leading pipe is still a table row" {
     try expectPlain(
         "  a  b\n" ++
-        "  " ++ dash ++ "  " ++ dash ++ "\n" ++
-        "  1  2\n",
+            "  " ++ dash ++ "  " ++ dash ++ "\n" ++
+            "  1  2\n",
         "a | b\n- | -\n1 | 2",
         80,
     );
@@ -1749,8 +1749,8 @@ test "a row without a leading pipe is still a table row" {
 test "alignment markers move the cell within its column" {
     try expectPlain(
         "  aaa  bbb  ccc\n" ++
-        "  " ++ dash ** 3 ++ "  " ++ dash ** 3 ++ "  " ++ dash ** 3 ++ "\n" ++
-        "  x      y   z\n",
+            "  " ++ @import("text.zig").repeat(dash, 3) ++ "  " ++ @import("text.zig").repeat(dash, 3) ++ "  " ++ @import("text.zig").repeat(dash, 3) ++ "\n" ++
+            "  x      y   z\n",
         "| aaa | bbb | ccc |\n| :- | -: | :-: |\n| x | y | z |",
         80,
     );
@@ -1759,8 +1759,8 @@ test "alignment markers move the cell within its column" {
 test "the header is bold and the rule is dim" {
     try expectStyled(
         "  \x1b[1mhi\x1b[0m  \x1b[1mx\x1b[0m\n" ++
-        "  \x1b[2m" ++ dash ** 2 ++ "\x1b[0m  \x1b[2m" ++ dash ++ "\x1b[0m\n" ++
-        "  a   y\n",
+            "  \x1b[2m" ++ @import("text.zig").repeat(dash, 2) ++ "\x1b[0m  \x1b[2m" ++ dash ++ "\x1b[0m\n" ++
+            "  a   y\n",
         "| **hi** | x |\n| --- | --- |\n| a | y |",
         80,
     );
@@ -1769,8 +1769,8 @@ test "the header is bold and the rule is dim" {
 test "a pipe-escaped cell does not split the row" {
     try expectPlain(
         "  a|b  x\n" ++
-        "  " ++ dash ** 3 ++ "  " ++ dash ++ "\n" ++
-        "  c|d  y\n",
+            "  " ++ @import("text.zig").repeat(dash, 3) ++ "  " ++ dash ++ "\n" ++
+            "  c|d  y\n",
         "| a\\|b | x |\n| --- | --- |\n| c\\|d | y |",
         80,
     );
@@ -1779,9 +1779,9 @@ test "a pipe-escaped cell does not split the row" {
 test "a row with a missing cell stops there, and an extra cell is kept" {
     try expectPlain(
         "  a  b  c\n" ++
-        "  " ++ dash ++ "  " ++ dash ++ "  " ++ dash ++ "\n" ++
-        "  1\n" ++
-        "  2  3  4\n",
+            "  " ++ dash ++ "  " ++ dash ++ "  " ++ dash ++ "\n" ++
+            "  1\n" ++
+            "  2  3  4\n",
         "| a | b | c |\n| - | - | - |\n| 1 |\n| 2 | 3 | 4 |",
         80,
     );
@@ -1790,8 +1790,8 @@ test "a row with a missing cell stops there, and an extra cell is kept" {
 test "a table inside a blockquote keeps its bars" {
     try expectPlain(
         vbar ++ "   a  b\n" ++
-        vbar ++ "   " ++ dash ++ "  " ++ dash ++ "\n" ++
-        vbar ++ "   1  2\n",
+            vbar ++ "   " ++ dash ++ "  " ++ dash ++ "\n" ++
+            vbar ++ "   1  2\n",
         "> | a | b |\n> | - | - |\n> | 1 | 2 |",
         80,
     );
@@ -1816,10 +1816,10 @@ test "a table wider than the terminal wraps cells inside their columns" {
 test "a table ends at a blank line" {
     try expectPlain(
         "  a  b\n" ++
-        "  " ++ dash ++ "  " ++ dash ++ "\n" ++
-        "  1  2\n" ++
-        "\n" ++
-        "after\n",
+            "  " ++ dash ++ "  " ++ dash ++ "\n" ++
+            "  1  2\n" ++
+            "\n" ++
+            "after\n",
         "| a | b |\n| - | - |\n| 1 | 2 |\n\nafter",
         80,
     );
@@ -1841,8 +1841,8 @@ test "a fence opened after a table body is not part of it" {
 test "a table survives being the last thing in the document" {
     try expectPlain(
         "  a  b\n" ++
-        "  " ++ dash ++ "  " ++ dash ++ "\n" ++
-        "  1  2\n",
+            "  " ++ dash ++ "  " ++ dash ++ "\n" ++
+            "  1  2\n",
         "| a | b |\n| - | - |\n| 1 | 2 |",
         80,
     );

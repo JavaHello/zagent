@@ -1,6 +1,8 @@
 # zagent
 
-A command-line AI agent built with [Zig](https://ziglang.org/) that can help you with any task using an OpenAI-compatible API.
+[中文使用说明](README.zh-CN.md)
+
+A command-line AI agent built with [Zig](https://ziglang.org/) that can help you with any task using the Responses API.
 
 ## Features
 
@@ -9,6 +11,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Tool use (function calling)** — the agent can execute tools to help you:
   - `shell` — run shell commands
   - `read_file` — read file contents
+  - `edit_file` — replace one exact, unique text block atomically while preserving file permissions
   - `apply_patch` — change a file by applying a unified diff, which is then shown to you as a coloured diff
   - `write_file` — create or overwrite a whole file
   - `list_dir` — list directory contents
@@ -22,13 +25,14 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
 - **Live progress** — waiting for the model, and running a tool, each get one animated line (`⠋ shell… 8s`) with the time so far, so a long wait never looks like a hang. Off unless both stdout and stderr are a terminal, where the line can be taken and given back
 - **Built-in provider presets** — one setting selects `deepseek` or `openai`, autodetected from `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` when unset
-- **OpenAI-compatible** — works with any endpoint that speaks the OpenAI chat-completions protocol (OpenAI, Azure OpenAI, Ollama, LM Studio, …)
+- **Responses API** — uses `POST /responses` with typed input/output items, function calling and stateless reasoning replay; works with OpenAI, DeepSeek or another endpoint implementing this protocol
 - **ANSI colour output**
 
 ## Requirements
 
-- Zig 0.16.0 or later
-- An OpenAI-compatible API key
+- Zig 0.17.x
+- Linux with bubblewrap (`bwrap`) and GNU coreutils (`timeout`) for tool execution
+- An API key and base URL for a Responses-compatible endpoint
 
 ## Build
 
@@ -37,6 +41,71 @@ zig build
 ```
 
 The binary is written to `zig-out/bin/zagent`.
+
+## Sandboxed tools
+
+Every built-in filesystem, search, HTTP and shell tool runs in a bubblewrap
+sandbox. Local MCP servers use the same boundary. Only the directory from which
+you start zagent is mounted writable. System programs and libraries under `/usr`
+are read-only; the host home, configuration files, credentials, other workspaces,
+processes and sockets are hidden. `/tmp` is private and discarded after each tool
+call. Zig compilation caches persist under the workspace’s `.zig-cache/global`.
+Symlinks cannot reach files outside the mounted workspace. Commands have a
+180-second default limit (`shell.timeout_seconds` accepts 1–3600); background processes do not survive the tool call. If sandbox
+startup fails, the tool returns an error without an unsandboxed fallback.
+
+Start zagent in the project directory you want it to work on. Files inside that
+workspace are available to tools, including any secrets you put there. Built-in
+tools receive a clean environment without your API keys. Local MCP servers get
+only the environment entries explicitly declared in their `env` configuration.
+Install their dependencies ahead of time inside `/usr` or the workspace.
+
+Tool networking is disabled by default. Set `AI_TOOL_NETWORK=1` to permit network
+access for commands, HTTP tools and local MCP servers. This shares the host
+network, including localhost services. Model API calls and explicitly configured
+remote MCP endpoints use the main process network independently of tool network
+access. Each sandbox has its own loopback interface even when networking is off;
+run a test server and client in the same shell call for local integration tests.
+
+```sh
+cd /path/to/project
+AI_PROVIDER=deepseek zagent "Analyze this project and update its documentation"
+AI_TOOL_NETWORK=1 zagent "Download the public API documentation and summarize it"
+```
+
+## Durable conversations
+
+Set `AI_SESSION_FILE` to save the conversation after each completed tool batch and
+answer. Starting zagent with the same file resumes its context. The session is
+bound to the original working directory. `/clear` also clears the saved session.
+The file contains task content and tool results, and should be stored outside the
+tool workspace if tools must not edit it. New files use mode 0600; do not share a
+session file between concurrent zagent processes. Invalid or mismatched session
+files are reported rather than silently discarded. Interrupted tool batches may
+have filesystem effects; inspect the workspace when resuming.
+
+```sh
+AI_SESSION_FILE="$HOME/.local/state/zagent/project.json" zagent "Implement the task"
+AI_SESSION_FILE="$HOME/.local/state/zagent/project.json" zagent "Continue and verify"
+```
+
+Transient network errors and HTTP 408/429/500/502/503/504 responses are retried up
+to three attempts. Exhausted tool iterations and truncated model output return
+an error instead of reporting completion.
+
+## Validation
+
+```sh
+zig build
+zig build test
+python3 tests/sandbox_integration.py
+python3 tests/completion_integration.py
+python3 tests/responses_failure_integration.py
+```
+
+The integration test uses a local mock model endpoint and the actual binary. It
+checks editing/search, host and credential isolation, symlink escapes, network
+isolation, API retries, session recovery and binary replacement during a run.
 
 ## Configuration
 
@@ -58,7 +127,7 @@ All configuration is also supported through environment variables:
 | `OPENAI_API_KEY`   | *(required for OpenAI)*          | Your OpenAI (or compatible) API key  |
 | `OPENAI_BASE_URL`  | `https://api.openai.com/v1`      | API base URL                         |
 | `OPENAI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
-| `OPENAI_MAX_TOKENS`| `4096`                           | Maximum tokens per response          |
+| `OPENAI_MAX_TOKENS`| `4096`                           | Maximum output tokens per response          |
 | `OPENAI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
 | `OPENAI_MAX_VERIFICATIONS` | `3`                     | Completion checks per query; `0` disables the check |
 | `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
@@ -80,7 +149,7 @@ Output that is not a terminal — piped, redirected, or under `TERM=dumb` — ge
 | `openai`   | `https://api.openai.com/v1`  | `gpt-4o-mini`    | `OPENAI_API_KEY`   |
 | `deepseek` | `https://api.deepseek.com`   | `deepseek-flash` | `DEEPSEEK_API_KEY` |
 
-To use some other OpenAI-compatible endpoint, leave `AI_PROVIDER` unset and set `AI_URL` / `AI_MODEL` yourself.
+To use some other Responses-compatible endpoint, leave `AI_PROVIDER` unset and set `AI_URL` / `AI_MODEL` yourself.
 
 Precedence, highest first: an explicit environment variable, then the config file, then the provider preset.
 
@@ -167,17 +236,17 @@ results, the final answer) to the model with no tools advertised, and expects
 An unfinished verdict is printed and fed back into the conversation, and the
 agent keeps working. Up to `AI_MAX_VERIFICATIONS` checks are made per query
 (3 by default); the budget is printed when it runs out, and `AI_MAX_VERIFICATIONS=0`
-turns the check off. A turn that used no tools is never checked, and neither is
-a turn whose answer reports a genuine blocker — a missing credential or an
-unreachable service is a finished turn, not a reason to loop.
+turns the check off. A turn that used no tools is never checked. A reported
+blocker, partial implementation or a plan is not a completed task. If the
+verification budget runs out while the task remains unfinished, the process
+returns `CompletionUnverified`.
 
 Two things worth knowing:
 
 - The check costs one extra request per tool-using turn, and it re-sends a
   summary of that turn rather than the whole history.
-- If the judge request fails or its reply cannot be read, the turn keeps the
-  answer it already printed. A broken checker must not trap the agent in a loop
-  that can never pass.
+- If the judge request fails or its reply cannot be read, the candidate answer
+  remains visible, but the process returns `CompletionUnverified`.
 
 ### Choices
 
@@ -356,7 +425,7 @@ file, and `mcp.example.json` shows every member it takes:
 
 An entry with `command` is started as a subprocess and spoken to over its
 standard streams; an entry with `url` is a Streamable HTTP endpoint. `env` adds
-variables to the subprocess's copy of the environment, `headers` are sent with
+variables to the subprocess's clean sandbox environment, `headers` are sent with
 every HTTP request, `timeoutMs` says how long a request waits for an answer
 (default 60000), and `disabled` keeps an entry without starting it.
 
@@ -421,16 +490,7 @@ Typing a `/command` shows its description as dim ghost text after the line,
 and `Tab` cycles through the commands that match what you have typed so far.
 (These hints apply to the REPL prompt only, not to `ask_user` menu answers.)
 
-### Using a local model (Ollama)
-
-```bash
-export OPENAI_BASE_URL=http://localhost:11434/v1
-export OPENAI_API_KEY=ollama
-export OPENAI_MODEL=llama3.2
-./zig-out/bin/zagent
-```
-
-### Using a custom OpenAI-compatible endpoint
+### Using a custom Responses-compatible endpoint
 
 ```bash
 export OPENAI_BASE_URL=https://your-endpoint/v1
@@ -448,17 +508,24 @@ export DEEPSEEK_API_KEY=your-deepseek-key
 
 The key alone selects the `deepseek` preset, as described under [Autodetection](#autodetection). Set `AI_PROVIDER=deepseek` as well if you want the choice to be explicit, or if a key in your config file would otherwise turn autodetection off.
 
-DeepSeek enables thinking mode by default, and zagent requests it explicitly rather than relying on that default. The recognised model names are:
+zagent calls the selected base URL’s `/responses` endpoint. `AI_MODEL` is sent
+unchanged, so provider-specific model names remain under your control. The
+client uses `max_output_tokens`, flat function definitions, and typed
+`function_call` / `function_call_output` items linked with `call_id`.
 
-| `AI_MODEL`          | Sent to the API      | Thinking mode |
-|---------------------|----------------------|---------------|
-| `deepseek-flash`    | `deepseek-flash`     | enabled       |
-| `deepseek-v4-pro`   | `deepseek-v4-pro`    | enabled       |
-| `deepseek-chat`     | `deepseek-flash`     | disabled      |
-| `deepseek-reasoner` | `deepseek-flash`     | enabled       |
-| `deepseek-v4-flash` | `deepseek-flash`     | disabled      |
+Requests set `store: false` and request `reasoning.encrypted_content`. Every
+returned output item is retained and replayed, including reasoning and function
+item IDs; durable sessions preserve them across restarts. Older sessions are
+converted to Responses input messages and call/output pairs. Legacy free-form
+`reasoning_content` strings are not sent as a Responses reasoning item.
 
-Any other model name is sent through unchanged with no `thinking` field. For the fastest and cheapest replies, use `AI_MODEL=deepseek-chat`, which turns thinking off.
+The main agent and the completion checker both use Responses. There is no
+automatic fallback to Chat Completions. `AI_URL` is the API base URL (for
+example `https://api.openai.com/v1` or `https://api.deepseek.com`), without the
+`/responses` suffix. A Chat Completions-only endpoint must be replaced with a
+Responses-compatible endpoint.
+
+Protocol mapping follows the [official Responses migration guide](https://developers.openai.com/api/docs/guides/migrate-to-responses).
 
 ## Run tests
 

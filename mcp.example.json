@@ -14,7 +14,7 @@
     "",
     "  command  start this program and speak MCP over its standard streams",
     "  args     the arguments for that program",
-    "  env      variables added to the server's copy of the environment",
+    "  env      explicit variables added to the server's clean sandbox environment",
     "  url      a Streamable HTTP endpoint, instead of a command",
     "  headers  sent with every HTTP request; where a token goes",
     "  timeoutMs  how long a request waits for an answer, default 60000.",

@@ -357,13 +357,12 @@ const LineBuffer = struct {
     }
 };
 
-/// How a server subprocess is launched. Its `argv[0]` is resolved on the PATH
-/// of *this* process, so `npx` and `uvx` are found the way a shell finds them.
+/// How a server subprocess is launched. Its command is resolved inside the
+/// sandbox, using /usr/bin:/bin unless the server explicitly configures PATH.
 pub const StdioSpec = struct {
     argv: []const []const u8,
-    /// Variables added on top of this process's own environment. A server
-    /// inherits that environment, because it is where its credentials and its
-    /// PATH live.
+    /// Explicit variables added to the server's clean sandbox environment.
+    /// The host environment is not inherited; declare required credentials here.
     env: []const [2][]const u8 = &.{},
 };
 
@@ -390,35 +389,31 @@ pub const Stdio = struct {
         spec: StdioSpec,
         parent_env: *const std.process.Environ.Map,
     ) !Stdio {
-        // The child's environment replaces its parent's rather than adding to
-        // it, so a server configured with extra variables gets a full copy of
-        // this process's environment with those written over it.
-        var env: ?std.process.Environ.Map = null;
-        defer if (env) |*map| map.deinit();
-
-        if (spec.env.len > 0) {
-            var map = try parent_env.clone(allocator);
-            errdefer map.deinit();
-            for (spec.env) |pair| {
-                // `put` asserts on a key that cannot be written as one, and a
-                // key comes from a file the user wrote: it is checked rather
-                // than assumed, so a typo is a message and not a panic.
-                if (!std.process.Environ.Map.validateKeyForPut(pair[0])) return Error.McpInvalidEnvKey;
-                try map.put(pair[0], pair[1]);
-            }
-            env = map;
+        // MCP commands receive the same filesystem/process boundary as built-ins.
+        // Credentials must be explicitly assigned in the server's env settings.
+        const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(workspace);
+        const network = if (parent_env.get("AI_TOOL_NETWORK")) |v| std.mem.eql(u8, v, "1") else false;
+        const base = try @import("sandbox.zig").argv(allocator, workspace, null, network, &.{});
+        defer allocator.free(base);
+        var command: std.ArrayList([]const u8) = .empty;
+        defer command.deinit(allocator);
+        try command.appendSlice(allocator, base[3 .. base.len - 1]);
+        for (spec.env) |pair| {
+            if (!std.process.Environ.Map.validateKeyForPut(pair[0])) return Error.McpInvalidEnvKey;
+            try command.appendSlice(allocator, &.{ "--setenv", pair[0], pair[1] });
         }
-
+        try command.append(allocator, "--");
+        try command.appendSlice(allocator, spec.argv);
+        var env = std.process.Environ.Map.init(allocator);
+        defer env.deinit();
+        try env.put("PATH", "/usr/bin:/bin");
         const child = try std.process.spawn(io, .{
-            .argv = spec.argv,
+            .argv = command.items,
             .stdin = .pipe,
             .stdout = .pipe,
-            // Inherited rather than piped: a server that logs is not talking to
-            // us, and a pipe nobody drains fills up and hangs it. Its output
-            // reaching the terminal is the price, and also the only way a
-            // server that dies at startup gets to say why.
             .stderr = .inherit,
-            .environ_map = if (env) |*map| map else null,
+            .environ_map = &env,
         });
 
         return .{
@@ -696,7 +691,7 @@ pub const Http = struct {
             // and a body that cannot be read is worth less than the status.
             const body = readBody(allocator, &response, max_error_body_bytes) catch
                 try allocator.dupe(u8, "");
-            return .{ .http_error = .{ .status = @intFromEnum(status), .body = body } };
+            return .{ .http_error = .{ .status = @backingInt(status), .body = body } };
         }
 
         if (std.mem.indexOf(u8, content_type, "text/event-stream") != null) {
@@ -1182,7 +1177,7 @@ test "a line buffer hands out whole messages however they arrive" {
 
     // An unterminated line that runs past the cap is refused rather than held.
     buffer.compact();
-    try buffer.push("x" ** 64);
+    try buffer.push(@import("text.zig").repeat("x", 64));
     try std.testing.expectError(Error.McpMessageTooLong, buffer.next(64));
 }
 

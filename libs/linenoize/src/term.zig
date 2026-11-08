@@ -195,7 +195,7 @@ pub fn beep(io: Io) !void {
     try File.stderr().writeStreamingAll(io, "\x07");
 }
 
-var utf8ConsoleBuffer = [_]u8{0} ** 10;
+var utf8ConsoleBuffer: [10]u8 = @splat(0);
 var utf8ConsoleReadBytes: usize = 0;
 
 // this is needed due to a bug in win32 console: https://github.com/microsoft/terminal/issues/4551

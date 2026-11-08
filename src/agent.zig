@@ -34,11 +34,12 @@ const SYSTEM_PROMPT =
     \\You are zagent, a powerful command-line AI assistant built with Zig.
     \\You can help users with any task by using the provided tools.
     \\
+    \\Tools run in a Linux sandbox. Only the current workspace is writable; host home and credentials are hidden. Network access is disabled unless AI_TOOL_NETWORK=1.
     \\Guidelines:
     \\- Be concise and direct in your responses.
     \\- Use the shell tool to run commands, install packages, or perform system operations.
     \\- Use http_request for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
-    \\- Use read_file to read a file. Use apply_patch to change one that exists: send a unified diff of just the lines that change, with enough context to place them. Do not write a whole file back through write_file to change part of it, and do not edit files through the shell.
+    \\- Use read_file to read a file. Use edit_file for an exact unique text replacement, or apply_patch for a unified diff with enough context to place it. Do not write a whole file back through write_file to change part of it, and do not edit files through the shell.
     \\- Use write_file only for a file that does not exist yet, or when the entire contents are being replaced. A file that does not exist can also be created with apply_patch and a '--- /dev/null' header.
     \\- Use list_dir to explore directories.
     \\- Use grep to search file contents, and find to locate files by name, instead of shelling out: they use ripgrep and fd where those are installed.
@@ -89,6 +90,8 @@ pub const Agent = struct {
     /// same reason as `render_markdown`: a search should not have to ask the
     /// filesystem a question whose answer cannot change while the agent runs.
     search: tools.SearchBackends,
+    tool_network: bool,
+    session_path: ?[]u8,
     /// Whether to render the model's markdown for a terminal. Decided once, in
     /// `init`, so the answer path never has to ask the operating system.
     render_markdown: bool,
@@ -124,6 +127,15 @@ pub const Agent = struct {
             .tool_call_id = null,
         });
 
+        const session_path = if (env.get("AI_SESSION_FILE")) |path| if (path.len > 0) try allocator.dupe(u8, path) else null else null;
+        errdefer if (session_path) |path| allocator.free(path);
+        if (session_path) |path| {
+            var loaded = try @import("session.zig").load(io, allocator, path);
+            defer loaded.deinit(allocator);
+            errdefer for (loaded.items) |message| message.deinit(allocator);
+            try history.appendSlice(allocator, loaded.items);
+        }
+
         return .{
             .allocator = allocator,
             .io = io,
@@ -133,6 +145,8 @@ pub const Agent = struct {
             .max_verifications = config.max_verifications,
             .linenoise = linenoise,
             .search = tools.detectSearchBackends(io, env),
+            .session_path = session_path,
+            .tool_network = if (env.get("AI_TOOL_NETWORK")) |v| std.mem.eql(u8, v, "1") else false,
             // The check is on stdout rather than on `linenoise.is_tty`, which
             // describes stdin: `zagent "q" < file` with a terminal on stdout
             // should still render, and `zagent "q" | less` must not.
@@ -153,18 +167,25 @@ pub const Agent = struct {
         for (self.history.items) |msg| msg.deinit(self.allocator);
         self.history.deinit(self.allocator);
         self.client.deinit();
+        if (self.session_path) |path| self.allocator.free(path);
     }
 
     /// Clear conversation history (keeps the system prompt).
     pub fn clearHistory(self: *Agent) void {
         for (self.history.items[1..]) |msg| msg.deinit(self.allocator);
         self.history.shrinkRetainingCapacity(1);
+        self.checkpoint() catch {};
+    }
+
+    fn checkpoint(self: *Agent) !void {
+        if (self.session_path) |path| try @import("session.zig").save(self.io, self.allocator, path, self.history.items[1..]);
     }
 
     /// Process a single user query: work on it until the model answers and the
     /// completion check agrees that the request is done.
     pub fn processQuery(self: *Agent, query: []const u8) !void {
         try self.appendUserMessage(query);
+        try self.checkpoint();
         // The judge is shown only what this turn produced, so remember where
         // the request it is checking starts.
         const turn_start = self.history.items.len;
@@ -174,7 +195,7 @@ pub const Agent = struct {
 
         while (true) {
             const turn = try self.runToolLoop();
-            if (!turn.completed) return;
+            if (!turn.completed) return error.IterationLimitReached;
             // Counted across the whole query, not per round: a round that only
             // claims the work is finished still has to pass the check.
             worked = worked or turn.tool_calls > 0;
@@ -183,14 +204,14 @@ pub const Agent = struct {
             if (self.max_verifications == 0) return;
 
             if (verifications == self.max_verifications) {
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ completion check budget ({d}) spent; ending the turn unchecked\n" ++ RESET, .{self.max_verifications});
-                return;
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ completion check budget ({d}) spent; task remains unverified\n" ++ RESET, .{self.max_verifications});
+                return error.CompletionUnverified;
             }
             verifications += 1;
 
             // The check announces itself from inside `judgeAnimated`, where it
             // can be animated for as long as the judge is thinking.
-            const verdict = (try self.judgeTurn(turn_start)) orelse return;
+            const verdict = (try self.judgeTurn(turn_start)) orelse return error.CompletionUnverified;
             defer verdict.deinit(self.allocator);
 
             if (verdict.complete) {
@@ -231,7 +252,7 @@ pub const Agent = struct {
             .enabled = self.animate_progress,
         });
         defer spin.stop();
-        return self.client.chat(messages, self.mcp_registry.functionJson()) catch |err| {
+        return self.client.respond(messages, self.mcp_registry.functionJson()) catch |err| {
             spin.stop();
             try self.reportHttpError();
             return err;
@@ -249,7 +270,7 @@ pub const Agent = struct {
             try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ checking completion…\n" ++ RESET, .{});
         }
         defer spin.stop();
-        return self.client.chatWithoutTools(messages) catch |err| {
+        return self.client.respondWithoutTools(messages) catch |err| {
             spin.stop();
             try self.reportHttpError();
             return err;
@@ -285,6 +306,7 @@ pub const Agent = struct {
             };
             defer response.deinit(self.allocator);
 
+            if (std.mem.eql(u8, response.finish_reason, "length")) return error.ResponseTruncated;
             if (std.mem.eql(u8, response.finish_reason, "tool_calls")) {
                 const tool_calls = response.tool_calls orelse {
                     try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});
@@ -297,14 +319,17 @@ pub const Agent = struct {
                     for (owned_calls) |c| c.deinit(self.allocator);
                     self.allocator.free(owned_calls);
                 }
-                // DeepSeek requires the assistant turn to be replayed as it was
-                // received, so keep any content alongside the tool calls.
+                // Keep exact Responses output items alongside the UI summary.
+                // This retains reasoning and function call IDs for stateless replay.
                 const owned_content = if (response.content) |value| try self.allocator.dupe(u8, value) else null;
                 errdefer if (owned_content) |value| self.allocator.free(value);
                 const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
                 errdefer if (owned_reasoning) |value| self.allocator.free(value);
 
+                const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
+                errdefer if (owned_items) |value| self.allocator.free(value);
                 try self.history.append(self.allocator, .{
+                    .response_items = owned_items,
                     .role = "assistant",
                     .content = owned_content,
                     .reasoning_content = owned_reasoning,
@@ -339,13 +364,14 @@ pub const Agent = struct {
                         .tool_call_id = call_id,
                     });
                 }
+                try self.checkpoint();
                 turn.tool_calls += tool_calls.len;
                 // Continue: call API again with tool results
             } else {
                 // Final answer
                 if (response.content) |content| {
                     const stdout = std.Io.File.stdout();
-                    try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+                    if (stdout.isTty(self.io) catch false) try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
                     try self.writeAnswer(content);
                     try stdout.writeStreamingAll(self.io, "\n");
 
@@ -354,7 +380,10 @@ pub const Agent = struct {
                     const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
                     errdefer if (owned_reasoning) |value| self.allocator.free(value);
 
+                    const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
+                    errdefer if (owned_items) |value| self.allocator.free(value);
                     try self.history.append(self.allocator, .{
+                        .response_items = owned_items,
                         .role = "assistant",
                         .content = owned_content,
                         .reasoning_content = owned_reasoning,
@@ -362,6 +391,7 @@ pub const Agent = struct {
                         .tool_call_id = null,
                     });
                 }
+                try self.checkpoint();
                 turn.completed = true;
                 break;
             }
@@ -558,108 +588,14 @@ pub const Agent = struct {
                 spinner.Spinner.disabled(self.io);
             defer spin.stop();
 
-            if (std.mem.eql(u8, call.name, "shell")) {
-                const command = openai.extractStringArg(self.allocator, call.arguments, "command") catch {
-                    break :blk .{
-                        .content = try self.allocator.dupe(u8, "Error: missing 'command' argument"),
-                        .is_error = true,
-                    };
-                };
-                defer self.allocator.free(command);
-                break :blk try tools.executeShell(self.io, self.allocator, command);
-            } else if (std.mem.eql(u8, call.name, "read_file")) {
-                const path = openai.extractStringArg(self.allocator, call.arguments, "path") catch {
-                    break :blk .{
-                        .content = try self.allocator.dupe(u8, "Error: missing 'path' argument"),
-                        .is_error = true,
-                    };
-                };
-                defer self.allocator.free(path);
-                break :blk try tools.readFile(self.io, self.allocator, path);
-            } else if (std.mem.eql(u8, call.name, "write_file")) {
-                const path = openai.extractStringArg(self.allocator, call.arguments, "path") catch {
-                    break :blk .{
-                        .content = try self.allocator.dupe(u8, "Error: missing 'path' argument"),
-                        .is_error = true,
-                    };
-                };
-                defer self.allocator.free(path);
-                const content = openai.extractStringArg(self.allocator, call.arguments, "content") catch {
-                    break :blk .{
-                        .content = try self.allocator.dupe(u8, "Error: missing 'content' argument"),
-                        .is_error = true,
-                    };
-                };
-                defer self.allocator.free(content);
-                break :blk try tools.writeFile(self.io, self.allocator, path, content);
-            } else if (std.mem.eql(u8, call.name, "apply_patch")) {
-                const patch_text = openai.extractStringArg(self.allocator, call.arguments, "patch") catch {
-                    break :blk .{
-                        .content = try self.allocator.dupe(u8, "Error: missing 'patch' argument; it has to hold a unified diff"),
-                        .is_error = true,
-                    };
-                };
-                defer self.allocator.free(patch_text);
-                break :blk try tools.applyPatch(self.io, self.allocator, patch_text);
-            } else if (std.mem.eql(u8, call.name, "list_dir")) {
-                const path = openai.extractStringArg(self.allocator, call.arguments, "path") catch {
-                    break :blk .{
-                        .content = try self.allocator.dupe(u8, "Error: missing 'path' argument"),
-                        .is_error = true,
-                    };
-                };
-                defer self.allocator.free(path);
-                break :blk try tools.listDir(self.io, self.allocator, path);
-            } else if (std.mem.eql(u8, call.name, "grep")) {
-                const args = tools.parseGrepArgs(self.allocator, call.arguments) catch |err| {
-                    break :blk .{
-                        .content = try std.fmt.allocPrint(
-                            self.allocator,
-                            "Error: grep arguments are unusable ({s}); it needs a non-empty 'pattern' holding a regular expression, and a 'path', 'glob', and 'ignore_case' it can use",
-                            .{@errorName(err)},
-                        ),
-                        .is_error = true,
-                    };
-                };
-                defer args.deinit(self.allocator);
-                break :blk try tools.grep(self.io, self.allocator, self.search, args);
-            } else if (std.mem.eql(u8, call.name, "find")) {
-                const args = tools.parseFindArgs(self.allocator, call.arguments) catch |err| {
-                    break :blk .{
-                        .content = try std.fmt.allocPrint(
-                            self.allocator,
-                            "Error: find arguments are unusable ({s}); it needs a non-empty 'pattern' holding a glob, and a 'path' it can use",
-                            .{@errorName(err)},
-                        ),
-                        .is_error = true,
-                    };
-                };
-                defer args.deinit(self.allocator);
-                break :blk try tools.find(self.io, self.allocator, self.search, args);
-            } else if (std.mem.eql(u8, call.name, "http_request")) {
-                const request = tools.parseHttpRequest(self.allocator, call.arguments) catch |err| {
-                    break :blk .{
-                        .content = try std.fmt.allocPrint(
-                            self.allocator,
-                            "Error: http_request arguments are unusable ({s}); it needs a 'url', and a 'method', 'headers', 'body', and 'save_to' it can use",
-                            .{@errorName(err)},
-                        ),
-                        .is_error = true,
-                    };
-                };
-                defer request.deinit(self.allocator);
-                break :blk try tools.httpRequest(self.io, self.allocator, request);
-            } else if (std.mem.eql(u8, call.name, "ask_user")) {
+            if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
             } else if (std.mem.startsWith(u8, call.name, mcp.tool_prefix)) {
                 // A tool of a connected MCP server: the registry knows which
                 // server it belongs to and what the server calls it.
                 break :blk try self.mcp_registry.call(self.allocator, call.name, call.arguments);
             } else {
-                break :blk .{
-                    .content = try std.fmt.allocPrint(self.allocator, "Unknown tool: {s}", .{call.name}),
-                    .is_error = true,
-                };
+                break :blk try @import("sandbox.zig").execute(self.io, self.allocator, self.tool_network, call.name, call.arguments);
             }
         };
 
