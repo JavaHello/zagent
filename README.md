@@ -249,6 +249,9 @@ Two things worth knowing:
   summary of that turn rather than the whole history. A turn too long for that
   summary keeps its most recent work — the answer, or the failure that stopped
   it — and omits the beginning, so the judge always sees how the turn ended.
+  Long tool results are shortened in the middle rather than at the end: a test
+  run's verdict, or a command's last lines, are the evidence the check rules
+  on, so they travel with the command that produced them.
 - If the judge request fails or its reply cannot be read, the check is asked
   again while the budget lasts, because such a reply says nothing about the
   work; every attempt spends a check. When no usable verdict can be read, the

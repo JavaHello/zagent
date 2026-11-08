@@ -217,7 +217,9 @@ fn writeLine(w: *std.Io.Writer, message: openai.Message) !bool {
 
     if (std.mem.eql(u8, message.role, "tool")) {
         if (message.content) |content| {
-            try w.print("result: {s}\n", .{truncateUtf8(content, max_result_bytes)});
+            try w.writeAll("result: ");
+            try writeBothEnds(w, content, max_result_bytes);
+            try w.writeByte('\n');
             return true;
         }
         return false;
@@ -240,6 +242,30 @@ fn truncateUtf8(text: []const u8, max_bytes: usize) []const u8 {
     var cut = max_bytes;
     while (cut > 0 and !std.unicode.utf8ValidateSlice(text[0..cut])) : (cut -= 1) {}
     return text[0..cut];
+}
+
+/// Stands between the two shown ends of a result too long to show whole.
+const elision = " … ";
+
+/// Write at most `max_bytes` of `text`, keeping both ends. The first lines say
+/// what the command did, and the last say how it ended — a test run's verdict,
+/// a diff's summary, an error's cause. Keeping only the head shows the judge
+/// the setup and hides the outcome, so a finished task looks unfinished;
+/// keeping only the tail would lose what was run at all.
+fn writeBothEnds(w: *std.Io.Writer, text: []const u8, max_bytes: usize) !void {
+    if (text.len <= max_bytes) return w.writeAll(text);
+    if (max_bytes <= elision.len) return w.writeAll(truncateUtf8(text, max_bytes));
+
+    const keep = max_bytes - elision.len;
+    const head_len = keep - keep / 2;
+    const tail_len = keep / 2;
+    try w.writeAll(truncateUtf8(text, head_len));
+    try w.writeAll(elision);
+    // The tail ends at the end of the text, which is valid, so a short walk
+    // finds the character boundary the cut may have landed inside.
+    var start = text.len - tail_len;
+    while (start < text.len and !std.unicode.utf8ValidateSlice(text[start..])) start += 1;
+    try w.writeAll(text[start..]);
 }
 
 /// The request the judge is asked to check, wrapped around the summary.
@@ -349,11 +375,16 @@ test "extract json object ignores braces inside strings" {
     try std.testing.expectEqual(@as(?[]const u8, null), extractJsonObject("no braces here"));
 }
 
-test "the summary lists tool calls and shortens long results" {
+test "the summary lists tool calls and shortens long results from the middle" {
     const allocator = std.testing.allocator;
-    const long_result = @import("text.zig").repeat("x", (max_result_bytes * 2));
+    // A test run: the command echoes its opening, and the verdict is at the
+    // end. Both have to survive, or the judge cannot tell success from setup.
+    const long_result = try std.fmt.allocPrint(allocator, "running tests...\n{s}\ntest result: ok. 42 passed\n", .{
+        @import("text.zig").repeat("x", (max_result_bytes * 2)),
+    });
+    defer allocator.free(long_result);
     var calls = [_]openai.ToolCallData{
-        .{ .id = "1", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
+        .{ .id = "1", .name = "shell", .arguments = "{\"command\":\"cargo test\"}" },
     };
     const messages = [_]openai.Message{
         .{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = &calls, .tool_call_id = null },
@@ -365,13 +396,20 @@ test "the summary lists tool calls and shortens long results" {
     const summary = try summarize(allocator, &messages, 8000);
     defer allocator.free(summary);
 
-    try std.testing.expect(std.mem.indexOf(u8, summary, "tool call: shell {\"command\":\"ls\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "tool call: shell {\"command\":\"cargo test\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "answer: Two files.") != null);
     // A follow-up carries what the user answered at a menu, which is what
     // stops the judge from asking for the same decision again.
     try std.testing.expect(std.mem.indexOf(u8, summary, "follow-up: [automatic self-check]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, @import("text.zig").repeat("x", max_result_bytes)) != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, @import("text.zig").repeat("x", (max_result_bytes + 1))) == null);
+    // The result keeps its first line and its last: how the run ended is the
+    // evidence the check rules on.
+    try std.testing.expect(std.mem.indexOf(u8, summary, "result: running tests...") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "test result: ok. 42 passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "result: ") != null);
+    // ...but no longer than the budget for one result.
+    const result_start = std.mem.indexOf(u8, summary, "result: ").? + "result: ".len;
+    const result_end = std.mem.indexOfPos(u8, summary, result_start, "\n").?;
+    try std.testing.expect(result_end - result_start <= max_result_bytes);
 }
 
 test "the summary keeps the end of a turn that is too long" {

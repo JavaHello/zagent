@@ -8,7 +8,8 @@ import tempfile
 import threading
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
-scenario = {'verdict': None, 'checks': 0, 'rounds': 0, 'judge_replies': []}
+scenario = {'verdict': None, 'checks': 0, 'rounds': 0, 'judge_replies': [],
+            'require': None, 'command': None}
 judge_prompts = []
 
 class API(http.server.BaseHTTPRequestHandler):
@@ -33,13 +34,30 @@ class API(http.server.BaseHTTPRequestHandler):
             # truncated response, or an HTTP error.
             if scenario['judge_replies']:
                 return self.reply(scenario['judge_replies'].pop(0))
+            # A check whose evidence is the tail of a tool result: it answers
+            # "complete" only when the summary it was given contains the line
+            # that proves the work is done.
+            if scenario['require'] is not None:
+                seen = scenario['require'] in body['input'][1]['content']
+                verdict = {'complete': seen,
+                           'reason': 'The test result is in the summary.' if seen
+                                     else 'The summary does not contain the test result.',
+                           'next_step': None if seen else 'Run the tests and show the result.'}
+                return self.reply({'status': 'completed', 'output': [
+                    {'type': 'message', 'role': 'assistant',
+                     'content': [{'type': 'output_text', 'text': json.dumps(verdict)}]}]})
             content = scenario['verdict']
             return self.reply({'status': 'completed', 'output': [
                 {'type': 'message', 'role': 'assistant',
                  'content': [{'type': 'output_text', 'text': content}]}]})
         answered = sum(m.get('type') == 'function_call_output' for m in body['input'])
         if answered < scenario['rounds'] or answered == 0:
-            command = 'printf task-evidence' if scenario['rounds'] == 0 else f'printf round-{answered}-' + 'x' * 400
+            if scenario['command'] is not None:
+                command = scenario['command']
+            elif scenario['rounds'] == 0:
+                command = 'printf task-evidence'
+            else:
+                command = f'printf round-{answered}-' + 'x' * 400
             return self.reply({'status': 'completed', 'output': [
                 {'type': 'function_call', 'call_id': f'probe-{answered}', 'name': 'shell',
                  'arguments': json.dumps({'command': command})}]})
@@ -105,8 +123,26 @@ try:
                                 capture_output=True, text=True, timeout=30)
         assert scenario['checks'] == 2, result.stderr
         assert result.returncode != 0 and 'CompletionUnverified' in result.stderr, result.stderr
+
+        # A finished task must pass the check on the evidence it produced. The
+        # proof here is the last line of a long test run, which the summary has
+        # to carry: keeping only the head of a result shows the setup and hides
+        # the verdict, so genuinely finished work is rejected.
+        scenario.update(verdict=None, checks=0, rounds=0, judge_replies=[],
+                        require='42 tests, 0 failures',
+                        # The proof is produced by the command, not spelled in
+                        # it, so an echoed command cannot stand in for a result.
+                        command="N=42; R=0; printf 'running the suite...\\n'; "
+                                "head -c 600 /dev/zero | tr '\\0' x; "
+                                "printf '\\n%s tests, %s failures\\n' \"$N\" \"$R\"")
+        result = subprocess.run([str(binary), 'Run the tests'], cwd=directory, env=env,
+                                capture_output=True, text=True, timeout=60)
+        assert scenario['checks'] == 1, result.stderr
+        assert '42 tests, 0 failures' in judge_prompts[-1], judge_prompts[-1]
+        assert result.returncode == 0, result.stderr
         print('PASS: accepted, rejected and invalid verdicts have correct exit status; '
               'a turn longer than the summary budget still shows its answer to the judge; '
-              'an unusable verdict is retried before the run is called unverified')
+              'an unusable verdict is retried before the run is called unverified; '
+              'a long tool result keeps the tail that proves the work is done')
 finally:
     server.shutdown()
