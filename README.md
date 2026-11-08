@@ -18,7 +18,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `grep` — search file contents, using `rg` where it is installed
   - `find` — find files by name, using `fd` where it is installed
   - `http_request` — fetch a URL or call an API, without shelling out to `curl`
-  - `ask_user` — put a question to you as a numbered list of options
+  - `ask_user` — put a question to you as an interactive selection menu
 - **MCP servers** — start servers described in `mcp.json` and give the tools they offer to the model beside the built-in ones
 - **Multi-turn tool chaining** — the agent loops until the task is complete
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
@@ -257,17 +257,20 @@ decision only you can make — the agent calls `ask_user` and you get a menu:
 
 ```
   Which approach should I use?
-    1) Rewrite in place  Keeps the history intact. (recommended)
+  > 1) Rewrite in place (recommended)  Keeps the history intact.
     2) New file  Leaves the original alone.
-  Enter takes option 1; type a number, or your own answer.
-choice ❯
+    3) Other / 自定义回答
+  ↑/↓ select · Enter confirm · Ctrl+C cancel
 ```
 
-Enter accepts the recommended option, a number picks another one, and anything
-else is passed to the agent as your own words. The judge can ask the same way:
+Use ↑/↓ (or j/k and Tab) to move, then Enter to confirm. The recommended option
+is selected initially, or the first option if none is recommended. Number keys
+1–9 also move the selection. Choose Other to type your own answer; Ctrl+C or
+Ctrl+D dismisses the menu. The judge can ask the same way:
 when it decides the work is blocked on a decision, it returns the options
 itself and you get the same menu. With no terminal to type at (piped input,
-single-query mode) the recommended option is taken and the agent says so.
+or an unsupported terminal) the recommended option is taken and the agent says
+so. Interactive menus also work in single-query mode and render on stderr.
 
 ### HTTP requests
 

@@ -463,14 +463,15 @@ pub const Agent = struct {
     /// to decide on its own.
     fn askChoice(self: *Agent, question: []const u8, options: []const menu.Option) !?[]u8 {
         self.terminal_title.update("waiting for input", self.current_task);
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-        try menu.writeMenu(&aw.writer, question, options);
-        try std.Io.File.stdout().writeStreamingAll(self.io, aw.written());
-
         const recommended = menu.recommendedIndex(options);
 
-        if (!self.linenoise.is_tty or !self.linenoise.term_supported) {
+        if (!self.linenoise.is_tty or !self.linenoise.term_supported or
+            !(std.Io.File.stderr().isTty(self.io) catch false))
+        {
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer aw.deinit();
+            try menu.writeMenu(&aw.writer, question, options);
+            try std.Io.File.stdout().writeStreamingAll(self.io, aw.written());
             // Nothing to read a choice from. Taking the recommendation keeps a
             // piped or single-query run moving instead of stalling it.
             if (recommended) |index| {
@@ -481,12 +482,10 @@ pub const Agent = struct {
             return null;
         }
 
-        const hint = if (recommended) |index|
-            try std.fmt.allocPrint(self.allocator, "  Enter takes option {d}; type a number, or your own answer.\n", .{index + 1})
-        else
-            try self.allocator.dupe(u8, "  Type the number of your choice.\n");
-        defer self.allocator.free(hint);
-        try printFmt(std.Io.File.stdout(), self.io, self.allocator, DIM ++ "{s}" ++ RESET, .{hint});
+        const selected = try menu.select(self.allocator, self.io, question, options) orelse return null;
+        if (selected < options.len) {
+            return try menu.describeAnswer(self.allocator, .{ .option = selected }, options);
+        }
 
         // A menu answer is free text, not a slash command, so completion and
         // hints are switched off for this read and restored afterwards.
@@ -511,7 +510,9 @@ pub const Agent = struct {
         };
         defer self.allocator.free(line);
 
-        return try menu.describeAnswer(self.allocator, menu.parseAnswer(line, options, recommended), options);
+        const answer = std.mem.trim(u8, line, " \t\r\n");
+        if (answer.len == 0) return null;
+        return try menu.describeAnswer(self.allocator, .{ .custom = answer }, options);
     }
 
     /// The ask_user tool: put the model's question to the user and hand the

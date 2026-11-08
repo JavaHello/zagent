@@ -1,4 +1,7 @@
 const std = @import("std");
+const term = @import("term.zig");
+const sanitize = @import("text.zig");
+const RawTerminal = @import("linenoise").RawTerminal;
 
 // ANSI colour codes
 const RESET = "\x1b[0m";
@@ -143,6 +146,120 @@ pub fn recommendedIndex(options: []const Option) ?usize {
     return null;
 }
 
+/// Keyboard state is independent of reads: a partial escape sequence never
+/// requires a blocking second read, and both CSI and application arrows work.
+const Selection = struct {
+    selected: usize,
+    count: usize,
+    escape: enum { none, start, sequence } = .none,
+
+    const Action = enum { redraw, accept, cancel, ignore };
+
+    fn key(self: *Selection, byte: u8) Action {
+        if (byte == 3 or byte == 4) return .cancel;
+        if (byte == '\r' or byte == '\n') return .accept;
+        if (byte == 0x1b) {
+            self.escape = .start;
+            return .ignore;
+        }
+        if (self.escape == .start and (byte == '[' or byte == 'O')) {
+            self.escape = .sequence;
+            return .ignore;
+        }
+        if (self.escape == .sequence) {
+            if (byte < 0x40 or byte > 0x7e) return .ignore;
+            self.escape = .none;
+            switch (byte) {
+                'A', 'Z' => self.selected = (self.selected + self.count - 1) % self.count,
+                'B' => self.selected = (self.selected + 1) % self.count,
+                'H' => self.selected = 0,
+                'F' => self.selected = self.count - 1,
+                else => return .ignore,
+            }
+            return .redraw;
+        }
+        self.escape = .none;
+        switch (byte) {
+            'k', 16 => self.selected = (self.selected + self.count - 1) % self.count,
+            'j', '\t', 14 => self.selected = (self.selected + 1) % self.count,
+            '1'...'9' => {
+                const index: usize = byte - '1';
+                if (index >= self.count) return .ignore;
+                self.selected = index;
+            },
+            else => return .ignore,
+        }
+        return .redraw;
+    }
+};
+
+/// Flatten and bound every row so wrapping or embedded controls cannot break
+/// cursor movement, including with Chinese labels and narrow terminals.
+fn writeRow(w: *std.Io.Writer, allocator: std.mem.Allocator, raw: []const u8, columns: usize) !void {
+    var clean: std.Io.Writer.Allocating = .init(allocator);
+    defer clean.deinit();
+    try sanitize.writeSanitized(&clean.writer, raw);
+    for (clean.written()) |*byte| {
+        if (byte.* == '\n' or byte.* == '\r' or byte.* == '\t') byte.* = ' ';
+    }
+    const bytes = clean.written();
+    const limit = @max(columns -| 1, 1);
+    const end = term.takeFit(bytes, limit);
+    try w.writeAll(bytes[0..end]);
+    try w.writeAll(RESET ++ "\x1b[K\r\n");
+}
+
+/// Returns options.len for the custom-answer row, or null on cancellation.
+/// Draw on stderr so redirected stdout receives no cursor control sequences.
+pub fn select(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !?usize {
+    const out = std.Io.File.stderr();
+    var raw = try RawTerminal.init(io, std.Io.File.stdin(), out);
+    defer raw.deinit();
+    try out.writeStreamingAll(io, "\x1b[?25l");
+    defer out.writeStreamingAll(io, RESET ++ "\x1b[?25h") catch {};
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("\r\n");
+    try writeRow(&aw.writer, allocator, question, term.columns(out));
+    try out.writeStreamingAll(io, aw.written());
+
+    var state = Selection{ .selected = recommendedIndex(options) orelse 0, .count = options.len + 1 };
+    const visible = @min(state.count, 5);
+    var drawn = false;
+    while (true) {
+        aw.clearRetainingCapacity();
+        if (drawn) try aw.writer.print("\x1b[{d}A\r", .{visible + 1});
+        const first = @min(state.selected -| (visible / 2), state.count - visible);
+        for (first..first + visible) |i| {
+            var row: std.Io.Writer.Allocating = .init(allocator);
+            defer row.deinit();
+            try row.writer.print("  {s} {d}) ", .{ if (i == state.selected) ">" else " ", i + 1 });
+            if (i < options.len) {
+                const option = options[i];
+                try row.writer.writeAll(option.label);
+                if (recommendedIndex(options) == i) try row.writer.writeAll(" (recommended)");
+                if (option.description.len > 0) try row.writer.print("  {s}", .{option.description});
+            } else try row.writer.writeAll("Other / 自定义回答");
+            if (i == state.selected) try aw.writer.writeAll("\x1b[1;36m");
+            try writeRow(&aw.writer, allocator, row.written(), term.columns(out));
+        }
+        try writeRow(&aw.writer, allocator, "  ↑/↓ select · Enter confirm · Ctrl+C cancel", term.columns(out));
+        try out.writeStreamingAll(io, aw.written());
+        drawn = true;
+
+        while (true) {
+            const byte = try raw.readByte() orelse return null;
+            switch (state.key(byte)) {
+                .accept => return state.selected,
+                .cancel => return null,
+                .redraw => break,
+                .ignore => {},
+            }
+        }
+    }
+}
+
 /// Write the numbered menu. Only the first option marked recommended is
 /// flagged, so a model that marks several cannot produce a contradictory list.
 pub fn writeMenu(w: *std.Io.Writer, question: []const u8, options: []const Option) !void {
@@ -217,6 +334,30 @@ const test_options = [_]Option{
     .{ .label = "Add tests", .description = "Covers the new branch.", .recommended = true },
     .{ .label = "Skip tests", .description = "", .recommended = false },
 };
+
+test "keyboard menu navigates arrows, wraps, and confirms explicitly" {
+    var state = Selection{ .selected = 0, .count = 3 };
+    for ("\x1b[A") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 2), state.selected);
+    for ("\x1bOB") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 0), state.selected);
+    try std.testing.expectEqual(Selection.Action.redraw, state.key('2'));
+    try std.testing.expectEqual(@as(usize, 1), state.selected);
+    try std.testing.expectEqual(Selection.Action.accept, state.key('\r'));
+    try std.testing.expectEqual(Selection.Action.cancel, state.key(3));
+    try std.testing.expectEqual(Selection.Action.cancel, state.key(4));
+    for ("\x1b[1;5B") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 2), state.selected);
+    _ = state.key('\t');
+    try std.testing.expectEqual(@as(usize, 0), state.selected);
+}
+
+test "menu rows fit CJK text and flatten model control characters" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeRow(&aw.writer, std.testing.allocator, "你\n好\x1b[2J世界", 7);
+    try std.testing.expectEqualStrings("你 好" ++ RESET ++ "\x1b[K\r\n", aw.written());
+}
 
 test "parse ask_user arguments" {
     const allocator = std.testing.allocator;

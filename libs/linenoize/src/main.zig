@@ -15,6 +15,27 @@ const getColumns = term.getColumns;
 pub const HintsCallback = *const fn (Allocator, []const u8) Allocator.Error!?[]const u8;
 pub const CompletionsCallback = *const fn (Allocator, []const u8) Allocator.Error![]const []const u8;
 
+/// A scoped raw terminal for widgets that do not edit a line.
+pub const RawTerminal = struct {
+    io: Io,
+    input: File,
+    output: File,
+    original: @typeInfo(@typeInfo(@TypeOf(enableRawMode)).@"fn".return_type.?).error_union.payload,
+
+    pub fn init(io: Io, input: File, output: File) !RawTerminal {
+        return .{ .io = io, .input = input, .output = output, .original = try enableRawMode(input, output) };
+    }
+
+    pub fn deinit(self: RawTerminal) void {
+        disableRawMode(self.input, self.output, self.original);
+    }
+
+    pub fn readByte(self: RawTerminal) !?u8 {
+        var byte: [1]u8 = undefined;
+        return if (try term.read(self.io, self.input, &byte) == 0) null else byte[0];
+    }
+};
+
 const key_null = 0;
 const key_ctrl_a = 1;
 const key_ctrl_b = 2;

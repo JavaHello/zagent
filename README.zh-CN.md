@@ -59,6 +59,8 @@ zagent '继续完成，检查已有文件和测试结果'
 
 交互模式支持 `/help`、`/model`、`/mcp`、`/clear`、`/quit`。`/clear` 同时清空持久化会话。单次查询模式将回答直接写入标准输出，可用于重定向生成文档。
 
+需要你选择方案时，`ask_user` 和完成检查会显示交互菜单：用 ↑/↓、j/k 或 Tab 切换，回车确认，也可按数字键 1–9 定位。默认选中推荐项，没有推荐项则选中第一项；选择“自定义回答”可输入文字，Ctrl+C 或 Ctrl+D 取消。菜单显示在 stderr，单次查询模式也可使用。没有可用终端时自动采用推荐项，没有推荐项则交回模型处理。
+
 达到工具迭代上限或模型输出被截断时返回错误。临时网络错误及 HTTP 408/429/500/502/503/504 最多尝试三次。默认有独立的完成检查；预算耗尽、检查失败或结果无法解析时返回 `CompletionUnverified`。报告阻塞不等于任务完成。它是模型检查，交付前仍应运行实际测试。
 
 ## 验证
@@ -69,6 +71,7 @@ zig build test
 python3 tests/sandbox_integration.py
 python3 tests/completion_integration.py
 python3 tests/responses_failure_integration.py
+python3 tests/menu_integration.py
 ```
 
 端到端测试通过本地模拟 API 驱动真实 zagent，覆盖文件编辑、补丁、搜索、工作目录隔离、符号链接逃逸、环境变量隔离、网络隔离、服务错误重试、会话恢复、执行上限退出状态和运行期间替换二进制。
