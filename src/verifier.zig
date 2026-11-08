@@ -140,27 +140,63 @@ fn extractJsonObject(text: []const u8) ?[]const u8 {
 /// passed separately; the user messages that appear here are the automatic
 /// self-check follow-ups and the answers the user gave to a menu, which the
 /// judge needs in order to stop asking for a decision already made.
+///
+/// A turn too long for `max_bytes` keeps its newest messages. The evidence
+/// that the request was carried out is at the end of the turn — the answer, or
+/// the failure that stopped it — so dropping the tail instead would show the
+/// judge the opening tool calls and hide the outcome, and it would keep
+/// answering "not done" about work that is finished.
 pub fn summarize(allocator: std.mem.Allocator, messages: []const openai.Message, max_bytes: usize) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-
-    var truncated = false;
+    // Rendered first, so that the lines that do not fit can be chosen from the
+    // end rather than as they are produced.
+    var lines: std.ArrayList([]u8) = .empty;
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
     for (messages) |message| {
         var line: std.Io.Writer.Allocating = .init(allocator);
         defer line.deinit();
         if (!try writeLine(&line.writer, message)) continue;
-
-        if (out.written().len + line.written().len > max_bytes) {
-            truncated = true;
-            break;
-        }
-        try out.writer.writeAll(line.written());
+        try lines.append(allocator, try line.toOwnedSlice());
     }
 
-    if (truncated) try out.writer.writeAll("... (earlier work omitted)\n");
+    var total: usize = 0;
+    for (lines.items) |line| total += line.len;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    if (total <= max_bytes) {
+        for (lines.items) |line| try out.writer.writeAll(line);
+        return out.toOwnedSlice();
+    }
+
+    // The marker is part of the budget, so the summary never grows past it.
+    const kept_budget = if (max_bytes > omission_marker.len) max_bytes - omission_marker.len else 0;
+    var first_kept = lines.items.len;
+    var kept: usize = 0;
+    while (first_kept > 0) {
+        const line = lines.items[first_kept - 1];
+        if (kept + line.len > kept_budget) break;
+        kept += line.len;
+        first_kept -= 1;
+    }
+
+    try out.writer.writeAll(omission_marker[0..@min(omission_marker.len, max_bytes)]);
+    if (first_kept == lines.items.len and lines.items.len > 0) {
+        // Not even the newest line fits whole. Show as much of it as the
+        // budget allows, so its outcome is still what the judge reads.
+        try out.writer.writeAll(truncateUtf8(lines.items[lines.items.len - 1], kept_budget));
+    } else {
+        for (lines.items[first_kept..]) |line| try out.writer.writeAll(line);
+    }
 
     return out.toOwnedSlice();
 }
+
+/// Stands in for the earliest part of a turn too long for the judge's budget.
+const omission_marker = "... (earlier work omitted)\n";
 
 fn writeLine(w: *std.Io.Writer, message: openai.Message) !bool {
     var wrote = false;
@@ -338,7 +374,7 @@ test "the summary lists tool calls and shortens long results" {
     try std.testing.expect(std.mem.indexOf(u8, summary, @import("text.zig").repeat("x", (max_result_bytes + 1))) == null);
 }
 
-test "the summary stops at its size limit" {
+test "the summary keeps the end of a turn that is too long" {
     const allocator = std.testing.allocator;
     const messages = [_]openai.Message{
         .{ .role = "assistant", .content = @import("text.zig").repeat("a", 200), .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
@@ -348,8 +384,25 @@ test "the summary stops at its size limit" {
     const summary = try summarize(allocator, &messages, 250);
     defer allocator.free(summary);
 
-    try std.testing.expect(std.mem.indexOf(u8, summary, "... (earlier work omitted)") != null);
-    try std.testing.expect(summary.len < 400);
+    // The newest answer is the evidence the judge rules on; the opening of the
+    // turn is what may be dropped. The marker says so and comes first.
+    try std.testing.expect(std.mem.startsWith(u8, summary, "... (earlier work omitted)\n"));
+    try std.testing.expect(std.mem.indexOf(u8, summary, @import("text.zig").repeat("b", 200)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, @import("text.zig").repeat("a", 200)) == null);
+    try std.testing.expect(summary.len <= 250);
+}
+
+test "an answer longer than the whole budget is still shown, truncated" {
+    const allocator = std.testing.allocator;
+    const messages = [_]openai.Message{
+        .{ .role = "assistant", .content = @import("text.zig").repeat("z", 400), .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+
+    const summary = try summarize(allocator, &messages, 100);
+    defer allocator.free(summary);
+
+    try std.testing.expect(summary.len <= 100);
+    try std.testing.expect(std.mem.startsWith(u8, summary, "... (earlier work omitted)\nanswer: zzz"));
 }
 
 test "truncating never splits a utf8 character" {

@@ -246,7 +246,9 @@ returns `CompletionUnverified`.
 Two things worth knowing:
 
 - The check costs one extra request per tool-using turn, and it re-sends a
-  summary of that turn rather than the whole history.
+  summary of that turn rather than the whole history. A turn too long for that
+  summary keeps its most recent work — the answer, or the failure that stopped
+  it — and omits the beginning, so the judge always sees how the turn ended.
 - If the judge request fails or its reply cannot be read, the candidate answer
   remains visible, but the process returns `CompletionUnverified`.
 
