@@ -17,6 +17,74 @@ pub const min_columns: usize = 24;
 /// Tab stops, for callers that expand tabs into spaces.
 pub const tab_width: usize = 4;
 
+/// Title updates use stderr so stdout remains suitable for pipes and files.
+/// Save/restore uses the xterm title stack without reading terminal input.
+pub const Title = struct {
+    io: std.Io,
+    enabled: bool,
+
+    pub fn init(io: std.Io, supported: bool) Title {
+        const self: Title = .{
+            .io = io,
+            .enabled = supported and (std.Io.File.stderr().isTty(io) catch false),
+        };
+        if (self.enabled) std.Io.File.stderr().writeStreamingAll(io, "\x1b[22;2t") catch {};
+        self.update("ready", "");
+        return self;
+    }
+
+    pub fn deinit(self: Title) void {
+        if (self.enabled) std.Io.File.stderr().writeStreamingAll(self.io, "\x1b[23;2t") catch {};
+    }
+
+    pub fn update(self: Title, activity: []const u8, task: []const u8) void {
+        if (!self.enabled) return;
+        var buf: [768]u8 = undefined;
+        const sequence = formatTitle(&buf, activity, task) catch return;
+        std.Io.File.stderr().writeStreamingAll(self.io, sequence) catch {};
+    }
+};
+
+fn formatTitle(buf: []u8, activity: []const u8, task: []const u8) ![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try w.writeAll("\x1b]2;zagent · ");
+    try writeTitleText(&w, activity, 48);
+    if (task.len > 0) {
+        try w.writeAll(" · ");
+        try writeTitleText(&w, task, 96);
+    }
+    try w.writeByte(0x07);
+    return w.buffered();
+}
+
+/// Keep valid Unicode, flatten whitespace, and remove terminal controls.
+fn writeTitleText(w: *std.Io.Writer, bytes: []const u8, limit: usize) !void {
+    var i: usize = 0;
+    var count: usize = 0;
+    while (i < bytes.len) {
+        if (count == limit) {
+            try w.writeAll("…");
+            return;
+        }
+        if (bytes[i] == 0x1b) {
+            i = text.skipAnsiEscape(bytes, i);
+            continue;
+        }
+        const cp = decodeAt(bytes, i);
+        const start = i;
+        i += cp.len;
+        if (!cp.valid) continue;
+        if (cp.value == '\n' or cp.value == '\r' or cp.value == '\t') {
+            try w.writeByte(' ');
+        } else if (cp.value < 0x20 or (cp.value >= 0x7f and cp.value <= 0x9f)) {
+            continue;
+        } else {
+            try w.writeAll(bytes[start..i]);
+        }
+        count += 1;
+    }
+}
+
 /// A codepoint decoded from a byte slice, along with how many bytes it took.
 /// An invalid sequence yields the offending byte with `valid == false`, so
 /// callers can keep making progress through malformed input.
@@ -138,6 +206,26 @@ pub fn columns(file: std.Io.File) usize {
 
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
+
+test "title keeps Unicode and removes escape sequences and control characters" {
+    var buf: [768]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "\x1b]2;zagent · read_file · 查看 文件 路径\x07",
+        try formatTitle(&buf, "read_file", "\x1b[31m查看\x1b[0m\n文件\t路径\x07\xc2\x9c\xff\x1b]2;injected\x07"),
+    );
+}
+
+test "title bounds long tasks at Unicode boundaries" {
+    var buf: [768]u8 = undefined;
+    var task: [300]u8 = undefined;
+    for (0..100) |i| @memcpy(task[i * 3 ..][0..3], "你");
+    const title = try formatTitle(&buf, "thinking…", &task);
+    const prefix = "\x1b]2;zagent · thinking… · ";
+    try expect(std.mem.startsWith(u8, title, prefix));
+    try std.testing.expectEqualStrings(task[0 .. 96 * 3], title[prefix.len .. prefix.len + 96 * 3]);
+    try std.testing.expectEqualStrings("…\x07", title[prefix.len + 96 * 3 ..]);
+    try expect(std.unicode.utf8ValidateSlice(title));
+}
 
 test "width counts cells, not bytes" {
     try expectEqual(0, width(""));

@@ -101,6 +101,8 @@ pub const Agent = struct {
     /// and neither is one where stdout is a file or a pager: the animation
     /// takes a line of the terminal, and it must be the only writer to it.
     animate_progress: bool,
+    terminal_title: term.Title,
+    current_task: []const u8 = "",
     /// The MCP servers and the tools they brought. Borrowed rather than owned:
     /// whoever started the agent outlives it, and the agent only reads this and
     /// calls through it.
@@ -160,10 +162,12 @@ pub const Agent = struct {
                 (std.Io.File.stdout().isTty(io) catch false) and
                 (std.Io.File.stderr().isTty(io) catch false),
             .mcp_registry = mcp_registry,
+            .terminal_title = term.Title.init(io, linenoise.term_supported),
         };
     }
 
     pub fn deinit(self: *Agent) void {
+        self.terminal_title.deinit();
         for (self.history.items) |msg| msg.deinit(self.allocator);
         self.history.deinit(self.allocator);
         self.client.deinit();
@@ -184,6 +188,17 @@ pub const Agent = struct {
     /// Process a single user query: work on it until the model answers and the
     /// completion check agrees that the request is done.
     pub fn processQuery(self: *Agent, query: []const u8) !void {
+        self.current_task = query;
+        defer self.current_task = "";
+        self.terminal_title.update("thinking…", query);
+        self.processQueryInner(query) catch |err| {
+            self.terminal_title.update("error", query);
+            return err;
+        };
+        self.terminal_title.update("ready", query);
+    }
+
+    fn processQueryInner(self: *Agent, query: []const u8) !void {
         try self.appendUserMessage(query);
         try self.checkpoint();
         // The judge is shown only what this turn produced, so remember where
@@ -248,6 +263,7 @@ pub const Agent = struct {
     /// results are printed, and the next frame of the animation would erase
     /// what was just printed. Here it ends before the caller writes a byte.
     fn chatAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
+        self.terminal_title.update("thinking…", self.current_task);
         var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "thinking…", .{
             .enabled = self.animate_progress,
         });
@@ -263,6 +279,7 @@ pub const Agent = struct {
     /// animate, the plain line it replaces is printed instead, so a redirected
     /// run still records that the check happened.
     fn judgeAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
+        self.terminal_title.update("checking completion…", self.current_task);
         var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking completion…", .{
             .enabled = self.animate_progress,
         });
@@ -442,6 +459,7 @@ pub const Agent = struct {
     /// chose. Returns null when the question was dismissed and the model has
     /// to decide on its own.
     fn askChoice(self: *Agent, question: []const u8, options: []const menu.Option) !?[]u8 {
+        self.terminal_title.update("waiting for input", self.current_task);
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         try menu.writeMenu(&aw.writer, question, options);
@@ -571,6 +589,7 @@ pub const Agent = struct {
     }
 
     fn executeTool(self: *Agent, call: ToolCallData) !tools.ToolResult {
+        self.terminal_title.update(call.name, self.current_task);
         try self.announceToolCall(call);
 
         const result: tools.ToolResult = blk: {

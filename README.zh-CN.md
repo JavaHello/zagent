@@ -17,6 +17,8 @@ cd /path/to/project
 
 只导出 `DEEPSEEK_API_KEY` 即可自动选择 DeepSeek；同时存在多个服务商的 key 时，可以显式设置 `AI_PROVIDER=deepseek`。
 
+终端标题会显示当前任务摘要及执行状态（思考、工具调用、完成检查或等待输入）。任务结束后显示就绪，出错时显示错误；正常退出时恢复原标题（需终端支持标题栈）。stderr 重定向时不发送标题控制序列。
+
 ```sh
 AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，修复问题并运行测试'
 /path/to/zagent/zig-out/bin/zagent '整理当前目录中的会议记录，生成行动项文档'
