@@ -323,7 +323,10 @@ pub const Agent = struct {
             };
             defer response.deinit(self.allocator);
 
-            if (std.mem.eql(u8, response.finish_reason, "length")) return error.ResponseTruncated;
+            if (std.mem.eql(u8, response.finish_reason, "length")) {
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: model output still exceeds the token budget after automatic retries; increase AI_MAX_TOKENS or split the task into smaller steps.\n" ++ RESET, .{});
+                return error.ResponseTruncated;
+            }
             if (std.mem.eql(u8, response.finish_reason, "tool_calls")) {
                 const tool_calls = response.tool_calls orelse {
                     try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});

@@ -137,23 +137,34 @@ pub const Client = struct {
         tools: Tools,
         extra_tools: []const []const u8,
     ) !ApiResponse {
-        const req_json = try buildRequestWithTools(
-            self.allocator,
-            self.model,
-            messages,
-            self.max_tokens,
-            tools,
-            extra_tools,
-        );
-        defer self.allocator.free(req_json);
-
         const response_url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{std.mem.trimEnd(u8, self.base_url, "/")});
         defer self.allocator.free(response_url);
 
         const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
         defer self.allocator.free(auth_header);
 
-        return self.performResponseWithRetry(response_url, auth_header, req_json);
+        var max_tokens = self.max_tokens;
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            const req_json = try buildRequestWithTools(
+                self.allocator,
+                self.model,
+                messages,
+                max_tokens,
+                tools,
+                extra_tools,
+            );
+            defer self.allocator.free(req_json);
+
+            const response = try self.performResponseWithRetry(response_url, auth_header, req_json);
+            if (!std.mem.eql(u8, response.finish_reason, "length")) return response;
+            // Discard partial output and retry the same input, so completed
+            // tools are not repeated and incomplete calls are never dispatched.
+            // Bound both the extra requests and their token budget.
+            if (attempt >= 3 or max_tokens >= 131072) return response;
+            response.deinit(self.allocator);
+            max_tokens = @min(@as(u32, 131072), @max(@as(u32, 1), max_tokens *| 2));
+        }
     }
 
     fn performResponseWithRetry(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8) !ApiResponse {
@@ -356,12 +367,18 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     if (root != .object) return error.InvalidResponse;
     if (root.object.get("error")) |api_error| if (api_error != .null) return error.ApiError;
     const status = try stringField(root, "status");
-    if (std.mem.eql(u8, status, "incomplete")) return .{
-        .content = null,
-        .reasoning_content = null,
-        .tool_calls = null,
-        .finish_reason = try allocator.dupe(u8, "length"),
-    };
+    if (std.mem.eql(u8, status, "incomplete")) {
+        const details = root.object.get("incomplete_details") orelse return error.ResponseNotCompleted;
+        if (details != .object) return error.ResponseNotCompleted;
+        const reason = try stringField(details, "reason");
+        if (!std.mem.eql(u8, reason, "max_output_tokens")) return error.ResponseNotCompleted;
+        return .{
+            .content = null,
+            .reasoning_content = null,
+            .tool_calls = null,
+            .finish_reason = try allocator.dupe(u8, "length"),
+        };
+    }
     if (!std.mem.eql(u8, status, "completed")) return error.ResponseNotCompleted;
     const output = root.object.get("output") orelse return error.InvalidResponse;
     if (output != .array) return error.InvalidResponse;
@@ -557,10 +574,12 @@ test "Responses parsing keeps call_id separate from item IDs and replays all out
 
 test "Responses refuses nonterminal, malformed and ambiguous outputs" {
     const a = std.testing.allocator;
-    const incomplete = try parseResponse(a, "{\"status\":\"incomplete\",\"output\":[{\"type\":\"function_call\"}]}");
+    const incomplete = try parseResponse(a, "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"function_call\"}]}");
     defer incomplete.deinit(a);
     try std.testing.expectEqualStrings("length", incomplete.finish_reason);
     try std.testing.expect(incomplete.tool_calls == null);
+    try std.testing.expectError(error.ResponseNotCompleted, parseResponse(a, "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"output\":[]}"));
+    try std.testing.expectError(error.ResponseNotCompleted, parseResponse(a, "{\"status\":\"incomplete\",\"output\":[]}"));
     try std.testing.expectError(error.ApiError, parseResponse(a, "{\"status\":\"failed\",\"error\":{\"message\":\"failure\"}}"));
     try std.testing.expectError(error.ResponseNotCompleted, parseResponse(a, "{\"status\":\"in_progress\",\"output\":[]}"));
     try std.testing.expectError(error.EmptyResponse, parseResponse(a, "{\"status\":\"completed\",\"output\":[]}"));
