@@ -43,7 +43,7 @@ const HELP =
 
 // Prompt passed to linenoise. Colour codes are fine here because
 // linenoize's width() implementation correctly ignores ANSI SGR sequences.
-const PROMPT = BOLD ++ GREEN ++ "you" ++ RESET ++ " \xe2\x9d\xaf ";
+const PROMPT = BOLD ++ GREEN ++ "\xe2\x9d\xaf " ++ RESET;
 
 /// Process arguments are borrowed from the OS (or from an iterator's internal
 /// buffer), so copy the ones we keep around for the lifetime of `main`.
@@ -231,6 +231,8 @@ fn runRepl(
 ) !void {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
+
+    agent.progress_prompt = if (ln.is_tty) PROMPT else null;
 
     try stdout.writeStreamingAll(io, MAGENTA ++ BOLD ++ BANNER ++ RESET);
     {

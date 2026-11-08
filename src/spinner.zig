@@ -2,8 +2,8 @@
 //!
 //! The request that answers a question can take seconds, and a tool can take
 //! minutes. With nothing moving, the terminal looks frozen, and the user cannot
-//! tell work in progress from a hang. This owns one line of the terminal for
-//! the length of that wait and gives it back erased.
+//! tell work in progress from a hang. This owns a status line and optionally
+//! an input prompt for the length of that wait and gives them back erased.
 //!
 //! The animation runs on its own task because the waiting thread is inside a
 //! blocking request. `io.concurrent` is the primitive, not `io.async`: with the
@@ -34,6 +34,10 @@ const erase = "\r\x1b[2K";
 const indent_width = 4;
 
 pub const Options = struct {
+    /// Share the query's clock across model requests and tool calls.
+    started: ?std.Io.Timestamp = null,
+    /// Keep an empty input prompt below the status while work is running.
+    prompt: ?[]const u8 = null,
     /// Whether the caller's terminal can carry an animated line. The caller
     /// decides, because only it knows whether something else — a pager, a
     /// redirected stdout — is using the terminal too.
@@ -104,14 +108,17 @@ fn animate(
     started: std.Io.Timestamp,
 ) void {
     // Runs on cancelation too: this is what gives the line back.
-    defer file.writeStreamingAll(io, erase) catch {};
+    defer file.writeStreamingAll(io, if (options.prompt != null)
+        erase ++ "\n" ++ erase ++ "\x1b[1A\r"
+    else
+        erase) catch {};
 
     io.sleep(.fromMilliseconds(options.first_frame_delay_ms), .awake) catch return;
 
     var index: usize = 0;
     while (true) : (index += 1) {
-        const elapsed_ms = started.untilNow(io, .awake).toMilliseconds();
-        if (elapsed_ms >= options.max_duration_ms) return;
+        const elapsed_ms = (options.started orelse started).untilNow(io, .awake).toMilliseconds();
+        if (started.untilNow(io, .awake).toMilliseconds() >= options.max_duration_ms) return;
 
         // Measured every frame, not once: a terminal can be resized while the
         // user waits, and a frame too wide for it wraps, half of it surviving
@@ -127,13 +134,18 @@ fn animate(
             budget,
         ) catch return;
         // Either of these can observe the cancelation; both end the loop.
-        file.writeStreamingAll(io, line) catch return;
+        var display_buf: [512]u8 = undefined;
+        const display = if (options.prompt) |prompt|
+            std.fmt.bufPrint(&display_buf, "{s}\n" ++ erase ++ "{s}\x1b[1A\r", .{ line, prompt }) catch return
+        else
+            line;
+        file.writeStreamingAll(io, display) catch return;
         io.sleep(.fromMilliseconds(options.frame_interval_ms), .awake) catch return;
     }
 }
 
 /// The bytes of one frame: the line cleared, the frame, the label, and how long
-/// the wait has been once that is worth saying.
+/// the query has been running.
 ///
 /// The label is shortened to fit `budget`, so the line never wraps. A wrapped
 /// line would be half erased by the next frame, leaving the rest of it on
@@ -146,9 +158,7 @@ fn formatLine(
     budget: usize,
 ) ![]const u8 {
     var tail_buf: [32]u8 = undefined;
-    // Below a second there is no number to read yet, and a "0s" that keeps
-    // being redrawn is noise.
-    const tail = if (seconds >= 1) try std.fmt.bufPrint(&tail_buf, " {d}s", .{seconds}) else "";
+    const tail = try std.fmt.bufPrint(&tail_buf, " {d}s", .{seconds});
 
     const taken = indent_width + term.width(tail);
     const room = if (budget > taken) budget - taken else 1;
@@ -163,7 +173,7 @@ const expectEqualStrings = std.testing.expectEqualStrings;
 test "a frame clears its line and names what is being waited for" {
     var buf: [256]u8 = undefined;
     try expectEqualStrings(
-        "\r\x1b[2K\x1b[2m  ⠋ thinking…\x1b[0m",
+        "\r\x1b[2K\x1b[2m  ⠋ thinking… 0s\x1b[0m",
         try formatLine(&buf, "⠋", "thinking…", 0, 80),
     );
     try expectEqualStrings(
@@ -232,4 +242,28 @@ test "the animation draws frames and gives the line back" {
     try expect(std.mem.indexOf(u8, written, "⠙") != null);
     // ...and the last thing written is the erasure that gives the line back.
     try expect(std.mem.endsWith(u8, written, "\r\x1b[2K"));
+}
+
+test "work status stays above the input prompt and clears both rows on stop" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "probe", .{});
+    defer file.close(io);
+
+    var spin = Spinner.start(io, file, "thinking…", .{
+        .enabled = true,
+        .prompt = "❯ ",
+        .first_frame_delay_ms = 0,
+        .frame_interval_ms = 1,
+    });
+    defer spin.stop();
+    try io.sleep(.fromMilliseconds(60), .awake);
+    spin.stop();
+
+    const written = try tmp.dir.readFileAlloc(io, "probe", std.testing.allocator, .limited(1 << 16));
+    defer std.testing.allocator.free(written);
+    try expect(std.mem.indexOf(u8, written, "thinking… 0s") != null);
+    try expect(std.mem.indexOf(u8, written, "\n" ++ erase ++ "❯ \x1b[1A\r") != null);
+    try expect(std.mem.endsWith(u8, written, erase ++ "\n" ++ erase ++ "\x1b[1A\r"));
 }

@@ -103,6 +103,8 @@ pub const Agent = struct {
     animate_progress: bool,
     terminal_title: term.Title,
     current_task: []const u8 = "",
+    query_started: ?std.Io.Timestamp = null,
+    progress_prompt: ?[]const u8 = null,
     /// The MCP servers and the tools they brought. Borrowed rather than owned:
     /// whoever started the agent outlives it, and the agent only reads this and
     /// calls through it.
@@ -188,6 +190,8 @@ pub const Agent = struct {
     /// Process a single user query: work on it until the model answers and the
     /// completion check agrees that the request is done.
     pub fn processQuery(self: *Agent, query: []const u8) !void {
+        self.query_started = std.Io.Timestamp.now(self.io, .awake);
+        defer self.query_started = null;
         self.current_task = query;
         defer self.current_task = "";
         self.terminal_title.update("thinking…", query);
@@ -196,6 +200,19 @@ pub const Agent = struct {
             return err;
         };
         self.terminal_title.update("ready", query);
+        const elapsed_ms = self.query_started.?.untilNow(self.io, .awake).toMilliseconds();
+        try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  Worked for {d}.{d}s\n" ++ RESET, .{
+            @divTrunc(elapsed_ms, 1000), @divTrunc(@mod(elapsed_ms, 1000), 100),
+        });
+    }
+
+    fn progressOptions(self: *Agent) spinner.Options {
+        return .{
+            .enabled = self.animate_progress,
+            .started = self.query_started,
+            .prompt = self.progress_prompt,
+            .first_frame_delay_ms = 0,
+        };
     }
 
     fn processQueryInner(self: *Agent, query: []const u8) !void {
@@ -264,9 +281,7 @@ pub const Agent = struct {
     /// what was just printed. Here it ends before the caller writes a byte.
     fn chatAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
         self.terminal_title.update("thinking…", self.current_task);
-        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "thinking…", .{
-            .enabled = self.animate_progress,
-        });
+        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "thinking…", self.progressOptions());
         defer spin.stop();
         return self.client.respond(messages, self.mcp_registry.functionJson()) catch |err| {
             spin.stop();
@@ -280,9 +295,7 @@ pub const Agent = struct {
     /// run still records that the check happened.
     fn judgeAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
         self.terminal_title.update("checking completion…", self.current_task);
-        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking completion…", .{
-            .enabled = self.animate_progress,
-        });
+        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking completion…", self.progressOptions());
         if (!spin.animating()) {
             try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ checking completion…\n" ++ RESET, .{});
         }
@@ -609,7 +622,7 @@ pub const Agent = struct {
             // this process's own string rather than one a server wrote.
             const label = tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
             var spin = if (label) |caption|
-                spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, .{ .enabled = self.animate_progress })
+                spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, self.progressOptions())
             else
                 spinner.Spinner.disabled(self.io);
             defer spin.stop();
