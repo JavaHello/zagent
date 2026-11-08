@@ -249,8 +249,11 @@ Two things worth knowing:
   summary of that turn rather than the whole history. A turn too long for that
   summary keeps its most recent work — the answer, or the failure that stopped
   it — and omits the beginning, so the judge always sees how the turn ended.
-- If the judge request fails or its reply cannot be read, the candidate answer
-  remains visible, but the process returns `CompletionUnverified`.
+- If the judge request fails or its reply cannot be read, the check is asked
+  again while the budget lasts, because such a reply says nothing about the
+  work; every attempt spends a check. When no usable verdict can be read, the
+  candidate answer remains visible, but the process returns
+  `CompletionUnverified`.
 
 ### Choices
 

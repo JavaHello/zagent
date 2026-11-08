@@ -239,11 +239,25 @@ pub const Agent = struct {
                 try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ completion check budget ({d}) spent; task remains unverified\n" ++ RESET, .{self.max_verifications});
                 return error.CompletionUnverified;
             }
-            verifications += 1;
 
-            // The check announces itself from inside `judgeAnimated`, where it
-            // can be animated for as long as the judge is thinking.
-            const verdict = (try self.judgeTurn(turn_start)) orelse return error.CompletionUnverified;
+            // A check that fails to produce a verdict — the request errored,
+            // the reply was truncated, or it was not JSON — says nothing about
+            // the work, so it is asked again while budget remains. The answer
+            // is already printed and the turn is over; throwing it away over
+            // one unusable reply is the worst of both outcomes. Each attempt
+            // spends a check, so a judge that can never be read is still
+            // bounded.
+            var judged: ?verifier.Verdict = null;
+            while (judged == null and verifications < self.max_verifications) {
+                verifications += 1;
+                // The check announces itself from inside `judgeAnimated`, where
+                // it can be animated for as long as the judge is thinking.
+                judged = try self.judgeTurn(turn_start);
+            }
+            const verdict = judged orelse {
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ✗ no usable completion verdict in {d} checks; the answer above stands unverified\n" ++ RESET, .{verifications});
+                return error.CompletionUnverified;
+            };
             defer verdict.deinit(self.allocator);
 
             if (verdict.complete) {
