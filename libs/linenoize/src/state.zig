@@ -124,9 +124,10 @@ pub const LinenoiseState = struct {
     buf: ArrayList(u8) = .empty,
     prompt: []const u8,
     pos: usize = 0,
-    old_pos: usize = 0,
+    cursor_row: usize = 0,
     cols: usize,
     max_rows: usize = 0,
+    viewport_start: usize = 0,
     popup_items: []@import("main.zig").PopupItem = &.{},
     popup_selected: usize = 0,
     popup_rows: usize = 0,
@@ -141,7 +142,7 @@ pub const LinenoiseState = struct {
             .stdin = in,
             .stdout = out,
             .prompt = prompt,
-            .cols = getColumns(ln.io, in, out) catch 80,
+            .cols = @max(getColumns(ln.io, in, out) catch 80, 4),
         };
     }
 
@@ -411,104 +412,108 @@ pub const LinenoiseState = struct {
         try writer.flush();
     }
 
+    fn usesMultiLine(self: *Self) bool {
+        return self.ln.multiline_mode and (self.max_rows > 0 or
+            std.mem.indexOfScalar(u8, self.buf.items, '\n') != null or
+            width(self.prompt) + width(self.buf.items) >= self.cols -| 1);
+    }
+
+    const Position = struct {
+        row: usize = 0,
+        col: usize = 0,
+
+        fn advance(self: *Position, cells: usize, columns: usize) bool {
+            if (self.col + cells > columns) {
+                self.row += 1;
+                self.col = 0;
+                self.col += cells;
+                return true;
+            }
+            self.col += cells;
+            return false;
+        }
+    };
+
+    /// Explicit CRLF and wrapping share the same layout used for the cursor.
+    fn writeInput(writer: *std.Io.Writer, bytes: []const u8, position: *Position, columns: usize, masked: bool) !void {
+        var iter = (try std.unicode.Utf8View.init(bytes)).iterator();
+        while (iter.nextCodepointSlice()) |cp| {
+            if (cp.len == 1 and cp[0] == '\n') {
+                try writer.writeAll("\r\n");
+                position.row += 1;
+                position.col = 0;
+            } else {
+                const cells = if (masked) 1 else width(cp);
+                if (position.advance(cells, columns)) try writer.writeAll("\r\n");
+                try writer.writeAll(if (masked) "*" else cp);
+            }
+        }
+    }
+
+    pub fn finishEdit(self: *Self) !void {
+        try self.clearPopup();
+        if (self.max_rows > self.cursor_row + 1) {
+            var buf: [64]u8 = undefined;
+            const move = try std.fmt.bufPrint(&buf, "\x1b[{d}B", .{self.max_rows - self.cursor_row - 1});
+            try self.stdout.writeStreamingAll(self.ln.io, move);
+        }
+    }
+
     fn refreshMultiLine(self: *Self) !void {
-        // File.writer() needs an explicit buffer and hands back a File.Writer;
-        // the Io.Writer API lives on its `interface` field.
-        var write_buf: [4096]u8 = undefined;
-        var file_writer = self.stdout.writer(self.ln.io, &write_buf);
-        const writer = &file_writer.interface;
-
-        const hint = try self.getHint();
-        defer if (hint) |str| self.allocator.free(str);
-
-        // Calculate widths
-        const pos = width(self.buf.items[0..self.pos]);
-        const prompt_width = width(self.prompt);
-        const hint_width = if (hint) |str| width(str) else 0;
-        const buf_width = width(self.buf.items);
-        const total_width = prompt_width + buf_width + hint_width;
-
-        var rows = (total_width + self.cols - 1) / self.cols;
-        const old_rpos = (prompt_width + self.old_pos + self.cols) / self.cols;
-        const old_max_rows = self.max_rows;
-
-        if (rows > self.max_rows) {
-            self.max_rows = rows;
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const writer = &aw.writer;
+        if (self.cursor_row > 0) try writer.print("\x1b[{d}A", .{self.cursor_row});
+        try writer.writeAll("\r");
+        for (0..self.max_rows) |row| {
+            try writer.writeAll("\x1b[2K");
+            if (row + 1 < self.max_rows) try writer.writeAll("\x1b[1B");
         }
+        if (self.max_rows > 1) try writer.print("\x1b[{d}A", .{self.max_rows - 1});
 
-        // Go to the last row
-        if (old_max_rows > old_rpos) {
-            try writer.print("\x1B[{}B", .{old_max_rows - old_rpos});
+        // Lay out the full input, then show only a screenful around the cursor.
+        // This keeps a large pasted file from moving above the terminal screen.
+        const columns = @max(self.cols -| 1, 2);
+        var layout: std.Io.Writer.Allocating = .init(self.allocator);
+        defer layout.deinit();
+        var position: Position = .{ .col = width(self.prompt) };
+        try layout.writer.writeAll(self.prompt);
+        try writeInput(&layout.writer, self.buf.items[0..self.pos], &position, columns, self.ln.mask_mode);
+        const cursor = position;
+        try writeInput(&layout.writer, self.buf.items[self.pos..], &position, columns, self.ln.mask_mode);
+        const height = @max(term.getRows(self.stdout) -| 2, 1);
+        if (cursor.row < self.viewport_start) self.viewport_start = cursor.row;
+        if (cursor.row >= self.viewport_start + height) self.viewport_start = cursor.row - height + 1;
+        self.viewport_start = @min(self.viewport_start, (position.row + 1) -| height);
+        var lines = std.mem.splitSequence(u8, layout.written(), "\r\n");
+        var row: usize = 0;
+        var visible: usize = 0;
+        while (lines.next()) |line| : (row += 1) {
+            if (row < self.viewport_start) continue;
+            if (visible == height) break;
+            if (visible > 0) try writer.writeAll("\r\n");
+            try writer.writeAll(line);
+            visible += 1;
         }
-
-        // Clear every row from bottom to top
-        if (old_max_rows > 0) {
-            var j: usize = 0;
-            while (j < old_max_rows - 1) : (j += 1) {
-                try writer.writeAll("\r\x1B[0K\x1B[1A");
-            }
-        }
-
-        // Clear the top line
-        try writer.writeAll("\r\x1B[0K");
-
-        // Write prompt
-        try writer.writeAll(self.prompt);
-
-        // Write current buffer content
-        if (self.ln.mask_mode) {
-            for (self.buf.items) |_| {
-                try writer.writeAll("*");
-            }
-        } else {
-            try writer.writeAll(self.buf.items);
-        }
-
-        // Show hints if applicable
-        if (hint) |str| {
-            try writer.writeAll(str);
-        }
-
-        // Reserve a newline if we filled all columns
-        if (self.pos > 0 and self.pos == self.buf.items.len and total_width % self.cols == 0) {
-            try writer.writeAll("\n\r");
-            rows += 1;
-            if (rows > self.max_rows) {
-                self.max_rows = rows;
-            }
-        }
-
-        // Move cursor to right position:
-        const rpos = (prompt_width + pos + self.cols) / self.cols;
-
-        // First, y position (move up if necessary)
-        if (rows > rpos) {
-            try writer.print("\x1B[{}A", .{rows - rpos});
-        }
-
-        // Then, x position (move right if necessary)
-        const col = (prompt_width + pos) % self.cols;
-        if (col > 0) {
-            try writer.print("\r\x1B[{}C", .{col});
-        } else {
-            try writer.writeAll("\r");
-        }
-
-        self.old_pos = pos;
-
-        try writer.flush();
+        const cursor_row = cursor.row - self.viewport_start;
+        if (visible > cursor_row + 1) try writer.print("\x1b[{d}A", .{visible - cursor_row - 1});
+        try writer.writeAll("\r");
+        if (cursor.col > 0) try writer.print("\x1b[{d}C", .{cursor.col});
+        self.cursor_row = cursor_row;
+        self.max_rows = visible;
+        try self.stdout.writeStreamingAll(self.ln.io, aw.written());
     }
 
     pub fn refreshLine(self: *Self) !void {
         try self.clearPopup();
         self.freePopup();
-        if (self.ln.multiline_mode) {
+        if (self.usesMultiLine()) {
             try self.refreshMultiLine();
         } else {
             try self.refreshSingleLine();
         }
         // The popup occupies rows below a horizontally scrolling input.
-        if (!self.ln.multiline_mode and !self.ln.mask_mode) {
+        if (!self.usesMultiLine() and !self.ln.mask_mode) {
             if (self.ln.popup_callback) |callback| {
                 self.popup_items = try callback(self.allocator, self.ln.io, self.buf.items[0..self.pos]);
                 self.popup_selected = 0;
@@ -580,6 +585,36 @@ pub const LinenoiseState = struct {
         }
     }
 
+    pub fn editMoveVertical(self: *Self, forward: bool) !void {
+        const bytes = self.buf.items;
+        if (std.mem.indexOfScalar(u8, bytes, '\n') == null)
+            return self.editHistoryNext(if (forward) .next else .prev);
+        const start = if (std.mem.lastIndexOfScalar(u8, bytes[0..self.pos], '\n')) |index| index + 1 else 0;
+        const column = width(bytes[start..self.pos]);
+        var target_start: usize = undefined;
+        var target_end: usize = undefined;
+        if (forward) {
+            const end = std.mem.indexOfScalarPos(u8, bytes, self.pos, '\n') orelse return;
+            target_start = end + 1;
+            target_end = std.mem.indexOfScalarPos(u8, bytes, target_start, '\n') orelse bytes.len;
+        } else {
+            if (start == 0) return;
+            target_end = start - 1;
+            target_start = if (std.mem.lastIndexOfScalar(u8, bytes[0..target_end], '\n')) |index| index + 1 else 0;
+        }
+        var pos = target_start;
+        var cells: usize = 0;
+        while (pos < target_end) {
+            const length = try std.unicode.utf8ByteSequenceLength(bytes[pos]);
+            const next = width(bytes[pos..][0..length]);
+            if (cells + next > column) break;
+            cells += next;
+            pos += length;
+        }
+        self.pos = pos;
+        try self.refreshLine();
+    }
+
     pub fn editMoveHome(self: *Self) !void {
         if (self.pos > 0) {
             self.pos = 0;
@@ -627,7 +662,7 @@ pub const LinenoiseState = struct {
     pub fn editDelete(self: *Self) !void {
         if (self.buf.items.len == 0 or self.pos >= self.buf.items.len) return;
 
-        const utf8_len = std.unicode.utf8CodepointSequenceLength(self.buf.items[self.pos]) catch 1;
+        const utf8_len = std.unicode.utf8ByteSequenceLength(self.buf.items[self.pos]) catch 1;
         std.mem.copyForwards(
             u8,
             self.buf.items[self.pos .. self.buf.items.len - utf8_len],
@@ -724,3 +759,55 @@ pub const LinenoiseState = struct {
         try self.refreshLine();
     }
 };
+
+test "multiline layout tracks CJK wrapping, blank lines and cursor splits" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var position: LinenoiseState.Position = .{ .col = 2 };
+    try LinenoiseState.writeInput(&output.writer, "你好ab", &position, 7, false);
+    try std.testing.expectEqual(1, position.row);
+    try std.testing.expectEqual(1, position.col);
+    try LinenoiseState.writeInput(&output.writer, "\n\n中", &position, 7, false);
+    try std.testing.expectEqual(3, position.row);
+    try std.testing.expectEqual(2, position.col);
+    try std.testing.expectEqualStrings("你好a\r\nb\r\n\r\n中", output.written());
+}
+
+test "large multiline input stays inside viewport and supports Unicode editing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try tmp.dir.createFile(std.testing.io, "output", .{});
+    defer out.close(std.testing.io);
+    var ln: Linenoise = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .env = undefined,
+        .history = History.empty(allocator),
+        .multiline_mode = true,
+    };
+    defer ln.deinit();
+    var state: LinenoiseState = .{
+        .allocator = allocator,
+        .ln = &ln,
+        .stdin = out,
+        .stdout = out,
+        .prompt = "> ",
+        .cols = 20,
+    };
+    defer state.buf.deinit(allocator);
+    for (0..60) |_| try state.buf.appendSlice(allocator, "你好\n");
+    state.pos = state.buf.items.len;
+    try state.refreshLine();
+    try std.testing.expectEqual(22, state.max_rows);
+    try std.testing.expectEqual(21, state.cursor_row);
+    try std.testing.expect(state.viewport_start > 0);
+    try state.editMoveVertical(false);
+    try std.testing.expectEqual(state.buf.items.len - 7, state.pos);
+    try state.editMoveRight();
+    try state.editBackspace();
+    try std.testing.expectEqualStrings("好\n", state.buf.items[state.pos..]);
+    try state.editMoveHome();
+    try std.testing.expectEqual(0, state.cursor_row);
+    try std.testing.expectEqual(0, state.viewport_start);
+}

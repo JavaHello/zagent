@@ -50,4 +50,12 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    const editor_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("libs/linenoize/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wcwidth", .module = wcwidth }},
+    }) });
+    const run_editor_tests = b.addRunArtifact(editor_tests);
+    test_step.dependOn(&run_editor_tests.step);
 }

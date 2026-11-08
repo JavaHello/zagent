@@ -187,6 +187,19 @@ pub fn getColumns(io: Io, in: File, out: File) !usize {
     }
 }
 
+pub fn getRows(file: File) usize {
+    if (is_windows) {
+        var info: w.CONSOLE_SCREEN_BUFFER_INFO = undefined;
+        if (k32.GetConsoleScreenBufferInfo(file.handle, &info) != 0)
+            return @intCast(info.srWindow.Bottom - info.srWindow.Top + 1);
+    } else {
+        var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+        const rc = std.posix.system.ioctl(file.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&size));
+        if (std.posix.errno(rc) == .SUCCESS and size.row > 0) return size.row;
+    }
+    return 24;
+}
+
 pub fn clearScreen(io: Io) !void {
     try File.stderr().writeStreamingAll(io, "\x1b[H\x1b[2J");
 }

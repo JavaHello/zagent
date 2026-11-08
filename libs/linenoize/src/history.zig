@@ -108,7 +108,7 @@ pub const History = struct {
         for (self.hist.items) |line| {
             // Only what `load` can read back is written, so that an entry too
             // long to be stored cannot take the tail of the file with it.
-            if (line.len > max_line_len) continue;
+            if (line.len > max_line_len or std.mem.indexOfAny(u8, line, "\r\n") != null) continue;
             try writer.writeAll(line);
             try writer.writeAll("\n");
         }

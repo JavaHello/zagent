@@ -74,6 +74,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
     var state = LinenoiseState.init(ln, in, out, prompt);
     defer state.buf.deinit(state.allocator);
     defer state.deinitPopup();
+    defer state.finishEdit() catch {};
 
     try state.ln.history.add("");
     state.ln.history.current = state.ln.history.hist.items.len - 1;
@@ -127,8 +128,12 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             key_ctrl_k => try state.editKillLineForward(),
             key_ctrl_l => {
                 try term.clearScreen(ln.io);
+                state.cursor_row = 0;
+                state.max_rows = 0;
+                state.popup_rows = 0;
                 try state.refreshLine();
             },
+            10 => try state.editInsert("\n"), // Ctrl+J
             key_enter => {
                 state.ln.history.pop();
                 return try ln.allocator.dupe(u8, state.buf.items);
@@ -144,26 +149,38 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                     continue;
                 }
                 switch (input_buf[0]) {
+                    key_enter, 10 => try state.editInsert("\n"), // Alt+Enter
                     'b' => try state.editMoveWordStart(),
                     'f' => try state.editMoveWordEnd(),
                     '[' => {
                         if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
                         switch (input_buf[0]) {
                             '0'...'9' => |num| {
-                                if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
-                                switch (input_buf[0]) {
-                                    '~' => switch (num) {
+                                var sequence: [32]u8 = undefined;
+                                sequence[0] = num;
+                                var length: usize = 1;
+                                while (length < sequence.len) {
+                                    if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
+                                    sequence[length] = input_buf[0];
+                                    length += 1;
+                                    if (input_buf[0] >= 0x40 and input_buf[0] <= 0x7e) break;
+                                }
+                                const code = sequence[0..length];
+                                if (std.mem.eql(u8, code, "200~")) {
+                                    const pasted = try readPaste(ln, in);
+                                    defer ln.allocator.free(pasted);
+                                    try state.editInsert(pasted);
+                                } else if (length == 2 and code[1] == '~') {
+                                    switch (num) {
                                         '1', '7' => try state.editMoveHome(),
                                         '3' => try state.editDelete(),
                                         '4', '8' => try state.editMoveEnd(),
                                         else => {},
-                                    },
-                                    '0'...'9' => {}, // TODO: read 2-digit CSI
-                                    else => {},
+                                    }
                                 }
                             },
-                            'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editHistoryNext(.prev),
-                            'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editHistoryNext(.next),
+                            'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editMoveVertical(false),
+                            'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editMoveVertical(true),
                             'Z' => if (state.popup_items.len > 0) try state.movePopup(false),
                             'C' => try state.editMoveRight(),
                             'D' => try state.editMoveLeft(),
@@ -177,8 +194,8 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                         switch (input_buf[0]) {
                             'H' => try state.editMoveHome(),
                             'F' => try state.editMoveEnd(),
-                            'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editHistoryNext(.prev),
-                            'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editHistoryNext(.next),
+                            'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editMoveVertical(false),
+                            'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editMoveVertical(true),
                             else => {},
                         }
                     },
@@ -206,8 +223,68 @@ fn linenoiseRaw(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]con
 
     const orig = try enableRawMode(in, out);
     defer disableRawMode(in, out, orig);
+    try out.writeStreamingAll(ln.io, "\x1b[?2004h");
+    defer out.writeStreamingAll(ln.io, "\x1b[?2004l") catch {};
 
     return try linenoiseEdit(ln, in, out, prompt);
+}
+
+/// Consume a bracketed paste as text, never as editor commands.
+fn readPaste(ln: *Linenoise, input: File) ![]u8 {
+    const end = "\x1b[201~";
+    var bytes: ArrayList(u8) = .empty;
+    defer bytes.deinit(ln.allocator);
+    var matched: usize = 0;
+    while (true) {
+        var byte: [1]u8 = undefined;
+        if (try term.read(ln.io, input, &byte) == 0) return error.EndOfStream;
+        if (byte[0] == end[matched]) {
+            matched += 1;
+            if (matched == end.len) break;
+        } else {
+            try bytes.appendSlice(ln.allocator, end[0..matched]);
+            matched = 0;
+            if (byte[0] == end[0]) {
+                matched = 1;
+            } else {
+                try bytes.append(ln.allocator, byte[0]);
+            }
+        }
+    }
+    return normalizePaste(ln.allocator, bytes.items);
+}
+
+fn normalizePaste(allocator: Allocator, bytes: []const u8) ![]u8 {
+    var result: ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const c = bytes[i];
+        if (c == '\r') {
+            try result.append(allocator, '\n');
+            i += if (i + 1 < bytes.len and bytes[i + 1] == '\n') @as(usize, 2) else 1;
+        } else if (c == '\t') {
+            try result.appendSlice(allocator, "    ");
+            i += 1;
+        } else if (c == '\n' or (c >= 32 and c < 127)) {
+            try result.append(allocator, c);
+            i += 1;
+        } else {
+            const length = std.unicode.utf8ByteSequenceLength(c) catch {
+                i += 1;
+                continue;
+            };
+            if (i + length <= bytes.len) {
+                const cp = std.unicode.utf8Decode(bytes[i..][0..length]) catch {
+                    i += 1;
+                    continue;
+                };
+                if (cp >= 0xa0) try result.appendSlice(allocator, bytes[i..][0..length]);
+                i += length;
+            } else i += 1;
+        }
+    }
+    return result.toOwnedSlice(allocator);
 }
 
 /// Read a line with no special features (no hints, no completions, no history)
@@ -277,4 +354,35 @@ pub const Linenoise = struct {
 
 test "all" {
     _ = @import("history.zig");
+    _ = @import("state.zig");
+}
+
+test "pasted text preserves lines and Unicode without terminal controls" {
+    const result = try normalizePaste(std.testing.allocator, "你好\r\n/quit\r下一行\n\tend\x03\x1b\xff");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("你好\n/quit\n下一行\n    end", result);
+}
+
+test "bracketed paste consumes embedded Enter and editor commands as text" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const output = try tmp.dir.createFile(std.testing.io, "paste", .{});
+    try output.writeStreamingAll(std.testing.io, "first\r\n/quit\n\x03你好\x1b[201~\r");
+    output.close(std.testing.io);
+    const file = try tmp.dir.openFile(std.testing.io, "paste", .{});
+    defer file.close(std.testing.io);
+    var ln: Linenoise = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .env = undefined,
+        .history = History.empty(allocator),
+    };
+    defer ln.deinit();
+    const result = try readPaste(&ln, file);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("first\n/quit\n你好", result);
+    var next: [1]u8 = undefined;
+    try std.testing.expectEqual(1, try term.read(std.testing.io, file, &next));
+    try std.testing.expectEqual(@as(u8, '\r'), next[0]);
 }

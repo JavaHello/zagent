@@ -107,9 +107,10 @@ fn animate(
     options: Options,
     started: std.Io.Timestamp,
 ) void {
+    var drawn = false;
     // Runs on cancelation too: this is what gives the line back.
-    defer file.writeStreamingAll(io, if (options.prompt != null)
-        erase ++ "\n" ++ erase ++ "\x1b[1A\r"
+    defer if (drawn) file.writeStreamingAll(io, if (options.prompt != null)
+        "\x1b[1A" ++ erase ++ "\r\n" ++ erase ++ "\x1b[1A\r"
     else
         erase) catch {};
 
@@ -136,10 +137,11 @@ fn animate(
         // Either of these can observe the cancelation; both end the loop.
         var display_buf: [512]u8 = undefined;
         const display = if (options.prompt) |prompt|
-            std.fmt.bufPrint(&display_buf, "{s}\n" ++ erase ++ "{s}\x1b[1A\r", .{ line, prompt }) catch return
+            std.fmt.bufPrint(&display_buf, "{s}{s}\r\n" ++ erase ++ "{s}", .{ if (index > 0) "\x1b[1A" else "", line, prompt }) catch return
         else
             line;
         file.writeStreamingAll(io, display) catch return;
+        drawn = true;
         io.sleep(.fromMilliseconds(options.frame_interval_ms), .awake) catch return;
     }
 }
@@ -264,6 +266,7 @@ test "work status stays above the input prompt and clears both rows on stop" {
     const written = try tmp.dir.readFileAlloc(io, "probe", std.testing.allocator, .limited(1 << 16));
     defer std.testing.allocator.free(written);
     try expect(std.mem.indexOf(u8, written, "thinking… 0s") != null);
-    try expect(std.mem.indexOf(u8, written, "\n" ++ erase ++ "❯ \x1b[1A\r") != null);
-    try expect(std.mem.endsWith(u8, written, erase ++ "\n" ++ erase ++ "\x1b[1A\r"));
+    try expect(std.mem.indexOf(u8, written, "\r\n" ++ erase ++ "❯ ") != null);
+    try expect(std.mem.indexOf(u8, written, "❯ \x1b[1A" ++ erase) != null);
+    try expect(std.mem.endsWith(u8, written, "\x1b[1A" ++ erase ++ "\r\n" ++ erase ++ "\x1b[1A\r"));
 }

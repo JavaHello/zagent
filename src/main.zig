@@ -232,6 +232,7 @@ fn runRepl(
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
 
+    ln.multiline_mode = true;
     agent.progress_prompt = if (ln.is_tty) PROMPT else null;
 
     try stdout.writeStreamingAll(io, MAGENTA ++ BOLD ++ BANNER ++ RESET);
@@ -243,7 +244,7 @@ fn runRepl(
         defer allocator.free(model_line);
         try stdout.writeStreamingAll(io, model_line);
     }
-    try stdout.writeStreamingAll(io, DIM ++ "  Type /help for commands, Ctrl+D to exit.\n\n" ++ RESET);
+    try stdout.writeStreamingAll(io, DIM ++ "  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
 
     if (config.api_key.len == 0) {
         // Name the variable that actually applies, so a provider user is not
@@ -274,7 +275,7 @@ fn runRepl(
         };
         defer allocator.free(raw_line);
 
-        const line = std.mem.trim(u8, raw_line, " \t\r");
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
 
         if (line.len == 0) continue;
 

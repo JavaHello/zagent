@@ -499,6 +499,11 @@ and what each brought. Seven behaviours are worth knowing:
 | `Tab` / `Enter` | Insert the selected candidate   |
 | `Ctrl+D`      | Exit                             |
 
+The prompt supports multiple lines: Enter submits; Alt+Enter or Ctrl+J inserts
+a newline. In terminals supporting bracketed paste, pasted newlines stay in
+the editor until you press Enter to send. Multiline entries can be recalled
+during the current session but are omitted from the on-disk input history.
+
 Typing `/` at the start of the prompt opens system command candidates. Typing
 `@` at a word boundary searches project file paths, and `$` shows a reserved
 “Coming soon” entry. Candidates filter as you type. Use ↑/↓ to select, Tab or
