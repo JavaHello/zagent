@@ -127,6 +127,9 @@ pub const LinenoiseState = struct {
     old_pos: usize = 0,
     cols: usize,
     max_rows: usize = 0,
+    popup_items: []@import("main.zig").PopupItem = &.{},
+    popup_selected: usize = 0,
+    popup_rows: usize = 0,
 
     const Self = @This();
 
@@ -140,6 +143,103 @@ pub const LinenoiseState = struct {
             .prompt = prompt,
             .cols = getColumns(ln.io, in, out) catch 80,
         };
+    }
+
+    pub fn deinitPopup(self: *Self) void {
+        self.clearPopup() catch {};
+        self.freePopup();
+    }
+
+    fn freePopup(self: *Self) void {
+        for (self.popup_items) |item| item.deinit(self.allocator);
+        if (self.popup_items.len > 0) self.allocator.free(self.popup_items);
+        self.popup_items = &.{};
+    }
+
+    fn clearPopup(self: *Self) !void {
+        if (self.popup_rows == 0) return;
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll("\x1b7");
+        for (0..self.popup_rows) |_| try aw.writer.writeAll("\r\n\x1b[2K");
+        try aw.writer.writeAll("\x1b8");
+        try self.stdout.writeStreamingAll(self.ln.io, aw.written());
+        self.popup_rows = 0;
+    }
+
+    fn popupText(writer: *std.Io.Writer, text: []const u8, remaining: *usize) !void {
+        var offset: usize = 0;
+        while (offset < text.len) {
+            const length = std.unicode.utf8ByteSequenceLength(text[offset]) catch 1;
+            if (offset + length > text.len) break;
+            const slice = text[offset..][0..length];
+            offset += length;
+            if (!std.unicode.utf8ValidateSlice(slice)) continue;
+            if (length == 1 and (slice[0] < 32 or slice[0] == 127)) continue;
+            const columns = width(slice);
+            if (columns > remaining.*) break;
+            try writer.writeAll(slice);
+            remaining.* -= columns;
+        }
+    }
+
+    fn drawPopup(self: *Self) !void {
+        if (self.popup_items.len == 0) return;
+        const visible = @min(self.popup_items.len, 6);
+        const first = @min(self.popup_selected -| (visible / 2), self.popup_items.len - visible);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        for (first..first + visible) |index| {
+            try aw.writer.writeAll("\r\n\x1b[2K");
+            const selected = index == self.popup_selected;
+            if (selected) try aw.writer.writeAll("\x1b[1;36m");
+            var remaining = self.cols -| 1;
+            try popupText(&aw.writer, if (selected) " > " else "   ", &remaining);
+            try popupText(&aw.writer, self.popup_items[index].label, &remaining);
+            try popupText(&aw.writer, "  ", &remaining);
+            try popupText(&aw.writer, self.popup_items[index].description, &remaining);
+            try aw.writer.writeAll("\x1b[0m");
+        }
+        try aw.writer.writeAll("\r\n\x1b[2K");
+        var remaining = self.cols -| 1;
+        try popupText(&aw.writer, " ↑/↓ select · Tab/Enter insert · Esc close", &remaining);
+        try aw.writer.print("\x1b[{d}A\r", .{visible + 1});
+        try self.stdout.writeStreamingAll(self.ln.io, aw.written());
+        self.popup_rows = visible + 1;
+        // Redraw the input after relative movement, including when the popup
+        // scrolled at the bottom of the terminal.
+        try self.refreshSingleLine();
+    }
+
+    pub fn movePopup(self: *Self, forward: bool) !void {
+        const count = self.popup_items.len;
+        if (count == 0) return;
+        self.popup_selected = if (forward) (self.popup_selected + 1) % count else (self.popup_selected + count - 1) % count;
+        try self.clearPopup();
+        try self.drawPopup();
+    }
+
+    pub fn dismissPopup(self: *Self) !void {
+        try self.clearPopup();
+        self.freePopup();
+    }
+
+    pub fn acceptPopup(self: *Self) !void {
+        const value = self.popup_items[self.popup_selected].value orelse {
+            try self.dismissPopup();
+            return;
+        };
+        var replacement: ArrayList(u8) = .empty;
+        errdefer replacement.deinit(self.allocator);
+        try replacement.appendSlice(self.allocator, value);
+        try replacement.appendSlice(self.allocator, self.buf.items[self.pos..]);
+        const new_pos = value.len;
+        try self.clearPopup();
+        self.freePopup();
+        self.buf.deinit(self.allocator);
+        self.buf = replacement;
+        self.pos = new_pos;
+        try self.refreshSingleLine();
     }
 
     pub fn browseCompletions(self: *Self) !?u8 {
@@ -400,10 +500,20 @@ pub const LinenoiseState = struct {
     }
 
     pub fn refreshLine(self: *Self) !void {
+        try self.clearPopup();
+        self.freePopup();
         if (self.ln.multiline_mode) {
             try self.refreshMultiLine();
         } else {
             try self.refreshSingleLine();
+        }
+        // The popup occupies rows below a horizontally scrolling input.
+        if (!self.ln.multiline_mode and !self.ln.mask_mode) {
+            if (self.ln.popup_callback) |callback| {
+                self.popup_items = try callback(self.allocator, self.ln.io, self.buf.items[0..self.pos]);
+                self.popup_selected = 0;
+                try self.drawPopup();
+            }
         }
     }
 

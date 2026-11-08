@@ -15,6 +15,20 @@ const getColumns = term.getColumns;
 pub const HintsCallback = *const fn (Allocator, []const u8) Allocator.Error!?[]const u8;
 pub const CompletionsCallback = *const fn (Allocator, []const u8) Allocator.Error![]const []const u8;
 
+pub const PopupItem = struct {
+    /// Replaces the input before the cursor; null denotes an informational row.
+    value: ?[]const u8,
+    label: []const u8,
+    description: []const u8,
+
+    pub fn deinit(self: PopupItem, allocator: Allocator) void {
+        if (self.value) |value| allocator.free(value);
+        allocator.free(self.label);
+        allocator.free(self.description);
+    }
+};
+pub const PopupCallback = *const fn (Allocator, Io, []const u8) Allocator.Error![]PopupItem;
+
 /// A scoped raw terminal for widgets that do not edit a line.
 pub const RawTerminal = struct {
     io: Io,
@@ -59,6 +73,7 @@ const key_backspace = 127;
 fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]const u8 {
     var state = LinenoiseState.init(ln, in, out, prompt);
     defer state.buf.deinit(state.allocator);
+    defer state.deinitPopup();
 
     try state.ln.history.add("");
     state.ln.history.current = state.ln.history.hist.items.len - 1;
@@ -70,9 +85,20 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
         var c = input_buf[0];
 
         // Browse completions before editing
-        if (c == key_tab) {
+        if (c == key_tab and ln.popup_callback == null) {
             if (try state.browseCompletions()) |new_c| {
                 c = new_c;
+            }
+        }
+
+        if (state.popup_items.len > 0) {
+            if (c == key_tab or c == key_enter) {
+                try state.acceptPopup();
+                continue;
+            }
+            if (c == key_ctrl_n or c == key_ctrl_p) {
+                try state.movePopup(c == key_ctrl_n);
+                continue;
             }
         }
 
@@ -113,7 +139,10 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             key_ctrl_u => try state.editKillLineBackward(),
             key_ctrl_w => try state.editDeletePrevWord(),
             key_esc => {
-                if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
+                if ((try term.readEscape(ln.io, in, &input_buf)) < 1) {
+                    try state.dismissPopup();
+                    continue;
+                }
                 switch (input_buf[0]) {
                     'b' => try state.editMoveWordStart(),
                     'f' => try state.editMoveWordEnd(),
@@ -133,8 +162,9 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                                     else => {},
                                 }
                             },
-                            'A' => try state.editHistoryNext(.prev),
-                            'B' => try state.editHistoryNext(.next),
+                            'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editHistoryNext(.prev),
+                            'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editHistoryNext(.next),
+                            'Z' => if (state.popup_items.len > 0) try state.movePopup(false),
                             'C' => try state.editMoveRight(),
                             'D' => try state.editMoveLeft(),
                             'H' => try state.editMoveHome(),
@@ -142,11 +172,13 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                             else => {},
                         }
                     },
-                    '0' => {
+                    'O', '0' => {
                         if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
                         switch (input_buf[0]) {
                             'H' => try state.editMoveHome(),
                             'F' => try state.editMoveEnd(),
+                            'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editHistoryNext(.prev),
+                            'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editHistoryNext(.next),
                             else => {},
                         }
                     },
@@ -197,6 +229,7 @@ pub const Linenoise = struct {
     term_supported: bool = false,
     hints_callback: ?HintsCallback = null,
     completions_callback: ?CompletionsCallback = null,
+    popup_callback: ?PopupCallback = null,
 
     const Self = @This();
 

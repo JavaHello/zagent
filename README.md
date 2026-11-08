@@ -488,12 +488,17 @@ and what each brought. Seven behaviours are worth knowing:
 | `/model`      | Show the current model           |
 | `/mcp`        | List the MCP servers and their tools |
 | `/quit`       | Exit                             |
-| `Tab`         | Complete a `/command`            |
+| `Tab` / `Enter` | Insert the selected candidate   |
 | `Ctrl+D`      | Exit                             |
 
-Typing a `/command` shows its description as dim ghost text after the line,
-and `Tab` cycles through the commands that match what you have typed so far.
-(These hints apply to the REPL prompt only, not to `ask_user` menu answers.)
+Typing `/` at the start of the prompt opens system command candidates. Typing
+`@` at a word boundary searches project file paths, and `$` shows a reserved
+“Coming soon” entry. Candidates filter as you type. Use ↑/↓ to select, Tab or
+Enter to insert, and Esc to dismiss; press Enter again to submit the line.
+File search skips `.git`, build caches and `node_modules`, and bounds traversal
+to keep large workspaces responsive. File selection inserts an `@path` reference
+(paths with spaces are quoted); it does not attach file contents automatically.
+These popups apply only to the REPL prompt.
 
 ### Using a custom Responses-compatible endpoint
 

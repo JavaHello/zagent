@@ -491,11 +491,14 @@ pub const Agent = struct {
         // hints are switched off for this read and restored afterwards.
         const saved_completions = self.linenoise.completions_callback;
         const saved_hints = self.linenoise.hints_callback;
+        const saved_popup = self.linenoise.popup_callback;
         self.linenoise.completions_callback = null;
         self.linenoise.hints_callback = null;
+        self.linenoise.popup_callback = null;
         defer {
             self.linenoise.completions_callback = saved_completions;
             self.linenoise.hints_callback = saved_hints;
+            self.linenoise.popup_callback = saved_popup;
         }
 
         const raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {

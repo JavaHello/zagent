@@ -35,7 +35,8 @@ const HELP =
     \\  /model       Show current model
     \\  /mcp         List the MCP servers and their tools
     \\  /quit, /exit Exit zagent
-    \\  Tab          Complete a /command (a description appears as you type)
+    \\  /, @, $      Command / project file / reserved candidates
+    \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
     \\  Ctrl+D       Exit zagent
     \\
 ;
@@ -163,11 +164,9 @@ pub fn main(init: std.process.Init) !void {
     // ask_user menu also works in single-query mode.
     var ln = Linenoise.init(allocator, io, env);
     defer ln.deinit();
-    // Slash commands complete on Tab and are described by dim ghost text as
-    // they are typed. The ask_user menu clears these around its own reads, so
-    // an answer there is never treated as a command.
+    // Show command, file, and reserved-extension candidates as the user types.
     ln.completions_callback = commands.complete;
-    ln.hints_callback = commands.hint;
+    ln.popup_callback = @import("completion.zig").candidates;
 
     const history_path = try openHistory(allocator, io, env, &ln);
     defer if (history_path) |path| allocator.free(path);
@@ -356,6 +355,7 @@ test {
     _ = @import("config.zig");
     _ = @import("provider.zig");
     _ = @import("menu.zig");
+    _ = @import("completion.zig");
     _ = @import("commands.zig");
     _ = @import("verifier.zig");
     _ = @import("style.zig");

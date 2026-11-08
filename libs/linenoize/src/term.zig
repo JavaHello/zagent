@@ -242,3 +242,15 @@ fn readPosix(io: Io, file: File, buffer: []u8) !usize {
 }
 
 pub const read = if (is_windows) readWin32Console else readPosix;
+
+/// A bare Escape dismisses a popup without waiting for another keystroke.
+pub fn readEscape(io: Io, file: File, buffer: []u8) !usize {
+    if (is_windows) return read(io, file, buffer);
+    const original = try std.posix.tcgetattr(file.handle);
+    var timed = original;
+    timed.cc[@backingInt(std.posix.V.MIN)] = 0;
+    timed.cc[@backingInt(std.posix.V.TIME)] = 1;
+    try std.posix.tcsetattr(file.handle, .NOW, timed);
+    defer std.posix.tcsetattr(file.handle, .NOW, original) catch {};
+    return read(io, file, buffer);
+}
