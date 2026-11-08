@@ -19,6 +19,11 @@ const builtin_tools =
     \\{"type":"function","function":{"name":"ask_user","description":"Ask the user to choose between concrete options when the request is ambiguous, or when a decision only the user can make blocks progress. Not for confirming routine steps.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}}}
 ;
 
+/// Largest output budget a truncated response may be retried with. DeepSeek
+/// rejects anything above 8192 output tokens for its chat models, so asking for
+/// more would turn a recoverable truncation into a hard error.
+const growth_cap: u32 = @import("config.zig").max_output_tokens_ceiling;
+
 /// The built-in tools as a whole `tools` member, for the request that has
 /// nothing of its own to add to them.
 pub const TOOLS_JSON = "[" ++ builtin_tools ++ "]";
@@ -161,9 +166,9 @@ pub const Client = struct {
             // Discard partial output and retry the same input, so completed
             // tools are not repeated and incomplete calls are never dispatched.
             // Bound both the extra requests and their token budget.
-            if (attempt >= 3 or max_tokens >= 131072) return response;
+            if (attempt >= 3 or max_tokens >= growth_cap) return response;
             response.deinit(self.allocator);
-            max_tokens = @min(@as(u32, 131072), @max(@as(u32, 1), max_tokens *| 2));
+            max_tokens = @min(growth_cap, @max(@as(u32, 1), max_tokens *| 2));
         }
     }
 

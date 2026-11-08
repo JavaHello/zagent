@@ -127,14 +127,14 @@ All configuration is also supported through environment variables:
 | `OPENAI_API_KEY`   | *(required for OpenAI)*          | Your OpenAI (or compatible) API key  |
 | `OPENAI_BASE_URL`  | `https://api.openai.com/v1`      | API base URL                         |
 | `OPENAI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
-| `OPENAI_MAX_TOKENS`| `4096`                           | Initial output token budget per response    |
+| `OPENAI_MAX_TOKENS`| `8192`                           | Initial output token budget per response    |
 | `OPENAI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
 | `OPENAI_MAX_VERIFICATIONS` | `3`                     | Completion checks per query; `0` disables the check |
 | `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
 
 Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`. `AI_MARKDOWN` is the exception: it is not a provider setting and has no `OPENAI_` spelling.
 
-When a response hits `max_output_tokens`, both the main conversation and completion check retry the same input with a doubled token budget, up to three retries and a growth cap of 131072 tokens. Partial tool calls are discarded and completed tool results are retained. If retries still truncate, increase `AI_MAX_TOKENS` or split the task into smaller steps.
+When a response hits `max_output_tokens`, both the main conversation and completion check retry the same input with a doubled token budget, up to three retries and a growth cap of 8192 tokens — the most DeepSeek's chat models accept. Since the default budget already equals that cap, the retry only grows a smaller configured `AI_MAX_TOKENS`. Partial tool calls are discarded and completed tool results are retained. If retries still truncate, split the task into smaller steps or use an endpoint with a larger output limit.
 
 ## Rendering
 

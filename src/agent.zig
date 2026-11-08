@@ -337,7 +337,7 @@ pub const Agent = struct {
             defer response.deinit(self.allocator);
 
             if (std.mem.eql(u8, response.finish_reason, "length")) {
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: model output still exceeds the token budget after automatic retries; increase AI_MAX_TOKENS or split the task into smaller steps.\n" ++ RESET, .{});
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: model output still exceeds the token budget after automatic retries; split the task into smaller steps, or raise AI_MAX_TOKENS if the endpoint accepts more than DeepSeek's 8192.\n" ++ RESET, .{});
                 return error.ResponseTruncated;
             }
             if (std.mem.eql(u8, response.finish_reason, "tool_calls")) {

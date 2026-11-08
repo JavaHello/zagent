@@ -56,7 +56,9 @@ try:
                                     capture_output=True, text=True, timeout=15)
             assert result.returncode != 0 and expected_error in result.stderr, result.stderr
             assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
-            expected_budgets = [4096, 8192, 16384, 32768] if expected_error == 'ResponseTruncated' else [4096]
+            # The default budget already sits on the growth cap, so a truncated
+            # response is reported instead of retried with a larger budget.
+            expected_budgets = [8192]
             assert [r['max_output_tokens'] for r in requests] == expected_budgets, requests
 
         # Recover after a completed tool without losing its result or replaying
@@ -74,12 +76,14 @@ try:
             partial, completed_text(json.dumps({'complete': True, 'reason': 'Verified evidence'})),
         ])
         requests.clear()
+        # Growth is only possible from below the cap, so this case lowers the
+        # budget to exercise the doubling up to the DeepSeek ceiling.
         result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
-                                env=dict(env, AI_MAX_VERIFICATIONS='1'),
+                                env=dict(env, AI_MAX_VERIFICATIONS='1', AI_MAX_TOKENS='2048'),
                                 capture_output=True, text=True, timeout=15)
         assert result.returncode == 0 and 'Recovered answer' in result.stdout, result.stderr
         assert not replies, replies
-        assert [r['max_output_tokens'] for r in requests] == [4096, 4096, 8192, 16384, 4096, 8192]
+        assert [r['max_output_tokens'] for r in requests] == [2048, 2048, 4096, 8192, 2048, 4096]
         assert requests[1]['input'] == requests[2]['input'] == requests[3]['input']
         assert any(item.get('type') == 'function_call_output' and 'retained-tool-evidence' in item['output']
                    for item in requests[1]['input']), requests[1]
@@ -88,7 +92,7 @@ try:
         assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
 
         # The growth cap must not loop or lower a larger configured budget.
-        for budget, expected in [(65536, [65536, 131072]), (200000, [200000])]:
+        for budget, expected in [(4096, [4096, 8192]), (8192, [8192]), (65536, [65536]), (200000, [200000])]:
             reply.clear()
             reply.update(partial)
             requests.clear()

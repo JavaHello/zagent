@@ -25,7 +25,7 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 /path/to/zagent/zig-out/bin/zagent '分析 sales.csv，检查缺失值并撰写报告'
 ```
 
-支持 `AI_URL`、`AI_MODEL`、`AI_KEY` 覆盖服务商默认值。主对话和完成检查统一调用 `POST <AI_URL>/responses`，不会回退到 Chat Completions。`AI_URL` 填基础地址，不包含 `/responses`；`AI_MODEL` 原样发送。`AI_MAX_TOKENS` 对应 Responses 的初始 `max_output_tokens`（默认 4096）。响应因 token 上限被截断时，保持输入不变，自动将预算翻倍重试，最多重试 3 次，自动增长上限为 131072；不会执行截断响应中的工具调用。仍然超限时会提示调整 `AI_MAX_TOKENS` 或拆分任务。
+支持 `AI_URL`、`AI_MODEL`、`AI_KEY` 覆盖服务商默认值。主对话和完成检查统一调用 `POST <AI_URL>/responses`，不会回退到 Chat Completions。`AI_URL` 填基础地址，不包含 `/responses`；`AI_MODEL` 原样发送。`AI_MAX_TOKENS` 对应 Responses 的初始 `max_output_tokens`（默认 8192，即 DeepSeek 对话模型的上限）。响应因 token 上限被截断时，保持输入不变，自动将预算翻倍重试，最多重试 3 次，自动增长上限为 8192；不会执行截断响应中的工具调用。默认值已等于该上限，因此只有把 `AI_MAX_TOKENS` 配得更小时才会触发翻倍；仍然超限时请拆分任务或改用输出上限更高的接口。
 
 工具定义使用 Responses 的扁平结构，工具结果通过 `call_id` 关联。请求设置 `store: false`，保留并回放全部输出 items（包括加密推理数据）；会话恢复也保留这些数据。旧版会话的消息、函数调用和结果会转换为 Responses 输入，旧的自由文本 `reasoning_content` 不会作为推理 item 发送。
 

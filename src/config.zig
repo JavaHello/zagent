@@ -3,7 +3,14 @@ const provider = @import("provider.zig");
 
 const Provider = provider.Provider;
 
-const default_max_tokens: u32 = 4096;
+/// The most output tokens a request may ask DeepSeek for: its chat models cap
+/// `max_output_tokens` at 8192. The default budget stays inside it, and the
+/// truncation retry in `openai.zig` grows no further.
+pub const max_output_tokens_ceiling: u32 = 8192;
+
+/// Initial budget per response. Only an endpoint that accepts more than the
+/// ceiling needs a larger value, which `AI_MAX_TOKENS` still provides.
+const default_max_tokens: u32 = max_output_tokens_ceiling;
 const default_max_iterations: u32 = 200;
 const default_max_verifications: u32 = 3;
 const default_markdown = true;
@@ -445,7 +452,7 @@ test "config defaults" {
     try std.testing.expectEqualStrings("https://api.openai.com/v1", config.base_url);
     try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
     try std.testing.expectEqualStrings("", config.api_key);
-    try std.testing.expectEqual(@as(u32, 4096), config.max_tokens);
+    try std.testing.expectEqual(@as(u32, 8192), config.max_tokens);
     try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
     try std.testing.expectEqual(@as(u32, 3), config.max_verifications);
     try std.testing.expect(config.markdown);
