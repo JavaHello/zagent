@@ -27,7 +27,13 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
                 };
             };
             defer allocator.free(path);
-            break :blk try tools.readFile(io, allocator, path);
+            const range = tools.parseReadRange(allocator, arguments) catch {
+                break :blk .{
+                    .content = try allocator.dupe(u8, "Error: start_line and end_line must be positive integers (1-based, inclusive), with end_line >= start_line"),
+                    .is_error = true,
+                };
+            };
+            break :blk try tools.readFileRange(io, allocator, path, range);
         } else if (std.mem.eql(u8, name, "write")) {
             const path = openai.extractStringArg(allocator, arguments, "path") catch {
                 break :blk .{
@@ -83,7 +89,7 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
                 break :blk .{
                     .content = try std.fmt.allocPrint(
                         allocator,
-                        "Error: grep arguments are unusable ({s}); it needs a non-empty 'pattern' holding a regular expression, and a 'path', 'glob', and 'ignore_case' it can use",
+                        "Error: grep arguments are unusable ({s}); expected a non-empty pattern, optional path/glob strings, ignore_case boolean, context_lines integer >= 0, and max_matches integer >= 1",
                         .{@errorName(err)},
                     ),
                     .is_error = true,
@@ -121,6 +127,42 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
             return error.UnknownTool;
         }
     };
+}
+
+test "read dispatch preserves defaults and forwards inclusive ranges" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "lines.txt", .data = "first\nsecond\nthird" });
+    const path = try tmp.dir.realPathFileAlloc(io, "lines.txt", a);
+    defer a.free(path);
+    const defaults = try std.json.Stringify.valueAlloc(a, .{ .path = path }, .{});
+    defer a.free(defaults);
+    const full = try execute(io, a, &env, "read", defaults);
+    defer full.deinit(a);
+    try std.testing.expect(!full.is_error);
+    try std.testing.expectEqualStrings("first\nsecond\nthird", full.content);
+    const args = try std.json.Stringify.valueAlloc(a, .{ .path = path, .start_line = 2, .end_line = 2 }, .{});
+    defer a.free(args);
+    const range = try execute(io, a, &env, "read", args);
+    defer range.deinit(a);
+    try std.testing.expect(!range.is_error);
+    try std.testing.expectEqualStrings("second\n", range.content);
+    const invalid = try std.json.Stringify.valueAlloc(a, .{ .path = path, .start_line = 0 }, .{});
+    defer a.free(invalid);
+    const rejected = try execute(io, a, &env, "read", invalid);
+    defer rejected.deinit(a);
+    try std.testing.expect(rejected.is_error);
+    // Shared parser for both advertised backend names.
+    for ([_][]const u8{ "rg", "grep" }) |name| {
+        const invalid_search = try execute(io, a, &env, name, "{\"pattern\":\"x\",\"max_matches\":0}");
+        defer invalid_search.deinit(a);
+        try std.testing.expect(invalid_search.is_error);
+        try std.testing.expect(std.mem.indexOf(u8, invalid_search.content, "max_matches") != null);
+    }
 }
 
 test "write creates overwrites and rejects mixed modes; legacy names are removed" {

@@ -10,7 +10,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use (function calling)** — the agent can execute tools to help you:
   - `bash` — run Bash commands
-  - `read` — read file contents
+  - `read` — read file contents or an inclusive line range (`start_line`, `end_line`, 1-based); use narrow ranges for large files (output is limited to about 8192 bytes)
   - `write` — create/overwrite with `content`, or replace one exact, unique block with `old_text`/`new_text` (atomic, preserving permissions)
   - `apply_patch` — change a file by applying a unified diff, which is then shown to you as a coloured diff
   - `ls` — list directory contents
@@ -457,6 +457,8 @@ body. Four behaviours are worth knowing:
 | `path`        | no       | File or directory to search, defaults to `.` |
 | `glob`        | no       | `grep` only: search only files whose name matches, e.g. `*.zig` |
 | `ignore_case` | no       | `grep` only: match case-insensitively |
+| `context_lines` | no     | `rg` / `grep`: number of surrounding lines before and after matches (integer >= 0; default 0) |
+| `max_matches` | no       | `rg` / `grep`: maximum matching lines **per file**, not globally (integer >= 1; default unlimited); the output byte limit still applies |
 
 Which program runs is decided once, at startup, from `PATH`, and never by the
 agent: `grep` uses `rg` where it is installed and the system `grep` otherwise,

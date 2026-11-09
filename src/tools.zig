@@ -112,7 +112,130 @@ pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []
     };
 }
 
+test "read ranges validate positive inclusive line numbers" {
+    const a = std.testing.allocator;
+    const defaults = try parseReadRange(a, "{}");
+    try std.testing.expectEqual(@as(usize, 1), defaults.start_line);
+    try std.testing.expect(defaults.end_line == null);
+    for ([_][]const u8{
+        "[]",                   "{\"start_line\":0}",                "{\"start_line\":-1}",
+        "{\"end_line\":0}",     "{\"start_line\":3,\"end_line\":2}", "{\"start_line\":1.5}",
+        "{\"end_line\":\"2\"}", "{\"start_line\":null}",
+    }) |json| try std.testing.expectError(error.InvalidArguments, parseReadRange(a, json));
+    const range = try parseReadRange(a, "{\"start_line\":2,\"end_line\":3}");
+    try std.testing.expectEqual(@as(usize, 2), range.start_line);
+    try std.testing.expectEqual(@as(?usize, 3), range.end_line);
+}
+
+test "read streams ranges beyond the old file and output limits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(a);
+    // More than 1 MiB before the target, without allocating skipped lines.
+    try data.appendNTimes(a, 'x', 1024 * 1024 + 1);
+    try data.appendSlice(a, "\none\r\ntwo\nlast");
+    try tmp.dir.writeFile(io, .{ .sub_path = "large.txt", .data = data.items });
+    const path = try tmp.dir.realPathFileAlloc(io, "large.txt", a);
+    defer a.free(path);
+    const cases = [_]struct { range: ReadRange, expected: []const u8 }{
+        .{ .range = .{ .start_line = 2, .end_line = 3 }, .expected = "one\r\ntwo\n" },
+        .{ .range = .{ .start_line = 4 }, .expected = "last" },
+        .{ .range = .{ .start_line = 5 }, .expected = "(no output)" },
+    };
+    for (cases) |case| {
+        const result = try readFileRange(io, a, path, case.range);
+        defer result.deinit(a);
+        try std.testing.expect(!result.is_error);
+        try std.testing.expectEqualStrings(case.expected, result.content);
+    }
+    const full = try readFile(io, a, path);
+    defer full.deinit(a);
+    try std.testing.expect(!full.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "start_line=1") != null);
+}
+
+test "search limits parse and reach both backends" {
+    const a = std.testing.allocator;
+    const args = try parseGrepArgs(a, "{\"pattern\":\"needle\",\"context_lines\":2,\"max_matches\":1}");
+    defer args.deinit(a);
+    try std.testing.expectEqual(@as(?usize, 2), args.context_lines);
+    try std.testing.expectEqual(@as(?usize, 1), args.max_matches);
+    for ([_]bool{ false, true }) |rg| {
+        const argv = try grepArgv(a, args, .{ .rg = rg });
+        defer freeGrepArgv(a, argv);
+        const start: usize = if (rg) 4 else 6;
+        try std.testing.expectEqualStrings("--context=2", argv[start]);
+        try std.testing.expectEqualStrings("--max-count=1", argv[start + 1]);
+    }
+    for ([_][]const u8{
+        "{\"pattern\":\"x\",\"context_lines\":-1}",
+        "{\"pattern\":\"x\",\"context_lines\":true}",
+        "{\"pattern\":\"x\",\"max_matches\":0}",
+        "{\"pattern\":\"x\",\"max_matches\":1.5}",
+        "{\"pattern\":\"x\",\"max_matches\":\"2\"}",
+    }) |json| try std.testing.expectError(error.InvalidArguments, parseGrepArgs(a, json));
+}
+
+test "grep includes context and stops matching per file" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "before\nneedle\nafter\ngap\nneedle later\n" });
+    const path = try tmp.dir.realPathFileAlloc(io, "note.txt", a);
+    defer a.free(path);
+    const result = try grep(io, a, .{}, .{
+        .pattern = "needle",
+        .path = path,
+        .glob = null,
+        .ignore_case = false,
+        .context_lines = 1,
+        .max_matches = 1,
+    });
+    defer result.deinit(a);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "needle later") == null);
+}
+
+pub const ReadRange = struct {
+    start_line: usize = 1,
+    end_line: ?usize = null,
+};
+
+pub fn optionalUnsigned(value: ?std.json.Value, minimum: usize) !?usize {
+    const field = value orelse return null;
+    if (field != .integer) return error.InvalidArguments;
+    const number = std.math.cast(usize, field.integer) orelse return error.InvalidArguments;
+    if (number < minimum) return error.InvalidArguments;
+    return number;
+}
+
+pub fn parseReadRange(allocator: std.mem.Allocator, arguments: []const u8) !ReadRange {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+    const range = ReadRange{
+        .start_line = (try optionalUnsigned(parsed.value.object.get("start_line"), 1)) orelse 1,
+        .end_line = try optionalUnsigned(parsed.value.object.get("end_line"), 1),
+    };
+    if (range.end_line) |end| {
+        if (end < range.start_line) return error.InvalidArguments;
+    }
+    return range;
+}
+
 pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
+    return readFileRange(io, allocator, path, .{});
+}
+
+pub fn readFileRange(io: std.Io, allocator: std.mem.Allocator, path: []const u8, range: ReadRange) !ToolResult {
+    if (range.start_line == 0 or (range.end_line != null and range.end_line.? < range.start_line))
+        return toolError(allocator, "Error: line numbers must be positive and end_line must be >= start_line", .{});
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) }),
@@ -121,18 +244,34 @@ pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Too
     };
     defer file.close(io);
 
-    const max_size = 1 * 1024 * 1024;
     var read_buf: [4096]u8 = undefined;
     var file_reader = file.reader(io, &read_buf);
-    const content = file_reader.interface.allocRemaining(allocator, .limited(max_size)) catch |err| {
-        return .{
-            .content = try std.fmt.allocPrint(allocator, "Error reading '{s}': {s}", .{ path, @errorName(err) }),
-            .is_error = true,
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(allocator);
+    var line: usize = 1;
+    var truncated = false;
+    while (range.end_line == null or line <= range.end_line.?) {
+        const byte = file_reader.interface.takeByte() catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return toolError(allocator, "Error reading '{s}': {s}", .{ path, @errorName(err) }),
         };
-    };
-
-    const normalized = try finalizeToolContent(allocator, content);
-    allocator.free(content);
+        if (line >= range.start_line) {
+            if (content.items.len == 8192) {
+                truncated = true;
+                break;
+            }
+            try content.append(allocator, byte);
+        }
+        if (byte == '\n') line = std.math.add(usize, line, 1) catch break;
+    }
+    const normalized = try finalizeToolContent(allocator, content.items);
+    if (truncated) {
+        defer allocator.free(normalized);
+        return .{
+            .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated at line {d}; read again with start_line={d} and a smaller end_line. A single line may exceed the output limit.]", .{ normalized, line, line }),
+            .is_error = false,
+        };
+    }
     return .{ .content = normalized, .is_error = false };
 }
 
@@ -328,6 +467,8 @@ pub const GrepArgs = struct {
     /// Only search files whose names match this glob.
     glob: ?[]const u8,
     ignore_case: bool,
+    context_lines: ?usize = null,
+    max_matches: ?usize = null,
 
     pub fn deinit(self: GrepArgs, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
@@ -361,6 +502,8 @@ pub fn parseGrepArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !
         .path = path,
         .glob = glob,
         .ignore_case = try optionalBool(arguments.get("ignore_case")),
+        .context_lines = try optionalUnsigned(arguments.get("context_lines"), 0),
+        .max_matches = try optionalUnsigned(arguments.get("max_matches"), 1),
     };
 }
 
@@ -406,11 +549,30 @@ fn optionalBool(value: ?std.json.Value) !bool {
 
 /// Build the argv for one grep call.
 ///
-/// The returned slice borrows `args` and string literals, so it stays valid for
-/// exactly as long as `args` does; only the slice itself is freed.
+/// Borrows args and literals, but owns numeric flags. Free with freeGrepArgv.
+pub fn freeGrepArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    freeGrepFlags(allocator, argv);
+    allocator.free(argv);
+}
+
+fn freeGrepFlags(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    if (argv.len == 0) return;
+    const start: usize = if (std.mem.eql(u8, argv[0], "rg")) 4 else 6;
+    if (argv.len <= start) return;
+    // Only the numeric flags immediately following the fixed backend flags
+    // are owned. Glob and pattern strings may contain flag-looking text.
+    for (argv[start..]) |arg| {
+        if (!std.mem.startsWith(u8, arg, "--context=") and !std.mem.startsWith(u8, arg, "--max-count=")) break;
+        allocator.free(arg);
+    }
+}
+
 pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs, backends: SearchBackends) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
-    errdefer argv.deinit(allocator);
+    errdefer {
+        freeGrepFlags(allocator, argv.items);
+        argv.deinit(allocator);
+    }
 
     if (backends.rg) {
         // The flags are passed even though ripgrep prints this shape by itself
@@ -420,6 +582,7 @@ pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs, backends: SearchBa
         // stripped of escapes before the model sees it, but that is no reason
         // to pay for them.
         try argv.appendSlice(allocator, &.{ "rg", "--line-number", "--no-heading", "--color=never" });
+        try appendGrepLimits(allocator, &argv, args);
         if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--glob", glob });
         if (args.ignore_case) try argv.append(allocator, "--ignore-case");
         // `--` keeps a pattern that starts with a dash from being read as a flag.
@@ -434,6 +597,7 @@ pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs, backends: SearchBa
         // skipped by hand because this grep does not read .gitignore and would
         // otherwise work through every object the repository has ever stored.
         try argv.appendSlice(allocator, &.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git" });
+        try appendGrepLimits(allocator, &argv, args);
         if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--include", glob });
         if (args.ignore_case) try argv.append(allocator, "-i");
         // `-e` rather than a bare pattern, for the same reason as `--` above.
@@ -443,7 +607,20 @@ pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs, backends: SearchBa
     return argv.toOwnedSlice(allocator);
 }
 
-/// Build the argv for one find call, under the same borrow rule as `grepArgv`.
+fn appendGrepLimits(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u8), args: GrepArgs) !void {
+    if (args.context_lines) |number| {
+        const flag = try std.fmt.allocPrint(allocator, "--context={d}", .{number});
+        errdefer allocator.free(flag);
+        try argv.append(allocator, flag);
+    }
+    if (args.max_matches) |number| {
+        const flag = try std.fmt.allocPrint(allocator, "--max-count={d}", .{number});
+        errdefer allocator.free(flag);
+        try argv.append(allocator, flag);
+    }
+}
+
+/// Build argv for one find call. Borrows args and literals; free only the slice.
 pub fn findArgv(allocator: std.mem.Allocator, args: FindArgs, backends: SearchBackends) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     errdefer argv.deinit(allocator);
@@ -541,7 +718,7 @@ fn runSearch(
 /// The grep tool: search file contents with a regular expression.
 pub fn grep(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, args: GrepArgs) !ToolResult {
     const argv = try grepArgv(allocator, args, backends);
-    defer allocator.free(argv);
+    defer freeGrepArgv(allocator, argv);
     return runSearch(io, allocator, argv, true);
 }
 
