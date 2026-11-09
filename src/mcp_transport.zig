@@ -628,7 +628,8 @@ pub const Http = struct {
         const arena = arena_state.allocator();
 
         var headers: std.ArrayList(std.http.Header) = .empty;
-        defer headers.deinit(allocator);
+        // The items were allocated from the arena, so it owns the list as well.
+        defer headers.deinit(arena);
         // Either answer is acceptable, and a server picks per request.
         try headers.append(arena, .{ .name = "Accept", .value = "application/json, text/event-stream" });
         if (call.protocol_version) |version| {
