@@ -195,6 +195,25 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                     '[' => {
                         if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
                         switch (input_buf[0]) {
+                            '<' => {
+                                // SGR mouse reports: consume clicks/releases too,
+                                // so coordinates can never enter the input buffer.
+                                var report: [64]u8 = undefined;
+                                var length: usize = 0;
+                                while (length < report.len) {
+                                    if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
+                                    report[length] = input_buf[0];
+                                    length += 1;
+                                    if (input_buf[0] >= 0x40 and input_buf[0] <= 0x7e) break;
+                                }
+                                if (mouseWheel(report[0..length])) |up| {
+                                    if (ln.scroll_callback) |scroll| {
+                                        try scroll(ln.layout_context, up);
+                                        // Scrolling must not reopen a dismissed popup.
+                                        if (ln.bottom_anchor) try state.refreshBottom(false) else try state.refreshLine();
+                                    }
+                                }
+                            },
                             '0'...'9' => |num| {
                                 var sequence: [32]u8 = undefined;
                                 sequence[0] = num;
@@ -259,6 +278,31 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                 try state.editInsert(utf8_buf[0..utf8_len]);
             },
         }
+    }
+}
+
+/// SGR report after CSI '<'. Only vertical wheel presses scroll the log.
+fn mouseWheel(report: []const u8) ?bool {
+    if (report.len == 0 or report[report.len - 1] != 'M') return null;
+    var fields = std.mem.splitScalar(u8, report[0 .. report.len - 1], ';');
+    const button = std.fmt.parseInt(u16, fields.next() orelse return null, 10) catch return null;
+    _ = std.fmt.parseInt(u16, fields.next() orelse return null, 10) catch return null;
+    _ = std.fmt.parseInt(u16, fields.next() orelse return null, 10) catch return null;
+    if (fields.next() != null) return null;
+    // Strip Shift/Alt/Ctrl modifiers, not motion or horizontal-wheel bits.
+    return switch (button & ~@as(u16, 4 | 8 | 16)) {
+        64 => true,
+        65 => false,
+        else => null,
+    };
+}
+
+test "SGR mouse wheel is distinct from clicks, releases and horizontal scrolling" {
+    try std.testing.expectEqual(true, mouseWheel("64;10;20M").?);
+    try std.testing.expectEqual(false, mouseWheel("65;10;20M").?);
+    try std.testing.expectEqual(true, mouseWheel("80;10;20M").?);
+    for ([_][]const u8{ "0;10;20M", "64;10;20m", "66;10;20M", "96;10;20M", "64;10M", "64;x;20M", "64;1;2;3M", "" }) |report| {
+        try std.testing.expectEqual(@as(?bool, null), mouseWheel(report));
     }
 }
 

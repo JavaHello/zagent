@@ -22,10 +22,14 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
     (root / 'src/中文 file.zig').write_text('')
     (root / 'node_modules').mkdir()
     (root / 'node_modules/hidden.zig').write_text('')
+    state = root / 'state' / 'zagent'
+    state.mkdir(parents=True)
+    (state / 'history').write_text('older question\n/help\n/model\n')
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 80, 0, 0))
     original = termios.tcgetattr(slave)
     env = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory,
+               XDG_STATE_HOME=str(root / 'state'),
                TERM='xterm-256color', AI_KEY='test', AI_MODEL='popup-mock',
                AI_MEMORY='0', AI_COMPACT_THRESHOLD='0')
     process = subprocess.Popen([str(binary)], cwd=directory, env=env,
@@ -47,7 +51,28 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
 
     try:
         read_until('❯ '.encode())
+        assert b'\x1b[?1000h\x1b[?1006h' in transcript
+        send(b'draft', '❯ draft'.encode())
+        # Recalled slash commands must not capture arrows in a completion menu.
+        send(b'\x1b[A', '❯ /model'.encode())
+        assert b'Tab/Enter insert' not in transcript
+        send(b'\x1b[A', '❯ /help'.encode())
+        send(b'\x1b[A', '❯ older question'.encode())
+        send(b'\x1b[B', '❯ /help'.encode())
+        send(b'\x1b[B', '❯ /model'.encode())
+        send(b'\x1b[B', '❯ draft'.encode())
+        # Wheel reports scroll the transcript, never input history; both
+        # directions work with the pointer over the bottom input row.
+        send(b'\x1b[<64;10;12M', '❯ draft'.encode())
+        assert b'\x1b[1;1H' in transcript  # log replay, not just input refresh
+        send(b'\x1b[<65;10;12M', '❯ draft'.encode())
+        # Clicks and releases are consumed without leaking coordinates.
+        send(b'\x1b[<0;10;12M\x1b[<0;10;12m!', '❯ draft!'.encode())
+        send(b'\x15', '❯ '.encode())
         send(b'/', b'/help  Show this help')
+        # Scrolling must also leave an active completion selection intact.
+        send(b'\x1b[<64;10;12M', b'/help  Show this help')
+        send(b'\x1b[<65;10;12M', b'/help  Show this help')
         send(b'\x1b[B\r', '❯ /clear'.encode())
         assert b'Conversation history cleared.' not in transcript
         send(b'\r', b'Conversation history cleared.')
@@ -67,9 +92,10 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         send(b'\x15check @alpha tail\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D', b'@src/alpha.zig  File')
         send(b'\t', '❯ check @src/alpha.zig tail'.encode())
         send(b'\x05\x15/qu\t\r', b'Goodbye!')
+        read_until(b'\x1b[?1006l\x1b[?1000l', raw=True)
         assert process.wait(timeout=5) == 0
         assert termios.tcgetattr(slave) == original
-        print('PASS: command navigation, explicit submission, file search, CJK/spaces, suffix preservation, empty/reserved states and terminal restoration')
+        print('PASS: slash-command history, mouse scrolling, command navigation, explicit submission, file search, CJK/spaces, suffix preservation and terminal restoration')
     finally:
         if process.poll() is None:
             process.kill()

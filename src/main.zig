@@ -34,7 +34,7 @@ const HELP =
     \\  /quit, /exit Exit zagent
     \\  /, @, $      Command / project file / reserved candidates
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
-    \\  PageUp/Down  Scroll output history
+    \\  Wheel/PageUp/Down  Scroll output history
     \\  While running: commands remain available; new questions are queued
     \\  Ctrl+Z       Suspend; resume with fg
     \\  Ctrl+D       Exit zagent

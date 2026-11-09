@@ -131,6 +131,8 @@ pub const LinenoiseState = struct {
     popup_items: []@import("main.zig").PopupItem = &.{},
     popup_selected: usize = 0,
     popup_rows: usize = 0,
+    /// Recalled commands must not divert subsequent arrows into completion.
+    history_navigation: bool = false,
     /// Ctrl-L asked the host to draw its log again.
     force_repaint: bool = false,
 
@@ -565,7 +567,7 @@ pub const LinenoiseState = struct {
     /// left the cursor, which the conversation scrolling above it can change.
     /// `recompute_popup` is false when only the highlight moved or the popup
     /// was just dismissed.
-    fn refreshBottom(self: *Self, recompute_popup: bool) !void {
+    pub fn refreshBottom(self: *Self, recompute_popup: bool) !void {
         const rows = @max(term.getRows(self.stdout), 2);
         // The window can change while a line is being edited; the host repaints
         // when it does, and the editor must wrap for the new width.
@@ -581,7 +583,7 @@ pub const LinenoiseState = struct {
         const total_rows = layout.total_rows;
 
         // The popup only appears above a single, unwrapped line, as inline.
-        if (recompute_popup and !self.ln.mask_mode and total_rows == 1) {
+        if (recompute_popup and !self.history_navigation and !self.ln.mask_mode and total_rows == 1) {
             if (self.ln.popup_callback) |callback| {
                 self.popup_items = try callback(self.allocator, self.ln.io, self.buf.items[0..self.pos]);
                 self.popup_selected = 0;
@@ -664,7 +666,7 @@ pub const LinenoiseState = struct {
             try self.refreshSingleLine();
         }
         // The popup occupies rows below a horizontally scrolling input.
-        if (!self.usesMultiLine() and !self.ln.mask_mode) {
+        if (!self.history_navigation and !self.usesMultiLine() and !self.ln.mask_mode) {
             if (self.ln.popup_callback) |callback| {
                 self.popup_items = try callback(self.allocator, self.ln.io, self.buf.items[0..self.pos]);
                 self.popup_selected = 0;
@@ -674,6 +676,7 @@ pub const LinenoiseState = struct {
     }
 
     pub fn editInsert(self: *Self, c: []const u8) !void {
+        self.history_navigation = false;
         try self.buf.resize(self.allocator, self.buf.items.len + c.len);
         if (self.buf.items.len > 0 and self.pos < self.buf.items.len - c.len) {
             std.mem.copyBackwards(
@@ -786,6 +789,7 @@ pub const LinenoiseState = struct {
     };
 
     pub fn editHistoryNext(self: *Self, dir: HistoryDirection) !void {
+        self.history_navigation = true;
         if (self.ln.history.hist.items.len > 0) {
             // Update the current history with the current line
             const old_index = self.ln.history.current;
@@ -811,6 +815,7 @@ pub const LinenoiseState = struct {
     }
 
     pub fn editDelete(self: *Self) !void {
+        self.history_navigation = false;
         if (self.buf.items.len == 0 or self.pos >= self.buf.items.len) return;
 
         const utf8_len = std.unicode.utf8ByteSequenceLength(self.buf.items[self.pos]) catch 1;
@@ -824,6 +829,7 @@ pub const LinenoiseState = struct {
     }
 
     pub fn editBackspace(self: *Self) !void {
+        self.history_navigation = false;
         if (self.buf.items.len == 0 or self.pos == 0) return;
 
         const utf8_len = self.prevCodepointLen(self.pos);
@@ -838,6 +844,7 @@ pub const LinenoiseState = struct {
     }
 
     pub fn editSwapPrev(self: *Self) !void {
+        self.history_navigation = false;
         //    aaa bb            =>   bb aaa
         //   ^   ^  ^- pos_end      ^  ^   ^- pos_end
         //   |   |                  |  |
@@ -874,6 +881,7 @@ pub const LinenoiseState = struct {
     }
 
     pub fn editDeletePrevWord(self: *Self) !void {
+        self.history_navigation = false;
         if (self.buf.items.len == 0 or self.pos == 0) return;
 
         const old_pos = self.pos;
@@ -894,11 +902,13 @@ pub const LinenoiseState = struct {
     }
 
     pub fn editKillLineForward(self: *Self) !void {
+        self.history_navigation = false;
         try self.buf.resize(self.allocator, self.pos);
         try self.refreshLine();
     }
 
     pub fn editKillLineBackward(self: *Self) !void {
+        self.history_navigation = false;
         const new_len = self.buf.items.len - self.pos;
         std.mem.copyForwards(
             u8,

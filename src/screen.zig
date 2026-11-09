@@ -24,8 +24,8 @@ const HIDE_CURSOR = "\x1b[?25l";
 const SHOW_CURSOR = "\x1b[?25h";
 const SAVE_CURSOR = "\x1b7";
 const RESTORE_CURSOR = "\x1b8";
-const ALT_ON = "\x1b[?1049h";
-const ALT_OFF = "\x1b[?1049l";
+const ALT_ON = "\x1b[?1049h\x1b[?1000h\x1b[?1006h";
+const ALT_OFF = "\x1b[?1006l\x1b[?1000l\x1b[?1049l";
 
 pub const Screen = struct {
     allocator: std.mem.Allocator,
