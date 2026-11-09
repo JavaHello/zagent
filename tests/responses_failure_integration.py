@@ -57,8 +57,9 @@ try:
             assert result.returncode != 0 and expected_error in result.stderr, result.stderr
             assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
             # The default budget already sits on the growth cap, so a truncated
-            # response is reported instead of retried with a larger budget.
-            expected_budgets = [8192]
+            # response is not retried with a larger budget. It is asked for a
+            # smaller step twice before the turn is given up.
+            expected_budgets = [8192, 8192, 8192] if expected_error == 'ResponseTruncated' else [8192]
             assert [r['max_output_tokens'] for r in requests] == expected_budgets, requests
 
         # Recover after a completed tool without losing its result or replaying
@@ -67,6 +68,40 @@ try:
         def completed_text(text):
             return {'status': 'completed', 'output': [{'type': 'message', 'role': 'assistant',
                     'content': [{'type': 'output_text', 'text': text}]}]}
+
+        def incomplete_text(text):
+            return {'status': 'incomplete', 'incomplete_details': {'reason': 'max_output_tokens'},
+                    'output': [{'type': 'message', 'role': 'assistant', 'status': 'incomplete',
+                                'content': [{'type': 'output_text', 'text': text}]}]}
+
+        # A reply cut short mid-answer is continued, not thrown away: the
+        # partial text is kept and the model is asked to carry on from it.
+        replies.extend([incomplete_text('Half an answer. '), completed_text('The rest.')])
+        requests.clear()
+        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory, env=env,
+                                capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        assert 'Half an answer. The rest.' in result.stdout, result.stdout
+        assert [r['max_output_tokens'] for r in requests] == [8192, 8192], requests
+        continued = requests[1]['input']
+        assert any(item.get('role') == 'assistant' and 'Half an answer.' in str(item.get('content'))
+                   for item in continued), continued
+        assert any(item.get('role') == 'user' and 'Continue exactly where it stopped' in str(item.get('content'))
+                   for item in continued), continued
+
+        # A call too large for the budget leaves no text to continue. The model
+        # is asked instead to retry in smaller steps, and the partial call is
+        # still never executed.
+        replies.extend([partial, completed_text('Split into chunks.')])
+        requests.clear()
+        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory, env=env,
+                                capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        assert 'Split into chunks.' in result.stdout, result.stdout
+        assert [r['max_output_tokens'] for r in requests] == [8192, 8192], requests
+        assert any(item.get('role') == 'user' and 'Try again in smaller steps' in str(item.get('content'))
+                   for item in requests[1]['input']), requests[1]
+        assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
 
         partial = cases[0][0]
         replies.extend([
@@ -92,7 +127,10 @@ try:
         assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
 
         # The growth cap must not loop or lower a larger configured budget.
-        for budget, expected in [(4096, [4096, 8192]), (8192, [8192]), (65536, [65536]), (200000, [200000])]:
+        # With no text to continue, each of the three attempts is given the
+        # configured budget (doubled only while below the 8192 ceiling).
+        for budget, expected in [(4096, [4096, 8192] * 3), (8192, [8192] * 3),
+                                 (65536, [65536] * 3), (200000, [200000] * 3)]:
             reply.clear()
             reply.update(partial)
             requests.clear()

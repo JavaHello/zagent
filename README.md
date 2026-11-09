@@ -100,8 +100,8 @@ AI_SESSION_FILE="$HOME/.local/state/zagent/project.json" zagent "Continue and ve
 ```
 
 Transient network errors and HTTP 408/429/500/502/503/504 responses are retried up
-to three attempts. Exhausted tool iterations and truncated model output return
-an error instead of reporting completion.
+to three attempts. Exhausted tool iterations, and output still cut off after
+bounded continuations, return an error instead of reporting completion.
 
 ## Validation
 
@@ -144,7 +144,7 @@ All configuration is also supported through environment variables:
 
 Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`. `AI_MARKDOWN` is the exception: it is not a provider setting and has no `OPENAI_` spelling.
 
-When a response hits `max_output_tokens`, both the main conversation and completion check retry the same input with a doubled token budget, up to three retries and a growth cap of 8192 tokens — the most DeepSeek's chat models accept. Since the default budget already equals that cap, the retry only grows a smaller configured `AI_MAX_TOKENS`. Partial tool calls are discarded and completed tool results are retained. If retries still truncate, split the task into smaller steps or use an endpoint with a larger output limit.
+When a response hits `max_output_tokens`, both the main conversation and completion check retry the same input with a doubled token budget, up to three retries and a growth cap of 8192 tokens — the most DeepSeek's chat models accept. Since the default budget already equals that cap, the retry only grows a smaller configured `AI_MAX_TOKENS`. Partial tool calls are discarded and completed tool results are retained. If the reply is still cut off, zagent keeps the partial text and asks the model to continue exactly where it stopped, up to eight times; a cut-off tool call is instead re-asked as a request to work in smaller steps, twice. Only when that also fails does the turn end with `ResponseTruncated`, after printing what was produced.
 
 ## Rendering
 

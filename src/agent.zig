@@ -26,6 +26,26 @@ const RED = "\x1b[31m";
 /// Longest transcript the completion judge is shown.
 const summary_max_bytes = 8000;
 
+/// How many times one reply may be continued after the output limit cut it
+/// short. Each continuation buys another full budget of text, so a handful is
+/// enough for any answer a person will read; the cap stops a model that never
+/// reaches a stopping point from spending the iteration budget on one turn.
+const max_continuations: usize = 8;
+
+/// How often a reply that produced no text at all is re-asked with a request to
+/// work in smaller steps. Repeating the same oversized request is rarely
+/// useful, so this is deliberately smaller than `max_continuations`.
+const max_empty_continuations: usize = 2;
+
+/// What to tell the model when the token limit cut its reply short. With part
+/// of the text in hand the job is to carry on from it; without any, the only
+/// way forward is a smaller step.
+const continue_prompt =
+    "Your previous reply was cut off by the model's output token limit. Continue exactly where it stopped, without repeating anything you already wrote, and keep the rest concise.";
+
+const restart_prompt =
+    "Your previous attempt was cut off by the model's output token limit before it delivered a usable reply. Try again in smaller steps: split large files into chunks and keep the response concise.";
+
 // Prompt for the choice menu. Colour codes are fine here because linenoize's
 // width() implementation correctly ignores ANSI SGR sequences.
 const CHOICE_PROMPT = BOLD ++ YELLOW ++ "choice" ++ RESET ++ " \xe2\x9d\xaf ";
@@ -342,23 +362,66 @@ pub const Agent = struct {
     fn runToolLoop(self: *Agent) !Turn {
         var turn: Turn = .{ .tool_calls = 0, .completed = false };
         var iteration: usize = 0;
+        // Text from replies that the token limit cut short. It is held back
+        // until the answer is complete, so the pieces print as the one reply
+        // they were meant to be instead of several half-rendered documents.
+        var carried: std.ArrayList(u8) = .empty;
+        defer carried.deinit(self.allocator);
+        var continuations: usize = 0;
+        var empty_continuations: usize = 0;
+        // Where this turn's continuation fragments start in the history. When
+        // the turn settles they are folded into the answer, or dropped if the
+        // reply turned into a tool call, so no transport scaffolding is kept.
+        var continuation_start: ?usize = null;
 
         while (iteration < self.max_iterations) : (iteration += 1) {
             const response = self.chatAnimated(self.history.items) catch |err| {
+                // Do not leave a continuation prompt as the last message for
+                // the next request to answer.
+                self.settleContinuations(&continuation_start, carried.items) catch {};
                 try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
                 return err;
             };
             defer response.deinit(self.allocator);
 
             if (std.mem.eql(u8, response.finish_reason, "length")) {
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: model output still exceeds the token budget after automatic retries; split the task into smaller steps, or raise AI_MAX_TOKENS if the endpoint accepts more than DeepSeek's 8192.\n" ++ RESET, .{});
-                return error.ResponseTruncated;
+                // The client already retried with a larger budget where its
+                // cap allowed it. What is left is to keep the text that was
+                // produced and ask for the rest, rather than lose the turn.
+                if (response.content) |partial| {
+                    if (continuations >= max_continuations) {
+                        try self.reportTruncation(&continuation_start, carried.items, partial);
+                        return error.ResponseTruncated;
+                    }
+                    continuations += 1;
+                    if (continuation_start == null) continuation_start = self.history.items.len;
+                    try carried.appendSlice(self.allocator, partial);
+                    try self.appendAssistantText(partial);
+                    try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  … reply cut off by the output limit; continuing where it stopped\n" ++ RESET, .{});
+                    try self.appendUserMessage(continue_prompt);
+                    continue;
+                }
+                if (empty_continuations >= max_empty_continuations) {
+                    try self.reportTruncation(&continuation_start, carried.items, "");
+                    return error.ResponseTruncated;
+                }
+                empty_continuations += 1;
+                if (continuation_start == null) continuation_start = self.history.items.len;
+                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  … reply cut off before any text; asking for a smaller step\n" ++ RESET, .{});
+                try self.appendUserMessage(if (carried.items.len > 0) continue_prompt else restart_prompt);
+                continue;
             }
             if (std.mem.eql(u8, response.finish_reason, "tool_calls")) {
                 const tool_calls = response.tool_calls orelse {
+                    self.settleContinuations(&continuation_start, carried.items) catch {};
                     try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});
                     return error.InvalidResponse;
                 };
+
+                // A partial reply that led to a tool call is not the answer;
+                // drop its fragments before the call joins the conversation.
+                try self.settleContinuations(&continuation_start, "");
+                carried.clearRetainingCapacity();
 
                 // Clone tool calls so the assistant message can own them
                 const owned_calls = try cloneToolCalls(self.allocator, tool_calls);
@@ -417,26 +480,40 @@ pub const Agent = struct {
             } else {
                 // Final answer
                 if (response.content) |content| {
+                    // Earlier pieces of this reply are already in the history;
+                    // print them together so markdown sees one document.
+                    var combined: ?[]u8 = null;
+                    defer if (combined) |buffered| self.allocator.free(buffered);
+                    const printed = if (carried.items.len > 0) blk: {
+                        combined = try std.mem.concat(self.allocator, u8, &.{ carried.items, content });
+                        break :blk combined.?;
+                    } else content;
                     const stdout = std.Io.File.stdout();
                     if (stdout.isTty(self.io) catch false) try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
-                    try self.writeAnswer(content);
+                    try self.writeAnswer(printed);
                     try stdout.writeStreamingAll(self.io, "\n");
 
-                    const owned_content = try self.allocator.dupe(u8, content);
-                    errdefer self.allocator.free(owned_content);
-                    const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
-                    errdefer if (owned_reasoning) |value| self.allocator.free(value);
+                    if (continuation_start != null) {
+                        // Fold the pieces and prompts into the one reply they
+                        // make up; incomplete items are never replayed.
+                        try self.settleContinuations(&continuation_start, printed);
+                    } else {
+                        const owned_content = try self.allocator.dupe(u8, content);
+                        errdefer self.allocator.free(owned_content);
+                        const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
+                        errdefer if (owned_reasoning) |value| self.allocator.free(value);
 
-                    const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
-                    errdefer if (owned_items) |value| self.allocator.free(value);
-                    try self.history.append(self.allocator, .{
-                        .response_items = owned_items,
-                        .role = "assistant",
-                        .content = owned_content,
-                        .reasoning_content = owned_reasoning,
-                        .tool_calls = null,
-                        .tool_call_id = null,
-                    });
+                        const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
+                        errdefer if (owned_items) |value| self.allocator.free(value);
+                        try self.history.append(self.allocator, .{
+                            .response_items = owned_items,
+                            .role = "assistant",
+                            .content = owned_content,
+                            .reasoning_content = owned_reasoning,
+                            .tool_calls = null,
+                            .tool_call_id = null,
+                        });
+                    }
                 }
                 try self.checkpoint();
                 turn.completed = true;
@@ -445,6 +522,9 @@ pub const Agent = struct {
         }
 
         if (iteration == self.max_iterations) {
+            // Keep whatever the cut-off replies had produced, but not the
+            // prompts that asked for it.
+            try self.settleContinuations(&continuation_start, carried.items);
             try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
         }
 
@@ -473,6 +553,13 @@ pub const Agent = struct {
             return null;
         };
         defer response.deinit(self.allocator);
+
+        // A verdict cut off by the token limit cannot be trusted, even when
+        // the fragment happens to parse: the outer loop asks again.
+        if (std.mem.eql(u8, response.finish_reason, "length")) {
+            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: the reply was truncated\n" ++ RESET, .{});
+            return null;
+        }
 
         const content = response.content orelse {
             try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: the reply was empty\n" ++ RESET, .{});
@@ -577,6 +664,51 @@ pub const Agent = struct {
             .tool_calls = null,
             .tool_call_id = null,
         });
+    }
+
+    /// Keep a partial reply in the history, without response items, so the
+    /// next request can continue it. Incomplete output must not be replayed.
+    fn appendAssistantText(self: *Agent, partial: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, partial);
+        errdefer self.allocator.free(owned);
+        try self.history.append(self.allocator, .{
+            .role = "assistant",
+            .content = owned,
+            .reasoning_content = null,
+            .tool_calls = null,
+            .tool_call_id = null,
+        });
+    }
+
+    /// Remove the partial replies and prompts a continuation left in the
+    /// history, keeping their text as one assistant message when there is any.
+    /// A turn that ends in a tool call or an error must not leave the model's
+    /// transport scaffolding behind for the next request to read.
+    fn settleContinuations(self: *Agent, start: *?usize, keep: []const u8) !void {
+        const index = start.* orelse return;
+        while (self.history.items.len > index) {
+            const message = self.history.items[self.history.items.len - 1];
+            self.history.items.len -= 1;
+            message.deinit(self.allocator);
+        }
+        start.* = null;
+        if (keep.len > 0) try self.appendAssistantText(keep);
+    }
+
+    /// Give up on a reply the token limit keeps cutting short. What was
+    /// produced before is still worth printing: losing it would be worse than
+    /// the error that ends the turn.
+    fn reportTruncation(self: *Agent, start: *?usize, carried: []const u8, partial: []const u8) !void {
+        const answer = try std.mem.concat(self.allocator, u8, &.{ carried, partial });
+        defer self.allocator.free(answer);
+        try self.settleContinuations(start, answer);
+        if (answer.len > 0) {
+            const stdout = std.Io.File.stdout();
+            if (stdout.isTty(self.io) catch false) try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+            try self.writeAnswer(answer);
+            try stdout.writeStreamingAll(self.io, "\n");
+        }
+        try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: model output still exceeds the token budget after automatic retries and continuations; split the task into smaller steps, or raise AI_MAX_TOKENS if the endpoint accepts more than DeepSeek's 8192.\n" ++ RESET, .{});
     }
 
     /// Announce a tool call on the line above whatever it prints.
@@ -712,4 +844,215 @@ fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptim
     const message = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(message);
     try file.writeStreamingAll(io, message);
+}
+
+/// A standalone agent for tests. The line editor and MCP registry live beside
+/// it because the agent only borrows them, and the whole harness is
+/// heap-allocated so their addresses stay valid while it runs.
+const TestHarness = struct {
+    env: std.process.Environ.Map,
+    config: Config,
+    linenoise: Linenoise,
+    registry: mcp.Registry,
+    agent: Agent,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io) !*TestHarness {
+        const self = try allocator.create(TestHarness);
+        errdefer allocator.destroy(self);
+
+        self.env = .init(allocator);
+        errdefer self.env.deinit();
+        try self.env.put("AI_URL", "http://127.0.0.1:1/v1");
+        try self.env.put("AI_MODEL", "test-model");
+        try self.env.put("AI_KEY", "test-key");
+
+        self.config = try Config.load(allocator, io, &self.env);
+        errdefer self.config.deinit();
+
+        self.linenoise = Linenoise.init(allocator, io, &self.env);
+        errdefer self.linenoise.deinit();
+
+        self.registry = mcp.Registry.empty(allocator, io);
+        errdefer self.registry.deinit();
+
+        self.agent = try Agent.init(allocator, io, self.config, &self.linenoise, &self.env, &self.registry);
+        return self;
+    }
+
+    fn deinit(self: *TestHarness, allocator: std.mem.Allocator) void {
+        self.agent.deinit();
+        self.registry.deinit();
+        self.linenoise.deinit();
+        self.config.deinit();
+        self.env.deinit();
+        allocator.destroy(self);
+    }
+};
+
+/// Scripted Responses bodies for `openai.Client`, so the loop can be driven
+/// without a socket. It records the budget of every request it is given.
+const MockTransport = struct {
+    replies: []const []const u8,
+    cursor: usize = 0,
+    budgets: std.ArrayList(u32) = .empty,
+    requests: std.ArrayList([]u8) = .empty,
+
+    fn send(context: *anyopaque, allocator: std.mem.Allocator, request: []const u8) anyerror![]u8 {
+        const self: *MockTransport = @ptrCast(@alignCast(context));
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
+        defer parsed.deinit();
+        const budget = parsed.value.object.get("max_output_tokens") orelse return error.InvalidRequest;
+        try self.budgets.append(allocator, @intCast(budget.integer));
+
+        const owned = try allocator.dupe(u8, request);
+        errdefer allocator.free(owned);
+        try self.requests.append(allocator, owned);
+
+        if (self.cursor >= self.replies.len) return error.NoScriptedReply;
+        const reply = self.replies[self.cursor];
+        self.cursor += 1;
+        return allocator.dupe(u8, reply);
+    }
+
+    fn deinit(self: *MockTransport, allocator: std.mem.Allocator) void {
+        for (self.requests.items) |request| allocator.free(request);
+        self.requests.deinit(allocator);
+        self.budgets.deinit(allocator);
+    }
+};
+
+const truncated_text =
+    "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"incomplete\",\"content\":[{\"type\":\"output_text\",\"text\":\"Half an \"}]}]}";
+
+const truncated_call =
+    "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"function_call\"}]}";
+
+const completed_answer =
+    "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer.\"}]}]}";
+
+const completed_split =
+    "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Split into chunks.\"}]}]}";
+
+/// Send fd 1 and 2 to /dev/null for the length of a test. The Zig test runner
+/// uses stdout as its protocol channel, and `runToolLoop` writes answers and
+/// progress directly to the process's standard files.
+const Silence = struct {
+    saved_out: std.Io.File,
+    saved_err: std.Io.File,
+    null_file: std.Io.File,
+
+    fn init(io: std.Io) !Silence {
+        const null_file = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .write_only });
+        errdefer null_file.close(io);
+        const saved_out = std.Io.File{ .handle = try duplicateFd(std.posix.STDOUT_FILENO), .flags = .{ .nonblocking = false } };
+        errdefer saved_out.close(io);
+        const saved_err = std.Io.File{ .handle = try duplicateFd(std.posix.STDERR_FILENO), .flags = .{ .nonblocking = false } };
+        errdefer saved_err.close(io);
+        try redirectFd(null_file.handle, std.posix.STDOUT_FILENO);
+        errdefer redirectFd(saved_out.handle, std.posix.STDOUT_FILENO) catch {};
+        try redirectFd(null_file.handle, std.posix.STDERR_FILENO);
+        return .{ .saved_out = saved_out, .saved_err = saved_err, .null_file = null_file };
+    }
+
+    fn deinit(self: *Silence, io: std.Io) void {
+        redirectFd(self.saved_out.handle, std.posix.STDOUT_FILENO) catch {};
+        redirectFd(self.saved_err.handle, std.posix.STDERR_FILENO) catch {};
+        self.saved_out.close(io);
+        self.saved_err.close(io);
+        self.null_file.close(io);
+    }
+};
+
+fn duplicateFd(fd: std.posix.fd_t) !std.posix.fd_t {
+    const result = std.posix.system.dup(fd);
+    if (std.posix.errno(result) != .SUCCESS) return error.DuplicateFdFailed;
+    return @intCast(result);
+}
+
+fn redirectFd(from: std.posix.fd_t, to: std.posix.fd_t) !void {
+    if (std.posix.errno(std.posix.system.dup2(from, to)) != .SUCCESS) return error.RedirectFdFailed;
+}
+
+test "a truncated reply is continued and kept as one message" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    var mock: MockTransport = .{ .replies = &.{ truncated_text, completed_answer } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+
+    const turn = try blk: {
+        var quiet = try Silence.init(std.testing.io);
+        defer quiet.deinit(std.testing.io);
+        try harness.agent.appendUserMessage("Do the task");
+        break :blk harness.agent.runToolLoop();
+    };
+
+    try std.testing.expect(turn.completed);
+    // The default budget is already on the growth cap, so truncation is
+    // answered by a continuation rather than by a larger request.
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 8192, 8192 }, mock.budgets.items);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "Continue exactly where it stopped") != null);
+    // The partial reply and the prompt that asked for the rest are folded
+    // into one assistant message; no scaffolding is left in the history.
+    try std.testing.expectEqual(@as(usize, 3), harness.agent.history.items.len);
+    const answer = harness.agent.history.items[2];
+    try std.testing.expectEqualStrings("assistant", answer.role);
+    try std.testing.expectEqualStrings("Half an answer.", answer.content.?);
+    try std.testing.expect(answer.response_items == null);
+}
+
+test "a truncated tool call is retried in smaller steps without a dangling prompt" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    var mock: MockTransport = .{ .replies = &.{ truncated_call, completed_split } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+
+    const turn = try blk: {
+        var quiet = try Silence.init(std.testing.io);
+        defer quiet.deinit(std.testing.io);
+        try harness.agent.appendUserMessage("Do the task");
+        break :blk harness.agent.runToolLoop();
+    };
+
+    try std.testing.expect(turn.completed);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 8192, 8192 }, mock.budgets.items);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "Try again in smaller steps") != null);
+    try std.testing.expectEqual(@as(usize, 3), harness.agent.history.items.len);
+    try std.testing.expectEqualStrings("Split into chunks.", harness.agent.history.items[2].content.?);
+}
+
+test "a reply that never stops truncating is given up on and still kept" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    // One initial reply plus `max_continuations` continuations, all cut off.
+    var replies: [max_continuations + 1][]const u8 = undefined;
+    for (&replies) |*reply| reply.* = truncated_text;
+    var mock: MockTransport = .{ .replies = &replies };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+
+    const outcome = blk: {
+        var quiet = try Silence.init(std.testing.io);
+        defer quiet.deinit(std.testing.io);
+        try harness.agent.appendUserMessage("Do the task");
+        break :blk harness.agent.runToolLoop();
+    };
+    try std.testing.expectError(error.ResponseTruncated, outcome);
+
+    try std.testing.expectEqual(max_continuations + 1, mock.budgets.items.len);
+    // The fragments become one assistant answer, and the prompts that asked
+    // for them are gone, so the next request sees a proper conversation.
+    try std.testing.expectEqual(@as(usize, 3), harness.agent.history.items.len);
+    const answer = harness.agent.history.items[2].content.?;
+    try std.testing.expectEqual(@as(usize, (max_continuations + 1) * "Half an ".len), answer.len);
+    for (0..max_continuations + 1) |index| {
+        try std.testing.expectEqualStrings("Half an ", answer[index * "Half an ".len ..][0.."Half an ".len]);
+    }
 }

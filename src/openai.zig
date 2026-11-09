@@ -80,6 +80,14 @@ pub const ApiResponse = struct {
     }
 };
 
+/// A replacement for the HTTP exchange, used to drive `respond` from tests
+/// without a socket. Production clients leave it null and talk to the network.
+pub const Transport = struct {
+    context: *anyopaque,
+    /// Handle one request and return the response body, which it owns.
+    send: *const fn (context: *anyopaque, allocator: std.mem.Allocator, request: []const u8) anyerror![]u8,
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -94,6 +102,8 @@ pub const Client = struct {
     /// erased by the next one. Whoever stops the animation reports it instead.
     http_error: ?[]u8,
     retryable_http_error: bool = false,
+    /// Set only by tests; see `Transport`.
+    transport: ?Transport = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Client {
         return .{
@@ -163,9 +173,11 @@ pub const Client = struct {
 
             const response = try self.performResponseWithRetry(response_url, auth_header, req_json);
             if (!std.mem.eql(u8, response.finish_reason, "length")) return response;
-            // Discard partial output and retry the same input, so completed
-            // tools are not repeated and incomplete calls are never dispatched.
-            // Bound both the extra requests and their token budget.
+            // Discard this attempt's partial output and retry the same input,
+            // so completed tools are not repeated and incomplete calls are
+            // never dispatched. Only the last attempt's partial text reaches
+            // the caller, which continues it. Bound both the extra requests
+            // and their token budget.
             if (attempt >= 3 or max_tokens >= growth_cap) return response;
             response.deinit(self.allocator);
             max_tokens = @min(growth_cap, @max(@as(u32, 1), max_tokens *| 2));
@@ -185,6 +197,14 @@ pub const Client = struct {
     }
 
     fn performResponseFetch(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8) !ApiResponse {
+        if (self.transport) |transport| {
+            const body = try transport.send(transport.context, self.allocator, req_json);
+            defer self.allocator.free(body);
+            if (self.http_error) |message| self.allocator.free(message);
+            self.http_error = null;
+            return parseResponse(self.allocator, body);
+        }
+
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
 
@@ -372,19 +392,16 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     if (root != .object) return error.InvalidResponse;
     if (root.object.get("error")) |api_error| if (api_error != .null) return error.ApiError;
     const status = try stringField(root, "status");
-    if (std.mem.eql(u8, status, "incomplete")) {
+    // A cut-off reply is not a failure: its text is worth keeping so the agent
+    // can continue it. Only the token limit is recoverable, and a partial tool
+    // call in it is never dispatched or replayed.
+    const truncated = std.mem.eql(u8, status, "incomplete");
+    if (truncated) {
         const details = root.object.get("incomplete_details") orelse return error.ResponseNotCompleted;
         if (details != .object) return error.ResponseNotCompleted;
         const reason = try stringField(details, "reason");
         if (!std.mem.eql(u8, reason, "max_output_tokens")) return error.ResponseNotCompleted;
-        return .{
-            .content = null,
-            .reasoning_content = null,
-            .tool_calls = null,
-            .finish_reason = try allocator.dupe(u8, "length"),
-        };
-    }
-    if (!std.mem.eql(u8, status, "completed")) return error.ResponseNotCompleted;
+    } else if (!std.mem.eql(u8, status, "completed")) return error.ResponseNotCompleted;
     const output = root.object.get("output") orelse return error.InvalidResponse;
     if (output != .array) return error.InvalidResponse;
     var content: std.Io.Writer.Allocating = .init(allocator);
@@ -396,12 +413,16 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     }
     for (output.array.items) |item| {
         const kind = try stringField(item, "type");
-        if (std.mem.eql(u8, kind, "function_call") or std.mem.eql(u8, kind, "message")) {
+        const is_message = std.mem.eql(u8, kind, "message");
+        if (!truncated and (std.mem.eql(u8, kind, "function_call") or is_message)) {
             if (item.object.get("status")) |item_status| {
                 if (item_status != .string or !std.mem.eql(u8, item_status.string, "completed")) return error.ResponseNotCompleted;
             }
         }
         if (std.mem.eql(u8, kind, "function_call")) {
+            // The arguments of a call cut off by the token limit are not valid
+            // JSON, so the call is dropped instead of executed or replayed.
+            if (truncated) continue;
             const id = try stringField(item, "call_id");
             const name = try stringField(item, "name");
             const arguments = try stringField(item, "arguments");
@@ -414,7 +435,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
             const owned_args = try allocator.dupe(u8, arguments);
             errdefer allocator.free(owned_args);
             try calls.append(allocator, .{ .id = owned_id, .name = owned_name, .arguments = owned_args });
-        } else if (std.mem.eql(u8, kind, "message")) {
+        } else if (is_message) {
             if (!std.mem.eql(u8, try stringField(item, "role"), "assistant")) return error.InvalidResponse;
             const blocks = item.object.get("content") orelse return error.InvalidResponse;
             if (blocks != .array) return error.InvalidResponse;
@@ -426,14 +447,16 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
                     try content.writer.writeAll(try stringField(block, "refusal"));
                 } else return error.UnsupportedOutputItem;
             }
-        } else if (!std.mem.eql(u8, kind, "reasoning")) return error.UnsupportedOutputItem;
+        } else if (!truncated and !std.mem.eql(u8, kind, "reasoning")) return error.UnsupportedOutputItem;
     }
-    if (calls.items.len == 0 and content.written().len == 0) return error.EmptyResponse;
+    if (!truncated and calls.items.len == 0 and content.written().len == 0) return error.EmptyResponse;
     const text = if (content.written().len > 0) try allocator.dupe(u8, content.written()) else null;
     errdefer if (text) |value| allocator.free(value);
-    const raw_items = try std.json.Stringify.valueAlloc(allocator, output, .{});
-    errdefer allocator.free(raw_items);
-    const reason = try allocator.dupe(u8, if (calls.items.len > 0) "tool_calls" else "stop");
+    // Incomplete output items must not be replayed: a partial call or message
+    // would be sent back to the model as if it had been completed.
+    const raw_items = if (truncated) null else try std.json.Stringify.valueAlloc(allocator, output, .{});
+    errdefer if (raw_items) |items| allocator.free(items);
+    const reason = try allocator.dupe(u8, if (truncated) "length" else if (calls.items.len > 0) "tool_calls" else "stop");
     errdefer allocator.free(reason);
     return .{
         .content = text,
@@ -583,6 +606,16 @@ test "Responses refuses nonterminal, malformed and ambiguous outputs" {
     defer incomplete.deinit(a);
     try std.testing.expectEqualStrings("length", incomplete.finish_reason);
     try std.testing.expect(incomplete.tool_calls == null);
+    try std.testing.expect(incomplete.content == null);
+    try std.testing.expect(incomplete.response_items == null);
+    // The text a truncated reply did produce is kept, while its incomplete
+    // message is never replayed as if it had been completed.
+    const partial = try parseResponse(a, "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"incomplete\",\"content\":[{\"type\":\"output_text\",\"text\":\"half an ans\"}]}]}");
+    defer partial.deinit(a);
+    try std.testing.expectEqualStrings("length", partial.finish_reason);
+    try std.testing.expectEqualStrings("half an ans", partial.content.?);
+    try std.testing.expect(partial.response_items == null);
+    try std.testing.expect(partial.tool_calls == null);
     try std.testing.expectError(error.ResponseNotCompleted, parseResponse(a, "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"output\":[]}"));
     try std.testing.expectError(error.ResponseNotCompleted, parseResponse(a, "{\"status\":\"incomplete\",\"output\":[]}"));
     try std.testing.expectError(error.ApiError, parseResponse(a, "{\"status\":\"failed\",\"error\":{\"message\":\"failure\"}}"));
