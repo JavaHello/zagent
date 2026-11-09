@@ -185,7 +185,9 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             },
             key_esc => {
                 if ((try term.readEscape(ln.io, in, &input_buf)) < 1) {
+                    try ln.escape(state.popup_items.len > 0);
                     try state.dismissPopup();
+                    try state.refreshLine();
                     continue;
                 }
                 switch (input_buf[0]) {
@@ -407,11 +409,20 @@ pub const Linenoise = struct {
     layout_callback: ?LayoutCallback = null,
     layout_context: ?*anyopaque = null,
     tick_callback: ?*const fn (?*anyopaque) anyerror!bool = null,
+    interrupt_callback: ?*const fn (?*anyopaque) anyerror!void = null,
+
     /// Direction (up) and whether to scroll a page rather than wheel lines.
     scroll_callback: ?*const fn (?*anyopaque, bool, bool) anyerror!void = null,
     /// The line being edited when Ctrl-Z suspended it, restored and freed by
     /// the next `linenoise` call.
     pending_input: ?[]u8 = null,
+
+    /// A completion popup gets first refusal; escape sequences never call this.
+    pub fn escape(self: *Linenoise, popup_open: bool) !void {
+        if (!popup_open) {
+            if (self.interrupt_callback) |interrupt| try interrupt(self.layout_context);
+        }
+    }
 
     const Self = @This();
 

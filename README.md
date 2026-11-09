@@ -636,6 +636,10 @@ Typing `/` at the start of the prompt opens system command candidates. Typing
 `@` at a word boundary searches project file paths, and `$` shows a reserved
 “Coming soon” entry. Candidates filter as you type. Use ↑/↓ to select, Tab or
 Enter to insert, and Esc to dismiss; press Enter again to submit the line.
+
+Press **Esc** to interrupt the current task, terminate its running tools, and clear
+queued questions while keeping your input draft. If a completion popup is open,
+Esc only closes the popup. Completed actions are not undone.
 File search skips `.git`, build caches and `node_modules`, and bounds traversal
 to keep large workspaces responsive. File selection inserts an `@path` reference
 (paths with spaces are quoted); it does not attach file contents automatically.

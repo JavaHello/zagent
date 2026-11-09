@@ -118,6 +118,7 @@ fn buildSystemPrompt(
 }
 
 pub const Agent = struct {
+    interrupted: std.atomic.Value(bool) = .init(false),
     allocator: std.mem.Allocator,
     io: std.Io,
     client: openai.Client,
@@ -576,6 +577,43 @@ pub const Agent = struct {
 
     /// Process a single user query: work on it until the model answers and the
     /// completion check agrees that the request is done.
+    /// Called only after the worker has joined. Preserve completed tool results
+    /// and explicitly settle any calls that cancellation left unanswered.
+    pub fn finishInterruption(self: *Agent) !void {
+        var index = self.history.items.len;
+        while (index > 0) {
+            index -= 1;
+            const calls = self.history.items[index].tool_calls orelse continue;
+            for (calls) |call| {
+                var answered = false;
+                for (self.history.items[index + 1 ..]) |message| {
+                    if (message.tool_call_id) |id| {
+                        if (std.mem.eql(u8, id, call.id)) answered = true;
+                    }
+                }
+                if (answered) continue;
+                const content = try self.allocator.dupe(u8, "Task interrupted by user. Execution may have partially completed; inspect actual state before retrying.");
+                errdefer self.allocator.free(content);
+                const id = try self.allocator.dupe(u8, call.id);
+                errdefer self.allocator.free(id);
+                try self.history.append(self.allocator, .{
+                    .role = "tool",
+                    .content = content,
+                    .tool_call_id = id,
+                    .reasoning_content = null,
+                    .tool_calls = null,
+                });
+            }
+            break;
+        }
+        self.terminal_title.update("ready", "");
+        try self.checkpoint();
+    }
+
+    fn checkInterrupted(self: *Agent) !void {
+        if (self.interrupted.load(.acquire)) return error.Canceled;
+    }
+
     pub fn processQuery(self: *Agent, query: []const u8) !void {
         self.query_started = std.Io.Timestamp.now(self.io, .awake);
         defer self.query_started = null;
@@ -601,7 +639,9 @@ pub const Agent = struct {
         });
         // The extraction is a small extra request, so it runs after the
         // user's own stats and never turns a finished answer into an error.
+        try self.checkInterrupted();
         self.extractMemories(query) catch {};
+        try self.checkInterrupted();
         try self.emit(std.Io.File.stderr(), BOLD ++ GREEN ++ "  ✓ Task completed" ++ RESET ++ "\n", .{});
     }
 
@@ -670,6 +710,7 @@ pub const Agent = struct {
         var worked = false;
 
         while (true) {
+            try self.checkInterrupted();
             const turn = try self.runToolLoop(&turn_start);
             if (!turn.completed) return error.IterationLimitReached;
             // Counted across the whole query, not per round: a round that only
@@ -688,6 +729,7 @@ pub const Agent = struct {
             // bounded.
             var judged: ?verifier.Verdict = null;
             while (judged == null and verifications < self.max_verifications) {
+                try self.checkInterrupted();
                 verifications += 1;
                 // The check announces itself from inside `judgeAnimated`, where
                 // it can be animated for as long as the judge is thinking.
@@ -745,6 +787,7 @@ pub const Agent = struct {
     /// results are printed, and the next frame of the animation would erase
     /// what was just printed. Here it ends before the caller writes a byte.
     fn chatAnimated(self: *Agent, messages: []const Message, stream: *AnswerStream) !openai.ApiResponse {
+        try self.checkInterrupted();
         self.terminal_title.update("thinking…", self.current_task);
         var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "thinking…", self.progressOptions());
         defer spin.stop();
@@ -763,6 +806,7 @@ pub const Agent = struct {
     /// animate, the plain line it replaces is printed instead, so a redirected
     /// run still records that the check happened.
     fn judgeAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
+        try self.checkInterrupted();
         self.terminal_title.update("checking completion…", self.current_task);
         var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking completion…", self.progressOptions());
         if (!spin.animating()) {
@@ -819,6 +863,7 @@ pub const Agent = struct {
         var continuation_start: ?usize = null;
 
         while (iteration < self.max_iterations) : (iteration += 1) {
+            try self.checkInterrupted();
             // Tool output can grow the conversation inside one turn. Compact
             // between iterations, but never while a cut-off reply is still
             // being carried: its fragments and the index that folds them are
@@ -879,31 +924,35 @@ pub const Agent = struct {
                 stream.flushPending() catch {};
 
                 // Clone tool calls so the assistant message can own them
-                const owned_calls = try cloneToolCalls(self.allocator, tool_calls);
-                errdefer {
-                    for (owned_calls) |c| c.deinit(self.allocator);
-                    self.allocator.free(owned_calls);
-                }
-                // Keep exact Responses output items alongside the UI summary.
-                // This retains reasoning and function call IDs for stateless replay.
-                const owned_content = if (response.content) |value| try self.allocator.dupe(u8, value) else null;
-                errdefer if (owned_content) |value| self.allocator.free(value);
-                const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
-                errdefer if (owned_reasoning) |value| self.allocator.free(value);
+                {
+                    const owned_calls = try cloneToolCalls(self.allocator, tool_calls);
+                    errdefer {
+                        for (owned_calls) |c| c.deinit(self.allocator);
+                        self.allocator.free(owned_calls);
+                    }
+                    // Keep exact Responses output items alongside the UI summary.
+                    // This retains reasoning and function call IDs for stateless replay.
+                    const owned_content = if (response.content) |value| try self.allocator.dupe(u8, value) else null;
+                    errdefer if (owned_content) |value| self.allocator.free(value);
+                    const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
+                    errdefer if (owned_reasoning) |value| self.allocator.free(value);
 
-                const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
-                errdefer if (owned_items) |value| self.allocator.free(value);
-                try self.history.append(self.allocator, .{
-                    .response_items = owned_items,
-                    .role = "assistant",
-                    .content = owned_content,
-                    .reasoning_content = owned_reasoning,
-                    .tool_calls = owned_calls,
-                    .tool_call_id = null,
-                });
+                    const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
+                    errdefer if (owned_items) |value| self.allocator.free(value);
+                    try self.history.append(self.allocator, .{
+                        .response_items = owned_items,
+                        .role = "assistant",
+                        .content = owned_content,
+                        .reasoning_content = owned_reasoning,
+                        .tool_calls = owned_calls,
+                        .tool_call_id = null,
+                    });
+                }
 
                 for (tool_calls) |call| {
+                    try self.checkInterrupted();
                     const result = self.executeTool(call) catch |err| blk: {
+                        if (self.interrupted.load(.acquire)) return error.Canceled;
                         const error_content = try std.fmt.allocPrint(
                             self.allocator,
                             "Tool execution error for {s}: {s}",

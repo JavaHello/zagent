@@ -19,12 +19,32 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        self.agent.interrupted.store(true, .release);
         if (self.future) |*f| _ = f.cancel(self.agent.io);
         _ = self.screen.drain() catch false;
         self.screen.replay() catch {};
         for (self.queue.items) |line| self.agent.allocator.free(line);
         self.queue.deinit(self.agent.allocator);
         if (self.answer) |answer| self.agent.allocator.free(answer);
+    }
+
+    pub fn interrupt(self: *Runtime) !void {
+        if (!self.busy()) return;
+        self.agent.interrupted.store(true, .release);
+        if (self.future) |*f| f.cancel(self.agent.io);
+        self.future = null;
+        self.done.store(false, .release);
+        self.waiting.store(false, .release);
+        self.answered.store(false, .release);
+        if (self.answer) |answer| self.agent.allocator.free(answer);
+        self.answer = null;
+        // Do not silently start another queued task after an explicit stop.
+        for (self.queue.items) |line| self.agent.allocator.free(line);
+        self.queue.clearRetainingCapacity();
+        try self.agent.finishInterruption();
+        _ = try self.screen.drain();
+        try self.screen.writeLog("\x1b[33mTask interrupted (Esc). Queued input cleared.\x1b[0m\n");
+        _ = try self.screen.drain();
     }
 
     pub fn submit(self: *Runtime, line: []const u8) !void {
@@ -49,6 +69,7 @@ pub const Runtime = struct {
         }
         if (!self.busy() and self.queue.items.len > 0) {
             const line = self.queue.orderedRemove(0);
+            self.agent.interrupted.store(false, .release);
             self.future = self.agent.io.concurrent(run, .{ self, line }) catch |err| {
                 self.agent.allocator.free(line);
                 return err;
@@ -61,6 +82,7 @@ pub const Runtime = struct {
         defer self.done.store(true, .release);
         defer self.agent.allocator.free(line);
         self.agent.processQuery(line) catch |err| {
+            if (self.agent.interrupted.load(.acquire)) return;
             const message = std.fmt.allocPrint(self.agent.allocator, "\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)}) catch return;
             defer self.agent.allocator.free(message);
             self.screen.writeLog(message) catch {};

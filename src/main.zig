@@ -37,6 +37,7 @@ const HELP =
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
     \\  Wheel/PageUp/Down  Scroll output history
     \\  While running: commands remain available; new questions are queued
+    \\  Esc          Stop current task and clear queued input (popup closes first)
     \\  Ctrl+Z       Suspend; resume with fg
     \\  Ctrl+D       Exit zagent
     \\
@@ -342,6 +343,7 @@ fn runRepl(
         agent.choice_callback = @import("runtime.zig").Runtime.choose;
         ln.tick_callback = tickRuntime;
         ln.scroll_callback = scrollRuntime;
+        ln.interrupt_callback = interruptRuntime;
     }
 
     ln.multiline_mode = true;
@@ -356,6 +358,7 @@ fn runRepl(
         ln.layout_context = null;
         ln.tick_callback = null;
         ln.scroll_callback = null;
+        ln.interrupt_callback = null;
         agent.choice_callback = null;
         agent.choice_context = null;
     }
@@ -564,6 +567,11 @@ fn layoutScreen(context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void 
 fn tickRuntime(context: ?*anyopaque) anyerror!bool {
     const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
     return runtime.tick();
+}
+
+fn interruptRuntime(context: ?*anyopaque) anyerror!void {
+    const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    try runtime.interrupt();
 }
 
 fn scrollRuntime(context: ?*anyopaque, up: bool, page: bool) anyerror!void {
