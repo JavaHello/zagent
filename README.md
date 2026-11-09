@@ -31,7 +31,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 ## Requirements
 
 - Zig 0.17.x
-- Linux with bubblewrap (`bwrap`) and GNU coreutils (`timeout`), **or** macOS with `sandbox-exec` for tool execution
+- For dangerous operations and local MCP servers: Linux with bubblewrap (`bwrap`) and GNU coreutils (`timeout`), **or** macOS with `sandbox-exec`; ordinary tools do not require a sandbox
 - An API key and base URL for a Responses-compatible endpoint
 
 ## Build
@@ -42,40 +42,34 @@ zig build
 
 The binary is written to `zig-out/bin/zagent`.
 
-## Sandboxed tools
+## Tool execution policy
 
-Every built-in filesystem, search, HTTP and shell tool runs in a sandbox. Local
-MCP servers use the same boundary. Only the directory from which you start zagent
-is mounted writable. System programs and libraries are read-only; the host home,
-configuration files, credentials, other workspaces, processes and sockets are
-hidden. `/tmp` is private and discarded after each tool call. Zig compilation
-caches persist under the workspace’s `.zig-cache/global`.
+Ordinary built-in filesystem, search, HTTP and shell tools run directly in the
+current working directory. They inherit the host environment (including credentials),
+filesystem permissions and network access. Start zagent in the intended project
+and only run trusted tasks. Zig compilation caches use `.zig-cache/global`.
 
-On Linux the sandbox is bubblewrap (`bwrap`), which mounts the workspace and
-read-only system paths into a private namespace; symlinks cannot reach files
-outside the mounted workspace. On macOS it is `sandbox-exec` with an SBPL
-profile, which grants read-write access to the workspace and a private temp
-directory and read-only access to system paths (`/usr`, `/bin`, `/sbin`,
-`/System`, `/Library`, `/private/etc`, `/dev`) plus `/opt/homebrew` so Homebrew
-tools keep working.
+A conservative heuristic routes dangerous operations to a sandbox: privilege
+escalation, system service or network administration, disk/power/account management,
+system package managers, shell references to protected system paths, and built-in
+writes to system paths. File-write checks resolve relative paths and existing
+symlinked parents. Detection is **not a security boundary**: scripts, dynamic shell
+commands and indirect side effects can evade it; some read-only commands may also
+be classified conservatively. No arbitrary-script isolation is promised.
 
-Commands have a 180-second default limit (`shell.timeout_seconds` accepts
-1–3600); background processes do not survive the tool call. If sandbox startup
-fails, the tool returns an error without an unsandboxed fallback.
+Dangerous operations use bubblewrap on Linux or `sandbox-exec` on macOS. Only the
+workspace is writable; the host home and credentials are hidden and the environment
+is clean. If sandbox startup fails, an error is returned, with no host fallback.
+Operations requiring real host configuration changes are therefore not performed.
+Local MCP servers continue to use this sandbox unconditionally and receive only
+explicitly configured environment entries.
 
-Start zagent in the project directory you want it to work on. Files inside that
-workspace are available to tools, including any secrets you put there. Built-in
-tools receive a clean environment without your API keys. Local MCP servers get
-only the environment entries explicitly declared in their `env` configuration.
-Install their dependencies ahead of time inside `/usr` or the workspace.
-
-Tool networking is disabled by default. Set `AI_TOOL_NETWORK=1` to permit network
-access for commands, HTTP tools and local MCP servers. This shares the host
-network, including localhost services. Model API calls and explicitly configured
-remote MCP endpoints use the main process network independently of tool network
-access. On Linux each sandbox has its own loopback interface even when networking
-is off; run a test server and client in the same shell call for local integration
-tests.
+Both direct and sandboxed tool calls retain a 180-second default limit
+(`shell.timeout_seconds` accepts 1–3600), output bounds and process-group cleanup.
+Sandbox networking is disabled by default; `AI_TOOL_NETWORK=1` enables host network
+access (including localhost) for sandboxed tools and local MCP servers. This setting
+does **not** restrict ordinary direct tools. Model API calls and explicitly configured
+remote MCP endpoints use the main process network independently.
 
 ```sh
 cd /path/to/project

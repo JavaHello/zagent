@@ -58,7 +58,7 @@ const SYSTEM_PROMPT =
     \\You are zagent, a powerful command-line AI assistant built with Zig.
     \\You can help users with any task by using the provided tools.
     \\
-    \\Tools run in a sandbox. Only the current workspace is writable; host home and credentials are hidden. Network access is disabled unless AI_TOOL_NETWORK=1.
+    \\Ordinary tools run directly in the current working directory with the host environment and network access. Commands detected as dangerous (privilege escalation, system or network configuration changes, system-path writes) run in a sandbox with no host fallback. AI_TOOL_NETWORK=1 enables network access only for sandboxed tools and local MCP servers. Detection is heuristic, not a security boundary; do not assume arbitrary scripts are isolated.
     \\Guidelines:
     \\- Be concise and direct in your responses.
     \\- Use the shell tool to run commands, install packages, or perform system operations.
@@ -126,6 +126,7 @@ pub const Agent = struct {
     /// filesystem a question whose answer cannot change while the agent runs.
     search: tools.SearchBackends,
     tool_network: bool,
+    tool_env: *const std.process.Environ.Map,
     session_path: ?[]u8,
     /// Durable notes loaded at startup and updated by the remember tool.
     memory: memory_mod.Memory,
@@ -204,6 +205,7 @@ pub const Agent = struct {
             .max_verifications = config.max_verifications,
             .linenoise = linenoise,
             .search = tools.detectSearchBackends(io, env),
+            .tool_env = env,
             .session_path = session_path,
             .memory = memory,
             .compact_threshold = config.compact_threshold,
@@ -1200,7 +1202,7 @@ pub const Agent = struct {
                 // server it belongs to and what the server calls it.
                 break :blk try self.mcp_registry.call(self.allocator, call.name, call.arguments);
             } else {
-                break :blk try @import("sandbox.zig").execute(self.io, self.allocator, self.tool_network, call.name, call.arguments);
+                break :blk try @import("execution.zig").execute(self.io, self.allocator, self.tool_env, self.tool_network, call.name, call.arguments);
             }
         };
 

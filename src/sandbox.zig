@@ -270,6 +270,38 @@ fn executeMacos(io: std.Io, allocator: std.mem.Allocator, network: bool, name: [
     defer l.deinit();
     defer l.releaseTempDir();
 
+    return executeLaunch(io, allocator, &l, workspace, timeout);
+}
+
+/// Run an ordinary tool with the host environment and current working directory,
+/// retaining the same timeout, output bounds and process-group cleanup.
+pub fn executeDirect(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8, arguments: []const u8) !tools.ToolResult {
+    if (arguments.len > 120 * 1024) return .{ .content = try allocator.dupe(u8, "Tool arguments exceed 120 KiB; split the operation into smaller patches."), .is_error = true };
+    const timeout = shellTimeout(allocator, name, arguments) catch return .{
+        .content = try allocator.dupe(u8, "Invalid timeout_seconds: use an integer from 1 to 3600."),
+        .is_error = true,
+    };
+    const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(workspace);
+    const exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(exe);
+    const deleted = " (deleted)";
+    const worker = if (std.mem.endsWith(u8, exe, deleted)) exe[0 .. exe.len - deleted.len] else exe;
+    var l: Launch = blk: {
+        const argv = try allocator.dupe([]const u8, &.{ worker, "--direct-tool-worker", name, arguments });
+        errdefer allocator.free(argv);
+        break :blk .{
+            .io = io,
+            .allocator = allocator,
+            .argv = argv,
+            .env = try env.clone(allocator),
+        };
+    };
+    defer l.deinit();
+    return executeLaunch(io, allocator, &l, workspace, timeout);
+}
+
+fn executeLaunch(io: std.Io, allocator: std.mem.Allocator, l: *Launch, workspace: []const u8, timeout: u32) !tools.ToolResult {
     var child = std.process.spawn(io, .{
         .argv = l.argv,
         .cwd = .{ .path = workspace },

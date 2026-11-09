@@ -216,17 +216,10 @@ pub fn buildSummaryMessages(
     previous: ?[]const u8,
     segment: []const u8,
 ) ![]Message {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-    if (previous) |summary| {
-        try w.writeAll("Summary so far:\n");
-        try w.writeAll(summary);
-        try w.writeAll("\n\n");
-    }
-    try w.writeAll("Next part of the conversation:\n");
-    try w.writeAll(segment);
-    const prompt = try aw.toOwnedSlice();
+    const prompt = if (previous) |summary|
+        try std.fmt.allocPrint(allocator, "Summary so far:\n{s}\n\nNext part of the conversation:\n{s}", .{ summary, segment })
+    else
+        try std.fmt.allocPrint(allocator, "Next part of the conversation:\n{s}", .{segment});
     errdefer allocator.free(prompt);
 
     const messages = try allocator.alloc(Message, 2);

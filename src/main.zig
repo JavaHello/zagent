@@ -100,12 +100,15 @@ pub fn main(init: std.process.Init) !void {
         args.deinit(allocator);
     }
 
-    if (args.items.len == 4 and std.mem.eql(u8, args.items[1], "--tool-worker")) {
+    const direct_worker = args.items.len == 4 and std.mem.eql(u8, args.items[1], "--direct-tool-worker");
+    if (args.items.len == 4 and (direct_worker or std.mem.eql(u8, args.items[1], "--tool-worker"))) {
         // Calling the internal dispatch flag on the host must not bypass the
         // sandbox. On Linux the worker is mounted at a private path that only
         // exists inside bubblewrap; on macOS the worker proves it is sandboxed
         // by failing to list /Users.
-        if (@import("builtin").os.tag == .macos) {
+        if (direct_worker) {
+            if (try @import("execution.zig").requiresSandbox(io, allocator, args.items[2], args.items[3])) return error.WorkerRequiresSandbox;
+        } else if (@import("builtin").os.tag == .macos) {
             @import("sandbox.zig").verifyMacosSandbox(io) catch return error.WorkerRequiresSandbox;
         } else {
             const executable = try std.process.executablePathAlloc(io, allocator);

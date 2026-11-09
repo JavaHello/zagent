@@ -4,7 +4,7 @@
 
 ## 构建与运行
 
-需要 Zig 0.17，以及 Linux 的 bubblewrap（和 GNU coreutils）或 macOS 自带的 `sandbox-exec`。工具启动失败时会返回错误，不会退回宿主机执行。
+需要 Zig 0.17。危险操作和本地 MCP 服务还需要 Linux 的 bubblewrap（和 GNU coreutils）或 macOS 自带的 `sandbox-exec`；沙箱启动失败时返回错误，不会退回宿主机执行。普通工具不依赖沙箱。
 
 ```sh
 zig build
@@ -33,16 +33,16 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 
 配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_MAX_VERIFICATIONS`、`AI_MARKDOWN`、`AI_COMPACT_THRESHOLD`、`AI_COMPACT_KEEP`、`AI_MEMORY`、`AI_MEMORY_AUTO`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。
 
-## 工具沙箱
+## 工具执行策略
 
-文件读写、补丁、目录搜索、HTTP 和 shell 工具都在独立沙箱内执行。本地 MCP 服务也使用该边界。
+普通文件读写、补丁、目录搜索、HTTP 和 shell 工具直接在当前工作目录执行，继承宿主机环境变量（包括凭据）、文件权限和网络权限。请在目标项目目录启动，并仅执行可信任务。
 
-- 启动 zagent 时所在的工作目录可读写。其他项目、宿主机 home、进程和凭据不挂载到沙箱。
-- 系统程序与库只读。Linux 下 `/usr`（含 `/bin`、`/sbin`、`/lib`）只读；macOS 下 `/usr`、`/bin`、`/sbin`、`/System`、`/Library`、`/private/etc`、`/dev` 以及 `/opt/homebrew` 只读。工具不继承 API key 等宿主机环境变量；MCP 只额外接收配置里显式声明的 `env`。
-- 工作目录中已有的文件都对工具开放，包括放在其中的凭据；请据此选择工作目录。
-- 默认禁止工具访问网络。需要下载或联网安装依赖时，由使用者设置 `AI_TOOL_NETWORK=1`。它会开放宿主机网络，包括本地服务。模型 API 和显式配置的远程 MCP 服务由主进程联网。
-- 单个命令默认最多运行 180 秒；shell 工具可用 `timeout_seconds` 设置 1–3600 秒。后台进程和临时目录不跨工具调用保留；工作目录中的文件保留。Zig 缓存保存在 `.zig-cache/global`。
-- Linux 下可在单个 shell 调用中启动测试服务和客户端，使用沙箱内的回环网络。
+- 保守启发式识别提权、系统服务/网络配置、磁盘/电源/账号管理、系统包管理，以及 shell 中的系统路径引用、内置工具的系统路径写入，将其交给沙箱。文件写入检查会解析相对路径和已有的符号链接父目录。
+- 危险操作仍使用 Linux bubblewrap 或 macOS `sandbox-exec`：仅工作目录可写，宿主机 home 和凭据隐藏，环境变量清理。沙箱无法启动就报错，绝不退回宿主机；因此不会真正修改宿主机系统配置。
+- 识别是启发式而非完整安全边界：动态拼接、脚本和间接副作用可能绕过识别，一些只读命令也可能保守地进入沙箱。不要假定任意脚本都被隔离。
+- 本地 MCP 服务继续强制使用沙箱，仅接收显式配置的额外 `env`。
+- `AI_TOOL_NETWORK=1` 仅开放沙箱工具和本地 MCP 服务的宿主机网络（包括 localhost）；普通直跑工具不受此开关限制。模型 API 和远程 MCP 使用主进程网络。
+- 直跑与沙箱工具均保留输出限制、进程组清理和超时：默认 180 秒，shell 的 `timeout_seconds` 可设为 1–3600 秒。后台进程不跨调用保留；直跑工具使用宿主机临时目录。Zig 缓存保存在 `.zig-cache/global`。
 
 局部修改可使用 `edit_file` 做精确文本替换：只匹配一次才写入，匹配不到或存在歧义时保留原文件，写入以原子替换完成并保留权限。多文件修改也支持严格校验的 unified diff；外层的 `*** Begin Patch` / `*** End Patch` 标记可以省略。
 
