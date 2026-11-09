@@ -892,6 +892,8 @@ pub const Renderer = struct {
         try self.wrap.w.flush();
     }
 
+    /// Lines containing pipes may be borrowed for table detection. Keep their
+    /// storage valid until the buffered table is flushed, or until `finish`.
     pub fn feedLine(self: *Renderer, raw: []const u8) !void {
         // A stray carriage return would send the cursor back to column zero.
         const line = std.mem.trimEnd(u8, raw, " \t\r");

@@ -1428,6 +1428,9 @@ const AnswerStream = struct {
     agent: *Agent,
     allocator: std.mem.Allocator,
     pending: std.ArrayList(u8) = .empty,
+    /// The renderer borrows table rows until the table is flushed. Keep those
+    /// lines separate from `pending`, which is compacted after every newline.
+    retained_lines: std.ArrayList([]u8) = .empty,
     buf: [8192]u8 = undefined,
     log_writer: ?ScreenLogWriter = null,
     file_writer: ?std.Io.File.Writer = null,
@@ -1462,7 +1465,14 @@ const AnswerStream = struct {
         return self;
     }
 
+    fn clearRetainedLines(self: *AnswerStream) void {
+        for (self.retained_lines.items) |line| self.allocator.free(line);
+        self.retained_lines.clearRetainingCapacity();
+    }
+
     fn deinit(self: *AnswerStream) void {
+        self.clearRetainedLines();
+        self.retained_lines.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -1502,7 +1512,13 @@ const AnswerStream = struct {
     fn emitLine(self: *AnswerStream, line: []const u8) !void {
         const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (self.renderer) |*r| {
-            try r.feedLine(trimmed);
+            const owned = try self.allocator.dupe(u8, trimmed);
+            self.retained_lines.append(self.allocator, owned) catch |err| {
+                self.allocator.free(owned);
+                return err;
+            };
+            try r.feedLine(owned);
+            if (r.table.count == 0) self.clearRetainedLines();
             // Push the line to the terminal now rather than waiting for the
             // writer's buffer to fill; that is what makes the answer stream.
             try r.flushWriter();
@@ -1533,9 +1549,51 @@ const AnswerStream = struct {
             try self.flushPending();
         }
         if (self.renderer) |*r| try r.finish();
+        self.clearRetainedLines();
         if (self.started) try self.agent.answerTrailer();
     }
 };
+
+test "streamed table rows survive pending buffer compaction and reallocation" {
+    const allocator = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const stream = try allocator.create(AnswerStream);
+    stream.* = .{
+        .agent = undefined, // emitLine's renderer path does not use the agent.
+        .allocator = allocator,
+        .renderer = render.Renderer.init(&output.writer, .{ .styled = false }),
+    };
+    defer stream.deinit();
+
+    const chunks = [_][]const u8{
+        "| Name | Value |\n| --- |",
+        " --- |\n| alpha | one |\n",
+        "| beta | two |\n",
+        "\nordinary text\n",
+        "not a table | still prose\n",
+    };
+    var document: std.ArrayList(u8) = .empty;
+    defer document.deinit(allocator);
+    for (chunks) |chunk| {
+        try document.appendSlice(allocator, chunk);
+        try stream.pending.appendSlice(allocator, chunk);
+        try stream.drainLines();
+        // Force the source allocation to be freed, even for small chunks.
+        const fresh = try allocator.dupe(u8, stream.pending.items);
+        stream.pending.deinit(allocator);
+        stream.pending = .empty;
+        defer allocator.free(fresh);
+        try stream.pending.appendSlice(allocator, fresh);
+    }
+    try stream.finish();
+    try std.testing.expectEqual(@as(usize, 0), stream.retained_lines.items.len);
+
+    var expected: std.Io.Writer.Allocating = .init(allocator);
+    defer expected.deinit();
+    try render.render(&expected.writer, document.items, .{ .styled = false });
+    try std.testing.expectEqualStrings(expected.written(), output.written());
+}
 
 fn cloneToolCalls(allocator: std.mem.Allocator, calls: []const ToolCallData) ![]ToolCallData {
     const result = try allocator.alloc(ToolCallData, calls.len);
