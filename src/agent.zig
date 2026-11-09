@@ -737,7 +737,7 @@ pub const Agent = struct {
             const response = self.chatAnimated(self.history.items, stream) catch |err| {
                 // Do not leave a continuation prompt as the last message for
                 // the next request to answer.
-                self.settleContinuations(&continuation_start, carried.items) catch {};
+                self.settleContinuations(&continuation_start, carried.items, null) catch {};
                 stream.flushPending() catch {};
                 try self.emit(std.Io.File.stderr(), RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
                 return err;
@@ -750,19 +750,19 @@ pub const Agent = struct {
                 // produced and ask for the rest, rather than lose the turn.
                 if (response.content) |partial| {
                     if (continuations >= max_continuations) {
-                        try self.reportTruncation(stream, &continuation_start, carried.items, partial);
+                        try self.reportTruncation(stream, &continuation_start, carried.items, partial, response.reasoning_content);
                         return error.ResponseTruncated;
                     }
                     continuations += 1;
                     if (continuation_start == null) continuation_start = self.history.items.len;
                     try carried.appendSlice(self.allocator, partial);
-                    try self.appendAssistantText(partial);
+                    try self.appendAssistantFragment(partial, response.reasoning_content);
                     try self.emit(std.Io.File.stderr(), DIM ++ "  … reply cut off by the output limit; continuing where it stopped\n" ++ RESET, .{});
                     try self.appendUserMessage(continue_prompt);
                     continue;
                 }
                 if (empty_continuations >= max_empty_continuations) {
-                    try self.reportTruncation(stream, &continuation_start, carried.items, "");
+                    try self.reportTruncation(stream, &continuation_start, carried.items, "", response.reasoning_content);
                     return error.ResponseTruncated;
                 }
                 empty_continuations += 1;
@@ -773,14 +773,14 @@ pub const Agent = struct {
             }
             if (std.mem.eql(u8, response.finish_reason, "tool_calls")) {
                 const tool_calls = response.tool_calls orelse {
-                    self.settleContinuations(&continuation_start, carried.items) catch {};
+                    self.settleContinuations(&continuation_start, carried.items, null) catch {};
                     try self.emit(std.Io.File.stderr(), RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});
                     return error.InvalidResponse;
                 };
 
                 // A partial reply that led to a tool call is not the answer;
                 // drop its fragments before the call joins the conversation.
-                try self.settleContinuations(&continuation_start, "");
+                try self.settleContinuations(&continuation_start, "", null);
                 carried.clearRetainingCapacity();
                 // Any commentary the model streamed before the call is shown;
                 // finish its last line so the tool announcement starts fresh.
@@ -866,7 +866,7 @@ pub const Agent = struct {
                     if (continuation_start != null) {
                         // Fold the pieces and prompts into the one reply they
                         // make up; incomplete items are never replayed.
-                        try self.settleContinuations(&continuation_start, printed);
+                        try self.settleContinuations(&continuation_start, printed, response.reasoning_content);
                     } else {
                         const owned_content = try self.allocator.dupe(u8, content);
                         errdefer self.allocator.free(owned_content);
@@ -894,7 +894,7 @@ pub const Agent = struct {
         if (iteration == self.max_iterations) {
             // Keep whatever the cut-off replies had produced, but not the
             // prompts that asked for it.
-            try self.settleContinuations(&continuation_start, carried.items);
+            try self.settleContinuations(&continuation_start, carried.items, null);
             stream.flushPending() catch {};
             try self.emit(std.Io.File.stderr(), RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
         }
@@ -1062,15 +1062,25 @@ pub const Agent = struct {
         });
     }
 
-    /// Keep a partial reply in the history, without response items, so the
-    /// next request can continue it. Incomplete output must not be replayed.
+    /// Keep a partial reply in the history, without reasoning, so the next
+    /// request can continue it. Incomplete output must not be replayed.
     fn appendAssistantText(self: *Agent, partial: []const u8) !void {
+        try self.appendAssistantFragment(partial, null);
+    }
+
+    /// Keep an assistant reply fragment in the history, with its chain-of-
+    /// thought text when known. Thinking mode requires the reasoning to be
+    /// passed back on later tool-carrying turns, even when the reply that
+    /// followed it was cut short.
+    fn appendAssistantFragment(self: *Agent, partial: []const u8, reasoning: ?[]const u8) !void {
         const owned = try self.allocator.dupe(u8, partial);
         errdefer self.allocator.free(owned);
+        const owned_reasoning = if (reasoning) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_reasoning) |value| self.allocator.free(value);
         try self.history.append(self.allocator, .{
             .role = "assistant",
             .content = owned,
-            .reasoning_content = null,
+            .reasoning_content = owned_reasoning,
             .tool_calls = null,
             .tool_call_id = null,
         });
@@ -1080,7 +1090,7 @@ pub const Agent = struct {
     /// history, keeping their text as one assistant message when there is any.
     /// A turn that ends in a tool call or an error must not leave the model's
     /// transport scaffolding behind for the next request to read.
-    fn settleContinuations(self: *Agent, start: *?usize, keep: []const u8) !void {
+    fn settleContinuations(self: *Agent, start: *?usize, keep: []const u8, reasoning: ?[]const u8) !void {
         const index = start.* orelse return;
         while (self.history.items.len > index) {
             const message = self.history.items[self.history.items.len - 1];
@@ -1088,16 +1098,16 @@ pub const Agent = struct {
             message.deinit(self.allocator);
         }
         start.* = null;
-        if (keep.len > 0) try self.appendAssistantText(keep);
+        if (keep.len > 0) try self.appendAssistantFragment(keep, reasoning);
     }
 
     /// Give up on a reply the token limit keeps cutting short. What was
     /// produced before is still worth printing: losing it would be worse than
     /// the error that ends the turn.
-    fn reportTruncation(self: *Agent, stream: *AnswerStream, start: *?usize, carried: []const u8, partial: []const u8) !void {
+    fn reportTruncation(self: *Agent, stream: *AnswerStream, start: *?usize, carried: []const u8, partial: []const u8, reasoning: ?[]const u8) !void {
         const answer = try std.mem.concat(self.allocator, u8, &.{ carried, partial });
         defer self.allocator.free(answer);
-        try self.settleContinuations(start, answer);
+        try self.settleContinuations(start, answer, reasoning);
         if (answer.len > 0) {
             if (stream.started) {
                 try stream.finish();

@@ -568,6 +568,18 @@ pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, me
             try w.writeByte('}');
             continue;
         }
+        // Older session snapshots carry unstructured Chat Completions
+        // reasoning strings. Convert them to a typed reasoning item so the
+        // chain-of-thought is passed back; thinking mode requires it when the
+        // request carries tools.
+        if (message.reasoning_content) |reasoning| {
+            if (reasoning.len > 0) {
+                try separator(w, &first);
+                try w.writeAll("{\"type\":\"reasoning\",\"content\":[{\"type\":\"reasoning_text\",\"text\":");
+                try std.json.Stringify.encodeJsonString(reasoning, .{}, w);
+                try w.writeAll("}]}");
+            }
+        }
         if (message.content) |content| {
             try separator(w, &first);
             try w.writeAll("{\"role\":");
@@ -576,8 +588,6 @@ pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, me
             try std.json.Stringify.encodeJsonString(content, .{}, w);
             try w.writeByte('}');
         }
-        // Older session snapshots are converted to typed call/output pairs.
-        // Their unstructured Chat Completions reasoning strings are not sent.
         if (message.tool_calls) |calls| for (calls) |call| {
             try separator(w, &first);
             try w.writeAll("{\"type\":\"function_call\",\"call_id\":");
@@ -639,6 +649,43 @@ fn writeFunction(w: *std.Io.Writer, tool: std.json.Value) !void {
     try w.writeAll(",\"parameters\":");
     try std.json.Stringify.value(parameters, .{}, w);
     try w.writeByte('}');
+}
+
+/// The plain chain-of-thought text from a response's completed reasoning
+/// items, or null when there is none. DeepSeek's thinking mode requires the
+/// reasoning to be passed back on later tool-carrying turns, even when the
+/// reply that followed it was cut off by the token limit.
+fn reasoningText(allocator: std.mem.Allocator, output: std.json.Value) !?[]u8 {
+    if (output != .array) return null;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    var first = true;
+    for (output.array.items) |item| {
+        if (item != .object) continue;
+        const kind = item.object.get("type") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "reasoning")) continue;
+        if (item.object.get("status")) |status| {
+            if (status != .string or !std.mem.eql(u8, status.string, "completed")) continue;
+        }
+        const blocks = item.object.get("content") orelse continue;
+        if (blocks != .array) continue;
+        for (blocks.array.items) |block| {
+            if (block != .object) continue;
+            const block_type = block.object.get("type") orelse continue;
+            if (block_type != .string or !std.mem.eql(u8, block_type.string, "reasoning_text")) continue;
+            const text = block.object.get("text") orelse continue;
+            if (text != .string) continue;
+            if (!first) try w.writeByte('\n');
+            first = false;
+            try w.writeAll(text.string);
+        }
+    }
+    if (first) {
+        aw.deinit();
+        return null;
+    }
+    return try aw.toOwnedSlice();
 }
 
 /// Parse only terminal Responses objects. Incomplete tool calls never execute.
@@ -713,6 +760,11 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     // would be sent back to the model as if it had been completed.
     const raw_items = if (truncated) null else try std.json.Stringify.valueAlloc(allocator, output, .{});
     errdefer if (raw_items) |items| allocator.free(items);
+    // Keep the chain-of-thought as plain text. Incomplete output items are not
+    // replayed, but the reasoning is complete and thinking mode requires it to
+    // be passed back when the next request carries tools.
+    const reasoning = try reasoningText(allocator, output);
+    errdefer if (reasoning) |value| allocator.free(value);
     const reason = try allocator.dupe(u8, if (truncated) "length" else if (calls.items.len > 0) "tool_calls" else "stop");
     errdefer allocator.free(reason);
     const usage: ?Usage = if (root.object.get("usage")) |usage_value| blk: {
@@ -726,7 +778,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     } else null;
     return .{
         .content = text,
-        .reasoning_content = null,
+        .reasoning_content = reasoning,
         .response_items = raw_items,
         .tool_calls = if (calls.items.len > 0) try calls.toOwnedSlice(allocator) else null,
         .finish_reason = reason,
@@ -861,11 +913,17 @@ test "Responses request uses typed items and flat non-strict function schemas" {
     try std.testing.expectEqual(@as(i64, 1234), root.get("max_output_tokens").?.integer);
     try std.testing.expect(!root.get("store").?.bool);
     const input = root.get("input").?.array.items;
-    try std.testing.expectEqual(@as(usize, 4), input.len);
-    try std.testing.expectEqualStrings("function_call", input[2].object.get("type").?.string);
+    try std.testing.expectEqual(@as(usize, 5), input.len);
+    // The legacy Chat Completions reasoning string is replayed as a typed
+    // reasoning item so thinking mode can receive it back.
+    try std.testing.expectEqualStrings("reasoning", input[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("legacy", input[1].object.get("content").?.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("assistant", input[2].object.get("role").?.string);
+    try std.testing.expect(input[2].object.get("reasoning_content") == null);
+    try std.testing.expectEqualStrings("function_call", input[3].object.get("type").?.string);
     try std.testing.expectEqualStrings("call_1", input[3].object.get("call_id").?.string);
-    try std.testing.expectEqualStrings("function_call_output", input[3].object.get("type").?.string);
-    try std.testing.expect(input[1].object.get("reasoning_content") == null);
+    try std.testing.expectEqualStrings("function_call_output", input[4].object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_1", input[4].object.get("call_id").?.string);
     const tools = root.get("tools").?.array.items;
     for (tools) |tool| {
         try std.testing.expect(tool.object.get("function") == null);
