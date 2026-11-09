@@ -179,17 +179,19 @@ pub fn main(init: std.process.Init) !void {
         if (!try workspace.isTrusted(allocator, io, env)) {
             const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
             defer allocator.free(canonical);
-            try printToStderr(allocator, io, "Trust this directory?\n  {s}\nTrusted directories allow tool execution and local MCP servers.\n" ++
-                "Type yes to trust and continue; anything else exits. [yes/No] ", .{canonical});
-            var consent = Linenoise.init(allocator, io, env);
-            defer consent.deinit();
-            if (!consent.is_tty) {
-                try std.Io.File.stderr().writeStreamingAll(io, "\nNot trusted. Run interactively to approve this directory first.\n");
+            const stderr = std.Io.File.stderr();
+            if (!(std.Io.File.stdin().isTty(io) catch false) or !(stderr.isTty(io) catch false)) {
+                try stderr.writeStreamingAll(io, "Not trusted. Run interactively to approve this directory first.\n");
                 std.process.exit(1);
             }
-            const answer = try consent.linenoise("");
-            defer if (answer) |value| allocator.free(value);
-            if (answer == null or !std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r\n"), "yes")) {
+            try printToStderr(allocator, io, "\nTrust this directory?\n  {s}\nTrusted directories allow tool execution and local MCP servers.\n", .{canonical});
+            const menu = @import("menu.zig");
+            const options = [_]menu.Option{
+                .{ .label = "Don't trust and exit", .description = "", .recommended = false },
+                .{ .label = "Trust and continue", .description = "", .recommended = false },
+            };
+            const answer = try menu.selectOnly(allocator, io, "Choose an action", &options);
+            if (answer == null or answer.? != 1) {
                 try std.Io.File.stderr().writeStreamingAll(io, "Not trusted. Exiting.\n");
                 std.process.exit(1);
             }

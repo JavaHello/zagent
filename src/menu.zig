@@ -212,6 +212,16 @@ fn writeRow(w: *std.Io.Writer, allocator: std.mem.Allocator, raw: []const u8, co
 /// Returns options.len for the custom-answer row, or null on cancellation.
 /// Draw on stderr so redirected stdout receives no cursor control sequences.
 pub fn select(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !?usize {
+    return selectMenu(allocator, io, question, options, true);
+}
+
+/// A closed menu with no custom-answer row; defaults to the first option.
+pub fn selectOnly(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !?usize {
+    return selectMenu(allocator, io, question, options, false);
+}
+
+fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option, allow_custom: bool) !?usize {
+    if (options.len == 0) return null;
     const out = std.Io.File.stderr();
     var raw = try RawTerminal.init(io, std.Io.File.stdin(), out);
     defer raw.deinit();
@@ -224,7 +234,7 @@ pub fn select(allocator: std.mem.Allocator, io: std.Io, question: []const u8, op
     try writeRow(&aw.writer, allocator, question, term.columns(out));
     try out.writeStreamingAll(io, aw.written());
 
-    var state = Selection{ .selected = recommendedIndex(options) orelse 0, .count = options.len + 1 };
+    var state = Selection{ .selected = recommendedIndex(options) orelse 0, .count = options.len + @intFromBool(allow_custom) };
     const visible = @min(state.count, 5);
     var drawn = false;
     while (true) {

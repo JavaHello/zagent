@@ -20,14 +20,20 @@ def interact(directory, env, answer):
     output = bytearray()
     try:
         deadline = time.monotonic() + 10
-        while b'[yes/No]' not in output:
+        while b'Enter confirm' not in output:
             assert time.monotonic() < deadline, output
             assert process.poll() is None, output
             if select.select([master], [], [], .1)[0]:
                 output.extend(os.read(master, 65536))
-        os.write(master, answer + b'\n')
-        if answer == b'yes':
-            # TERM=dumb uses canonical input, so subsequent commands can queue.
+        assert b"Don't trust and exit" in output, output
+        assert b'Trust and continue' in output, output
+        assert b'Other /' not in output, output
+        os.write(master, answer)
+        if answer == b'\x1b[B\r':
+            # Wait until raw-mode selection has ended before queuing lines.
+            while not (workspace_state(directory, env) / 'trusted').exists():
+                assert time.monotonic() < deadline, output
+                time.sleep(.01)
             os.write(master, b'/memory\n/remember globally saved note\n/quit\n')
         while process.poll() is None:
             assert time.monotonic() < deadline, output
@@ -61,8 +67,9 @@ with tempfile.TemporaryDirectory(prefix='zagent-trust-') as temporary:
     rejected = run(first, stdin='yes\n')
     assert rejected.returncode != 0 and 'Not trusted' in rejected.stderr
     assert not state.exists(), 'piped input must not grant trust'
-    code, output = interact(first, env, b'no')
-    assert code != 0 and not state.exists(), output
+    for keys in (b'\r', b'\x1b[B\x1b[A\r', b'\x03', b'\x04'):
+        code, output = interact(first, env, keys)
+        assert code != 0 and not state.exists(), output
 
     legacy = first / '.zagent'
     (legacy / 'sessions').mkdir(parents=True)
@@ -70,7 +77,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-trust-') as temporary:
     session_id = 'a' * 32
     snapshot = {'version': 1, 'workspace': str(first.resolve()), 'messages': []}
     (legacy / 'sessions' / f'{session_id}.json').write_text(json.dumps(snapshot))
-    code, output = interact(first, env, b'yes')
+    code, output = interact(first, env, b'\x1b[B\r')
     assert code == 0, output
     assert b'legacy durable note' not in output, output
     assert (state / 'trusted').read_text() == str(first.resolve())
