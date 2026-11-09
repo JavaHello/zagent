@@ -39,6 +39,24 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
     return null;
 }
 
+test "shell status survives empty output, stderr, signals and truncation" {
+    const cases = [_]struct { command: []const u8, prefix: []const u8, is_error: bool }{
+        .{ .command = "exit 0", .prefix = "Exit code: 0\n(no output)", .is_error = false },
+        .{ .command = "exit 42", .prefix = "Exit code: 42\n(no output)", .is_error = true },
+        .{ .command = "printf out; printf err >&2; exit 7", .prefix = "Exit code: 7\nout\nstderr: err", .is_error = true },
+        .{ .command = "printf warning >&2", .prefix = "Exit code: 0\n", .is_error = false },
+        .{ .command = "kill -TERM $$", .prefix = "Exit code: unavailable (termination: ", .is_error = true },
+        .{ .command = "printf '%10000s' ''; exit 9", .prefix = "Exit code: 9\n", .is_error = true },
+    };
+    for (cases) |case| {
+        const result = try executeShell(std.testing.io, std.testing.allocator, case.command);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.is_error, result.is_error);
+        try std.testing.expect(std.mem.startsWith(u8, result.content, case.prefix));
+        try std.testing.expect(result.content.len < 10000);
+    }
+}
+
 pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
     return executeShellWithEnv(io, allocator, command, null);
 }
@@ -53,13 +71,21 @@ pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    const exit_code: u8 = switch (result.term) {
+    const exit_code: ?u8 = switch (result.term) {
         .exited => |code| code,
-        else => 1,
+        else => null,
     };
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
+
+    // Content is sent to the model and persisted in session history. Keep
+    // status first so truncating long command output cannot hide it.
+    if (exit_code) |code| {
+        try aw.writer.print("Exit code: {d}\n", .{code});
+    } else {
+        try aw.writer.print("Exit code: unavailable (termination: {any})\n", .{result.term});
+    }
 
     if (result.stdout.len > 0) {
         const normalized = try normalizeToolText(allocator, result.stdout);
@@ -73,7 +99,7 @@ pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []
         defer allocator.free(normalized);
         try aw.writer.writeAll(normalized);
     }
-    if (aw.written().len == 0) {
+    if (result.stdout.len == 0 and result.stderr.len == 0) {
         try aw.writer.writeAll("(no output)");
     }
 
@@ -82,7 +108,7 @@ pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []
 
     return .{
         .content = content,
-        .is_error = exit_code != 0,
+        .is_error = exit_code == null or exit_code.? != 0,
     };
 }
 
@@ -916,7 +942,7 @@ test "bash supports arrays and double brackets" {
     const result = try executeShell(std.testing.io, std.testing.allocator, "items=(hello world); [[ ${#items[@]} == 2 ]] && printf '%s' \"${items[1]}\"");
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("world", result.content);
+    try std.testing.expectEqualStrings("Exit code: 0\nworld", result.content);
 }
 
 test "shell echo" {

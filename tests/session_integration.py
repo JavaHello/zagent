@@ -22,6 +22,13 @@ class API(http.server.BaseHTTPRequestHandler):
         if handle_planning(self, body):
             return
         requests.append(body)
+        if ('first-session-marker' in json.dumps(body.get('input', []))
+                and not any(item.get('type') == 'function_call_output'
+                            for item in body.get('input', []))):
+            send_response(self, body, {'status': 'completed', 'output': [
+                {'type': 'function_call', 'id': 'fc_exit', 'call_id': 'exit_call',
+                 'name': 'bash', 'arguments': json.dumps({'command': 'exit 42'})}]})
+            return
         send_response(self, body, {'status': 'completed', 'output': [
             {'type': 'message', 'role': 'assistant', 'content': [
                 {'type': 'output_text', 'text': 'Saved answer'}]}]})
@@ -54,6 +61,11 @@ try:
         first = session_id(run('first-session-marker'))
         path = state / 'sessions' / f'{first}.json'
         old = path.read_bytes()
+        saved = json.loads(old)
+        assert any(message.get('role') == 'tool'
+                   and message.get('content') == 'Exit code: 42\n(no output)'
+                   for message in saved['messages']), saved
+        assert 'Exit code: 42' in json.dumps(requests[-1]), requests[-1]
         second = session_id(run(stdin='/new\n/session\n/quit\n'))
         assert second != first
         assert path.read_bytes() == old
@@ -64,6 +76,7 @@ try:
         assert session_id(resumed) == first
         assert 'first-session-marker' in json.dumps(requests[-1]), requests[-1]
         assert 'Saved answer' in json.dumps(requests[-1]), requests[-1]
+        assert 'Exit code: 42' in json.dumps(requests[-1]), requests[-1]
         assert len(list(path.parent.glob('*.json'))) == 3
         run('--resume', first, stdin='/clear\n/quit\n')
         assert json.loads(path.read_text())['messages'] == []

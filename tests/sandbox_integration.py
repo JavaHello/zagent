@@ -145,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     assert 'Replaced one exact text block' in observed[11], observed[11]
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
-    assert observed[9] == '(no output)', observed[9]
+    assert observed[9] == 'Exit code: 0\n(no output)', observed[9]
     # Exercise disabled sandbox policy through the real CLI/worker boundary.
     calls[:] = [
         ('bash', {'command': 'items=(hello world); [[ ${#items[@]} == 2 ]] && printf "%s" "${items[1]}"'}),
@@ -169,7 +169,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     finally:
         server.shutdown()
     assert off.returncode == 0, off.stderr
-    assert observed[:2] == ['world', 'BASH_ONLY\n'], observed
+    assert observed[:2] == ['Exit code: 0\nworld', 'Exit code: 0\nBASH_ONLY\n'], observed
     assert 'requires isolation and was not executed' in observed[2], observed
     assert 'skipped local MCP server' in off.stderr, off.stderr
     assert not (workspace / 'MCP_MUST_NOT_START').exists()
