@@ -581,7 +581,8 @@ pub const Agent = struct {
 
     fn progressOptions(self: *Agent) spinner.Options {
         return .{
-            .enabled = self.animate_progress and self.choice_callback == null,
+            .enabled = self.animate_progress,
+            .screen = if (self.choice_callback != null) self.screen else null,
             .started = self.query_started,
             .prompt = self.progress_prompt,
             .first_frame_delay_ms = 0,

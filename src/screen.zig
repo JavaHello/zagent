@@ -47,11 +47,33 @@ pub const Screen = struct {
     buffered: bool = false,
     queued: std.ArrayList(u8) = .empty,
     queue_mutex: std.Io.Mutex = .init,
+    progress: [256]u8 = undefined,
+    progress_len: usize = 0,
+    pending_progress: [256]u8 = undefined,
+    pending_progress_len: usize = 0,
+    progress_changed: bool = false,
+
+    /// Workers publish a transient line; only the foreground draws it.
+    pub fn setProgress(self: *Screen, line: []const u8) void {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        const len = @min(line.len, self.pending_progress.len);
+        @memcpy(self.pending_progress[0..len], line[0..len]);
+        self.pending_progress_len = len;
+        self.progress_changed = true;
+    }
 
     pub fn drain(self: *Screen) !bool {
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
-        if (self.queued.items.len == 0) return false;
+        const changed = self.progress_changed;
+        if (changed) {
+            self.progress_len = self.pending_progress_len;
+            @memcpy(self.progress[0..self.progress_len], self.pending_progress[0..self.progress_len]);
+            self.progress_changed = false;
+            self.dirty = true;
+        }
+        if (self.queued.items.len == 0) return changed;
         const old_rows = if (self.scroll_rows > 0) blk: {
             const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
             defer self.allocator.free(rows);
@@ -247,6 +269,10 @@ pub const Screen = struct {
         try w.writeAll(view[start..]);
         try w.writeAll(SAVE_CURSOR);
         try w.print("\x1b[{d};1H\x1b[0J", .{top});
+        if (self.progress_len > 0) {
+            try w.writeAll(self.progress[0..self.progress_len]);
+            try w.writeAll("\r\n");
+        }
         try w.writeAll(RESTORE_CURSOR);
         try w.writeAll(SHOW_CURSOR);
         try w.flush();
@@ -279,11 +305,12 @@ pub const Screen = struct {
     }
 
     fn logBottom(self: *const Screen) usize {
-        return self.rows -| @min(self.input_rows, self.rows -| 1);
+        const reserved = self.input_rows + @as(usize, if (self.progress_len > 0) 1 else 0);
+        return self.rows -| @min(reserved, self.rows -| 1);
     }
 
     fn inputTop(self: *const Screen) usize {
-        return self.logBottom() + 1;
+        return self.rows -| @min(self.input_rows, self.rows -| 1) + 1;
     }
 
     fn saveCursor(self: *Screen) void {
@@ -502,6 +529,29 @@ test "visual history rows count wrapping, CJK and ANSI without splitting UTF-8" 
     const rows = try visualRows(a, "\x1b[31m你好ab\x1b[0m\nlast\n", 4);
     defer a.free(rows);
     try std.testing.expectEqualSlices(usize, &.{ 0, 11, 18, 23 }, rows);
+}
+
+test "worker progress reserves a transient row above input without entering history" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var s = Screen.init(a, io, false);
+    defer s.deinit();
+    s.rows = 16;
+    s.input_rows = 3;
+    try std.testing.expectEqual(@as(usize, 13), s.logBottom());
+    s.setProgress("thinking… 1s · in 10 · out 0");
+    try std.testing.expectEqual(@as(usize, 0), s.progress_len);
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqualStrings("thinking… 1s · in 10 · out 0", s.progress[0..s.progress_len]);
+    try std.testing.expectEqual(@as(usize, 12), s.logBottom());
+    try std.testing.expectEqual(@as(usize, 14), s.inputTop());
+    try std.testing.expectEqual(@as(usize, 0), s.transcript.items.len);
+    try std.testing.expect(!try s.drain());
+    s.setProgress("");
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqual(@as(usize, 0), s.progress_len);
+    try std.testing.expectEqual(@as(usize, 13), s.logBottom());
+    try std.testing.expectEqual(@as(usize, 14), s.inputTop());
 }
 
 test "buffered output is drained by the UI and keeps a scrolled viewport anchored" {

@@ -88,6 +88,8 @@ try:
             until('❯ '.encode())
             os.write(master, b'first question\r')
             assert started.wait(8)
+            until(b's \xc2\xb7 in ')
+            assert b'thinking' in ansi.sub(b'', transcript), transcript
             send(b'/model\r\r', b'Model: runtime-mock')
             assert not release.is_set()
             send(b'/status\r\r', b'Account quota:')

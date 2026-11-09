@@ -20,6 +20,7 @@
 const std = @import("std");
 const sgr = @import("style.zig");
 const term = @import("term.zig");
+const Screen = @import("screen.zig").Screen;
 
 /// The frames of the animation, one cell each.
 const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
@@ -34,6 +35,8 @@ const erase = "\r\x1b[2K";
 const indent_width = 4;
 
 pub const Options = struct {
+    /// In interactive mode publish frames for the foreground instead of writing.
+    screen: ?*Screen = null,
     /// Share the query's clock across model requests and tool calls.
     started: ?std.Io.Timestamp = null,
     /// Keep an empty input prompt below the status while work is running.
@@ -114,7 +117,9 @@ fn animate(
 ) void {
     var drawn = false;
     // Runs on cancelation too: this is what gives the line back.
-    defer if (drawn) file.writeStreamingAll(io, if (options.prompt != null)
+    defer if (options.screen) |screen|
+        screen.setProgress("")
+    else if (drawn) file.writeStreamingAll(io, if (options.prompt != null)
         "\x1b[1A" ++ erase ++ "\r\n" ++ erase ++ "\x1b[1A\r"
     else
         erase) catch {};
@@ -142,6 +147,11 @@ fn animate(
             if (options.out_tokens) |p| p.load(.monotonic) else null,
         ) catch return;
         // Either of these can observe the cancelation; both end the loop.
+        if (options.screen) |screen| {
+            screen.setProgress(line);
+            io.sleep(.fromMilliseconds(options.frame_interval_ms), .awake) catch return;
+            continue;
+        }
         var display_buf: [512]u8 = undefined;
         const display = if (options.prompt) |prompt|
             std.fmt.bufPrint(&display_buf, "{s}{s}\r\n" ++ erase ++ "{s}", .{ if (index > 0) "\x1b[1A" else "", line, prompt }) catch return
