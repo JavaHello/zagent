@@ -5,6 +5,8 @@ const provider = @import("provider.zig");
 const history = @import("history.zig");
 const commands = @import("commands.zig");
 const mcp = @import("mcp.zig");
+const banner = @import("banner.zig");
+const term = @import("term.zig");
 const Linenoise = @import("linenoise").Linenoise;
 
 // ANSI colour codes
@@ -13,19 +15,7 @@ const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const RED = "\x1b[31m";
 const GREEN = "\x1b[32m";
-const MAGENTA = "\x1b[35m";
 const YELLOW = "\x1b[33m";
-
-const BANNER =
-    \\
-    \\   ███████╗ █████╗  ██████╗ ███████╗███╗   ██╗████████╗
-    \\   ╚════██║██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝
-    \\       ██╔╝███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   
-    \\      ██╔╝ ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   
-    \\      ██║  ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   
-    \\      ╚═╝  ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   
-    \\
-;
 
 const HELP =
     \\Commands:
@@ -101,13 +91,19 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.items.len == 4 and std.mem.eql(u8, args.items[1], "--tool-worker")) {
-        // The worker is mounted at this private path by sandbox.zig. Calling
-        // the internal dispatch flag on the host must not bypass the sandbox.
-        const executable = try std.process.executablePathAlloc(io, allocator);
-        defer allocator.free(executable);
-        const deleted = " (deleted)";
-        const worker_path = if (std.mem.endsWith(u8, executable, deleted)) executable[0 .. executable.len - deleted.len] else executable;
-        if (!std.mem.eql(u8, worker_path, "/zagent-worker")) return error.WorkerRequiresSandbox;
+        // Calling the internal dispatch flag on the host must not bypass the
+        // sandbox. On Linux the worker is mounted at a private path that only
+        // exists inside bubblewrap; on macOS the worker proves it is sandboxed
+        // by failing to list /Users.
+        if (@import("builtin").os.tag == .macos) {
+            @import("sandbox.zig").verifyMacosSandbox(io) catch return error.WorkerRequiresSandbox;
+        } else {
+            const executable = try std.process.executablePathAlloc(io, allocator);
+            defer allocator.free(executable);
+            const deleted = " (deleted)";
+            const worker_path = if (std.mem.endsWith(u8, executable, deleted)) executable[0 .. executable.len - deleted.len] else executable;
+            if (!std.mem.eql(u8, worker_path, "/zagent-worker")) return error.WorkerRequiresSandbox;
+        }
         const result = @import("tool_worker.zig").execute(io, allocator, env, args.items[2], args.items[3]) catch |err| tools_error: {
             break :tools_error @import("tools.zig").ToolResult{
                 .content = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}),
@@ -216,13 +212,14 @@ pub fn main(init: std.process.Init) !void {
         try agent.processQuery(query);
     } else {
         // Interactive REPL mode
-        try runRepl(allocator, io, &agent, config, &ln, history_path, &registry);
+        try runRepl(allocator, io, env, &agent, config, &ln, history_path, &registry);
     }
 }
 
 fn runRepl(
     allocator: std.mem.Allocator,
     io: std.Io,
+    env: *const std.process.Environ.Map,
     agent: *Agent,
     config: Config,
     ln: *Linenoise,
@@ -235,12 +232,26 @@ fn runRepl(
     ln.multiline_mode = true;
     agent.progress_prompt = if (ln.is_tty) PROMPT else null;
 
-    try stdout.writeStreamingAll(io, MAGENTA ++ BOLD ++ BANNER ++ RESET);
     {
+        // The wordmark is drawn through an allocating writer because a
+        // truecolour one costs a few kilobytes of escape sequences. Colour is
+        // for a terminal only: piped to a file it would be noise.
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try banner.write(&aw.writer, .{
+            .mode = banner.detect(env, ln.term_supported and (stdout.isTty(io) catch false)),
+            .columns = term.columns(stdout),
+        });
+        try aw.writer.writeByte('\n');
+        try stdout.writeStreamingAll(io, aw.written());
+    }
+    {
+        // The label is dim and the model name is not, so the eye lands on the
+        // value rather than on the word "Model".
         const model_line = if (config.provider) |selected|
-            try std.fmt.allocPrint(allocator, DIM ++ "  Model : {s}  ({s})\n" ++ RESET, .{ config.model, @tagName(selected) })
+            try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}" ++ DIM ++ " · {s}\n" ++ RESET, .{ config.model, @tagName(selected) })
         else
-            try std.fmt.allocPrint(allocator, DIM ++ "  Model : {s}\n" ++ RESET, .{config.model});
+            try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}\n", .{config.model});
         defer allocator.free(model_line);
         try stdout.writeStreamingAll(io, model_line);
     }
@@ -363,6 +374,7 @@ test {
     _ = @import("verifier.zig");
     _ = @import("style.zig");
     _ = @import("term.zig");
+    _ = @import("banner.zig");
     _ = @import("text.zig");
     _ = @import("render.zig");
     _ = @import("spinner.zig");

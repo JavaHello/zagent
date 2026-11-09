@@ -1784,10 +1784,10 @@ const fake_server_script =
     \\done
 ;
 
-/// A stdio server is launched inside the Linux sandbox, which does not exist
-/// on other hosts, so the tests that spawn one cannot run on them.
-fn skipUnlessLinux() !void {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+/// A stdio server is launched inside the sandbox, which only exists on Linux
+/// and macOS, so the tests that spawn one cannot run on other hosts.
+fn skipUnlessSandboxed() !void {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
 }
 
 /// Start the shell server in `mode` and connect to it the way the agent does.
@@ -2189,7 +2189,7 @@ test "a version the server does not have is read from its refusal" {
 }
 
 test "the shell server answers tools over stdio" {
-    try skipUnlessLinux();
+    try skipUnlessSandboxed();
     const allocator = std.testing.allocator;
 
     var connection = try startFakeServer(allocator, "modern", 5_000);
@@ -2217,7 +2217,7 @@ test "the shell server answers tools over stdio" {
 }
 
 test "the shell server is opened the old way when it needs the handshake" {
-    try skipUnlessLinux();
+    try skipUnlessSandboxed();
     const allocator = std.testing.allocator;
 
     var connection = try startFakeServer(allocator, "legacy", 5_000);
@@ -2237,7 +2237,7 @@ test "the shell server is opened the old way when it needs the handshake" {
 }
 
 test "a server that prints a banner before its first message still connects" {
-    try skipUnlessLinux();
+    try skipUnlessSandboxed();
     const allocator = std.testing.allocator;
 
     // npm and friends write to stdout before the server has said anything.
@@ -2248,7 +2248,7 @@ test "a server that prints a banner before its first message still connects" {
 }
 
 test "a server that never answers is given up on" {
-    try skipUnlessLinux();
+    try skipUnlessSandboxed();
     const allocator = std.testing.allocator;
 
     // Both questions go unanswered, so the second one's deadline is what ends
@@ -2280,7 +2280,7 @@ test "a tool the registry does not have is named as such" {
 }
 
 test "a server is given the variables its configuration adds" {
-    try skipUnlessLinux();
+    try skipUnlessSandboxed();
     const allocator = std.testing.allocator;
 
     var connection = try startFakeServerWithEnv(allocator, "env");
@@ -2299,7 +2299,7 @@ test "a server is given the variables its configuration adds" {
 }
 
 test "the /mcp listing names the servers and what they brought" {
-    try skipUnlessLinux();
+    try skipUnlessSandboxed();
     const allocator = std.testing.allocator;
 
     // Everything here is handed to the registry, which is then what frees it:
@@ -2378,7 +2378,7 @@ test "over http the era is read from a refusal" {
 }
 
 test "the registry connects what mcp.json names, end to end" {
-    try skipUnlessLinux();
+    try skipUnlessSandboxed();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

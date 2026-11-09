@@ -122,7 +122,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     snapshot = json.loads((root / 'session.json').read_text())
     assert all(m['response_items'] for m in snapshot['messages'] if m['role'] == 'assistant')
     assert any(i.get('type') == 'reasoning' for i in requests[-2]['input'])
-    assert snapshot['workspace'] == str(workspace)
+    assert snapshot['workspace'] == os.path.realpath(str(workspace))
     assert len(snapshot['messages']) == 2 * len(calls) + 4
     assert 'ENV_CLEAN' in observed[0], observed[0]
     assert (workspace / 'notes.md').read_text() == '# Report\nAnalysis checked.\n'
@@ -131,7 +131,9 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     assert outside.read_text() == 'SECRET_OUTSIDE_WORKSPACE_9c18'
     assert all('SECRET_OUTSIDE_WORKSPACE_9c18' not in item for item in observed)
     assert all('Error' in observed[i] or 'stderr:' in observed[i] for i in (5, 7, 8, 9)), observed
-    assert 'ConnectionRefusedError' in observed[9], observed[9]
+    # Linux's private loopback returns ECONNREFUSED; macOS sandbox-exec denies
+    # the connect() syscall with EPERM. Both prove the tool had no network.
+    assert 'ConnectionRefusedError' in observed[9] or 'PermissionError' in observed[9], observed[9]
     assert 'Replaced one exact text block' in observed[11], observed[11]
     assert 'not found' in observed[12] and 'Error' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]

@@ -4,7 +4,7 @@
 
 ## 构建与运行
 
-需要 Linux、Zig 0.17、bubblewrap 和 GNU coreutils。工具启动失败时会返回错误，不会退回宿主机执行。
+需要 Zig 0.17，以及 Linux 的 bubblewrap（和 GNU coreutils）或 macOS 自带的 `sandbox-exec`。工具启动失败时会返回错误，不会退回宿主机执行。
 
 ```sh
 zig build
@@ -18,6 +18,8 @@ cd /path/to/project
 只导出 `DEEPSEEK_API_KEY` 即可自动选择 DeepSeek；同时存在多个服务商的 key 时，可以显式设置 `AI_PROVIDER=deepseek`。
 
 终端标题会显示当前任务摘要及执行状态（思考、工具调用、完成检查或等待输入）。任务结束后显示就绪，出错时显示错误；正常退出时恢复原标题（需终端支持标题栈）。stderr 重定向时不发送标题控制序列。
+
+启动时会打印 zagent 艺术字，每个字符单独着色：从左上角的青色到右下角的品红，形成一条对角渐变。`COLORTERM` 为 `truecolor` 或 `24bit` 时使用 24 位真彩色，否则退回 256 色调色板；标准输出不是终端、`NO_COLOR` 非空，或窗口窄到放不下这些字形时，改用单行 `✦ zagent` 且不加颜色。
 
 ```sh
 AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，修复问题并运行测试'
@@ -36,11 +38,11 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 文件读写、补丁、目录搜索、HTTP 和 shell 工具都在独立沙箱内执行。本地 MCP 服务也使用该边界。
 
 - 启动 zagent 时所在的工作目录可读写。其他项目、宿主机 home、进程和凭据不挂载到沙箱。
-- `/usr` 中的程序与系统库只读。工具不继承 API key 等宿主机环境变量；MCP 只额外接收配置里显式声明的 `env`。
+- 系统程序与库只读。Linux 下 `/usr`（含 `/bin`、`/sbin`、`/lib`）只读；macOS 下 `/usr`、`/bin`、`/sbin`、`/System`、`/Library`、`/private/etc`、`/dev` 以及 `/opt/homebrew` 只读。工具不继承 API key 等宿主机环境变量；MCP 只额外接收配置里显式声明的 `env`。
 - 工作目录中已有的文件都对工具开放，包括放在其中的凭据；请据此选择工作目录。
 - 默认禁止工具访问网络。需要下载或联网安装依赖时，由使用者设置 `AI_TOOL_NETWORK=1`。它会开放宿主机网络，包括本地服务。模型 API 和显式配置的远程 MCP 服务由主进程联网。
 - 单个命令默认最多运行 180 秒；shell 工具可用 `timeout_seconds` 设置 1–3600 秒。后台进程和临时目录不跨工具调用保留；工作目录中的文件保留。Zig 缓存保存在 `.zig-cache/global`。
-- 在单个 shell 调用中启动测试服务和客户端，可以使用沙箱内的回环网络。
+- Linux 下可在单个 shell 调用中启动测试服务和客户端，使用沙箱内的回环网络。
 
 局部修改可使用 `edit_file` 做精确文本替换：只匹配一次才写入，匹配不到或存在歧义时保留原文件，写入以原子替换完成并保留权限。多文件修改也支持严格校验的 unified diff；外层的 `*** Begin Patch` / `*** End Patch` 标记可以省略。
 

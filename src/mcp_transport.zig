@@ -382,6 +382,9 @@ pub const Stdio = struct {
     /// Lines that were not JSON-RPC messages, counted over the whole
     /// connection.
     garbage: usize = 0,
+    /// macOS: the private temp directory owned by the sandboxed server. It is
+    /// removed when the server is closed.
+    tmp_dir: ?[]u8 = null,
 
     pub fn start(
         allocator: std.mem.Allocator,
@@ -394,26 +397,19 @@ pub const Stdio = struct {
         const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
         defer allocator.free(workspace);
         const network = if (parent_env.get("AI_TOOL_NETWORK")) |v| std.mem.eql(u8, v, "1") else false;
-        const base = try @import("sandbox.zig").argv(allocator, workspace, null, network, &.{});
-        defer allocator.free(base);
-        var command: std.ArrayList([]const u8) = .empty;
-        defer command.deinit(allocator);
-        try command.appendSlice(allocator, base[3 .. base.len - 1]);
         for (spec.env) |pair| {
             if (!std.process.Environ.Map.validateKeyForPut(pair[0])) return Error.McpInvalidEnvKey;
-            try command.appendSlice(allocator, &.{ "--setenv", pair[0], pair[1] });
         }
-        try command.append(allocator, "--");
-        try command.appendSlice(allocator, spec.argv);
-        var env = std.process.Environ.Map.init(allocator);
-        defer env.deinit();
-        try env.put("PATH", "/usr/bin:/bin");
+        var l = try @import("sandbox.zig").launch(io, allocator, workspace, null, network, spec.argv, spec.env, null);
+        defer l.deinit();
+        const tmp_dir = l.tmp_dir;
         const child = try std.process.spawn(io, .{
-            .argv = command.items,
+            .argv = l.argv,
+            .cwd = .{ .path = workspace },
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .inherit,
-            .environ_map = &env,
+            .environ_map = &l.env,
         });
 
         return .{
@@ -421,6 +417,7 @@ pub const Stdio = struct {
             .allocator = allocator,
             .child = child,
             .inbox = .{ .allocator = allocator },
+            .tmp_dir = tmp_dir,
         };
     }
 
@@ -441,6 +438,11 @@ pub const Stdio = struct {
             self.child.stdin = null;
         }
         if (self.child.id != null) self.child.kill(self.io);
+        if (self.tmp_dir) |d| {
+            std.Io.Dir.cwd().deleteTree(self.io, d) catch {};
+            self.allocator.free(d);
+            self.tmp_dir = null;
+        }
     }
 
     fn notify(self: *Stdio, json: []const u8) !void {

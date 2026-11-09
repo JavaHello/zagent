@@ -31,7 +31,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 ## Requirements
 
 - Zig 0.17.x
-- Linux with bubblewrap (`bwrap`) and GNU coreutils (`timeout`) for tool execution
+- Linux with bubblewrap (`bwrap`) and GNU coreutils (`timeout`), **or** macOS with `sandbox-exec` for tool execution
 - An API key and base URL for a Responses-compatible endpoint
 
 ## Build
@@ -44,15 +44,24 @@ The binary is written to `zig-out/bin/zagent`.
 
 ## Sandboxed tools
 
-Every built-in filesystem, search, HTTP and shell tool runs in a bubblewrap
-sandbox. Local MCP servers use the same boundary. Only the directory from which
-you start zagent is mounted writable. System programs and libraries under `/usr`
-are read-only; the host home, configuration files, credentials, other workspaces,
-processes and sockets are hidden. `/tmp` is private and discarded after each tool
-call. Zig compilation caches persist under the workspace’s `.zig-cache/global`.
-Symlinks cannot reach files outside the mounted workspace. Commands have a
-180-second default limit (`shell.timeout_seconds` accepts 1–3600); background processes do not survive the tool call. If sandbox
-startup fails, the tool returns an error without an unsandboxed fallback.
+Every built-in filesystem, search, HTTP and shell tool runs in a sandbox. Local
+MCP servers use the same boundary. Only the directory from which you start zagent
+is mounted writable. System programs and libraries are read-only; the host home,
+configuration files, credentials, other workspaces, processes and sockets are
+hidden. `/tmp` is private and discarded after each tool call. Zig compilation
+caches persist under the workspace’s `.zig-cache/global`.
+
+On Linux the sandbox is bubblewrap (`bwrap`), which mounts the workspace and
+read-only system paths into a private namespace; symlinks cannot reach files
+outside the mounted workspace. On macOS it is `sandbox-exec` with an SBPL
+profile, which grants read-write access to the workspace and a private temp
+directory and read-only access to system paths (`/usr`, `/bin`, `/sbin`,
+`/System`, `/Library`, `/private/etc`, `/dev`) plus `/opt/homebrew` so Homebrew
+tools keep working.
+
+Commands have a 180-second default limit (`shell.timeout_seconds` accepts
+1–3600); background processes do not survive the tool call. If sandbox startup
+fails, the tool returns an error without an unsandboxed fallback.
 
 Start zagent in the project directory you want it to work on. Files inside that
 workspace are available to tools, including any secrets you put there. Built-in
@@ -64,8 +73,9 @@ Tool networking is disabled by default. Set `AI_TOOL_NETWORK=1` to permit networ
 access for commands, HTTP tools and local MCP servers. This shares the host
 network, including localhost services. Model API calls and explicitly configured
 remote MCP endpoints use the main process network independently of tool network
-access. Each sandbox has its own loopback interface even when networking is off;
-run a test server and client in the same shell call for local integration tests.
+access. On Linux each sandbox has its own loopback interface even when networking
+is off; run a test server and client in the same shell call for local integration
+tests.
 
 ```sh
 cd /path/to/project
@@ -142,6 +152,8 @@ Replies are markdown, and in a terminal they are rendered rather than printed as
 
 Output that is not a terminal — piped, redirected, or under `TERM=dumb` — gets the raw markdown instead, so `zagent "..." > notes.md` and `zagent "..." | grep` see exactly what the model wrote. Set `AI_MARKDOWN=0` to turn rendering off in a terminal as well.
 
+The startup wordmark is coloured per cell: a diagonal gradient runs from aqua at the top left to fuchsia at the bottom right. It is drawn in 24-bit colour when `COLORTERM` advertises `truecolor` or `24bit`, in the 256-colour palette otherwise, and as plain text when stdout is not a terminal, `NO_COLOR` is set to a non-empty value, or the window is too narrow for the letterforms — then a one-line `✦ zagent` takes their place.
+
 ## Providers
 
 `AI_PROVIDER` selects a built-in preset that supplies the base URL, the default model, and the name of the environment variable holding the API key:
@@ -186,13 +198,16 @@ export OPENAI_API_KEY=sk-...
 ```
 
 ```
- ______ _       ___  ___  _____  _   _ _____
-|___  //_\     / _ \|  _\| ____|| \ | |_   _|
-   / // _ \   | |_| | | _| |__  |  \| | | |
-  / // ___ \  |  _  | |_|| |__  | |\  | | |
- /_//_/   \_\ |_| |_|___/|_____||_| \_| |_|
-  Model : gpt-4o-mini
-  Type /help for commands, Ctrl+D to exit.
+  ███████╗ █████╗  ██████╗ ███████╗███╗   ██╗████████╗
+  ╚══███╔╝██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝
+    ███╔╝ ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║
+   ███╔╝  ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║
+  ███████╗██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║
+  ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝
+  ✦ an AI agent in your terminal
+
+  Model  gpt-4o-mini · openai
+  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+D to exit. /help for commands.
 
 you ❯ list all .zig files in the current directory
   ⚙ shell {"command":"find . -name '*.zig' -type f"}
@@ -569,6 +584,7 @@ src/
                 apply_patch, list_dir, grep, find, http_request)
   diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
+  banner.zig  — The startup wordmark: letterforms, gradient, colour fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer
   verifier.zig — Completion judge: prompt, turn summary, verdict parsing
 build.zig     — Zig build script
