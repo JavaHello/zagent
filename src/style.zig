@@ -1,4 +1,6 @@
 //! SGR escape sequences, defined once.
+//! Colours use the terminal theme's standard ANSI palette only; do not add
+//! custom RGB colours or fixed extended-palette indices.
 //!
 //! These are plain `const` slices rather than functions or `[N:0]u8` values on
 //! purpose: `PROMPT` in `main.zig` and `CHOICE_PROMPT` in `agent.zig` build

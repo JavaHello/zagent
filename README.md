@@ -240,7 +240,7 @@ Replies are markdown, and in a terminal they are rendered rather than printed as
 
 Output that is not a terminal — piped, redirected, or under `TERM=dumb` — gets the raw markdown instead, so `zagent "..." > notes.md` and `zagent "..." | grep` see exactly what the model wrote. Set `AI_MARKDOWN=0` to turn rendering off in a terminal as well.
 
-The startup wordmark is coloured per cell: a diagonal gradient runs from aqua at the top left to fuchsia at the bottom right. It is drawn in 24-bit colour when `COLORTERM` advertises `truecolor` or `24bit`, in the 256-colour palette otherwise, and as plain text when stdout is not a terminal, `NO_COLOR` is set to a non-empty value, or the window is too narrow for the letterforms — then a one-line `✦ zagent` takes their place.
+The startup wordmark uses the terminal theme's standard ANSI cyan, with no custom RGB colours, 256-colour palette or gradient. Other semantic UI colours also use the terminal's standard palette and follow its theme. Output is uncoloured when stdout is not a terminal, `TERM=dumb`, or `NO_COLOR` is non-empty. When the window is too narrow for the letterforms, a one-line `✦ zagent` takes their place.
 
 ## Providers
 
@@ -704,7 +704,7 @@ src/
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
   compact.zig — Context budget, safe cut points, and summary requests
   memory.zig  — Durable notes: file format, prompt section, extraction
-  banner.zig  — The startup wordmark: letterforms, gradient, colour fallback
+  banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer
   verifier.zig — Completion judge: prompt, turn summary, verdict parsing
 build.zig     — Zig build script
