@@ -59,7 +59,7 @@ class API(http.server.BaseHTTPRequestHandler):
             else:
                 command = f'printf round-{answered}-' + 'x' * 400
             return self.reply({'status': 'completed', 'output': [
-                {'type': 'function_call', 'call_id': f'probe-{answered}', 'name': 'shell',
+                {'type': 'function_call', 'call_id': f'probe-{answered}', 'name': 'bash',
                  'arguments': json.dumps({'command': command})}]})
         return self.reply({'status': 'completed', 'output': [
             {'type': 'message', 'role': 'assistant',

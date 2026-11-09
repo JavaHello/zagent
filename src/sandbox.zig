@@ -433,7 +433,7 @@ pub fn verifyMacosSandbox(io: std.Io) !void {
 }
 
 fn shellTimeout(allocator: std.mem.Allocator, name: []const u8, arguments: []const u8) !u32 {
-    if (!std.mem.eql(u8, name, "bash") and !std.mem.eql(u8, name, "shell")) return 180;
+    if (!std.mem.eql(u8, name, "bash")) return 180;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArguments;
@@ -456,10 +456,11 @@ test "sandbox launch requires a bounded workspace" {
 
 test "shell timeout is bounded and applies only to commands" {
     const a = std.testing.allocator;
-    try std.testing.expectEqual(@as(u32, 180), try shellTimeout(a, "shell", "{}"));
-    try std.testing.expectEqual(@as(u32, 600), try shellTimeout(a, "shell", "{\"timeout_seconds\":600}"));
-    try std.testing.expectEqual(@as(u32, 180), try shellTimeout(a, "read_file", "{\"timeout_seconds\":600}"));
-    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "shell", "{\"timeout_seconds\":0}"));
-    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "shell", "{\"timeout_seconds\":3601}"));
-    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "shell", "{\"timeout_seconds\":\"600\"}"));
+    try std.testing.expectEqual(@as(u32, 180), try shellTimeout(a, "bash", "{}"));
+    try std.testing.expectEqual(@as(u32, 600), try shellTimeout(a, "bash", "{\"timeout_seconds\":600}"));
+    try std.testing.expectEqual(@as(u32, 180), try shellTimeout(a, "read", "{\"timeout_seconds\":600}"));
+    try std.testing.expectEqual(@as(u32, 180), try shellTimeout(a, "shell", "{\"timeout_seconds\":600}"));
+    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "bash", "{\"timeout_seconds\":0}"));
+    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "bash", "{\"timeout_seconds\":3601}"));
+    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "bash", "{\"timeout_seconds\":\"600\"}"));
 }

@@ -32,7 +32,7 @@ server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
     with tempfile.TemporaryDirectory(prefix='zagent-response-status-') as directory:
-        call = {'id': 'fc_unsafe', 'type': 'function_call', 'call_id': 'call_unsafe', 'name': 'write_file',
+        call = {'id': 'fc_unsafe', 'type': 'function_call', 'call_id': 'call_unsafe', 'name': 'write',
                 'arguments': json.dumps({'path': 'MUST_NOT_EXIST', 'content': 'unsafe partial response'})}
         cases = [
             ({'status': 'incomplete', 'incomplete_details': {'reason': 'max_output_tokens'}, 'output': [call]}, 'ResponseTruncated'),
@@ -114,7 +114,7 @@ try:
 
         replies.extend([
             {'status': 'completed', 'output': [{'type': 'function_call', 'call_id': 'read_evidence',
-                'name': 'read_file', 'arguments': json.dumps({'path': 'evidence.txt'})}]},
+                'name': 'read', 'arguments': json.dumps({'path': 'evidence.txt'})}]},
             partial, partial, completed_text('Recovered answer'),
             partial, completed_text(json.dumps({'complete': True, 'reason': 'Verified evidence'})),
         ])

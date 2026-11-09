@@ -9,14 +9,14 @@ pub fn requiresSandbox(io: std.Io, allocator: std.mem.Allocator, name: []const u
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArguments;
     const obj = parsed.value.object;
-    if (std.mem.eql(u8, name, "bash") or std.mem.eql(u8, name, "shell")) {
+    if (std.mem.eql(u8, name, "bash")) {
         const value = obj.get("command") orelse return error.InvalidArguments;
         if (value != .string) return error.InvalidArguments;
         return dangerousCommand(value.string);
     }
     // Resolve symlinks and relative paths before checking file-writing tools.
     const key: []const u8 = if (std.mem.eql(u8, name, "http_request")) "save_to" else "path";
-    if (std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file") or std.mem.eql(u8, name, "http_request")) {
+    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "http_request")) {
         if (obj.get(key)) |value| {
             if (value != .string) return error.InvalidArguments;
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
@@ -89,11 +89,11 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
     return sandbox.executeDirect(io, allocator, env, name, arguments);
 }
 
-test "unavailable sandbox rejects dangerous bash and legacy shell calls" {
+test "unavailable sandbox rejects dangerous bash calls" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
-    for ([_][]const u8{ "bash", "shell" }) |name| {
+    for ([_][]const u8{"bash"}) |name| {
         const result = try execute(std.testing.io, a, &env, false, false, name, "{\"command\":\"sudo true\"}");
         defer result.deinit(a);
         try std.testing.expect(result.is_error);
@@ -109,8 +109,8 @@ test "ordinary development commands run directly; system changes require sandbox
     for ([_][]const u8{ "sudo true", "echo x > /etc/hosts", "ip route add default", "sh -c 'systemctl restart ssh'", "true && /sbin/reboot", "mkfs.ext4 /dev/sda" }) |command| {
         try std.testing.expect(dangerousCommand(command));
     }
-    try std.testing.expect(try requiresSandbox(std.testing.io, a, "write_file", "{\"path\":\"/etc/hosts\"}"));
-    try std.testing.expect(!try requiresSandbox(std.testing.io, a, "write_file", "{\"path\":\"src/main.zig\"}"));
+    try std.testing.expect(try requiresSandbox(std.testing.io, a, "write", "{\"path\":\"/etc/hosts\"}"));
+    try std.testing.expect(!try requiresSandbox(std.testing.io, a, "write", "{\"path\":\"src/main.zig\"}"));
     try std.testing.expect(!try requiresSandbox(std.testing.io, a, "http_request", "{\"url\":\"https://example.com\"}"));
-    try std.testing.expectError(error.InvalidArguments, requiresSandbox(std.testing.io, a, "shell", "{}"));
+    try std.testing.expectError(error.InvalidArguments, requiresSandbox(std.testing.io, a, "bash", "{}"));
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const search_tools = @import("tools.zig");
 const codex_auth = @import("codex_auth.zig");
 const Config = @import("config.zig").Config;
 
@@ -9,13 +10,12 @@ const Config = @import("config.zig").Config;
 /// so that the tools of the MCP servers connected at the moment can follow it.
 const builtin_tools =
     \\{"type":"function","function":{"name":"bash","description":"Execute a Bash command and return its output. Use this to run programs, inspect the system, manage files, and more.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read the contents of a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"write_file","description":"Write content to a file, creating or overwriting it","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}}},
-    \\{"type":"function","function":{"name":"edit_file","description":"Edit an existing file by replacing one exact, unique text block. Prefer this for small edits or appending to a unique final block; no line counts are needed. Copy old_text exactly from the current file and include enough context to match once. Nothing changes if the text is absent or ambiguous.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}}},
+    \\{"type":"function","function":{"name":"read","description":"Read the contents of a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"write","description":"Create or overwrite a file with content, OR replace one exact, unique text block using old_text and new_text. Never combine these modes. Prefer exact replacement for partial edits: copy old_text from the current file with enough context to match once; nothing changes if absent or ambiguous. Use content only for new files or full replacements.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Entire file contents for creation or full replacement"},"old_text":{"type":"string","description":"Exact non-empty text to replace"},"new_text":{"type":"string","description":"Replacement text"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"apply_patch","description":"Change existing files by applying a unified diff. This is how an edit is made instead of writing the whole file back. The patch is a standard unified diff: a header line '--- a/path' and a '+++ b/path' line, then one or more hunks. Each hunk starts with '@@ -<start>,<count> +<start>,<count> @@' giving the line numbers in the file before and after the change, followed by the hunk's lines, each prefixed with a single space (unchanged context), '-' (removed) or '+' (added). Copy the context lines from the file exactly as they are, indentation included: the patch is refused rather than guessed at if they do not match. Keep the counts in the '@@' line equal to the number of lines below it when possible; the tool recomputes mistaken counts from the hunk body, but still requires exact matching context. A zero-length old range inserts after its stated old line. Send a new file as '--- /dev/null' with a hunk that adds every line, and delete one with '+++ /dev/null' and a hunk that removes every line. Several files may be patched in one call by putting one '---'/'+++' pair after another.","parameters":{"type":"object","properties":{"patch":{"type":"string","description":"The unified diff to apply, with its newlines"}},"required":["patch"]}}},
-    \\{"type":"function","function":{"name":"list_dir","description":"List the contents of a directory","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regular expression and return the matching lines with their file and line number. Prefer this over running grep or rg through the shell. Binary files are skipped.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File or directory to search, defaults to the current directory"},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"}},"required":["pattern"]}}},
-    \\{"type":"function","function":{"name":"find","description":"Find files and directories whose name matches a glob and return their paths. Prefer this over running find or fd through the shell.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob the name must match, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search in, defaults to the current directory"}},"required":["pattern"]}}},
+    \\{"type":"function","function":{"name":"ls","description":"List the contents of a directory","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regular expression and return the matching lines with their file and line number. Use this search tool instead of shell commands. Binary files are skipped.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File or directory to search, defaults to the current directory"},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"}},"required":["pattern"]}}},
+    \\{"type":"function","function":{"name":"find","description":"Find files and directories whose name matches a glob and return their paths. Use this filename search tool instead of shell commands.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob the name must match, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search in, defaults to the current directory"}},"required":["pattern"]}}},
     \\{"type":"function","function":{"name":"http_request","description":"Make an HTTP request and return its status line, response headers, and body. Use this instead of curl for fetching URLs and calling APIs. Set Content-Type yourself when you send a body; use save_to to download the body to a file instead of returning it.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"The full URL, including the scheme"},"method":{"type":"string","description":"HTTP method: GET, HEAD, POST, PUT, PATCH, DELETE, or OPTIONS. Defaults to GET"},"headers":{"type":"object","description":"Request headers as name/value pairs","additionalProperties":{"type":"string"}},"body":{"type":"string","description":"Request body, for a method that takes one"},"save_to":{"type":"string","description":"Write the response body to this file path instead of returning it"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"ask_user","description":"Ask the user to choose between concrete options when the request is ambiguous, or when a decision only the user can make blocks progress. Not for confirming routine steps.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}}},
     \\{"type":"function","function":{"name":"remember","description":"Save one durable note to memory so it survives this session. Use it when the user states a lasting preference, convention or constraint, when a project fact or build command is learned, or when a decision is made that future work must respect. Do not save transient status, one-off task details, secrets, or anything the user asked to forget.","parameters":{"type":"object","properties":{"text":{"type":"string","description":"One short, self-contained sentence in the user's language"}},"required":["text"]}}}
@@ -29,6 +29,31 @@ const growth_cap: u32 = @import("config.zig").max_output_tokens_ceiling;
 /// The built-in tools as a whole `tools` member, for the request that has
 /// nothing of its own to add to them.
 pub const TOOLS_JSON = "[" ++ builtin_tools ++ "]";
+
+test "search registration follows installed backends and advertises renamed filesystem tools" {
+    const allocator = std.testing.allocator;
+    for ([_]search_tools.SearchBackends{ .{}, .{ .rg = true }, .{ .fd = true }, .{ .rg = true, .fd = true } }) |search| {
+        const body = try buildRequestWithSearch(allocator, "test", &.{}, 100, .included, &.{}, false, search);
+        defer allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        var names: std.StringHashMap(void) = .init(allocator);
+        defer names.deinit();
+        for (parsed.value.object.get("tools").?.array.items) |tool| {
+            try names.put(tool.object.get("name").?.string, {});
+        }
+        for ([_][]const u8{ "read", "write", "ls", "apply_patch" }) |name| {
+            try std.testing.expect(names.contains(name));
+        }
+        for ([_][]const u8{ "read_file", "write_file", "edit_file", "list_dir" }) |name| {
+            try std.testing.expect(!names.contains(name));
+        }
+        try std.testing.expectEqual(search.rg, names.contains("rg"));
+        try std.testing.expectEqual(!search.rg, names.contains("grep"));
+        try std.testing.expectEqual(search.fd, names.contains("fd"));
+        try std.testing.expectEqual(!search.fd, names.contains("find"));
+    }
+}
 
 pub const ToolCallData = struct {
     id: []const u8,
@@ -121,6 +146,7 @@ pub const Client = struct {
     /// erased by the next one. Whoever stops the animation reports it instead.
     http_error: ?[]u8,
     retryable_http_error: bool = false,
+    search: search_tools.SearchBackends = .{},
     /// Set only by tests; see `Transport`.
     transport: ?Transport = null,
     /// Live token accounting, read by the spinner while a request is in
@@ -287,7 +313,7 @@ pub const Client = struct {
         var max_tokens = self.max_tokens;
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
-            const ordinary_json = try buildRequestWithTools(
+            const ordinary_json = try buildRequestWithSearch(
                 self.allocator,
                 self.model,
                 messages,
@@ -295,6 +321,7 @@ pub const Client = struct {
                 tools,
                 extra_tools,
                 sink != null or self.codex_auth_path != null,
+                self.search,
             );
             defer self.allocator.free(ordinary_json);
             const req_json = if (self.codex_auth_path != null) try codexRequest(self.allocator, ordinary_json) else try self.allocator.dupe(u8, ordinary_json);
@@ -609,6 +636,10 @@ pub fn buildRequest(allocator: std.mem.Allocator, model: []const u8, messages: [
 }
 
 pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8, stream: bool) ![]u8 {
+    return buildRequestWithSearch(allocator, model, messages, max_tokens, tools, extra_tools, stream, .{});
+}
+
+pub fn buildRequestWithSearch(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8, stream: bool, search: search_tools.SearchBackends) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     const w = &aw.writer;
@@ -678,6 +709,13 @@ pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, me
         const builtin = try std.json.parseFromSlice(std.json.Value, allocator, TOOLS_JSON, .{});
         defer builtin.deinit();
         for (builtin.value.array.items) |tool| {
+            var function = tool.object.get("function").?;
+            const name = function.object.get("name").?.string;
+            if (search.rg and std.mem.eql(u8, name, "grep")) {
+                function.object.getPtr("name").?.* = .{ .string = "rg" };
+            } else if (search.fd and std.mem.eql(u8, name, "find")) {
+                function.object.getPtr("name").?.* = .{ .string = "fd" };
+            }
             try separator(w, &first);
             try writeFunction(w, tool);
         }

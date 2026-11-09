@@ -24,30 +24,30 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     outside = root / 'private'
     outside.write_text('SECRET_OUTSIDE_WORKSPACE_9c18')
     (workspace / 'escape').symlink_to(outside)
-    forbidden = subprocess.run([str(live_binary), '--direct-tool-worker', 'write_file',
+    forbidden = subprocess.run([str(live_binary), '--direct-tool-worker', 'write',
                                 json.dumps({'path': '/etc/zagent-policy-test-must-not-exist', 'content': 'must not run'})],
                                cwd=workspace, env={'PATH': '/usr/bin:/bin'}, capture_output=True,
                                text=True, timeout=10)
     assert forbidden.returncode != 0 and 'WorkerRequiresSandbox' in forbidden.stderr, forbidden.stderr
     assert not (workspace / 'HOST_WORKER_BYPASS').exists()
     calls = [
-        ('shell', {'command': 'test -n "$DEEPSEEK_API_KEY" && test -n "$OPENAI_API_KEY" && test -n "$PRIVATE_SENTINEL" && echo ENV_INHERITED'}),
-        ('write_file', {'path': 'notes.md', 'content': '# Report\nAnalysis complete.\n'}),
+        ('bash', {'command': 'test -n "$DEEPSEEK_API_KEY" && test -n "$OPENAI_API_KEY" && test -n "$PRIVATE_SENTINEL" && echo ENV_INHERITED'}),
+        ('write', {'path': 'notes.md', 'content': '# Report\nAnalysis complete.\n'}),
         ('apply_patch', {'patch': '--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n # Report\n-Analysis complete.\n+Analysis verified.\n*** End Patch\n'}),
         ('grep', {'pattern': 'verified', 'path': '.'}),
         ('find', {'pattern': '*.md', 'path': '.'}),
-        ('read_file', {'path': 'escape'}),
-        ('write_file', {'path': 'escape', 'content': 'SHOULD_NOT_ESCAPE'}),
-        ('read_file', {'path': str(outside)}),
-        ('shell', {'command': 'cat escape; echo SHOULD_NOT_ESCAPE > escape'}),
-        ('shell', {'command': "python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", 1), timeout=1)'"}),
+        ('read', {'path': 'escape'}),
+        ('write', {'path': 'escape', 'content': 'SHOULD_NOT_ESCAPE'}),
+        ('read', {'path': str(outside)}),
+        ('bash', {'command': 'cat escape; echo SHOULD_NOT_ESCAPE > escape'}),
+        ('bash', {'command': "python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", 1), timeout=1)'"}),
     ]
-    calls.append(('shell', {'command': 'sleep 5; echo SHOULD_HAVE_TIMED_OUT', 'timeout_seconds': 1}))
+    calls.append(('bash', {'command': 'sleep 5; echo SHOULD_HAVE_TIMED_OUT', 'timeout_seconds': 1}))
     calls.extend([
-        ('edit_file', {'path': 'notes.md', 'old_text': 'Analysis verified.', 'new_text': 'Analysis checked.'}),
-        ('edit_file', {'path': 'notes.md', 'old_text': 'not present', 'new_text': 'MUST_NOT_APPEAR'}),
-        ('edit_file', {'path': 'escape', 'old_text': 'SHOULD_NOT_ESCAPE', 'new_text': 'DIRECT_EDIT_WORKED'}),
-        ('shell', {'command': 'echo DANGEROUS_HOST_WRITE > /etc/zagent-policy-test-must-not-exist && echo SANDBOX_PRIVATE_WRITE'}),
+        ('write', {'path': 'notes.md', 'old_text': 'Analysis verified.', 'new_text': 'Analysis checked.'}),
+        ('write', {'path': 'notes.md', 'old_text': 'not present', 'new_text': 'MUST_NOT_APPEAR'}),
+        ('write', {'path': 'escape', 'old_text': 'SHOULD_NOT_ESCAPE', 'new_text': 'DIRECT_EDIT_WORKED'}),
+        ('bash', {'command': 'echo DANGEROUS_HOST_WRITE > /etc/zagent-policy-test-must-not-exist && echo SANDBOX_PRIVATE_WRITE'}),
     ])
     observed = []
     requests = []
@@ -96,7 +96,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
             send_response(self, body, {'id': f'resp_{len(requests)}', 'object': 'response', 'status': 'completed', 'error': None, 'output': output})
 
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
-    calls[9] = ('shell', {'command': f"python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", {server.server_port}), timeout=1)'"})
+    calls[9] = ('bash', {'command': f"python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", {server.server_port}), timeout=1)'"})
     threading.Thread(target=server.serve_forever, daemon=True).start()
     env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'XDG_CONFIG_HOME': str(root),
            'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_MODEL': 'test-model',
@@ -146,7 +146,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     # Exercise disabled sandbox policy through the real CLI/worker boundary.
     calls[:] = [
         ('bash', {'command': 'items=(hello world); [[ ${#items[@]} == 2 ]] && printf "%s" "${items[1]}"'}),
-        ('shell', {'command': 'echo LEGACY_ALIAS'}),
+        ('bash', {'command': 'echo BASH_ONLY'}),
         ('bash', {'command': 'echo MUST_NOT_RUN > /etc/zagent-policy-test-must-not-exist'}),
     ]
     observed.clear()
@@ -167,11 +167,11 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     finally:
         server.shutdown()
     assert off.returncode == 0, off.stderr
-    assert observed[:2] == ['world', 'LEGACY_ALIAS\n'], observed
+    assert observed[:2] == ['world', 'BASH_ONLY\n'], observed
     assert 'requires isolation and was not executed' in observed[2], observed
     assert 'skipped local MCP server' in off.stderr, off.stderr
     assert not (workspace / 'MCP_MUST_NOT_START').exists()
     assert not Path('/etc/zagent-policy-test-must-not-exist').exists()
     tool_names = [t['name'] for t in requests[0]['tools']]
     assert 'bash' in tool_names and 'shell' not in tool_names, tool_names
-    print('PASS: direct editing/search, host environment/network, dangerous-command isolation, timeout, API retry, durable resume, Bash/legacy alias, sandbox off and local MCP skip')
+    print('PASS: direct editing/search, host environment/network, dangerous-command isolation, timeout, API retry, durable resume, Bash, sandbox off and local MCP skip')

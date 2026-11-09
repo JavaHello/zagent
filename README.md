@@ -9,14 +9,13 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Interactive REPL** — a full-screen conversation with the prompt pinned to the bottom, and a prompt history that ↑/↓ recall across runs; `Ctrl+Z` suspends and `fg` redraws the whole record
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use (function calling)** — the agent can execute tools to help you:
-  - `bash` — run Bash commands (`shell` remains a compatibility alias)
-  - `read_file` — read file contents
-  - `edit_file` — replace one exact, unique text block atomically while preserving file permissions
+  - `bash` — run Bash commands
+  - `read` — read file contents
+  - `write` — create/overwrite with `content`, or replace one exact, unique block with `old_text`/`new_text` (atomic, preserving permissions)
   - `apply_patch` — change a file by applying a unified diff, which is then shown to you as a coloured diff
-  - `write_file` — create or overwrite a whole file
-  - `list_dir` — list directory contents
-  - `grep` — search file contents, using `rg` where it is installed
-  - `find` — find files by name, using `fd` where it is installed
+  - `ls` — list directory contents
+  - `rg` / `grep` — search file contents; dynamically advertise `rg` if installed on PATH, otherwise `grep`
+  - `fd` / `find` — find files by name; dynamically advertise `fd` if installed on PATH, otherwise `find`; prompt guidance follows the selected tools
   - `http_request` — fetch a URL or call an API, without shelling out to `curl`
   - `ask_user` — put a question to you as an interactive selection menu
 - **MCP servers** — start servers described in `mcp.json` and give the tools they offer to the model beside the built-in ones
@@ -665,8 +664,8 @@ src/
   history.zig  — Prompt history: where it is stored, and when it is saved
   provider.zig — Built-in provider presets
   openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
-  tools.zig   — Tool implementations (shell, read_file, write_file,
-                apply_patch, list_dir, grep, find, http_request)
+  tools.zig   — Tool implementations (bash, read, write,
+                apply_patch, ls, rg/grep, fd/find, http_request)
   diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
   compact.zig — Context budget, safe cut points, and summary requests

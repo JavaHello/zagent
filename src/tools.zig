@@ -22,12 +22,12 @@ pub const ToolResult = struct {
 pub fn progressLabel(name: []const u8) ?[]const u8 {
     const labels = [_]struct { name: []const u8, label: []const u8 }{
         .{ .name = "bash", .label = "bash…" },
-        .{ .name = "shell", .label = "bash…" },
-        .{ .name = "read_file", .label = "read_file…" },
-        .{ .name = "write_file", .label = "write_file…" },
+        .{ .name = "read", .label = "read…" },
+        .{ .name = "write", .label = "write…" },
+        .{ .name = "ls", .label = "ls…" },
+        .{ .name = "rg", .label = "rg…" },
+        .{ .name = "fd", .label = "fd…" },
         .{ .name = "apply_patch", .label = "apply_patch…" },
-        .{ .name = "edit_file", .label = "edit_file…" },
-        .{ .name = "list_dir", .label = "list_dir…" },
         .{ .name = "grep", .label = "grep…" },
         .{ .name = "find", .label = "find…" },
         .{ .name = "http_request", .label = "http_request…" },
@@ -138,7 +138,7 @@ pub fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, con
 
 /// Replace one exact, unique text block without requiring hunk line counts.
 pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_text: []const u8, new_text: []const u8) !ToolResult {
-    if (old_text.len == 0) return toolError(allocator, "Error: old_text must be non-empty; use write_file for a new file.", .{});
+    if (old_text.len == 0) return toolError(allocator, "Error: old_text must be non-empty; use write with content for a new file.", .{});
     const cwd = std.Io.Dir.cwd();
     const target = cwd.realPathFileAlloc(io, path, allocator) catch |err| return toolError(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) });
     defer allocator.free(target);
@@ -1454,8 +1454,8 @@ test "finalize tool content truncates on utf8 boundary" {
 }
 
 test "every tool that waits has a progress label, ask_user does not" {
-    try std.testing.expectEqualStrings(progressLabel("bash").?, progressLabel("shell").?);
-    const labelled = [_][]const u8{ "bash", "read_file", "write_file", "apply_patch", "edit_file", "list_dir", "grep", "find", "http_request" };
+    try std.testing.expect(progressLabel("shell") == null);
+    const labelled = [_][]const u8{ "bash", "read", "write", "ls", "rg", "fd", "apply_patch", "grep", "find", "http_request" };
     for (labelled) |name| {
         const label = progressLabel(name) orelse return error.TestUnexpectedResult;
         // The label names the tool, so a user watching the line knows what is

@@ -64,10 +64,9 @@ const SYSTEM_PROMPT =
     \\- Before executing a new user task, briefly explain the goal and practical approach if no initial plan has already been provided. Do not repeat a plan already present in the conversation.
     \\- Use the bash tool to run Bash commands, install packages, or perform system operations.
     \\- Use http_request for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
-    \\- Use read_file to read a file. Use edit_file for an exact unique text replacement, or apply_patch for a unified diff with enough context to place it. Do not write a whole file back through write_file to change part of it, and do not edit files through the shell.
-    \\- Use write_file only for a file that does not exist yet, or when the entire contents are being replaced. A file that does not exist can also be created with apply_patch and a '--- /dev/null' header.
-    \\- Use list_dir to explore directories.
-    \\- Use grep to search file contents, and find to locate files by name, instead of shelling out: they use ripgrep and fd where those are installed.
+    \\- Use read to read a file. Use write with old_text and new_text for an exact unique text replacement, or apply_patch for a unified diff with enough context to place it. Do not rewrite a whole file for a partial edit, and do not edit files through the shell.
+    \\- Use write with content only for a new file or full replacement; never combine content with old_text/new_text. A new file can also be created with apply_patch and a '--- /dev/null' header.
+    \\- Use ls to explore directories.
     \\- Chain multiple tool calls to accomplish complex tasks step by step.
     \\- Always explain what you are doing when using tools.
     \\- If an operation fails, analyze the error and try a different approach, but stop after 3-5 failed attempts and explain what went wrong.
@@ -86,11 +85,16 @@ fn buildSystemPrompt(
     allocator: std.mem.Allocator,
     registry: *const mcp.Registry,
     memory_section: ?[]const u8,
+    search: tools.SearchBackends,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
 
     try aw.writer.writeAll(SYSTEM_PROMPT);
+    try aw.writer.print("\n- Use {s} to search file contents, and {s} to locate files by name, instead of shelling out. Search tools are loaded according to PATH, preferring rg over grep and fd over find.\n", .{
+        if (search.rg) "rg" else "grep",
+        if (search.fd) "fd" else "find",
+    });
     if (registry.functionJson().len > 0) {
         try aw.writer.writeAll(
             "\n- Tools whose name starts with mcp__ come from an MCP server that is connected;" ++
@@ -180,7 +184,10 @@ pub const Agent = struct {
         const memory_section = try memory.promptSection(allocator, memory_mod.prompt_budget);
         defer if (memory_section) |section| allocator.free(section);
 
-        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory_section);
+        const search = tools.detectSearchBackends(io, env);
+        var client = openai.Client.init(allocator, io, config);
+        client.search = search;
+        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory_section, search);
         errdefer allocator.free(system_content);
         try history.append(allocator, .{
             .role = "system",
@@ -202,12 +209,12 @@ pub const Agent = struct {
         return .{
             .allocator = allocator,
             .io = io,
-            .client = openai.Client.init(allocator, io, config),
+            .client = client,
             .history = history,
             .max_iterations = config.max_iterations,
             .max_verifications = config.max_verifications,
             .linenoise = linenoise,
-            .search = tools.detectSearchBackends(io, env),
+            .search = search,
             .tool_env = env,
             .session_path = session_path,
             .memory = memory,
@@ -278,7 +285,7 @@ pub const Agent = struct {
     fn refreshSystemPrompt(self: *Agent) !void {
         const section = try self.memory.promptSection(self.allocator, memory_mod.prompt_budget);
         defer if (section) |value| self.allocator.free(value);
-        const content = try buildSystemPrompt(self.allocator, self.mcp_registry, section);
+        const content = try buildSystemPrompt(self.allocator, self.mcp_registry, section, self.search);
         errdefer self.allocator.free(content);
 
         const previous = self.history.items[0].content;
