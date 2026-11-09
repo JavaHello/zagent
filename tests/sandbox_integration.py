@@ -103,13 +103,15 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
            'AI_KEY': 'local-test', 'AI_MAX_VERIFICATIONS': '0', 'AI_MAX_ITERATIONS': '20',
            'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0',
            'DEEPSEEK_API_KEY': 'must-not-reach-tools', 'OPENAI_API_KEY': 'must-not-reach-tools',
-           'PRIVATE_SENTINEL': 'must-not-reach-tools', 'AI_SESSION_FILE': str(root / 'session.json')}
+           'PRIVATE_SENTINEL': 'must-not-reach-tools'}
     try:
         result = subprocess.run([str(live_binary), 'Exercise the tools'], cwd=workspace, env=env,
                                 text=True, capture_output=True, timeout=120)
-        resumed = subprocess.run([str(live_binary), 'Continue the saved conversation'], cwd=workspace, env=env,
+        session_path, = (workspace / '.zagent/sessions').glob('*.json')
+        resumed = subprocess.run([str(live_binary), '--resume', session_path.stem,
+                                  'Continue the saved conversation'], cwd=workspace, env=env,
                                  text=True, capture_output=True, timeout=120)
-        limited_env = dict(env, AI_MAX_ITERATIONS='1', AI_SESSION_FILE=str(root / 'limited.json'))
+        limited_env = dict(env, AI_MAX_ITERATIONS='1')
         limited = subprocess.run([str(live_binary), 'Reach the iteration limit'], cwd=workspace, env=limited_env,
                                  text=True, capture_output=True, timeout=120)
     finally:
@@ -120,7 +122,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     assert len(observed) == len(calls) + 1, observed
     assert len([m for m in requests[-2]['input'] if m.get('role') == 'user']) == 2
     assert limited.returncode != 0 and 'IterationLimitReached' in limited.stderr
-    snapshot = json.loads((root / 'session.json').read_text())
+    snapshot = json.loads(session_path.read_text())
     # The preflight stores its public approach as a plain assistant message;
     # execution responses must still retain their exact replay items.
     assert all(m['response_items'] for m in snapshot['messages']
@@ -159,8 +161,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     }}))
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    off_env = dict(env, AI_TOOL_SANDBOX='off', AI_URL=f'http://127.0.0.1:{server.server_port}/v1',
-                   AI_SESSION_FILE=str(root / 'off-session.json'))
+    off_env = dict(env, AI_TOOL_SANDBOX='off', AI_URL=f'http://127.0.0.1:{server.server_port}/v1')
     try:
         off = subprocess.run([str(live_binary), 'Exercise disabled sandbox'], cwd=workspace,
                              env=off_env, text=True, capture_output=True, timeout=60)

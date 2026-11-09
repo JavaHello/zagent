@@ -1,8 +1,34 @@
-//! Opt-in durable conversations. API configuration and credentials are excluded.
+//! Durable conversations. API configuration and credentials are excluded.
 const std = @import("std");
 const openai = @import("openai.zig");
 const Message = openai.Message;
 const Snapshot = struct { version: u32 = 1, workspace: []const u8, messages: []Message };
+
+pub fn newId(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    var bytes: [16]u8 = undefined;
+    std.Io.random(io, &bytes);
+    return std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(bytes, .lower)});
+}
+
+pub fn pathForId(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
+    if (id.len != 32) return error.InvalidSessionId;
+    for (id) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return error.InvalidSessionId;
+    }
+    return std.fmt.allocPrint(allocator, ".zagent/sessions/{s}.json", .{id});
+}
+
+test "session IDs are unique and cannot escape the session directory" {
+    const a = std.testing.allocator;
+    const first = try newId(std.testing.io, a);
+    defer a.free(first);
+    const second = try newId(std.testing.io, a);
+    defer a.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    const path = try pathForId(a, first);
+    defer a.free(path);
+    try std.testing.expectError(error.InvalidSessionId, pathForId(a, "../session"));
+}
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages: []Message) !void {
     const cwd = std.Io.Dir.cwd();

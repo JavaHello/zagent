@@ -23,7 +23,8 @@ const HELP =
     \\Commands:
     \\  /help        Show this help message
     \\  /clear       Clear conversation history
-    \\  /new         Start a new conversation (same as /clear)
+    \\  /new         Create a new session (preserve the previous one)
+    \\  /session     Show the current session ID and resume command
     \\  /compact     Summarize older messages to free context
     \\  /memory      List saved memories
     \\  /remember <text>  Save a note to memory
@@ -137,11 +138,11 @@ pub fn main(init: std.process.Init) !void {
             "With no query, start an interactive conversation.\n\n" ++
             "  --help, -h          Show this help\n" ++
             "  --version           Show version\n" ++
+            "  --resume <id>       Resume a saved session in this workspace\n" ++
             "  login / logout      Sign in with ChatGPT / remove local credentials\n" ++
             "  models              List models for the selected provider\n\n" ++
             "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
-            "AI_SESSION_FILE       Save and resume this workspace's conversation\n" ++
             "AI_COMPACT_THRESHOLD  Estimated token budget before older messages are summarized\n" ++
             "AI_COMPACT_KEEP       Newest messages kept verbatim across a compaction\n" ++
             "AI_MEMORY=0           Disable durable memory for this workspace\n" ++
@@ -202,6 +203,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    var query_start: usize = 1;
+    var resume_id: ?[]const u8 = null;
+    if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "--resume")) {
+        if (args.items.len < 3) {
+            try std.Io.File.stderr().writeStreamingAll(io, "Usage: zagent --resume <session-id> [query ...]\n");
+            std.process.exit(1);
+        }
+        resume_id = args.items[2];
+        query_start = 3;
+    }
+
     // The terminal is created here rather than inside the REPL so that the
     // ask_user menu also works in single-query mode.
     var ln = Linenoise.init(allocator, io, env);
@@ -252,14 +264,25 @@ pub fn main(init: std.process.Init) !void {
     var agent = try Agent.init(allocator, io, config, &ln, env, &registry, sandbox_available);
     defer agent.deinit();
 
-    if (args.items.len > 1) {
+    agent.startSession(resume_id) catch |err| {
+        try printToStderr(allocator, io, "Cannot open session: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    if (args.items.len > query_start) {
+        if (agent.session_id) |id| {
+            try printToStderr(allocator, io, "Session: {s} (resume: zagent --resume {s})\n", .{ id, id });
+        }
         // Single-query mode: join remaining args as the query
-        const query = try std.mem.join(allocator, " ", args.items[1..]);
+        const query = try std.mem.join(allocator, " ", args.items[query_start..]);
         defer allocator.free(query);
         try agent.processQuery(query);
     } else {
         // Interactive REPL mode
         try runRepl(allocator, io, env, &agent, config, &ln, history_path, &registry);
+        if (agent.session_id) |id| {
+            try printToStderr(allocator, io, "Resume session: zagent --resume {s}\n", .{id});
+        }
     }
 }
 
@@ -336,6 +359,11 @@ fn runRepl(
         defer allocator.free(model_line);
         try writeOut(&screen, stdout, io, model_line);
     }
+    if (agent.session_id) |id| {
+        const message = try std.fmt.allocPrint(allocator, "  Session  {s}\n  Resume   zagent --resume {s}\n", .{ id, id });
+        defer allocator.free(message);
+        try writeOut(&screen, stdout, io, message);
+    }
     try writeOut(&screen, stdout, io, DIM ++ "  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
 
     if (config.api_key.len == 0 and config.provider != .codex) {
@@ -404,7 +432,7 @@ fn runRepl(
 
         if (runtime.busy() and line[0] == '/' and
             !std.mem.eql(u8, line, "/status") and !std.mem.eql(u8, line, "/help") and
-            !std.mem.eql(u8, line, "/model") and !std.mem.eql(u8, line, "/mcp") and
+            !std.mem.eql(u8, line, "/model") and !std.mem.eql(u8, line, "/mcp") and !std.mem.eql(u8, line, "/session") and
             !std.mem.eql(u8, line, "/quit") and !std.mem.eql(u8, line, "/exit"))
         {
             try screen.writeLog("This command changes session state; retry after the current task finishes.\n");
@@ -416,7 +444,21 @@ fn runRepl(
             break;
         } else if (std.mem.eql(u8, line, "/help")) {
             try writeOut(&screen, stdout, io, HELP);
-        } else if (std.mem.eql(u8, line, "/clear") or std.mem.eql(u8, line, "/new")) {
+        } else if (std.mem.eql(u8, line, "/session")) {
+            const message = try std.fmt.allocPrint(allocator, "Session: {s}\nResume: zagent --resume {s}\n", .{ agent.session_id.?, agent.session_id.? });
+            defer allocator.free(message);
+            try writeOut(&screen, stdout, io, message);
+        } else if (std.mem.eql(u8, line, "/new")) {
+            agent.startSession(null) catch |err| {
+                const message = try std.fmt.allocPrint(allocator, "Cannot create session: {s}\n", .{@errorName(err)});
+                defer allocator.free(message);
+                try writeOut(&screen, stderr, io, message);
+                continue;
+            };
+            const message = try std.fmt.allocPrint(allocator, "New session: {s}\nResume: zagent --resume {s}\n", .{ agent.session_id.?, agent.session_id.? });
+            defer allocator.free(message);
+            try writeOut(&screen, stdout, io, message);
+        } else if (std.mem.eql(u8, line, "/clear")) {
             agent.clearHistory();
             try writeOut(&screen, stdout, io, DIM ++ "Conversation history cleared.\n" ++ RESET);
         } else if (std.mem.eql(u8, line, "/compact")) {

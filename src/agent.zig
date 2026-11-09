@@ -137,6 +137,7 @@ pub const Agent = struct {
     sandbox_available: bool,
     tool_env: *const std.process.Environ.Map,
     session_path: ?[]u8,
+    session_id: ?[]u8 = null,
     /// Durable notes loaded at startup and updated by the remember tool.
     memory: memory_mod.Memory,
     /// Estimated token budget; 0 disables automatic compaction.
@@ -200,15 +201,6 @@ pub const Agent = struct {
             .tool_call_id = null,
         });
 
-        const session_path = if (env.get("AI_SESSION_FILE")) |path| if (path.len > 0) try allocator.dupe(u8, path) else null else null;
-        errdefer if (session_path) |path| allocator.free(path);
-        if (session_path) |path| {
-            var loaded = try @import("session.zig").load(io, allocator, path);
-            defer loaded.deinit(allocator);
-            errdefer for (loaded.items) |message| message.deinit(allocator);
-            try history.appendSlice(allocator, loaded.items);
-        }
-
         return .{
             .allocator = allocator,
             .io = io,
@@ -219,7 +211,7 @@ pub const Agent = struct {
             .linenoise = linenoise,
             .search = search,
             .tool_env = env,
-            .session_path = session_path,
+            .session_path = null,
             .memory = memory,
             .compact_threshold = config.compact_threshold,
             .compact_keep = config.compact_keep,
@@ -250,6 +242,7 @@ pub const Agent = struct {
         self.client.deinit();
         self.memory.deinit();
         if (self.session_path) |path| self.allocator.free(path);
+        if (self.session_id) |id| self.allocator.free(id);
     }
 
     /// Draw the conversation on `screen` instead of on the files the progress
@@ -277,6 +270,36 @@ pub const Agent = struct {
         for (self.history.items[1..]) |msg| msg.deinit(self.allocator);
         self.history.shrinkRetainingCapacity(1);
         self.checkpoint() catch {};
+    }
+
+    /// Switch only after the new snapshot has been created or fully validated.
+    pub fn startSession(self: *Agent, resume_id: ?[]const u8) !void {
+        const session = @import("session.zig");
+        const id = if (resume_id) |value| try self.allocator.dupe(u8, value) else try session.newId(self.io, self.allocator);
+        errdefer self.allocator.free(id);
+        const path = try session.pathForId(self.allocator, id);
+        errdefer self.allocator.free(path);
+        var loaded: std.ArrayList(Message) = .empty;
+        defer {
+            for (loaded.items) |message| message.deinit(self.allocator);
+            loaded.deinit(self.allocator);
+        }
+        if (resume_id != null) {
+            try std.Io.Dir.cwd().access(self.io, path, .{});
+            loaded = try session.load(self.io, self.allocator, path);
+        } else {
+            try session.save(self.io, self.allocator, path, &.{});
+        }
+        try self.history.ensureTotalCapacity(self.allocator, loaded.items.len + 1);
+        for (self.history.items[1..]) |message| message.deinit(self.allocator);
+        self.history.shrinkRetainingCapacity(1);
+        self.history.appendSliceAssumeCapacity(loaded.items);
+        loaded.clearRetainingCapacity();
+        if (self.session_path) |old| self.allocator.free(old);
+        if (self.session_id) |old| self.allocator.free(old);
+        self.session_path = path;
+        self.session_id = id;
+        self.client.resetTokenCounters();
     }
 
     fn checkpoint(self: *Agent) !void {

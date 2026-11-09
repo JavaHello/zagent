@@ -19,7 +19,8 @@ pub const Command = struct {
 pub const all = [_]Command{
     .{ .name = "/help", .description = "Show this help message" },
     .{ .name = "/clear", .description = "Clear conversation history" },
-    .{ .name = "/new", .description = "Start a new conversation (same as /clear)" },
+    .{ .name = "/new", .description = "Create a new session (preserve the previous one)" },
+    .{ .name = "/session", .description = "Show the current session ID and resume command" },
     .{ .name = "/compact", .description = "Summarize older messages to free context" },
     .{ .name = "/memory", .description = "List saved memories" },
     .{ .name = "/remember", .description = "Save a note to memory: /remember <text>" },

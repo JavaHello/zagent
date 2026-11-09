@@ -86,19 +86,26 @@ AI_TOOL_NETWORK=1 zagent "Download the public API documentation and summarize it
 
 ## Durable conversations
 
-Set `AI_SESSION_FILE` to save the conversation after each completed tool batch and
-answer. Starting zagent with the same file resumes its context. The session is
-bound to the original working directory. `/clear` also clears the saved session.
-The file contains task content and tool results, and should be stored outside the
-tool workspace if tools must not edit it. New files use mode 0600; do not share a
-session file between concurrent zagent processes. Invalid or mismatched session
-files are reported rather than silently discarded. Interrupted tool batches may
-have filesystem effects; inspect the workspace when resuming.
+Every launch creates a fresh session ID, saved automatically in the current
+workspace's `.zagent/sessions/<id>.json`. The startup message and `/session`
+show the ID and resume command. `/new` creates another ID without overwriting
+the previous conversation; `/clear` empties only the current session.
+From the original working directory, restore a session with:
 
 ```sh
-AI_SESSION_FILE="$HOME/.local/state/zagent/project.json" zagent "Implement the task"
-AI_SESSION_FILE="$HOME/.local/state/zagent/project.json" zagent "Continue and verify"
+zagent --resume <session-id>
+zagent --resume <session-id> "Continue the task"
 ```
+
+Resume retains the ID and model context. Missing, invalid or corrupt IDs fail
+without creating an empty session. Session files contain conversation and tool
+data: do not commit sensitive snapshots or resume the same ID concurrently.
+
+Snapshots are saved after each completed tool batch and answer. Sessions are
+bound to the original working directory. New files use mode 0600 and contain no
+API configuration. Invalid or mismatched session files are reported rather than
+silently discarded. Interrupted tool batches may have filesystem effects;
+inspect the workspace when resuming.
 
 Transient network errors and HTTP 408/429/500/502/503/504 responses are retried up
 to three attempts. Exhausted tool iterations, and output still cut off after
@@ -579,7 +586,8 @@ and what each brought. Seven behaviours are worth knowing:
 |---------------|----------------------------------|
 | `/help`       | Show help                        |
 | `/clear`      | Clear conversation history       |
-| `/new`        | Start a new conversation (same as `/clear`) |
+| `/new`        | Create a new session, preserving the previous one |
+| `/session`    | Show the current session ID and resume command |
 | `/compact`    | Summarize older messages to free context |
 | `/memory`     | List saved memories              |
 | `/remember <text>` | Save a note to memory        |
