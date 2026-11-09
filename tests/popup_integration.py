@@ -53,7 +53,13 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
 
     try:
         read_until('❯ '.encode())
-        assert b'\x1b[?1000h\x1b[?1006h' in transcript
+        assert b'\x1b[?1000h\x1b[?1002h\x1b[?1006h' in transcript
+        # Drag output, release to copy via OSC 52, and keep the input intact.
+        transcript.clear()
+        os.write(master, b'\x1b[<0;1;1M\x1b[<32;70;10M\x1b[<0;70;10m')
+        read_until(b'\x1b]52;c;', raw=True)
+        read_until('已复制 '.encode())
+        assert b'\x1b[7m' in transcript
         send(b'draft', '❯ draft'.encode())
         # Recalled slash commands must not capture arrows in a completion menu.
         send(b'\x1b[A', '❯ /model'.encode())
@@ -94,7 +100,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         send(b'\x15check @alpha tail\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D', b'@src/alpha.zig  File')
         send(b'\t', '❯ check @src/alpha.zig tail'.encode())
         send(b'\x05\x15/qu\t\r', b'Goodbye!')
-        read_until(b'\x1b[?1006l\x1b[?1000l', raw=True)
+        read_until(b'\x1b[?1006l\x1b[?1002l\x1b[?1000l', raw=True)
         assert process.wait(timeout=5) == 0
         assert termios.tcgetattr(slave) == original
         print('PASS: slash-command history, mouse scrolling, command navigation, explicit submission, file search, CJK/spaces, suffix preservation and terminal restoration')

@@ -343,6 +343,7 @@ fn runRepl(
         agent.choice_callback = @import("runtime.zig").Runtime.choose;
         ln.tick_callback = tickRuntime;
         ln.scroll_callback = scrollRuntime;
+        ln.mouse_callback = mouseRuntime;
         ln.interrupt_callback = interruptRuntime;
     }
 
@@ -358,6 +359,7 @@ fn runRepl(
         ln.layout_context = null;
         ln.tick_callback = null;
         ln.scroll_callback = null;
+        ln.mouse_callback = null;
         ln.interrupt_callback = null;
         agent.choice_callback = null;
         agent.choice_context = null;
@@ -572,6 +574,11 @@ fn tickRuntime(context: ?*anyopaque) anyerror!bool {
 fn interruptRuntime(context: ?*anyopaque) anyerror!void {
     const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
     try runtime.interrupt();
+}
+
+fn mouseRuntime(context: ?*anyopaque, report: []const u8) anyerror!void {
+    const rt: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context orelse return));
+    try rt.screen.mouse(report);
 }
 
 fn scrollRuntime(context: ?*anyopaque, up: bool, page: bool) anyerror!void {

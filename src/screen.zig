@@ -24,8 +24,9 @@ const HIDE_CURSOR = "\x1b[?25l";
 const SHOW_CURSOR = "\x1b[?25h";
 const SAVE_CURSOR = "\x1b7";
 const RESTORE_CURSOR = "\x1b8";
-const ALT_ON = "\x1b[?1049h\x1b[?1000h\x1b[?1006h";
-const ALT_OFF = "\x1b[?1006l\x1b[?1000l\x1b[?1049l";
+const ALT_ON = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const ALT_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l";
+const selection = @import("selection.zig");
 
 pub const Screen = struct {
     allocator: std.mem.Allocator,
@@ -52,6 +53,69 @@ pub const Screen = struct {
     pending_progress: [256]u8 = undefined,
     pending_progress_len: usize = 0,
     progress_changed: bool = false,
+    anchor: ?usize = null,
+    anchor_end: usize = 0,
+    selection_start: usize = 0,
+    selection_end: usize = 0,
+    dragging: bool = false,
+    notice: [128]u8 = undefined,
+    notice_len: usize = 0,
+    notice_started: ?std.Io.Timestamp = null,
+
+    pub fn mouse(self: *Screen, report: []const u8) !void {
+        if (!self.active) return;
+        const m = selection.parse(report) orelse return;
+        // Only unmodified left-button presses, drags and releases select.
+        if (m.button != 0 and m.button != 32) return;
+        if (m.y > self.logBottom() and !self.dragging) return;
+        const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
+        defer self.allocator.free(rows);
+        const end_row = rows.len - @min(self.scroll_rows, rows.len -| self.logBottom());
+        const first = end_row -| self.logBottom();
+        const row = @min(first + @min(m.y, self.logBottom()) - 1, end_row - 1);
+        const begin = rows[row];
+        const end = if (row + 1 < rows.len) rows[row + 1] else self.transcript.items.len;
+        const line = self.transcript.items[begin..end];
+        const point = begin + selection.offset(line, m.x - 1, false);
+        const point_end = begin + selection.offset(line, m.x - 1, true);
+        if (!m.release and m.button == 0) {
+            self.anchor = point;
+            self.anchor_end = point_end;
+            self.selection_start = point;
+            self.selection_end = point;
+            self.dragging = true;
+        } else if (self.dragging) {
+            const anchor = self.anchor orelse return;
+            // A click without motion is not a selection.
+            if (point != anchor or self.selection_end != self.selection_start) {
+                self.selection_start = @min(anchor, point);
+                self.selection_end = @max(self.anchor_end, point_end);
+            }
+            if (m.release) {
+                self.dragging = false;
+                if (self.selection_end > self.selection_start) try self.copySelection();
+            }
+        } else return;
+        self.dirty = true;
+    }
+
+    fn copySelection(self: *Screen) !void {
+        const plain = try selection.plain(self.allocator, self.transcript.items[self.selection_start..self.selection_end]);
+        defer self.allocator.free(plain);
+        if (plain.len == 0) return;
+        const encoder = std.base64.standard.Encoder;
+        const encoded = try self.allocator.alloc(u8, encoder.calcSize(plain.len));
+        defer self.allocator.free(encoded);
+        _ = encoder.encode(encoded, plain);
+        // OSC 52 works locally and over SSH; the terminal controls permission.
+        try self.out.writeStreamingAll(self.io, "\x1b]52;c;");
+        try self.out.writeStreamingAll(self.io, encoded);
+        try self.out.writeStreamingAll(self.io, "\x07");
+        const count = try std.unicode.utf8CountCodepoints(plain);
+        const message = try std.fmt.bufPrint(&self.notice, "已复制 {d} 个字符", .{count});
+        self.notice_len = message.len;
+        self.notice_started = std.Io.Timestamp.now(self.io, .awake);
+    }
 
     /// Workers publish a transient line; only the foreground draws it.
     pub fn setProgress(self: *Screen, line: []const u8) void {
@@ -64,10 +128,20 @@ pub const Screen = struct {
     }
 
     pub fn drain(self: *Screen) !bool {
+        // Keep the viewport stable while the pointer is selecting streamed text.
+        if (self.dragging) return false;
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
-        const changed = self.progress_changed;
-        if (changed) {
+        var changed = self.progress_changed;
+        if (self.notice_started) |started| {
+            if (started.untilNow(self.io, .awake).toMilliseconds() >= 3000) {
+                self.notice_len = 0;
+                self.notice_started = null;
+                self.dirty = true;
+                changed = true;
+            }
+        }
+        if (self.progress_changed) {
             self.progress_len = self.pending_progress_len;
             @memcpy(self.progress[0..self.progress_len], self.pending_progress[0..self.progress_len]);
             self.progress_changed = false;
@@ -93,6 +167,8 @@ pub const Screen = struct {
     /// Wheel events advance a few visual rows; keyboard paging keeps its
     /// viewport-sized step. Wrapped lines count as separate visual rows.
     pub fn scroll(self: *Screen, up: bool, page: bool) !void {
+        self.dragging = false;
+        self.selection_end = self.selection_start;
         _ = try self.drain();
         const step = if (page) @max(@as(usize, 1), self.logBottom() -| 1) else 3;
         const total = try visualRows(self.allocator, self.transcript.items, self.cols);
@@ -251,7 +327,6 @@ pub const Screen = struct {
         // The editor turns off output post-processing, so a bare newline would
         // leave the column where it was. Writing CRLF keeps the replay correct
         // both while a line is being edited and between turns.
-        var start: usize = 0;
         const offsets = try visualRows(self.allocator, self.transcript.items, self.cols);
         defer self.allocator.free(offsets);
         self.scroll_rows = @min(self.scroll_rows, offsets.len -| bottom);
@@ -261,18 +336,35 @@ pub const Screen = struct {
         const view_end = if (end_row < offsets.len) offsets[end_row] else self.transcript.items.len;
         const end = if (end_row < offsets.len and view_end > view_start and self.transcript.items[view_end - 1] == '\n') view_end - 1 else view_end;
         const view = self.transcript.items[view_start..end];
-        start = 0;
-        for (view, 0..) |byte, index| {
-            if (byte != '\n') continue;
-            try w.writeAll(view[start..index]);
-            try w.writeAll("\r\n");
-            start = index + 1;
+        var index: usize = 0;
+        var inverse = false;
+        while (index < view.len) {
+            if (view[index] == 0x1b) {
+                const next = @import("text.zig").skipAnsiEscape(view, index);
+                try w.writeAll(view[index..next]);
+                if (inverse) try w.writeAll("\x1b[7m");
+                index = next;
+                continue;
+            }
+            const selected = view_start + index >= self.selection_start and view_start + index < self.selection_end;
+            if (selected != inverse) try w.writeAll(if (selected) "\x1b[7m" else "\x1b[27m");
+            inverse = selected;
+            const cp = term.decodeAt(view, index);
+            if (view[index] == '\n') {
+                if (inverse) try w.writeAll("\x1b[27m");
+                inverse = false;
+                try w.writeAll("\r\n");
+            } else {
+                try w.writeAll(view[index..][0..cp.len]);
+            }
+            index += cp.len;
         }
-        try w.writeAll(view[start..]);
+        if (inverse) try w.writeAll("\x1b[27m");
         try w.writeAll(SAVE_CURSOR);
         try w.print("\x1b[{d};1H\x1b[0J", .{top});
-        if (self.progress_len > 0) {
-            try w.writeAll(self.progress[0..self.progress_len]);
+        if (self.notice_len > 0 or self.progress_len > 0) {
+            try w.writeAll(RESET);
+            try w.writeAll(if (self.notice_len > 0) self.notice[0..self.notice_len] else self.progress[0..self.progress_len]);
             try w.writeAll("\r\n");
         }
         try w.writeAll(RESTORE_CURSOR);
@@ -307,7 +399,7 @@ pub const Screen = struct {
     }
 
     fn logBottom(self: *const Screen) usize {
-        const reserved = self.input_rows + @as(usize, if (self.progress_len > 0) 1 else 0);
+        const reserved = self.input_rows + @as(usize, if (self.progress_len > 0 or self.notice_len > 0) 1 else 0);
         return self.rows -| @min(reserved, self.rows -| 1);
     }
 
@@ -525,6 +617,44 @@ fn raiseStop() void {
 
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
+
+test "drag selects Unicode output and release copies once with character notice" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    s.out = file;
+    defer {
+        s.active = false;
+        s.deinit();
+    }
+    try s.transcript.appendSlice(a, "\x1b[31m你ab\x1b[0m\nsecond");
+    try s.mouse("0;1;1M");
+    try s.mouse("32;3;1M");
+    try std.testing.expect(s.dragging);
+    try s.replay();
+    try s.mouse("0;3;1m");
+    try std.testing.expect(!s.dragging);
+    try std.testing.expectEqualStrings("已复制 2 个字符", s.notice[0..s.notice_len]);
+    const output = try readOutput(tmp.dir, a);
+    defer a.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[7m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\x1b]52;c;5L2gYQ==\x07") != null);
+    try s.mouse("0;3;1m");
+    const again = try readOutput(tmp.dir, a);
+    defer a.free(again);
+    try std.testing.expectEqual(output.len, again.len);
+    // Reverse selection covers the same glyphs, and a click alone is a no-op.
+    try s.mouse("0;3;1M");
+    try s.mouse("32;1;1M");
+    try s.mouse("0;1;1m");
+    try std.testing.expectEqualStrings("已复制 2 个字符", s.notice[0..s.notice_len]);
+    try s.mouse("0;1;1M");
+    try s.mouse("0;1;1m");
+    try std.testing.expectEqual(s.selection_start, s.selection_end);
+}
 
 test "visual history rows count wrapping, CJK and ANSI without splitting UTF-8" {
     const a = std.testing.allocator;
