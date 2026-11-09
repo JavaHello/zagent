@@ -343,3 +343,97 @@ test "a transcript keeps both sides and truncates long tool output" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[truncated]") != null);
     try std.testing.expect(rendered.len < long.len);
 }
+
+test "compaction triggers exactly at the token budget" {
+    const messages = [_]Message{.{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null }};
+    const tokens: u32 = @intCast(estimateTokens(&messages));
+    try std.testing.expect(tokens > 0);
+    try std.testing.expect(needsCompaction(&messages, tokens));
+    try std.testing.expect(!needsCompaction(&messages, tokens + 1));
+    try std.testing.expectEqual(@as(u64, 0), estimateTokens(&.{}));
+}
+
+test "short histories and keeping the entire history cannot be compacted" {
+    const messages = [_]Message{
+        .{ .role = "system", .content = "sys", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "user", .content = "q", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = "a", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    try std.testing.expectEqual(@as(?usize, null), findCut(&.{}, 0));
+    for (0..messages.len + 1) |len| {
+        try std.testing.expectEqual(@as(?usize, null), findCut(messages[0..len], 0));
+    }
+    try std.testing.expectEqual(@as(?usize, null), findCut(&messages, std.math.maxInt(u32)));
+}
+
+test "UTF8 truncation handles every boundary of mixed width text" {
+    const input = "a中🙂b";
+    const expected = [_][]const u8{ "", "a", "a", "a", "a中", "a中", "a中", "a中", "a中🙂", input };
+    for (expected, 0..) |value, limit| {
+        const actual = truncateUtf8(input, limit);
+        try std.testing.expectEqualStrings(value, actual);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(actual));
+    }
+}
+
+test "summary sanitization rejects whitespace and trims without changing text" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "", " \t\r\n" }) |input| {
+        try std.testing.expectError(error.EmptySummary, sanitizeSummary(allocator, input));
+    }
+    const summary = try sanitizeSummary(allocator, " \t\r\n保留  内容\n下一步 \t\r\n");
+    defer allocator.free(summary);
+    try std.testing.expectEqualStrings("保留  内容\n下一步", summary);
+}
+
+test "summary byte limit never splits a multibyte character" {
+    const allocator = std.testing.allocator;
+    const prefix = try allocator.alloc(u8, max_summary_bytes - 1);
+    defer allocator.free(prefix);
+    @memset(prefix, 'x');
+    const input = try std.fmt.allocPrint(allocator, "{s}🙂tail", .{prefix});
+    defer allocator.free(input);
+    const summary = try sanitizeSummary(allocator, input);
+    defer allocator.free(summary);
+    try std.testing.expectEqualStrings(prefix, summary);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(summary));
+}
+
+test "transcript renders only the requested range and preserves tool arguments" {
+    const allocator = std.testing.allocator;
+    var calls = [_]openai.ToolCallData{.{ .id = "1", .name = "shell", .arguments = "{\"command\":\"zig build test\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "secret", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = "checking", .reasoning_content = null, .tool_calls = &calls, .tool_call_id = null },
+        .{ .role = "user", .content = "outside range", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const transcript = try renderTranscript(allocator, &messages, 1, 2);
+    defer allocator.free(transcript);
+    try std.testing.expectEqualStrings("Assistant called shell: {\"command\":\"zig build test\"}\nAssistant: checking\n\n", transcript);
+    const empty = try renderTranscript(allocator, &messages, 2, 2);
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+}
+
+test "summary requests include previous context only when supplied" {
+    const allocator = std.testing.allocator;
+    const fresh = try buildSummaryMessages(allocator, null, "new segment");
+    defer freeSummaryMessages(allocator, fresh);
+    try std.testing.expectEqual(@as(usize, 2), fresh.len);
+    try std.testing.expectEqualStrings("system", fresh[0].role);
+    try std.testing.expectEqualStrings(SUMMARY_SYSTEM_PROMPT, fresh[0].content.?);
+    try std.testing.expectEqualStrings("user", fresh[1].role);
+    try std.testing.expectEqualStrings("Next part of the conversation:\nnew segment", fresh[1].content.?);
+    const continued = try buildSummaryMessages(allocator, "earlier facts", "new segment");
+    defer freeSummaryMessages(allocator, continued);
+    try std.testing.expectEqualStrings("Summary so far:\nearlier facts\n\nNext part of the conversation:\nnew segment", continued[1].content.?);
+}
+
+fn checkSummaryAllocationFailures(allocator: std.mem.Allocator) !void {
+    const messages = try buildSummaryMessages(allocator, "previous", "segment");
+    defer freeSummaryMessages(allocator, messages);
+}
+
+test "summary request construction releases allocations on every failure path" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSummaryAllocationFailures, .{});
+}

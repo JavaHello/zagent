@@ -41,6 +41,14 @@ try:
             ({'status': 'queued', 'output': [call]}, 'ResponseNotCompleted'),
             ({'status': 'completed', 'output': []}, 'EmptyResponse'),
             ({'choices': [{'message': {'content': 'legacy response'}}]}, 'InvalidResponse'),
+            # Even a valid first call must not run when a later item makes the
+            # response invalid: dispatch waits for validation of the full batch.
+            ({'status': 'completed', 'output': [call, dict(call)]}, 'DuplicateCallId'),
+            ({'status': 'completed', 'output': [call, dict(call, call_id='')]}, 'InvalidResponse'),
+            ({'status': 'completed', 'output': [call, dict(call, call_id='other', name='')]}, 'InvalidResponse'),
+            ({'status': 'completed', 'output': [call, dict(call, call_id='other', arguments={})]}, 'InvalidResponse'),
+            ({'status': 'completed', 'output': [call, {'type': 'message', 'role': 'user', 'content': []}]}, 'InvalidResponse'),
+            ({'status': 'completed', 'output': [call, {'type': 'unknown'}]}, 'UnsupportedOutputItem'),
         ]
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1/', 'AI_MODEL': 'test-model',
