@@ -126,6 +126,8 @@ pub const Agent = struct {
     max_verifications: u32,
     /// The terminal ask_user and the choice menus read from.
     linenoise: *Linenoise,
+    choice_context: ?*anyopaque = null,
+    choice_callback: ?*const fn (?*anyopaque, []const u8, []const menu.Option) anyerror!?[]u8 = null,
     /// Which search programs the machine has. Decided once, in `init`, for the
     /// same reason as `render_markdown`: a search should not have to ask the
     /// filesystem a question whose answer cannot change while the agent runs.
@@ -577,7 +579,7 @@ pub const Agent = struct {
 
     fn progressOptions(self: *Agent) spinner.Options {
         return .{
-            .enabled = self.animate_progress,
+            .enabled = self.animate_progress and self.choice_callback == null,
             .started = self.query_started,
             .prompt = self.progress_prompt,
             .first_frame_delay_ms = 0,
@@ -1008,6 +1010,7 @@ pub const Agent = struct {
     /// to decide on its own.
     fn askChoice(self: *Agent, question: []const u8, options: []const menu.Option) !?[]u8 {
         self.terminal_title.update("waiting for input", self.current_task);
+        if (self.choice_callback) |choose| return choose(self.choice_context, question, options);
         const recommended = menu.recommendedIndex(options);
 
         if (!self.linenoise.is_tty or !self.linenoise.term_supported or

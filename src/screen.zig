@@ -43,6 +43,40 @@ pub const Screen = struct {
     input_rows: usize = 1,
     /// The log has to be drawn again before the next write.
     dirty: bool = true,
+    scroll_rows: usize = 0,
+    buffered: bool = false,
+    queued: std.ArrayList(u8) = .empty,
+    queue_mutex: std.Io.Mutex = .init,
+
+    pub fn drain(self: *Screen) !bool {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        if (self.queued.items.len == 0) return false;
+        const old_rows = if (self.scroll_rows > 0) blk: {
+            const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
+            defer self.allocator.free(rows);
+            break :blk rows.len;
+        } else 0;
+        try self.transcript.appendSlice(self.allocator, self.queued.items);
+        if (old_rows > 0) {
+            const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
+            defer self.allocator.free(rows);
+            self.scroll_rows += rows.len -| old_rows;
+        }
+        self.queued.clearRetainingCapacity();
+        self.dirty = true;
+        return true;
+    }
+
+    pub fn scroll(self: *Screen, up: bool) !void {
+        _ = try self.drain();
+        const page = @max(@as(usize, 1), self.logBottom() -| 1);
+        const total = try visualRows(self.allocator, self.transcript.items, self.cols);
+        defer self.allocator.free(total);
+        const limit = total.len -| self.logBottom();
+        self.scroll_rows = if (up) @min(limit, self.scroll_rows +| page) else self.scroll_rows -| page;
+        self.dirty = true;
+    }
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, active: bool) Screen {
         return .{
@@ -56,6 +90,7 @@ pub const Screen = struct {
     pub fn deinit(self: *Screen) void {
         if (self.active) self.leave();
         self.transcript.deinit(self.allocator);
+        self.queued.deinit(self.allocator);
     }
 
     pub fn isActive(self: *const Screen) bool {
@@ -101,6 +136,7 @@ pub const Screen = struct {
     /// doing it here too would save the editor's own cursor on every keystroke.
     pub fn reserveInput(self: *Screen, wanted: usize, repaint: bool) !void {
         if (!self.active) return;
+        _ = try self.drain();
         const resized = self.refreshSize();
         if (repaint) self.dirty = true;
         const clamped = @max(@as(usize, 1), @min(wanted, self.rows -| 1));
@@ -147,6 +183,12 @@ pub const Screen = struct {
     /// Append to the conversation and show it.
     pub fn writeLog(self: *Screen, bytes: []const u8) !void {
         if (!self.active or bytes.len == 0) return;
+        if (self.buffered) {
+            self.queue_mutex.lockUncancelable(self.io);
+            defer self.queue_mutex.unlock(self.io);
+            try self.queued.appendSlice(self.allocator, bytes);
+            return;
+        }
         if (self.dirty or repaintPending()) try self.replay();
         try self.transcript.appendSlice(self.allocator, bytes);
         try self.out.writeStreamingAll(self.io, bytes);
@@ -186,13 +228,23 @@ pub const Screen = struct {
         // leave the column where it was. Writing CRLF keeps the replay correct
         // both while a line is being edited and between turns.
         var start: usize = 0;
-        for (self.transcript.items, 0..) |byte, index| {
+        const offsets = try visualRows(self.allocator, self.transcript.items, self.cols);
+        defer self.allocator.free(offsets);
+        self.scroll_rows = @min(self.scroll_rows, offsets.len -| bottom);
+        const end_row = offsets.len - self.scroll_rows;
+        const first_row = end_row -| bottom;
+        const view_start = offsets[first_row];
+        const view_end = if (end_row < offsets.len) offsets[end_row] else self.transcript.items.len;
+        const end = if (end_row < offsets.len and view_end > view_start and self.transcript.items[view_end - 1] == '\n') view_end - 1 else view_end;
+        const view = self.transcript.items[view_start..end];
+        start = 0;
+        for (view, 0..) |byte, index| {
             if (byte != '\n') continue;
-            try w.writeAll(self.transcript.items[start..index]);
+            try w.writeAll(view[start..index]);
             try w.writeAll("\r\n");
             start = index + 1;
         }
-        try w.writeAll(self.transcript.items[start..]);
+        try w.writeAll(view[start..]);
         try w.writeAll(SAVE_CURSOR);
         try w.print("\x1b[{d};1H\x1b[0J", .{top});
         try w.writeAll(RESTORE_CURSOR);
@@ -247,6 +299,40 @@ pub const Screen = struct {
 
 /// A `std.Io.Writer` over the screen's log, so the markdown renderer can stream
 /// into the conversation through its own small buffer.
+fn visualRows(a: std.mem.Allocator, bytes: []const u8, cols: usize) ![]usize {
+    var rows: std.ArrayList(usize) = .empty;
+    errdefer rows.deinit(a);
+    try rows.append(a, 0);
+    var column: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (bytes[i] == 0x1b) {
+            i = @import("text.zig").skipAnsiEscape(bytes, i);
+            continue;
+        }
+        if (bytes[i] == '\n') {
+            i += 1;
+            column = 0;
+            try rows.append(a, i);
+            continue;
+        }
+        if (bytes[i] == '\r') {
+            column = 0;
+            i += 1;
+            continue;
+        }
+        const cp = term.decodeAt(bytes, i);
+        const width = term.codepointWidth(cp);
+        if (width > 0 and column + width > @max(cols, 1)) {
+            try rows.append(a, i);
+            column = 0;
+        }
+        column += width;
+        i += cp.len;
+    }
+    return rows.toOwnedSlice(a);
+}
+
 pub const LogWriter = struct {
     screen: *Screen,
     writer: std.Io.Writer,
@@ -410,6 +496,35 @@ fn raiseStop() void {
 
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
+
+test "visual history rows count wrapping, CJK and ANSI without splitting UTF-8" {
+    const a = std.testing.allocator;
+    const rows = try visualRows(a, "\x1b[31m你好ab\x1b[0m\nlast\n", 4);
+    defer a.free(rows);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 11, 18, 23 }, rows);
+}
+
+test "buffered output is drained by the UI and keeps a scrolled viewport anchored" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.rows = 5;
+    s.cols = 20;
+    s.buffered = true;
+    try s.writeLog("one\ntwo\nthree\nfour\nfive\nsix");
+    try std.testing.expectEqual(@as(usize, 0), s.transcript.items.len);
+    try std.testing.expect(try s.drain());
+    try s.scroll(true);
+    try std.testing.expectEqual(@as(usize, 2), s.scroll_rows);
+    try s.writeLog("\nseven\neight");
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqual(@as(usize, 4), s.scroll_rows);
+    try s.scroll(false);
+    try s.scroll(false);
+    try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
+    try std.testing.expect(!try s.drain());
+}
 
 test "the log region keeps at least one row above the input" {
     var s: Screen = .{ .allocator = std.testing.allocator, .io = std.testing.io, .out = undefined, .active = false };

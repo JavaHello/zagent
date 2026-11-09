@@ -98,6 +98,13 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
     try state.refreshLine();
 
     while (true) {
+        if (ln.tick_callback) |tick| {
+            if (try tick(ln.layout_context)) try state.refreshLine();
+            if (@import("builtin").os.tag != .windows) {
+                var fds = [_]std.posix.pollfd{.{ .fd = in.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                if (try std.posix.poll(&fds, 100) == 0) continue;
+            }
+        }
         var input_buf: [1]u8 = undefined;
         if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
         var c = input_buf[0];
@@ -208,6 +215,12 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                                         '1', '7' => try state.editMoveHome(),
                                         '3' => try state.editDelete(),
                                         '4', '8' => try state.editMoveEnd(),
+                                        '5', '6' => {
+                                            if (ln.scroll_callback) |scroll| {
+                                                try scroll(ln.layout_context, num == '5');
+                                                try state.refreshLine();
+                                            }
+                                        },
                                         else => {},
                                     }
                                 }
@@ -349,6 +362,8 @@ pub const Linenoise = struct {
     /// How the host is told how many bottom rows the editor needs.
     layout_callback: ?LayoutCallback = null,
     layout_context: ?*anyopaque = null,
+    tick_callback: ?*const fn (?*anyopaque) anyerror!bool = null,
+    scroll_callback: ?*const fn (?*anyopaque, bool) anyerror!void = null,
     /// The line being edited when Ctrl-Z suspended it, restored and freed by
     /// the next `linenoise` call.
     pending_input: ?[]u8 = null,

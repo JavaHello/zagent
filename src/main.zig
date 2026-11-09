@@ -34,6 +34,8 @@ const HELP =
     \\  /quit, /exit Exit zagent
     \\  /, @, $      Command / project file / reserved candidates
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
+    \\  PageUp/Down  Scroll output history
+    \\  While running: commands remain available; new questions are queued
     \\  Ctrl+Z       Suspend; resume with fg
     \\  Ctrl+D       Exit zagent
     \\
@@ -283,16 +285,29 @@ fn runRepl(
     defer agent.attachScreen(null);
     try screen.enter();
     defer screen.deinit();
+    var runtime = @import("runtime.zig").Runtime{ .agent = agent, .screen = &screen };
+    if (screen.isActive()) {
+        screen.buffered = true;
+        agent.choice_context = &runtime;
+        agent.choice_callback = @import("runtime.zig").Runtime.choose;
+        ln.tick_callback = tickRuntime;
+        ln.scroll_callback = scrollRuntime;
+    }
 
     ln.multiline_mode = true;
     ln.bottom_anchor = screen.isActive();
     ln.layout_callback = layoutScreen;
-    ln.layout_context = &screen;
+    ln.layout_context = &runtime;
     // The editor must not keep pointing at a screen that is about to go away.
     defer {
+        runtime.deinit();
         ln.bottom_anchor = false;
         ln.layout_callback = null;
         ln.layout_context = null;
+        ln.tick_callback = null;
+        ln.scroll_callback = null;
+        agent.choice_callback = null;
+        agent.choice_context = null;
     }
     // Fullscreen keeps its own blank prompt row at the bottom, so the
     // animation must not draw a second prompt above it.
@@ -363,7 +378,10 @@ fn runRepl(
 
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
 
-        if (line.len == 0) continue;
+        if (line.len == 0) {
+            if (runtime.waiting.load(.acquire)) try runtime.submit(line);
+            continue;
+        }
 
         // The editor's rows are cleared once the line is read; the question
         // still belongs in the record, with the prompt it was typed after. An
@@ -383,6 +401,15 @@ fn runRepl(
         // answer cannot lose the question that asked for it.
         try ln.history.add(line);
         if (history_path) |path| history.save(io, ln, path);
+
+        if (runtime.busy() and line[0] == '/' and
+            !std.mem.eql(u8, line, "/status") and !std.mem.eql(u8, line, "/help") and
+            !std.mem.eql(u8, line, "/model") and !std.mem.eql(u8, line, "/mcp") and
+            !std.mem.eql(u8, line, "/quit") and !std.mem.eql(u8, line, "/exit"))
+        {
+            try screen.writeLog("This command changes session state; retry after the current task finishes.\n");
+            continue;
+        }
 
         if (std.mem.eql(u8, line, "/quit") or std.mem.eql(u8, line, "/exit")) {
             try writeOut(&screen, stdout, io, DIM ++ "Goodbye!\n" ++ RESET);
@@ -407,7 +434,9 @@ fn runRepl(
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\nLast turn tokens (server usage or estimate): input {d}, output {d}\n", .{ config.model, counts.input, counts.output });
             defer allocator.free(msg);
             try writeOut(&screen, stdout, io, msg);
-            const quota = agent.client.quotaStatus() catch |err| {
+            var status_client = @import("openai.zig").Client.init(allocator, io, config);
+            defer status_client.deinit();
+            const quota = status_client.quotaStatus() catch |err| {
                 try reportCommandError(allocator, &screen, io, "status: quota unavailable", err);
                 continue;
             };
@@ -422,6 +451,8 @@ fn runRepl(
             defer aw.deinit();
             try registry.writeStatus(&aw.writer);
             try writeOut(&screen, stdout, io, aw.written());
+        } else if (screen.isActive()) {
+            try runtime.submit(line);
         } else {
             agent.processQuery(line) catch |err| {
                 const errmsg = try std.fmt.allocPrint(allocator, "\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
@@ -457,8 +488,18 @@ fn reportCommandError(
 /// The editor reports how many rows it needs at the bottom. Reserving them is
 /// what repaints the conversation when the prompt grows.
 fn layoutScreen(context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void {
-    const screen: *Screen = @ptrCast(@alignCast(context));
-    try screen.reserveInput(rows, repaint);
+    const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    try runtime.screen.reserveInput(rows, repaint);
+}
+
+fn tickRuntime(context: ?*anyopaque) anyerror!bool {
+    const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    return runtime.tick();
+}
+
+fn scrollRuntime(context: ?*anyopaque, up: bool) anyerror!void {
+    const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    try runtime.screen.scroll(up);
 }
 
 /// Says what is being waited for before each server is started. Written to
