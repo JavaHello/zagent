@@ -76,14 +76,16 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
             defer allocator.free(patch_text);
             break :blk try tools.applyPatch(io, allocator, patch_text);
         } else if (std.mem.eql(u8, name, "ls")) {
-            const path = openai.extractStringArg(allocator, arguments, "path") catch {
+            const parsed = std.json.parseFromSlice(struct {
+                path: []const u8 = ".",
+            }, allocator, arguments, .{ .ignore_unknown_fields = true }) catch {
                 break :blk .{
-                    .content = try allocator.dupe(u8, "Error: missing 'path' argument"),
+                    .content = try allocator.dupe(u8, "Error: ls expects an optional 'path' string (defaults to the current directory)"),
                     .is_error = true,
                 };
             };
-            defer allocator.free(path);
-            break :blk try tools.listDir(io, allocator, path);
+            defer parsed.deinit();
+            break :blk try tools.listDir(io, allocator, parsed.value.path);
         } else if (std.mem.eql(u8, name, "rg") or std.mem.eql(u8, name, "grep")) {
             const args = tools.parseGrepArgs(allocator, arguments) catch |err| {
                 break :blk .{
@@ -236,6 +238,31 @@ test "read write and ls operate on an existing file" {
     defer listed.deinit(a);
     try std.testing.expect(!listed.is_error);
     try std.testing.expect(std.mem.indexOf(u8, listed.content, "note.txt") != null);
+}
+
+test "ls defaults to the current directory" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const result = try execute(std.testing.io, a, &env, "ls", "{}");
+    defer result.deinit(a);
+    try std.testing.expect(!result.is_error);
+    const explicit = try execute(std.testing.io, a, &env, "ls", "{\"path\":\".\"}");
+    defer explicit.deinit(a);
+    try std.testing.expect(!explicit.is_error);
+    try std.testing.expectEqualStrings(explicit.content, result.content);
+}
+
+test "ls rejects invalid path arguments" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    for ([_][]const u8{ "{\"path\":null}", "{\"path\":42}", "[]", "not json" }) |args| {
+        const result = try execute(std.testing.io, a, &env, "ls", args);
+        defer result.deinit(a);
+        try std.testing.expect(result.is_error);
+        try std.testing.expect(std.mem.startsWith(u8, result.content, "Error: ls expects"));
+    }
 }
 
 test "filesystem tools dispatch without legacy aliases" {
