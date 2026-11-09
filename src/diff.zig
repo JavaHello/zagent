@@ -233,7 +233,13 @@ fn planFile(
     var removed: usize = 0;
 
     for (file.hunks) |hunk| {
-        const stated = if (hunk.header.old_start > 0) hunk.header.old_start - 1 else 0;
+        // A zero-length old range names the line *before* an insertion.
+        const stated = if (oldSideLen(hunk) == 0)
+            hunk.header.old_start
+        else if (hunk.header.old_start > 0)
+            hunk.header.old_start - 1
+        else
+            0;
         // `locate` has more than one way to find nothing, and each explains
         // itself; `describeMiss` is for the one that has nothing to say yet.
         const already_said = diag.written().len;
@@ -391,7 +397,13 @@ fn locate(diag: *Diagnostic, path: []const u8, lines: []const []const u8, consum
     const need = oldSideLen(hunk);
     // A hunk that only adds lines has nothing to match against; it goes where
     // it says it goes, which is how the first lines of a new file are placed.
-    if (need == 0) return @min(@max(stated, consumed), lines.len);
+    if (need == 0) {
+        if (stated < consumed or stated > lines.len) {
+            diag.say("the insertion at patch line {d} names position {d} in '{s}', outside the remaining range {d}..{d}; add context or correct the line number", .{ hunk.patch_line, stated, path, consumed, lines.len });
+            return null;
+        }
+        return stated;
+    }
 
     const from = @max(stated, consumed);
     if (matchesAt(lines, from, hunk)) return from;
@@ -717,16 +729,18 @@ fn parseFile(
 
         const actual_old = countKind(body.items, .context) + countKind(body.items, .remove);
         const actual_new = countKind(body.items, .context) + countKind(body.items, .add);
-        if (actual_old != header.old_count or actual_new != header.new_count) {
-            diag.say(
-                "the hunk header on line {d} accounts for {d} old and {d} new lines, and the hunk carries {d} and {d}. Check the '@@' line against what follows it: a hunk that was cut off looks the same",
-                .{ at, header.old_count, header.new_count, actual_old, actual_new },
-            );
+        if (body.items.len == 0) {
+            diag.say("the hunk header on line {d} has no body", .{at});
             return error.BadPatch;
         }
+        // Counts are redundant: the body supplies them. Never relax the text
+        // comparison when repairing a model's arithmetic.
+        var corrected = header;
+        corrected.old_count = actual_old;
+        corrected.new_count = actual_new;
 
         try hunks.append(allocator, .{
-            .header = header,
+            .header = corrected,
             .lines = try body.toOwnedSlice(allocator),
             .patch_line = at,
         });
@@ -743,10 +757,10 @@ fn parseFile(
 
 /// Read the lines of one hunk.
 ///
-/// How many lines to read is decided by the counts in the header, which is what
-/// those counts are for: a hunk's last line is followed by the next hunk's
-/// `@@`, or by the next file's `--- a/path`, and only the count says which
-/// lines belong to this hunk and which to the file after it.
+/// Structural boundaries delimit a hunk; declared counts are only a hint for
+/// unprefixed blank lines. Text is still matched exactly when applying it.
+/// A file boundary needs a complete header triple, not just a removed line
+/// whose text happens to start with '-- '.
 fn readHunkBody(
     allocator: std.mem.Allocator,
     cursor: *Cursor,
@@ -773,9 +787,16 @@ fn readHunkBody(
             continue;
         }
 
-        if (old_seen >= header.old_count and new_seen >= header.new_count) break;
+        if (std.mem.startsWith(u8, line, "--- ") and
+            cursor.lines.len - cursor.i >= 3 and
+            std.mem.startsWith(u8, cursor.lines[cursor.i + 1], "+++ ") and
+            std.mem.startsWith(u8, cursor.lines[cursor.i + 2], "@@")) break;
+        // A git mail trailer is not a removed line.
+        if (std.mem.eql(u8, line, "-- ") and
+            old_seen >= header.old_count and new_seen >= header.new_count) break;
 
         if (line.len == 0) {
+            if (old_seen >= header.old_count and new_seen >= header.new_count) break;
             // An empty line where the hunk still needs lines is a context line
             // whose marking space went missing, which is how a model writes a
             // blank line of context far more often than it means anything else.
@@ -1242,39 +1263,98 @@ test "a file that is not a diff is refused with the line that gave it away" {
     try testing.expect(std.mem.indexOf(u8, message, "Here is the patch") != null);
 }
 
-test "a hunk whose counts do not match its lines is refused" {
+test "incorrect hunk counts are recomputed without weakening text matching" {
     const allocator = testing.allocator;
-    const patch =
-        \\--- a/note.txt
-        \\+++ b/note.txt
-        \\@@ -1,3 +1,3 @@
-        \\ first
-        \\-second
-        \\+SECOND
-    ;
-    const message = try applyRefused(allocator, patch);
-    defer allocator.free(message);
-    try testing.expect(std.mem.indexOf(u8, message, "accounts for 3 old and 3 new lines, and the hunk carries 2 and 2") != null);
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+    for ([_][]const u8{ "3", "1" }) |count| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "first\nsecond\n" });
+        const patch = try std.fmt.allocPrint(allocator, "--- {s}/note.txt\n+++ {s}/note.txt\n@@ -1,{s} +1,{s} @@\n first\n-second\n+SECOND\n", .{ dir, dir, count, count });
+        defer allocator.free(patch);
+        const outcome = try applyOk(allocator, patch);
+        defer outcome.deinit(allocator);
+        try expectFileContent(allocator, &tmp, "note.txt", "first\nSECOND\n");
+        // Reapplying still fails: arithmetic repair must not repair text.
+        const message = try applyRefused(allocator, patch);
+        defer allocator.free(message);
+        try expectFileContent(allocator, &tmp, "note.txt", "first\nSECOND\n");
+    }
 }
 
-test "a line the '@@' counts left out is refused as counts that are too low" {
+test "zero length ranges insert after the stated old line" {
     const allocator = testing.allocator;
-    // The two lines the header accounts for are there, so the hunk reads as
-    // complete before its last line — and that line is a hunk line, so the
-    // complaint has to be about the counts rather than about that line.
-    const patch =
-        \\--- a/note.txt
-        \\+++ b/note.txt
-        \\@@ -1,2 +1,2 @@
-        \\ one
-        \\ two
-        \\ three
-    ;
-    const message = try applyRefused(allocator, patch);
-    defer allocator.free(message);
-    try testing.expect(std.mem.indexOf(u8, message, "line 6 reads as a hunk line") != null);
-    try testing.expect(std.mem.indexOf(u8, message, "accounts for 2 old and 2 new lines") != null);
-    try testing.expect(std.mem.indexOf(u8, message, "none of the space") == null);
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "one\ntwo\nthree\n" });
+    const patch = try patchFor(allocator, dir,
+        \\--- {0s}/note.txt
+        \\+++ {0s}/note.txt
+        \\@@ -2,0 +3 @@
+        \\+inserted
+    );
+    defer allocator.free(patch);
+    const outcome = try applyOk(allocator, patch);
+    defer outcome.deinit(allocator);
+    try expectFileContent(allocator, &tmp, "note.txt", "one\ntwo\ninserted\nthree\n");
+}
+
+test "context free insertions at both ends work and out of range is refused" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+    for ([_]usize{ 0, 2, 99 }) |position| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "one\ntwo\n" });
+        const patch = try std.fmt.allocPrint(allocator, "--- {s}/note.txt\n+++ {s}/note.txt\n@@ -{d},0 +1 @@\n+new\n", .{ dir, dir, position });
+        defer allocator.free(patch);
+        if (position == 99) {
+            const message = try applyRefused(allocator, patch);
+            defer allocator.free(message);
+            try testing.expect(std.mem.indexOf(u8, message, "outside") != null);
+            try expectFileContent(allocator, &tmp, "note.txt", "one\ntwo\n");
+        } else {
+            const outcome = try applyOk(allocator, patch);
+            defer outcome.deinit(allocator);
+            try expectFileContent(allocator, &tmp, "note.txt", if (position == 0) "new\none\ntwo\n" else "one\ntwo\nnew\n");
+        }
+    }
+}
+
+test "recounted hunks stop at file headers but not header like removed text" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "one.txt", .data = "-- old\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.txt", .data = "old\n" });
+    const patch = try std.fmt.allocPrint(allocator,
+        \\--- {s}/one.txt
+        \\+++ {s}/one.txt
+        \\@@ -1,7 +1,7 @@
+        \\--- old
+        \\+++ new
+        \\--- {s}/two.txt
+        \\+++ {s}/two.txt
+        \\@@ -1,8 +1,8 @@
+        \\-old
+        \\+new
+    , .{ dir, dir, dir, dir });
+    defer allocator.free(patch);
+    const outcome = try applyOk(allocator, patch);
+    defer outcome.deinit(allocator);
+    try testing.expectEqual(@as(usize, 2), outcome.applied.len);
+    try expectFileContent(allocator, &tmp, "one.txt", "++ new\n");
+    try expectFileContent(allocator, &tmp, "two.txt", "new\n");
 }
 
 test "a git path loses its a/ or b/ prefix, and a timestamp is not part of it" {
@@ -1306,9 +1386,8 @@ test "a file whose second hunk is wrong is refused whole" {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try fixturePath(&tmp, &buf);
 
-    // The first hunk reads and the second one does not: the file must come out
-    // of this untouched, and nothing the first hunk read may be left behind —
-    // which is the one path where a hunk that parsed is not owned by anything.
+    // The first hunk matches but the second does not. Planning must leave the
+    // entire file untouched, even after a previous hunk has been rebuilt.
     const patch = try patchFor(allocator, dir,
         \\--- {0s}/note.txt
         \\+++ {0s}/note.txt
@@ -1316,13 +1395,14 @@ test "a file whose second hunk is wrong is refused whole" {
         \\-one
         \\+ONE
         \\@@ -3,2 +3,2 @@
-        \\ three
+        \\-not-three
+        \\+THREE
     );
     defer allocator.free(patch);
 
     const message = try applyRefused(allocator, patch);
     defer allocator.free(message);
-    try testing.expect(std.mem.indexOf(u8, message, "accounts for 2 old") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "not-three") != null);
     try expectFileContent(allocator, &tmp, "note.txt", "one\ntwo\nthree\nfour\n");
 }
 
