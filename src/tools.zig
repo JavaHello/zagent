@@ -30,6 +30,7 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
         .{ .name = "grep", .label = "grep…" },
         .{ .name = "find", .label = "find…" },
         .{ .name = "http_request", .label = "http_request…" },
+        .{ .name = "remember", .label = "remember…" },
     };
     for (labels) |entry| {
         if (std.mem.eql(u8, name, entry.name)) return entry.label;

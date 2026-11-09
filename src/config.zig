@@ -14,6 +14,14 @@ const default_max_tokens: u32 = max_output_tokens_ceiling;
 const default_max_iterations: u32 = 200;
 const default_max_verifications: u32 = 3;
 const default_markdown = true;
+/// Estimated tokens at which older messages are summarized. 0 switches
+/// automatic compaction off.
+const default_compact_threshold: u32 = 48_000;
+/// Newest messages kept verbatim when the rest of the conversation is
+/// summarized.
+const default_compact_keep: u32 = 16;
+const default_memory = true;
+const default_memory_auto = true;
 
 const ConfigFile = struct {
     provider: ?[]u8 = null,
@@ -24,6 +32,10 @@ const ConfigFile = struct {
     max_iterations: ?u32 = null,
     max_verifications: ?u32 = null,
     markdown: ?bool = null,
+    compact_threshold: ?u32 = null,
+    compact_keep: ?u32 = null,
+    memory: ?bool = null,
+    memory_auto: ?bool = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
         if (self.provider) |value| allocator.free(value);
@@ -151,6 +163,14 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         config.max_verifications = std.fmt.parseInt(u32, value, 10) catch default_max_verifications;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MARKDOWN")) {
         config.markdown = parseBool(value);
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_COMPACT_THRESHOLD")) {
+        config.compact_threshold = std.fmt.parseInt(u32, value, 10) catch default_compact_threshold;
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_COMPACT_KEEP")) {
+        config.compact_keep = std.fmt.parseInt(u32, value, 10) catch default_compact_keep;
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_MEMORY")) {
+        config.memory = parseBool(value);
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_MEMORY_AUTO")) {
+        config.memory_auto = parseBool(value);
     }
 }
 
@@ -377,6 +397,37 @@ fn resolve(
         file_config.markdown,
         default_markdown,
     );
+    const compact_threshold = try resolveU32(
+        allocator,
+        env,
+        &.{"AI_COMPACT_THRESHOLD"},
+        file_config.compact_threshold,
+        default_compact_threshold,
+    );
+    const compact_keep = @max(
+        try resolveU32(
+            allocator,
+            env,
+            &.{"AI_COMPACT_KEEP"},
+            file_config.compact_keep,
+            default_compact_keep,
+        ),
+        2,
+    );
+    const memory = try resolveBool(
+        allocator,
+        env,
+        &.{"AI_MEMORY"},
+        file_config.memory,
+        default_memory,
+    );
+    const memory_auto = try resolveBool(
+        allocator,
+        env,
+        &.{"AI_MEMORY_AUTO"},
+        file_config.memory_auto,
+        default_memory_auto,
+    );
 
     return .{
         .allocator = allocator,
@@ -387,6 +438,10 @@ fn resolve(
         .max_iterations = max_iterations,
         .max_verifications = max_verifications,
         .markdown = markdown,
+        .compact_threshold = compact_threshold,
+        .compact_keep = compact_keep,
+        .memory = memory,
+        .memory_auto = memory_auto,
         .provider = selected_provider,
     };
 }
@@ -404,6 +459,15 @@ pub const Config = struct {
     /// Render assistant markdown for a terminal instead of printing it raw.
     /// A stdout that is not a terminal always prints raw, whatever this says.
     markdown: bool,
+    /// Estimated token budget. Older messages are summarized when the
+    /// conversation is about to exceed it. 0 disables automatic compaction.
+    compact_threshold: u32,
+    /// Newest messages kept verbatim across a compaction.
+    compact_keep: u32,
+    /// Keep durable notes between sessions, and expose the remember tool.
+    memory: bool,
+    /// Ask the model after each turn whether anything should be remembered.
+    memory_auto: bool,
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
 
@@ -456,6 +520,10 @@ test "config defaults" {
     try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
     try std.testing.expectEqual(@as(u32, 3), config.max_verifications);
     try std.testing.expect(config.markdown);
+    try std.testing.expectEqual(default_compact_threshold, config.compact_threshold);
+    try std.testing.expectEqual(default_compact_keep, config.compact_keep);
+    try std.testing.expect(config.memory);
+    try std.testing.expect(config.memory_auto);
 }
 
 fn markdownSetting(
@@ -534,6 +602,61 @@ test "verification budget prefers the environment and keeps zero" {
         defer config.deinit();
 
         try std.testing.expectEqual(@as(u32, 2), config.max_verifications);
+    }
+}
+
+test "compaction and memory settings prefer the environment and keep zero" {
+    const allocator = std.testing.allocator;
+
+    {
+        var env = try testEnv(allocator, &.{
+            .{ "AI_COMPACT_THRESHOLD", "0" },
+            .{ "AI_COMPACT_KEEP", "4" },
+            .{ "AI_MEMORY", "false" },
+            .{ "AI_MEMORY_AUTO", "off" },
+        });
+        defer env.deinit();
+
+        var file_config = try testFile(allocator, &.{
+            .{ "AI_COMPACT_THRESHOLD", "12000" },
+            .{ "AI_COMPACT_KEEP", "8" },
+            .{ "AI_MEMORY", "true" },
+            .{ "AI_MEMORY_AUTO", "true" },
+        });
+        defer file_config.deinit(allocator);
+
+        const config = try resolve(allocator, &file_config, &env);
+        defer config.deinit();
+
+        // A zero threshold is a value, not a missing setting: it turns
+        // automatic compaction off.
+        try std.testing.expectEqual(@as(u32, 0), config.compact_threshold);
+        try std.testing.expectEqual(@as(u32, 4), config.compact_keep);
+        try std.testing.expect(!config.memory);
+        try std.testing.expect(!config.memory_auto);
+    }
+
+    {
+        var env = try testEnv(allocator, &.{});
+        defer env.deinit();
+
+        var file_config = try testFile(allocator, &.{
+            .{ "AI_COMPACT_THRESHOLD", "12000" },
+            .{ "AI_COMPACT_KEEP", "1" },
+            .{ "AI_MEMORY", "0" },
+        });
+        defer file_config.deinit(allocator);
+
+        const config = try resolve(allocator, &file_config, &env);
+        defer config.deinit();
+
+        try std.testing.expectEqual(@as(u32, 12000), config.compact_threshold);
+        // Fewer than two kept messages would make every cut unsafe.
+        try std.testing.expectEqual(@as(u32, 2), config.compact_keep);
+        try std.testing.expect(!config.memory);
+        // The extractor default stays on; the memory flag is what switches
+        // the feature off, and Agent pairs the two.
+        try std.testing.expect(config.memory_auto);
     }
 }
 

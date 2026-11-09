@@ -31,7 +31,7 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 
 工具定义使用 Responses 的扁平结构，工具结果通过 `call_id` 关联。请求设置 `store: false`，保留并回放全部输出 items（包括加密推理数据）；会话恢复也保留这些数据。旧版会话的消息、函数调用和结果会转换为 Responses 输入，旧的自由文本 `reasoning_content` 不会作为推理 item 发送。
 
-配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。
+配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_MAX_VERIFICATIONS`、`AI_MARKDOWN`、`AI_COMPACT_THRESHOLD`、`AI_COMPACT_KEEP`、`AI_MEMORY`、`AI_MEMORY_AUTO`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。
 
 ## 工具沙箱
 
@@ -59,7 +59,13 @@ zagent '继续完成，检查已有文件和测试结果'
 
 建议把会话文件放在工具工作目录之外，避免工具修改。文件包含任务内容、工具调用和结果，不包含 API 配置。不要让多个进程同时使用同一会话文件。中断发生在工具运行期间时，文件修改可能已经生效；恢复后应检查实际工作目录。
 
-交互模式支持 `/help`、`/model`、`/mcp`、`/clear`、`/quit`。`/clear` 同时清空持久化会话。单次查询模式将回答直接写入标准输出，可用于重定向生成文档。
+## 上下文压缩与记忆
+
+对话变长后，上下文会超出模型能容纳的范围。zagent 在每次请求前（以及工具循环的每次迭代之间）估算对话大小；超过 `AI_COMPACT_THRESHOLD`（默认 48000 个估算 token）时，把较早的消息替换为一段模型生成的摘要，并原样保留最新的 `AI_COMPACT_KEEP` 条消息（默认 16 条）。摘要按大小分块生成，每块都带上已有摘要，因此压缩很长的历史也不需要一次超大请求。切分点只会落在不会拆散“工具调用 + 工具结果”的位置；如果模型没能给出可用摘要，历史保持不变，本轮继续运行。`/compact` 可手动触发同样的操作。设置 `AI_COMPACT_THRESHOLD=0` 可关闭自动压缩。
+
+工作区中的 `.zagent/memory.md` 保存跨会话的长期记忆，格式是可直接阅读和编辑的 Markdown 列表。模型在关键点调用 `remember` 工具、用户执行 `/remember <文本>`，或每轮结束后的保守提取器判断出现了值得长期保存的信息时，都会写入一条笔记。重复内容会被忽略，最多保留 200 条，每条 500 字节。启动时会把最新的笔记注入系统提示（有固定预算，不会挤掉主要指令）。`/memory` 列出笔记，`/forget <序号>` 或 `/forget all` 删除。记忆文件读写失败不会影响正常对话；`AI_MEMORY=0` 关闭该功能，`AI_MEMORY_AUTO=0` 只关闭每轮自动提取，`AI_MEMORY_FILE` 可指定其它文件。
+
+交互模式支持 `/help`、`/model`、`/mcp`、`/compact`、`/memory`、`/remember`、`/forget`、`/clear`、`/quit`。`/clear` 同时清空持久化会话。单次查询模式将回答直接写入标准输出，可用于重定向生成文档。
 
 在终端中运行时，交互会话会占满整个屏幕：banner 和对话在上方滚动，输入提示固定在最下方一行，输入多行内容时输入区向上扩展。程序使用终端备用屏幕，退出后 shell 原有内容和回滚记录原样恢复。
 

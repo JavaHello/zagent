@@ -47,7 +47,8 @@ try:
         ]
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1/', 'AI_MODEL': 'test-model',
-               'AI_KEY': 'local-test', 'AI_MAX_VERIFICATIONS': '0'}
+               'AI_KEY': 'local-test', 'AI_MAX_VERIFICATIONS': '0',
+               'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0'}
         for response, expected_error in cases:
             requests.clear()
             reply.clear()

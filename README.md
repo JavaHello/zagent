@@ -103,6 +103,54 @@ Transient network errors and HTTP 408/429/500/502/503/504 responses are retried 
 to three attempts. Exhausted tool iterations, and output still cut off after
 bounded continuations, return an error instead of reporting completion.
 
+## Context compaction
+
+A long conversation eventually costs more context than the model has. zagent
+estimates the size of the conversation before every request (and between tool
+iterations, where output can grow it fastest). Once it crosses
+`AI_COMPACT_THRESHOLD` estimated tokens — 48,000 by default — the older messages
+are replaced by one summary and the newest `AI_COMPACT_KEEP` messages (16 by
+default) are kept verbatim.
+
+The summary is produced by the model in bounded chunks, each one carrying the
+summary so far, so compacting a very large history never needs a single
+oversized request. The split always falls on a boundary that keeps each tool
+result attached to the assistant call that produced it. If the model cannot
+produce a usable summary, the history is left untouched and the turn continues;
+losing the conversation is worse than one turn over budget. `/compact` runs the
+same operation on demand.
+
+```sh
+# Summarize sooner, keeping only the last two turns verbatim
+AI_COMPACT_THRESHOLD=20000 AI_COMPACT_KEEP=4 zagent
+```
+
+Set `AI_COMPACT_THRESHOLD=0` to disable automatic compaction.
+
+## Memory
+
+zagent keeps durable notes between sessions in `.zagent/memory.md` inside the
+workspace — a plain markdown list the user can read and edit. A note is saved
+when the model calls the `remember` tool at a key point (a preferred convention,
+a project fact, a decision that future work must respect), when the user runs
+`/remember <text>`, or when the conservative end-of-turn extractor decides that
+something durable emerged. Duplicates are ignored, and the list is capped at
+200 notes of 500 bytes each.
+
+At startup the newest notes are added to the system prompt within a fixed
+budget, so a long memory cannot crowd out the instructions. `/memory` lists the
+notes, and `/forget <n>` or `/forget all` removes them. A read or write failure
+never breaks a session.
+
+```sh
+AI_MEMORY=0 zagent                 # disable memory entirely
+AI_MEMORY_AUTO=0 zagent            # keep the remember tool, skip the per-turn extractor
+AI_MEMORY_FILE=/path/to/notes.md zagent
+```
+
+The memory file is workspace-local. Add `.zagent/` to the project's `.gitignore`
+if the notes should not be committed; this repository does exactly that.
+
 ## Validation
 
 ```sh
@@ -124,7 +172,7 @@ Configuration can be loaded from a config file and/or environment variables. The
 - `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
 - `~/.config/zagent` (fallback)
 
-The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS`, `AI_MARKDOWN` (or their `OPENAI_*` equivalents). Environment variables override config file values.
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS`, `AI_MARKDOWN`, `AI_COMPACT_THRESHOLD`, `AI_COMPACT_KEEP`, `AI_MEMORY`, `AI_MEMORY_AUTO`. The `AI_MAX_*` and URL/model/key settings also accept their `OPENAI_*` spelling. Environment variables override config file values.
 
 See `zagent.example.conf` for a complete example config file, and
 `mcp.example.json` for the MCP servers zagent can be given.
@@ -141,8 +189,13 @@ All configuration is also supported through environment variables:
 | `OPENAI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
 | `OPENAI_MAX_VERIFICATIONS` | `3`                     | Completion checks per query; `0` disables the check |
 | `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
+| `AI_COMPACT_THRESHOLD` | `48000`                      | Estimated tokens before older messages are summarized; `0` disables |
+| `AI_COMPACT_KEEP`  | `16`                             | Newest messages kept verbatim across a compaction |
+| `AI_MEMORY`        | `true`                           | Keep durable notes in the workspace and expose the `remember` tool |
+| `AI_MEMORY_AUTO`   | `true`                           | Ask the model after each turn whether anything should be remembered |
+| `AI_MEMORY_FILE`   | `<workspace>/.zagent/memory.md`  | Where the notes are stored |
 
-Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`. `AI_MARKDOWN` is the exception: it is not a provider setting and has no `OPENAI_` spelling.
+Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`. `AI_MARKDOWN`, `AI_COMPACT_*` and `AI_MEMORY*` are the exceptions: they are not provider settings and have no `OPENAI_` spelling.
 
 When a response hits `max_output_tokens`, both the main conversation and completion check retry the same input with a doubled token budget, up to three retries and a growth cap of 8192 tokens — the most DeepSeek's chat models accept. Since the default budget already equals that cap, the retry only grows a smaller configured `AI_MAX_TOKENS`. Partial tool calls are discarded and completed tool results are retained. If the reply is still cut off, zagent keeps the partial text and asks the model to continue exactly where it stopped, up to eight times; a cut-off tool call is instead re-asked as a request to work in smaller steps, twice. Only when that also fails does the turn end with `ResponseTruncated`, after printing what was produced.
 
@@ -521,6 +574,10 @@ and what each brought. Seven behaviours are worth knowing:
 | `/help`       | Show help                        |
 | `/clear`      | Clear conversation history       |
 | `/new`        | Start a new conversation (same as `/clear`) |
+| `/compact`    | Summarize older messages to free context |
+| `/memory`     | List saved memories              |
+| `/remember <text>` | Save a note to memory        |
+| `/forget <n\|all>` | Remove a saved note, or all of them |
 | `/model`      | Show the current model           |
 | `/mcp`        | List the MCP servers and their tools |
 | `/quit`       | Exit                             |
@@ -599,6 +656,8 @@ src/
                 apply_patch, list_dir, grep, find, http_request)
   diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
+  compact.zig — Context budget, safe cut points, and summary requests
+  memory.zig  — Durable notes: file format, prompt section, extraction
   banner.zig  — The startup wordmark: letterforms, gradient, colour fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer
   verifier.zig — Completion judge: prompt, turn summary, verdict parsing

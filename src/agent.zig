@@ -5,6 +5,8 @@ const diff = @import("diff.zig");
 const text = @import("text.zig");
 const menu = @import("menu.zig");
 const verifier = @import("verifier.zig");
+const compact = @import("compact.zig");
+const memory_mod = @import("memory.zig");
 const mcp = @import("mcp.zig");
 const render = @import("render.zig");
 const term = @import("term.zig");
@@ -70,6 +72,8 @@ const SYSTEM_PROMPT =
     \\- If an operation fails, analyze the error and try a different approach, but stop after 3-5 failed attempts and explain what went wrong.
     \\- If a task seems impossible with available tools (e.g. requires a web browser, authentication, or blocked services), report this to the user instead of retrying endlessly.
     \\- Do not repeat the same tool call with the same parameters.
+    \\- When you learn something durable — a user preference, a project fact, a decision, or a constraint — call remember with a short, self-contained note. Do not save transient details, secrets, or anything the user asked you to forget.
+    \\- When the conversation grows long, earlier messages may be replaced by a summary. Treat that summary as part of the conversation, and keep your own replies concise so it stays useful.
     \\- When the request is ambiguous, or when a decision only the user can make is blocking you, call ask_user with two to four concrete options and mark the one you recommend. Ask only when the answer changes what you do next; decide routine details yourself.
     \\- After every turn that used tools, an automatic completion check reviews your work. If it reports unfinished work, act on it instead of restating your answer.
 ;
@@ -77,21 +81,30 @@ const SYSTEM_PROMPT =
 /// The system prompt as the model is given it: the constant above, plus what
 /// the MCP servers contribute — a sentence naming their tools, when there are
 /// any, and whatever each server says about using it.
-fn buildSystemPrompt(allocator: std.mem.Allocator, registry: *const mcp.Registry) ![]u8 {
-    if (registry.functionJson().len == 0) return allocator.dupe(u8, SYSTEM_PROMPT);
-
+fn buildSystemPrompt(
+    allocator: std.mem.Allocator,
+    registry: *const mcp.Registry,
+    memory_section: ?[]const u8,
+) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
 
     try aw.writer.writeAll(SYSTEM_PROMPT);
-    try aw.writer.writeAll(
-        "\n- Tools whose name starts with mcp__ come from an MCP server that is connected;" ++
-            " call one exactly as you would any other tool.\n",
-    );
+    if (registry.functionJson().len > 0) {
+        try aw.writer.writeAll(
+            "\n- Tools whose name starts with mcp__ come from an MCP server that is connected;" ++
+                " call one exactly as you would any other tool.\n",
+        );
 
-    if (try registry.instructions(allocator)) |notes| {
-        defer allocator.free(notes);
-        try aw.writer.writeAll(notes);
+        if (try registry.instructions(allocator)) |notes| {
+            defer allocator.free(notes);
+            try aw.writer.writeAll(notes);
+            try aw.writer.writeByte('\n');
+        }
+    }
+    if (memory_section) |section| {
+        try aw.writer.writeByte('\n');
+        try aw.writer.writeAll(section);
         try aw.writer.writeByte('\n');
     }
 
@@ -114,6 +127,14 @@ pub const Agent = struct {
     search: tools.SearchBackends,
     tool_network: bool,
     session_path: ?[]u8,
+    /// Durable notes loaded at startup and updated by the remember tool.
+    memory: memory_mod.Memory,
+    /// Estimated token budget; 0 disables automatic compaction.
+    compact_threshold: u32,
+    /// Newest messages kept verbatim across a compaction.
+    compact_keep: u32,
+    /// Ask the model after each turn whether anything should be remembered.
+    memory_auto: bool,
     /// Whether to render the model's markdown for a terminal. Decided once, in
     /// `init`, so the answer path never has to ask the operating system.
     render_markdown: bool,
@@ -147,7 +168,15 @@ pub const Agent = struct {
         var history: std.ArrayList(Message) = .empty;
         errdefer history.deinit(allocator);
 
-        const system_content = try buildSystemPrompt(allocator, mcp_registry);
+        var memory = if (config.memory)
+            try memory_mod.Memory.init(allocator, io, env)
+        else
+            try memory_mod.Memory.initWithPath(allocator, io, null);
+        errdefer memory.deinit();
+        const memory_section = try memory.promptSection(allocator, memory_mod.prompt_budget);
+        defer if (memory_section) |section| allocator.free(section);
+
+        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory_section);
         errdefer allocator.free(system_content);
         try history.append(allocator, .{
             .role = "system",
@@ -176,6 +205,10 @@ pub const Agent = struct {
             .linenoise = linenoise,
             .search = tools.detectSearchBackends(io, env),
             .session_path = session_path,
+            .memory = memory,
+            .compact_threshold = config.compact_threshold,
+            .compact_keep = config.compact_keep,
+            .memory_auto = config.memory and config.memory_auto,
             .tool_network = if (env.get("AI_TOOL_NETWORK")) |v| std.mem.eql(u8, v, "1") else false,
             // The check is on stdout rather than on `linenoise.is_tty`, which
             // describes stdin: `zagent "q" < file` with a terminal on stdout
@@ -199,6 +232,7 @@ pub const Agent = struct {
         for (self.history.items) |msg| msg.deinit(self.allocator);
         self.history.deinit(self.allocator);
         self.client.deinit();
+        self.memory.deinit();
         if (self.session_path) |path| self.allocator.free(path);
     }
 
@@ -233,6 +267,271 @@ pub const Agent = struct {
         if (self.session_path) |path| try @import("session.zig").save(self.io, self.allocator, path, self.history.items[1..]);
     }
 
+    /// Rebuild the system prompt so notes saved during this session are part
+    /// of every later request.
+    fn refreshSystemPrompt(self: *Agent) !void {
+        const section = try self.memory.promptSection(self.allocator, memory_mod.prompt_budget);
+        defer if (section) |value| self.allocator.free(value);
+        const content = try buildSystemPrompt(self.allocator, self.mcp_registry, section);
+        errdefer self.allocator.free(content);
+
+        const previous = self.history.items[0].content;
+        self.history.items[0].content = content;
+        if (previous) |value| self.allocator.free(value);
+    }
+
+    /// Fold the messages before a safe cut into one summary. Returns false
+    /// when there is nothing safe to compact or the model could not produce a
+    /// summary; in both cases the history is left as it was, because losing
+    /// the conversation is worse than exceeding the budget by one turn.
+    fn compactHistory(self: *Agent, turn_start: ?*usize) !bool {
+        const cut = compact.findCut(self.history.items, self.compact_keep) orelse return false;
+        const before = compact.estimateTokens(self.history.items);
+
+        const summary = self.summarizeRange(1, cut) catch |err| {
+            if (self.client.takeHttpError()) |message| {
+                defer self.allocator.free(message);
+                try self.emit(std.Io.File.stderr(), RED ++ "  ✗ {s}\n" ++ RESET, .{message});
+            }
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ context compaction skipped: {s}\n" ++ RESET, .{@errorName(err)});
+            return false;
+        };
+        defer self.allocator.free(summary);
+
+        const shift = compact.install(self.allocator, &self.history, cut, summary) catch |err| {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ context compaction skipped: {s}\n" ++ RESET, .{@errorName(err)});
+            return false;
+        };
+        if (turn_start) |index| {
+            if (index.* >= cut) {
+                index.* -= shift;
+            } else {
+                // The turn began in the part that was summarized; the first
+                // kept message is the nearest point the verifier can use.
+                index.* = @min(index.*, 2);
+            }
+        }
+        self.checkpoint() catch {};
+
+        const after = compact.estimateTokens(self.history.items);
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ⟳ compacted {d} earlier messages (~{d} tokens freed)\n" ++ RESET, .{ cut - 2, before -| after });
+        return true;
+    }
+
+    /// Compact when the estimated conversation has crossed the budget.
+    fn compactIfNeeded(self: *Agent, turn_start: ?*usize) !bool {
+        if (self.compact_threshold == 0) return false;
+        if (!compact.needsCompaction(self.history.items, self.compact_threshold)) return false;
+        return self.compactHistory(turn_start);
+    }
+
+    /// Summarize `[from, to)` in bounded chunks, carrying the summary so far
+    /// into each request. Returns an owned summary.
+    fn summarizeRange(self: *Agent, from: usize, to: usize) ![]u8 {
+        var running: ?[]u8 = null;
+        errdefer if (running) |value| self.allocator.free(value);
+
+        var start = from;
+        while (start < to) {
+            var end = start;
+            var weight: usize = 0;
+            while (end < to) {
+                const next = compact.messageWeight(self.history.items[end]);
+                if (end > start and weight + next > compact.max_chunk_bytes) break;
+                weight += next;
+                end += 1;
+            }
+            if (end == start) end = start + 1;
+
+            const segment = try compact.renderTranscript(self.allocator, self.history.items, start, end);
+            defer self.allocator.free(segment);
+            const messages = try compact.buildSummaryMessages(self.allocator, running, segment);
+            defer compact.freeSummaryMessages(self.allocator, messages);
+
+            const response = try self.client.respondWithoutTools(messages);
+            defer response.deinit(self.allocator);
+            if (!std.mem.eql(u8, response.finish_reason, "stop")) return error.SummaryTruncated;
+            const content = response.content orelse return error.EmptySummary;
+            const next = try compact.sanitizeSummary(self.allocator, content);
+            if (running) |old| self.allocator.free(old);
+            running = next;
+            start = end;
+        }
+        return running orelse error.EmptySummary;
+    }
+
+    /// `/compact`: summarize the older part of the conversation now, whether
+    /// or not the budget has been reached.
+    pub fn compactCommand(self: *Agent) !void {
+        if (compact.findCut(self.history.items, self.compact_keep) == null) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  nothing to compact yet\n" ++ RESET, .{});
+            return;
+        }
+        _ = try self.compactHistory(null);
+    }
+
+    /// `/memory`: list what is saved, newest last.
+    pub fn listMemory(self: *Agent) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try self.memory.writeList(&aw.writer);
+        try self.writeLogOrStdout(aw.written());
+    }
+
+    /// `/remember <text>`: save a note by hand, as the model's remember tool
+    /// does, and make it part of this session's system prompt.
+    pub fn rememberCommand(self: *Agent, note: []const u8) !void {
+        if (!self.memory.enabled) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  memory is disabled\n" ++ RESET, .{});
+            return;
+        }
+        if (note.len == 0) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /remember <text>\n" ++ RESET, .{});
+            return;
+        }
+
+        const added = self.memory.add(note) catch |err| {
+            try self.emit(std.Io.File.stderr(), RED ++ "  ✗ could not remember: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        if (!added) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  already remembered\n" ++ RESET, .{});
+            return;
+        }
+        self.memory.save() catch |err| {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        self.refreshSystemPrompt() catch {};
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ remembered: {s}\n" ++ RESET, .{note});
+    }
+
+    /// `/forget <n|all>`: drop one numbered note, or every note.
+    pub fn forgetCommand(self: *Agent, argument: []const u8) !void {
+        if (!self.memory.enabled) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  memory is disabled\n" ++ RESET, .{});
+            return;
+        }
+        const arg = std.mem.trim(u8, argument, " \t");
+        if (arg.len == 0) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /forget <number> | /forget all\n" ++ RESET, .{});
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(arg, "all")) {
+            self.memory.clear();
+            self.memory.save() catch |err| {
+                try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
+                return;
+            };
+            self.refreshSystemPrompt() catch {};
+            try self.emit(std.Io.File.stderr(), DIM ++ "  all memories forgotten\n" ++ RESET, .{});
+            return;
+        }
+        const number = std.fmt.parseInt(usize, arg, 10) catch {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /forget <number> | /forget all\n" ++ RESET, .{});
+            return;
+        };
+        if (number == 0 or !self.memory.remove(number - 1)) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  no memory number {d} (see /memory)\n" ++ RESET, .{number});
+            return;
+        }
+        self.memory.save() catch |err| {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        self.refreshSystemPrompt() catch {};
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ forgot memory {d}\n" ++ RESET, .{number});
+    }
+
+    /// The remember tool: save one durable note and tell the model whether it
+    /// was new.
+    fn rememberTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        if (!self.memory.enabled) {
+            return .{
+                .content = try self.allocator.dupe(u8, "Memory is disabled (AI_MEMORY=0)."),
+                .is_error = true,
+            };
+        }
+        const note = openai.extractStringArg(self.allocator, arguments, "text") catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: remember needs a non-empty 'text' string"),
+                .is_error = true,
+            };
+        };
+        defer self.allocator.free(note);
+
+        const added = self.memory.add(note) catch |err| switch (err) {
+            error.EmptyMemory => return .{
+                .content = try self.allocator.dupe(u8, "Error: remember needs a non-empty 'text' string"),
+                .is_error = true,
+            },
+            else => return err,
+        };
+        if (!added) {
+            return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Already in memory: {s}", .{note}),
+                .is_error = false,
+            };
+        }
+
+        self.memory.save() catch |err| {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
+        };
+        self.refreshSystemPrompt() catch {};
+        return .{
+            .content = try std.fmt.allocPrint(self.allocator, "Saved to memory: {s}", .{note}),
+            .is_error = false,
+        };
+    }
+
+    /// After a turn, ask the model whether anything durable emerged. This is
+    /// deliberately conservative, and does nothing when memory is off.
+    fn extractMemories(self: *Agent, query: []const u8) !void {
+        if (!self.memory_auto or !self.memory.enabled) return;
+        if (self.history.items.len <= 1) return;
+
+        const window = 12;
+        const from = if (self.history.items.len > window) self.history.items.len - window else 1;
+        const transcript = try compact.renderTranscript(self.allocator, self.history.items, from, self.history.items.len);
+        defer self.allocator.free(transcript);
+        const known = try self.memory.promptSection(self.allocator, memory_mod.prompt_budget);
+        defer if (known) |value| self.allocator.free(value);
+
+        const messages = try memory_mod.buildExtractMessages(self.allocator, query, transcript, known);
+        defer memory_mod.freeExtractMessages(self.allocator, messages);
+
+        self.terminal_title.update("checking memory…", self.current_task);
+        defer self.terminal_title.update("ready", self.current_task);
+        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking memory…", self.progressOptions());
+        defer spin.stop();
+        const response = self.client.respondWithoutTools(messages) catch {
+            // Optional work: drop the stored HTTP detail rather than letting a
+            // later, unrelated failure report it as its own.
+            if (self.client.takeHttpError()) |message| self.allocator.free(message);
+            return;
+        };
+        defer response.deinit(self.allocator);
+        if (!std.mem.eql(u8, response.finish_reason, "stop")) return;
+        const content = response.content orelse return;
+
+        var extracted = memory_mod.parseExtraction(self.allocator, content);
+        defer extracted.deinit();
+        if (extracted.notes.items.len == 0) return;
+
+        var added: usize = 0;
+        for (extracted.notes.items) |note| {
+            if (self.memory.add(note) catch false) added += 1;
+        }
+        if (added == 0) return;
+
+        self.memory.save() catch |err| {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        self.refreshSystemPrompt() catch {};
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ✧ remembered {d} note{s}\n" ++ RESET, .{ added, if (added == 1) "" else "s" });
+    }
+
     /// Process a single user query: work on it until the model answers and the
     /// completion check agrees that the request is done.
     pub fn processQuery(self: *Agent, query: []const u8) !void {
@@ -255,6 +554,9 @@ pub const Agent = struct {
             counts.input,
             counts.output,
         });
+        // The extraction is a small extra request, so it runs after the
+        // user's own stats and never turns a finished answer into an error.
+        self.extractMemories(query) catch {};
     }
 
     fn progressOptions(self: *Agent) spinner.Options {
@@ -271,15 +573,19 @@ pub const Agent = struct {
     fn processQueryInner(self: *Agent, query: []const u8) !void {
         try self.appendUserMessage(query);
         try self.checkpoint();
+        // A conversation that has grown past the budget is compacted before
+        // the request that would otherwise carry all of it.
+        _ = self.compactIfNeeded(null) catch false;
         // The judge is shown only what this turn produced, so remember where
-        // the request it is checking starts.
-        const turn_start = self.history.items.len;
+        // the request it is checking starts. Compaction during the turn moves
+        // this index down; `runToolLoop` updates it.
+        var turn_start = self.history.items.len;
 
         var verifications: u32 = 0;
         var worked = false;
 
         while (true) {
-            const turn = try self.runToolLoop();
+            const turn = try self.runToolLoop(&turn_start);
             if (!turn.completed) return error.IterationLimitReached;
             // Counted across the whole query, not per round: a round that only
             // claims the work is finished still has to pass the check.
@@ -305,7 +611,7 @@ pub const Agent = struct {
                 verifications += 1;
                 // The check announces itself from inside `judgeAnimated`, where
                 // it can be animated for as long as the judge is thinking.
-                judged = try self.judgeTurn(turn_start);
+                judged = try self.judgeTurn(query, turn_start);
             }
             const verdict = judged orelse {
                 try self.emit(std.Io.File.stderr(), DIM ++ "  ✗ no usable completion verdict in {d} checks; the answer above stands unverified\n" ++ RESET, .{verifications});
@@ -396,7 +702,11 @@ pub const Agent = struct {
 
     /// Run the tool-call loop until the model answers or the iteration budget
     /// runs out. The answer is printed and kept in the history.
-    fn runToolLoop(self: *Agent) !Turn {
+    fn runToolLoop(self: *Agent, turn_start: ?*usize) !Turn {
+        // Tests drive the loop directly, without a query around it; give them
+        // a boundary of their own rather than making the caller invent one.
+        var local_turn_start = self.history.items.len;
+        const start = turn_start orelse &local_turn_start;
         var turn: Turn = .{ .tool_calls = 0, .completed = false };
         var iteration: usize = 0;
         // Text from replies that the token limit cut short. It is held back
@@ -417,6 +727,13 @@ pub const Agent = struct {
         var continuation_start: ?usize = null;
 
         while (iteration < self.max_iterations) : (iteration += 1) {
+            // Tool output can grow the conversation inside one turn. Compact
+            // between iterations, but never while a cut-off reply is still
+            // being carried: its fragments and the index that folds them are
+            // not safe to move until the continuation settles.
+            if (continuation_start == null) {
+                _ = self.compactIfNeeded(start) catch false;
+            }
             const response = self.chatAnimated(self.history.items, stream) catch |err| {
                 // Do not leave a continuation prompt as the last message for
                 // the next request to answer.
@@ -589,8 +906,7 @@ pub const Agent = struct {
     /// user's request. Returns null when the judge could not be consulted or
     /// its reply could not be read: an unjudgeable turn keeps the answer it
     /// already printed rather than looping on a check that cannot pass.
-    fn judgeTurn(self: *Agent, turn_start: usize) !?verifier.Verdict {
-        const request = self.history.items[turn_start - 1].content orelse "";
+    fn judgeTurn(self: *Agent, request: []const u8, turn_start: usize) !?verifier.Verdict {
         const summary = try verifier.summarize(self.allocator, self.history.items[turn_start..], summary_max_bytes);
         defer self.allocator.free(summary);
         const prompt = try verifier.buildPrompt(self.allocator, request, summary);
@@ -865,7 +1181,9 @@ pub const Agent = struct {
                 spinner.Spinner.disabled(self.io);
             defer spin.stop();
 
-            if (std.mem.eql(u8, call.name, "ask_user")) {
+            if (std.mem.eql(u8, call.name, "remember")) {
+                break :blk try self.rememberTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
             } else if (std.mem.startsWith(u8, call.name, mcp.tool_prefix)) {
                 // A tool of a connected MCP server: the registry knows which
@@ -1105,6 +1423,8 @@ const TestHarness = struct {
         try self.env.put("AI_URL", "http://127.0.0.1:1/v1");
         try self.env.put("AI_MODEL", "test-model");
         try self.env.put("AI_KEY", "test-key");
+        // Never read or write the developer's real memory file from a test.
+        try self.env.put("AI_MEMORY", "0");
 
         self.config = try Config.load(allocator, io, &self.env);
         errdefer self.config.deinit();
@@ -1213,6 +1533,41 @@ fn redirectFd(from: std.posix.fd_t, to: std.posix.fd_t) !void {
     if (std.posix.errno(std.posix.system.dup2(from, to)) != .SUCCESS) return error.RedirectFdFailed;
 }
 
+test "compaction replaces old turns with a summary and keeps the recent ones" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    harness.agent.compact_keep = 2;
+
+    try harness.agent.appendUserMessage("one");
+    try harness.agent.appendAssistantText("answer one");
+    try harness.agent.appendUserMessage("two");
+    try harness.agent.appendAssistantText("answer two");
+    try harness.agent.appendUserMessage("three");
+    try harness.agent.appendAssistantText("answer three");
+    try harness.agent.appendUserMessage("four");
+    try harness.agent.appendAssistantText("answer four");
+
+    var mock: MockTransport = .{ .replies = &.{completed_answer} };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+
+    {
+        var quiet = try Silence.init(std.testing.io);
+        defer quiet.deinit(std.testing.io);
+        try harness.agent.compactCommand();
+    }
+
+    // system, summary, then the newest turn verbatim.
+    try std.testing.expectEqual(@as(usize, 4), harness.agent.history.items.len);
+    try std.testing.expectEqualStrings("system", harness.agent.history.items[0].role);
+    const summary = harness.agent.history.items[1].content.?;
+    try std.testing.expect(std.mem.indexOf(u8, summary, "Earlier conversation summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "answer.") != null);
+    try std.testing.expectEqualStrings("four", harness.agent.history.items[2].content.?);
+    try std.testing.expectEqualStrings("answer four", harness.agent.history.items[3].content.?);
+}
+
 test "a truncated reply is continued and kept as one message" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);
@@ -1226,7 +1581,7 @@ test "a truncated reply is continued and kept as one message" {
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
         try harness.agent.appendUserMessage("Do the task");
-        break :blk harness.agent.runToolLoop();
+        break :blk harness.agent.runToolLoop(null);
     };
 
     try std.testing.expect(turn.completed);
@@ -1256,7 +1611,7 @@ test "a truncated tool call is retried in smaller steps without a dangling promp
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
         try harness.agent.appendUserMessage("Do the task");
-        break :blk harness.agent.runToolLoop();
+        break :blk harness.agent.runToolLoop(null);
     };
 
     try std.testing.expect(turn.completed);
@@ -1282,7 +1637,7 @@ test "a reply that never stops truncating is given up on and still kept" {
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
         try harness.agent.appendUserMessage("Do the task");
-        break :blk harness.agent.runToolLoop();
+        break :blk harness.agent.runToolLoop(null);
     };
     try std.testing.expectError(error.ResponseTruncated, outcome);
 

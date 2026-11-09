@@ -26,7 +26,8 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 80, 0, 0))
     original = termios.tcgetattr(slave)
     env = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory,
-               TERM='xterm-256color', AI_KEY='test', AI_MODEL='popup-mock')
+               TERM='xterm-256color', AI_KEY='test', AI_MODEL='popup-mock',
+               AI_MEMORY='0', AI_COMPACT_THRESHOLD='0')
     process = subprocess.Popen([str(binary)], cwd=directory, env=env,
                                stdin=slave, stdout=slave, stderr=slave)
     transcript = bytearray()

@@ -8,5 +8,8 @@ src/root.zig
 # Private task transcripts and session checkpoints
 .runs/
 
+# Workspace-local agent memory
+.zagent/
+
 # Python integration-test cache
 __pycache__/

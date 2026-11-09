@@ -71,7 +71,8 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-completion-') as directory:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_MODEL': 'mock',
-               'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '5', 'AI_MAX_VERIFICATIONS': '1'}
+               'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '5', 'AI_MAX_VERIFICATIONS': '1',
+               'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0'}
         for verdict, expected_ok in [
             (json.dumps({'complete': True, 'reason': 'Verified evidence'}), True),
             (json.dumps({'complete': False, 'reason': 'Missing behavior', 'next_step': 'Implement it'}), False),

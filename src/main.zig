@@ -24,6 +24,10 @@ const HELP =
     \\  /help        Show this help message
     \\  /clear       Clear conversation history
     \\  /new         Start a new conversation (same as /clear)
+    \\  /compact     Summarize older messages to free context
+    \\  /memory      List saved memories
+    \\  /remember <text>  Save a note to memory
+    \\  /forget <n|all>   Remove a saved note
     \\  /model       Show current model
     \\  /mcp         List the MCP servers and their tools
     \\  /quit, /exit Exit zagent
@@ -130,6 +134,11 @@ pub fn main(init: std.process.Init) !void {
             "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
             "AI_SESSION_FILE       Save and resume this workspace's conversation\n" ++
+            "AI_COMPACT_THRESHOLD  Estimated token budget before older messages are summarized\n" ++
+            "AI_COMPACT_KEEP       Newest messages kept verbatim across a compaction\n" ++
+            "AI_MEMORY=0           Disable durable memory for this workspace\n" ++
+            "AI_MEMORY_AUTO=0      Keep the remember tool, skip the per-turn extractor\n" ++
+            "AI_MEMORY_FILE        Store memory in another file\n" ++
             "AI_TOOL_NETWORK=1     Enable tool network access (default: off)\n\n" ++
             "Tools require Linux, bubblewrap and GNU timeout. Only the current\n" ++
             "workspace is writable. Build with Zig 0.17.0.\n");
@@ -352,6 +361,16 @@ fn runRepl(
         } else if (std.mem.eql(u8, line, "/clear") or std.mem.eql(u8, line, "/new")) {
             agent.clearHistory();
             try writeOut(&screen, stdout, io, DIM ++ "Conversation history cleared.\n" ++ RESET);
+        } else if (std.mem.eql(u8, line, "/compact")) {
+            agent.compactCommand() catch |err| try reportCommandError(allocator, &screen, io, "compact", err);
+        } else if (std.mem.eql(u8, line, "/memory")) {
+            agent.listMemory() catch |err| try reportCommandError(allocator, &screen, io, "memory", err);
+        } else if (std.mem.eql(u8, line, "/remember") or std.mem.startsWith(u8, line, "/remember ")) {
+            const note = std.mem.trim(u8, line["/remember".len..], " \t");
+            agent.rememberCommand(note) catch |err| try reportCommandError(allocator, &screen, io, "remember", err);
+        } else if (std.mem.eql(u8, line, "/forget") or std.mem.startsWith(u8, line, "/forget ")) {
+            const argument = std.mem.trim(u8, line["/forget".len..], " \t");
+            agent.forgetCommand(argument) catch |err| try reportCommandError(allocator, &screen, io, "forget", err);
         } else if (std.mem.eql(u8, line, "/model")) {
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\n", .{config.model});
             defer allocator.free(msg);
@@ -378,6 +397,19 @@ fn runRepl(
 fn writeOut(screen: *Screen, file: std.Io.File, io: std.Io, bytes: []const u8) !void {
     if (screen.isActive()) return screen.writeLog(bytes);
     try file.writeStreamingAll(io, bytes);
+}
+
+/// Report a slash-command failure without taking the REPL down with it.
+fn reportCommandError(
+    allocator: std.mem.Allocator,
+    screen: *Screen,
+    io: std.Io,
+    command: []const u8,
+    err: anyerror,
+) !void {
+    const message = try std.fmt.allocPrint(allocator, RED ++ "Error: {s}: {s}" ++ RESET ++ "\n", .{ command, @errorName(err) });
+    defer allocator.free(message);
+    try writeOut(screen, std.Io.File.stderr(), io, message);
 }
 
 /// The editor reports how many rows it needs at the bottom. Reserving them is
@@ -433,6 +465,8 @@ test {
     _ = @import("completion.zig");
     _ = @import("commands.zig");
     _ = @import("verifier.zig");
+    _ = @import("compact.zig");
+    _ = @import("memory.zig");
     _ = @import("style.zig");
     _ = @import("term.zig");
     _ = @import("screen.zig");
