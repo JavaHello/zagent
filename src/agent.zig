@@ -61,6 +61,7 @@ const SYSTEM_PROMPT =
     \\Ordinary tools run directly in the current working directory with the host environment and network access. Commands detected as dangerous (privilege escalation, system or network configuration changes, system-path writes) run in a sandbox with no host fallback. AI_TOOL_NETWORK=1 enables network access only for sandboxed tools and local MCP servers. Detection is heuristic, not a security boundary; do not assume arbitrary scripts are isolated.
     \\Guidelines:
     \\- Be concise and direct in your responses.
+    \\- Before executing a new user task, briefly explain the goal and practical approach if no initial plan has already been provided. Do not repeat a plan already present in the conversation.
     \\- Use the shell tool to run commands, install packages, or perform system operations.
     \\- Use http_request for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
     \\- Use read_file to read a file. Use edit_file for an exact unique text replacement, or apply_patch for a unified diff with enough context to place it. Do not write a whole file back through write_file to change part of it, and do not edit files through the shell.
@@ -540,14 +541,17 @@ pub const Agent = struct {
         self.query_started = std.Io.Timestamp.now(self.io, .awake);
         defer self.query_started = null;
         self.client.resetTokenCounters();
-        self.current_task = query;
+        // Never use raw user input as a terminal title, even while planning.
+        self.current_task = "";
         defer self.current_task = "";
-        self.terminal_title.update("thinking…", query);
-        self.processQueryInner(query) catch |err| {
-            self.terminal_title.update("error", query);
+        self.terminal_title.update("planning…", "");
+        var task_title: ?[]u8 = null;
+        defer if (task_title) |title| self.allocator.free(title);
+        self.processQueryInner(query, &task_title) catch |err| {
+            self.terminal_title.update("error", self.current_task);
             return err;
         };
-        self.terminal_title.update("ready", query);
+        self.terminal_title.update("ready", self.current_task);
         const elapsed_ms = self.query_started.?.untilNow(self.io, .awake).toMilliseconds();
         const counts = self.client.tokenCounts();
         try self.emit(std.Io.File.stderr(), DIM ++ "  Worked for {d}.{d}s · in {d} · out {d} tokens\n" ++ RESET, .{
@@ -572,12 +576,50 @@ pub const Agent = struct {
         };
     }
 
-    fn processQueryInner(self: *Agent, query: []const u8) !void {
+    /// A separate tool-free request establishes intent before any execution.
+    /// Keep its public approach in history so the execution request can use it.
+    fn planTask(self: *Agent) !?[]u8 {
+        var messages: std.ArrayList(Message) = .empty;
+        defer messages.deinit(self.allocator);
+        try messages.appendSlice(self.allocator, self.history.items);
+        try messages.append(self.allocator, .{
+            .role = "developer",
+            .reasoning_content = null,
+            .tool_calls = null,
+            .tool_call_id = null,
+            .content = "Before executing the latest user request, identify the goal and a brief practical approach using conversation context. Do not execute or claim work is done. Return only JSON: {\"title\":\"a concise task summary in the user's language, fewer than 80 Unicode characters, not a copy of the input\",\"approach\":\"one brief sentence explaining what you will do and how, in the user's language\"}.",
+        });
+        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "planning…", self.progressOptions());
+        const response = self.client.respondWithoutTools(messages.items) catch {
+            spin.stop();
+            if (self.client.takeHttpError()) |detail| self.allocator.free(detail);
+            return null;
+        };
+        spin.stop();
+        defer response.deinit(self.allocator);
+        if (!std.mem.eql(u8, response.finish_reason, "stop")) return null;
+        const content = response.content orelse return null;
+        const parsed = std.json.parseFromSlice(struct { title: []const u8, approach: []const u8 }, self.allocator, content, .{ .ignore_unknown_fields = true }) catch return null;
+        defer parsed.deinit();
+        const title = std.mem.trim(u8, parsed.value.title, " \t\r\n");
+        const approach = std.mem.trim(u8, parsed.value.approach, " \t\r\n");
+        if (title.len == 0 or approach.len == 0) return null;
+        const owned = try self.allocator.dupe(u8, title);
+        errdefer self.allocator.free(owned);
+        try self.emit(std.Io.File.stdout(), "{s}\n\n", .{approach});
+        try self.appendAssistantText(approach);
+        return owned;
+    }
+
+    fn processQueryInner(self: *Agent, query: []const u8, task_title: *?[]u8) !void {
         try self.appendUserMessage(query);
         try self.checkpoint();
         // A conversation that has grown past the budget is compacted before
         // the request that would otherwise carry all of it.
         _ = self.compactIfNeeded(null) catch false;
+        task_title.* = try self.planTask();
+        self.current_task = task_title.* orelse "Task";
+        self.terminal_title.update("thinking…", self.current_task);
         // The judge is shown only what this turn produced, so remember where
         // the request it is checking starts. Compaction during the turn moves
         // this index down; `runToolLoop` updates it.
@@ -1548,6 +1590,44 @@ fn duplicateFd(fd: std.posix.fd_t) !std.posix.fd_t {
 
 fn redirectFd(from: std.posix.fd_t, to: std.posix.fd_t) !void {
     if (std.posix.errno(std.posix.system.dup2(from, to)) != .SUCCESS) return error.RedirectFdFailed;
+}
+
+test "planning generates a title before execution and keeps only the public approach" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+    const reply =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"title\\\":\\\"修复终端标题\\\",\\\"approach\\\":\\\"先定位标题逻辑，再修改并测试。\\\"}\"}]}]}";
+    var mock: MockTransport = .{ .replies = &.{reply} };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("不要把这段原文直接放到标题上");
+    const title = (try harness.agent.planTask()).?;
+    defer allocator.free(title);
+    try std.testing.expectEqualStrings("修复终端标题", title);
+    try std.testing.expectEqualStrings("先定位标题逻辑，再修改并测试。", harness.agent.history.items[2].content.?);
+    try std.testing.expectEqual(@as(usize, 1), mock.requests.items.len);
+    const request = try std.json.parseFromSlice(std.json.Value, allocator, mock.requests.items[0], .{});
+    defer request.deinit();
+    try std.testing.expect(request.value.object.get("tools") == null);
+}
+
+test "unusable planning responses do not become titles or history" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+    var mock: MockTransport = .{ .replies = &.{ completed_answer, truncated_text } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("Raw input must not be a title");
+    const before = harness.agent.history.items.len;
+    try std.testing.expect((try harness.agent.planTask()) == null);
+    try std.testing.expect((try harness.agent.planTask()) == null);
+    try std.testing.expectEqual(before, harness.agent.history.items.len);
 }
 
 test "compaction replaces old turns with a summary and keeps the recent ones" {

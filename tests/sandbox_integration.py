@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the real API -> agent -> sandbox boundary without paid API calls."""
-from mock_api import send_response
+from mock_api import send_response, handle_planning, PLAN_APPROACH
 
 import http.server
 import json
@@ -58,6 +58,8 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            if handle_planning(self, body):
+                return
             requests.append(body)
             if len(requests) == 1:
                 os.replace(replacement, live_binary)
@@ -113,21 +115,24 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     finally:
         server.shutdown()
     assert result.returncode == 0, result.stderr
-    assert result.stdout == 'BOUNDARY_TEST_COMPLETE\n', result.stderr
+    assert result.stdout == PLAN_APPROACH + '\n\nBOUNDARY_TEST_COMPLETE\n', result.stderr
     assert resumed.returncode == 0, resumed.stderr
     assert len(observed) == len(calls) + 1, observed
     assert len([m for m in requests[-2]['input'] if m.get('role') == 'user']) == 2
     assert limited.returncode != 0 and 'IterationLimitReached' in limited.stderr
     snapshot = json.loads((root / 'session.json').read_text())
-    assert all(m['response_items'] for m in snapshot['messages'] if m['role'] == 'assistant')
+    # The preflight stores its public approach as a plain assistant message;
+    # execution responses must still retain their exact replay items.
+    assert all(m['response_items'] for m in snapshot['messages']
+               if m['role'] == 'assistant' and m['content'] != PLAN_APPROACH)
     assert any(i.get('type') == 'reasoning' for i in requests[-2]['input'])
     assert snapshot['workspace'] == os.path.realpath(str(workspace))
-    assert len(snapshot['messages']) == 2 * len(calls) + 4
+    assert len(snapshot['messages']) == 2 * len(calls) + 6
     assert 'ENV_INHERITED' in observed[0], observed[0]
     assert (workspace / 'notes.md').read_text() == '# Report\nAnalysis checked.\n'
     assert 'notes.md' in observed[3] and 'verified' in observed[3], observed[3]
     assert 'notes.md' in observed[4], observed[4]
-    assert outside.read_text() == 'DIRECT_EDIT_WORKED\n'
+    assert outside.read_text() == 'DIRECT_EDIT_WORKED\n', (outside.read_text(), observed[6:14])
     assert 'SECRET_OUTSIDE_WORKSPACE_9c18' in observed[5]
     assert not Path('/etc/zagent-policy-test-must-not-exist').exists()
     assert 'stderr:' in observed[14] or 'failed' in observed[14].lower(), observed[14]

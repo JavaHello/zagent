@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Partial/failed Responses must never dispatch a function call or silently succeed."""
-from mock_api import send_response
+from mock_api import send_response, handle_planning
 
 import http.server
 import json
@@ -20,8 +20,10 @@ class API(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        paths.append(self.path)
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if handle_planning(self, body):
+            return
+        paths.append(self.path)
         requests.append(body)
         assert 'input' in body and 'messages' not in body
         send_response(self, body, replies.pop(0) if replies else reply)

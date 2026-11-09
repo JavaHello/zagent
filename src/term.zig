@@ -47,11 +47,16 @@ pub const Title = struct {
 
 fn formatTitle(buf: []u8, activity: []const u8, task: []const u8) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
-    try w.writeAll("\x1b]2;zagent · ");
-    try writeTitleText(&w, activity, 48);
+    try w.writeAll("\x1b]2;");
+    const start = w.buffered().len;
+    try w.writeAll("zagent · ");
+    try writeTitleText(&w, activity, 24);
     if (task.len > 0) {
         try w.writeAll(" · ");
-        try writeTitleText(&w, task, 96);
+        const used = std.unicode.utf8CountCodepoints(w.buffered()[start..]) catch unreachable;
+        // Reserve one character for a possible ellipsis: the entire visible
+        // title, including application name and activity, stays below 80.
+        try writeTitleText(&w, task, 78 - used);
     }
     try w.writeByte(0x07);
     return w.buffered();
@@ -243,9 +248,23 @@ test "title bounds long tasks at Unicode boundaries" {
     const title = try formatTitle(&buf, "thinking…", &task);
     const prefix = "\x1b]2;zagent · thinking… · ";
     try expect(std.mem.startsWith(u8, title, prefix));
-    try std.testing.expectEqualStrings(task[0 .. 96 * 3], title[prefix.len .. prefix.len + 96 * 3]);
-    try std.testing.expectEqualStrings("…\x07", title[prefix.len + 96 * 3 ..]);
+    const kept = 78 - (try std.unicode.utf8CountCodepoints("zagent · thinking… · "));
+    try std.testing.expectEqualStrings(task[0 .. kept * 3], title[prefix.len .. prefix.len + kept * 3]);
+    try std.testing.expectEqualStrings("…\x07", title[prefix.len + kept * 3 ..]);
+    try expect((try std.unicode.utf8CountCodepoints(title[4 .. title.len - 1])) < 80);
     try expect(std.unicode.utf8ValidateSlice(title));
+}
+
+test "title bounds both long activities and tasks together" {
+    var buf: [768]u8 = undefined;
+    const segment = "这是一个很长的工具名称和任务摘要用于验证完整标题限制";
+    const long = segment ++ segment ++ segment ++ segment;
+    const title = try formatTitle(&buf, long, long);
+    const visible = title[4 .. title.len - 1];
+    try expect((try std.unicode.utf8CountCodepoints(visible)) < 80);
+    try expect(std.unicode.utf8ValidateSlice(visible));
+    const idle = try formatTitle(&buf, long, "");
+    try expect((try std.unicode.utf8CountCodepoints(idle[4 .. idle.len - 1])) < 80);
 }
 
 test "width counts cells, not bytes" {

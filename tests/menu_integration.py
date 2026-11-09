@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Exercise ask_user through a real PTY and a local Responses API stub."""
-from mock_api import send_response
+from mock_api import send_response, handle_planning
 
 import http.server
 import json
+import re
 import os
 from pathlib import Path
 import pty
@@ -26,6 +27,8 @@ class API(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if handle_planning(self, body):
+            return
         results = [m for m in body['input'] if m.get('type') == 'function_call_output']
         if not body.get('tools'):
             content = json.dumps({'complete': True, 'reason': 'Choice received'})
@@ -88,6 +91,10 @@ try:
                 assert len(answers) == previous_answers + 1, answers
                 assert expected in answers[-1], answers
                 assert termios.tcgetattr(slave) == original, 'raw terminal was not restored'
+                titles = re.findall(rb'\x1b\]2;([^\x07]*)\x07', transcript)
+                assert any(b'Carry out the task' in title for title in titles), titles
+                assert all(b'Ask me to choose' not in title for title in titles), titles
+                assert all(len(title.decode('utf-8')) < 80 for title in titles), titles
             finally:
                 if process.poll() is None:
                     process.kill()
