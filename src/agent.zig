@@ -24,6 +24,7 @@ const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
 const CYAN = "\x1b[36m";
+const GREEN = "\x1b[32m";
 const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 
@@ -575,6 +576,7 @@ pub const Agent = struct {
         // The extraction is a small extra request, so it runs after the
         // user's own stats and never turns a finished answer into an error.
         self.extractMemories(query) catch {};
+        try self.emit(std.Io.File.stderr(), BOLD ++ GREEN ++ "  ✓ Task completed" ++ RESET ++ "\n", .{});
     }
 
     fn progressOptions(self: *Agent) spinner.Options {

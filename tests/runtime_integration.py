@@ -98,7 +98,10 @@ try:
             send(b'\x1b[5~\x1b[6~/model\r\r', b'Model: runtime-mock')
             release.set()
             until(b'Enter an option number or your own answer below')
-            send(b'1\r', b'Background answer complete')
+            # Clear any command-menu input left by the preceding redraw.
+            send(b'\x15' + b'1\r', b'Background answer complete')
+            until('✓ Task completed'.encode())
+            assert b'\x1b[1m\x1b[32m' + '  ✓ Task completed'.encode() + b'\x1b[0m' in transcript, transcript
             deadline = time.monotonic() + 8
             while not answers:
                 assert time.monotonic() < deadline
