@@ -9,7 +9,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Interactive REPL** — a full-screen conversation with the prompt pinned to the bottom, and a prompt history that ↑/↓ recall across runs; `Ctrl+Z` suspends and `fg` redraws the whole record
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use (function calling)** — the agent can execute tools to help you:
-  - `shell` — run shell commands
+  - `bash` — run Bash commands (`shell` remains a compatibility alias)
   - `read_file` — read file contents
   - `edit_file` — replace one exact, unique text block atomically while preserving file permissions
   - `apply_patch` — change a file by applying a unified diff, which is then shown to you as a coloured diff
@@ -62,11 +62,18 @@ Dangerous operations use bubblewrap on Linux or `sandbox-exec` on macOS. Only th
 workspace is writable; the host home and credentials are hidden and the environment
 is clean. If sandbox startup fails, an error is returned, with no host fallback.
 Operations requiring real host configuration changes are therefore not performed.
-Local MCP servers continue to use this sandbox unconditionally and receive only
-explicitly configured environment entries.
+Sandbox support is detected once at startup by actually launching the backend.
+`AI_TOOL_SANDBOX=auto` (default) skips unavailable sandbox support with a warning;
+`required` fails startup if unavailable; `off` disables sandbox support without probing.
+This setting can also be set in the config file and is independent of networking.
+When sandbox support is disabled or unavailable, operations requiring isolation are
+refused (never run on the host), and local stdio MCP servers are skipped. Remote
+MCP endpoints and ordinary tools remain available. Local MCP servers always use
+the sandbox and receive only explicitly configured environment entries.
 
 Both direct and sandboxed tool calls retain a 180-second default limit
-(`shell.timeout_seconds` accepts 1–3600), output bounds and process-group cleanup.
+(`bash.timeout_seconds` accepts 1–3600), output bounds and process-group cleanup.
+Commands use `bash --noprofile --norc -c`, not `/bin/sh`.
 Sandbox networking is disabled by default; `AI_TOOL_NETWORK=1` enables host network
 access (including localhost) for sandboxed tools and local MCP servers. This setting
 does **not** restrict ordinary direct tools. Model API calls and explicitly configured

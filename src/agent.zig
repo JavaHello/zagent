@@ -62,7 +62,7 @@ const SYSTEM_PROMPT =
     \\Guidelines:
     \\- Be concise and direct in your responses.
     \\- Before executing a new user task, briefly explain the goal and practical approach if no initial plan has already been provided. Do not repeat a plan already present in the conversation.
-    \\- Use the shell tool to run commands, install packages, or perform system operations.
+    \\- Use the bash tool to run Bash commands, install packages, or perform system operations.
     \\- Use http_request for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
     \\- Use read_file to read a file. Use edit_file for an exact unique text replacement, or apply_patch for a unified diff with enough context to place it. Do not write a whole file back through write_file to change part of it, and do not edit files through the shell.
     \\- Use write_file only for a file that does not exist yet, or when the entire contents are being replaced. A file that does not exist can also be created with apply_patch and a '--- /dev/null' header.
@@ -127,6 +127,7 @@ pub const Agent = struct {
     /// filesystem a question whose answer cannot change while the agent runs.
     search: tools.SearchBackends,
     tool_network: bool,
+    sandbox_available: bool,
     tool_env: *const std.process.Environ.Map,
     session_path: ?[]u8,
     /// Durable notes loaded at startup and updated by the remember tool.
@@ -166,6 +167,7 @@ pub const Agent = struct {
         linenoise: *Linenoise,
         env: *const std.process.Environ.Map,
         mcp_registry: *mcp.Registry,
+        sandbox_available: bool,
     ) !Agent {
         var history: std.ArrayList(Message) = .empty;
         errdefer history.deinit(allocator);
@@ -213,6 +215,7 @@ pub const Agent = struct {
             .compact_keep = config.compact_keep,
             .memory_auto = config.memory and config.memory_auto,
             .tool_network = if (env.get("AI_TOOL_NETWORK")) |v| std.mem.eql(u8, v, "1") else false,
+            .sandbox_available = sandbox_available,
             // The check is on stdout rather than on `linenoise.is_tty`, which
             // describes stdin: `zagent "q" < file` with a terminal on stdout
             // should still render, and `zagent "q" | less` must not.
@@ -1251,7 +1254,7 @@ pub const Agent = struct {
                 // server it belongs to and what the server calls it.
                 break :blk try self.mcp_registry.call(self.allocator, call.name, call.arguments);
             } else {
-                break :blk try @import("execution.zig").execute(self.io, self.allocator, self.tool_env, self.tool_network, call.name, call.arguments);
+                break :blk try @import("execution.zig").execute(self.io, self.allocator, self.tool_env, self.tool_network, self.sandbox_available, call.name, call.arguments);
             }
         };
 
@@ -1501,7 +1504,7 @@ const TestHarness = struct {
         self.registry = mcp.Registry.empty(allocator, io);
         errdefer self.registry.deinit();
 
-        self.agent = try Agent.init(allocator, io, self.config, &self.linenoise, &self.env, &self.registry);
+        self.agent = try Agent.init(allocator, io, self.config, &self.linenoise, &self.env, &self.registry, false);
         return self;
     }
 

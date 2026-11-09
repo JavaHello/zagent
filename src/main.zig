@@ -145,9 +145,11 @@ pub fn main(init: std.process.Init) !void {
             "AI_MEMORY=0           Disable durable memory for this workspace\n" ++
             "AI_MEMORY_AUTO=0      Keep the remember tool, skip the per-turn extractor\n" ++
             "AI_MEMORY_FILE        Store memory in another file\n" ++
-            "AI_TOOL_NETWORK=1     Enable tool network access (default: off)\n\n" ++
-            "Tools require Linux, bubblewrap and GNU timeout. Only the current\n" ++
-            "workspace is writable. Build with Zig 0.17.0.\n");
+            "AI_TOOL_NETWORK=1     Enable sandbox network access (default: off)\n" ++
+            "AI_TOOL_SANDBOX       auto (default), required, or off\n\n" ++
+            "Bash tools run on the host; operations requiring isolation never fall back.\n" ++
+            "Sandbox: Linux (bubblewrap + GNU timeout), macOS (sandbox-exec).\n" ++
+            "Unsupported sandboxes are skipped in auto mode. Build with Zig 0.17.0.\n");
         return;
     }
     if (args.items.len == 2 and std.mem.eql(u8, args.items[1], "--version")) {
@@ -220,10 +222,11 @@ pub fn main(init: std.process.Init) !void {
     }
     const stderr = std.Io.File.stderr();
     var watcher = McpProgress{ .io = io, .allocator = allocator };
-    var registry = mcp.Registry.connect(allocator, io, env, &problems, .{
+    const sandbox_available = try @import("sandbox.zig").initialize(io, allocator, config.tool_sandbox);
+    var registry = mcp.Registry.connectWithSandbox(allocator, io, env, &problems, .{
         .context = &watcher,
         .started = McpProgress.started,
-    }) catch |err| failed: {
+    }, sandbox_available) catch |err| failed: {
         try printToStderr(allocator, io, YELLOW ++ "  ⚠ mcp: no servers were read: {s}\n" ++ RESET, .{@errorName(err)});
         break :failed mcp.Registry.empty(allocator, io);
     };
@@ -244,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var agent = try Agent.init(allocator, io, config, &ln, env, &registry);
+    var agent = try Agent.init(allocator, io, config, &ln, env, &registry, sandbox_available);
     defer agent.deinit();
 
     if (args.items.len > 1) {

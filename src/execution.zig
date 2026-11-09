@@ -9,7 +9,7 @@ pub fn requiresSandbox(io: std.Io, allocator: std.mem.Allocator, name: []const u
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArguments;
     const obj = parsed.value.object;
-    if (std.mem.eql(u8, name, "shell")) {
+    if (std.mem.eql(u8, name, "bash") or std.mem.eql(u8, name, "shell")) {
         const value = obj.get("command") orelse return error.InvalidArguments;
         if (value != .string) return error.InvalidArguments;
         return dangerousCommand(value.string);
@@ -74,13 +74,31 @@ fn dangerousCommand(command: []const u8) bool {
     return false;
 }
 
-pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, network: bool, name: []const u8, arguments: []const u8) !tools.ToolResult {
+pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, network: bool, sandbox_available: bool, name: []const u8, arguments: []const u8) !tools.ToolResult {
     const isolated = requiresSandbox(io, allocator, name, arguments) catch return .{
         .content = try allocator.dupe(u8, "Invalid tool arguments; execution was not attempted."),
         .is_error = true,
     };
-    if (isolated) return sandbox.execute(io, allocator, network, name, arguments);
+    if (isolated) {
+        if (!sandbox_available) return .{
+            .content = try allocator.dupe(u8, "Sandbox is disabled or unavailable; this operation requires isolation and was not executed."),
+            .is_error = true,
+        };
+        return sandbox.execute(io, allocator, network, name, arguments);
+    }
     return sandbox.executeDirect(io, allocator, env, name, arguments);
+}
+
+test "unavailable sandbox rejects dangerous bash and legacy shell calls" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    for ([_][]const u8{ "bash", "shell" }) |name| {
+        const result = try execute(std.testing.io, a, &env, false, false, name, "{\"command\":\"sudo true\"}");
+        defer result.deinit(a);
+        try std.testing.expect(result.is_error);
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "was not executed") != null);
+    }
 }
 
 test "ordinary development commands run directly; system changes require sandbox" {

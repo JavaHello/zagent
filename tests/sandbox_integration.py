@@ -143,4 +143,35 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
     assert observed[9] == '(no output)', observed[9]
-    print('PASS: direct editing/search, host environment/network, dangerous-command isolation, timeout, API retry, durable resume')
+    # Exercise disabled sandbox policy through the real CLI/worker boundary.
+    calls[:] = [
+        ('bash', {'command': 'items=(hello world); [[ ${#items[@]} == 2 ]] && printf "%s" "${items[1]}"'}),
+        ('shell', {'command': 'echo LEGACY_ALIAS'}),
+        ('bash', {'command': 'echo MUST_NOT_RUN > /etc/zagent-policy-test-must-not-exist'}),
+    ]
+    observed.clear()
+    requests.clear()
+    shutil.copy2(live_binary, replacement)
+    config_dir = root / 'zagent'
+    config_dir.mkdir()
+    (config_dir / 'mcp.json').write_text(json.dumps({'mcpServers': {
+        'disabled-local': {'command': 'sh', 'args': ['-c', 'touch MCP_MUST_NOT_START']}
+    }}))
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    off_env = dict(env, AI_TOOL_SANDBOX='off', AI_URL=f'http://127.0.0.1:{server.server_port}/v1',
+                   AI_SESSION_FILE=str(root / 'off-session.json'))
+    try:
+        off = subprocess.run([str(live_binary), 'Exercise disabled sandbox'], cwd=workspace,
+                             env=off_env, text=True, capture_output=True, timeout=60)
+    finally:
+        server.shutdown()
+    assert off.returncode == 0, off.stderr
+    assert observed[:2] == ['world', 'LEGACY_ALIAS\n'], observed
+    assert 'requires isolation and was not executed' in observed[2], observed
+    assert 'skipped local MCP server' in off.stderr, off.stderr
+    assert not (workspace / 'MCP_MUST_NOT_START').exists()
+    assert not Path('/etc/zagent-policy-test-must-not-exist').exists()
+    tool_names = [t['name'] for t in requests[0]['tools']]
+    assert 'bash' in tool_names and 'shell' not in tool_names, tool_names
+    print('PASS: direct editing/search, host environment/network, dangerous-command isolation, timeout, API retry, durable resume, Bash/legacy alias, sandbox off and local MCP skip')

@@ -1366,8 +1366,25 @@ pub const Registry = struct {
         problems: *std.ArrayList([]u8),
         progress: ?Progress,
     ) !Registry {
+        return connectWithSandbox(allocator, io, env, problems, progress, true);
+    }
+
+    pub fn connectWithSandbox(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        problems: *std.ArrayList([]u8),
+        progress: ?Progress,
+        sandbox_available: bool,
+    ) !Registry {
         const configs = try loadServers(allocator, io, env, problems);
         defer allocator.free(configs);
+        for (configs) |*entry| {
+            if (!sandbox_available and entry.transport == .stdio and !entry.disabled) {
+                entry.disabled = true;
+                try addProblem(allocator, problems, "{s}: skipped local MCP server (sandbox disabled or unavailable)", .{entry.name});
+            }
+        }
 
         var registry: Registry = .{
             .allocator = allocator,

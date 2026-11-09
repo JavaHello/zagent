@@ -21,7 +21,8 @@ pub const ToolResult = struct {
 /// the line to itself.
 pub fn progressLabel(name: []const u8) ?[]const u8 {
     const labels = [_]struct { name: []const u8, label: []const u8 }{
-        .{ .name = "shell", .label = "shell…" },
+        .{ .name = "bash", .label = "bash…" },
+        .{ .name = "shell", .label = "bash…" },
         .{ .name = "read_file", .label = "read_file…" },
         .{ .name = "write_file", .label = "write_file…" },
         .{ .name = "apply_patch", .label = "apply_patch…" },
@@ -44,7 +45,7 @@ pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u
 
 pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []const u8, env: ?*const std.process.Environ.Map) !ToolResult {
     const result = try std.process.run(allocator, io, .{
-        .argv = &[_][]const u8{ "sh", "-c", command },
+        .argv = &[_][]const u8{ "bash", "--noprofile", "--norc", "-c", command },
         .environ_map = env,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
@@ -911,6 +912,13 @@ fn toolError(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anyty
     return .{ .content = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
 }
 
+test "bash supports arrays and double brackets" {
+    const result = try executeShell(std.testing.io, std.testing.allocator, "items=(hello world); [[ ${#items[@]} == 2 ]] && printf '%s' \"${items[1]}\"");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("world", result.content);
+}
+
 test "shell echo" {
     const result = try executeShell(std.testing.io, std.testing.allocator, "echo hello");
     defer result.deinit(std.testing.allocator);
@@ -1446,7 +1454,8 @@ test "finalize tool content truncates on utf8 boundary" {
 }
 
 test "every tool that waits has a progress label, ask_user does not" {
-    const labelled = [_][]const u8{ "shell", "read_file", "write_file", "apply_patch", "edit_file", "list_dir", "grep", "find", "http_request" };
+    try std.testing.expectEqualStrings(progressLabel("bash").?, progressLabel("shell").?);
+    const labelled = [_][]const u8{ "bash", "read_file", "write_file", "apply_patch", "edit_file", "list_dir", "grep", "find", "http_request" };
     for (labelled) |name| {
         const label = progressLabel(name) orelse return error.TestUnexpectedResult;
         // The label names the tool, so a user watching the line knows what is

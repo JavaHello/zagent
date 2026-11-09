@@ -5,7 +5,7 @@ const openai = @import("openai.zig");
 pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8, arguments: []const u8) !tools.ToolResult {
     const search = tools.detectSearchBackends(io, env);
     return blk: {
-        if (std.mem.eql(u8, name, "shell")) {
+        if (std.mem.eql(u8, name, "bash") or std.mem.eql(u8, name, "shell")) {
             const command = openai.extractStringArg(allocator, arguments, "command") catch {
                 break :blk .{
                     .content = try allocator.dupe(u8, "Error: missing 'command' argument"),

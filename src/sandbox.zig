@@ -6,6 +6,37 @@ const tools = @import("tools.zig");
 
 const native_os = builtin.os.tag;
 
+/// Independent from network permission. Never falls back to host execution.
+pub const Mode = enum { auto, required, off };
+
+/// Probe the real isolation backend, not just whether its executable exists:
+/// Linux can install bwrap while disabling unprivileged namespaces.
+pub fn available(io: std.Io, allocator: std.mem.Allocator) bool {
+    if (native_os != .linux and native_os != .macos) return false;
+    const workspace = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch return false;
+    defer allocator.free(workspace);
+    var l = launch(io, allocator, workspace, null, false, &.{"/bin/true"}, &.{}, 5) catch return false;
+    defer l.deinit();
+    defer l.releaseTempDir();
+    const result = std.process.run(allocator, io, .{
+        .argv = l.argv,
+        .environ_map = &l.env,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term == .exited and result.term.exited == 0;
+}
+
+pub fn initialize(io: std.Io, allocator: std.mem.Allocator, mode: Mode) !bool {
+    if (mode == .off) return false;
+    if (available(io, allocator)) return true;
+    if (mode == .required) return error.SandboxUnavailable;
+    try std.Io.File.stderr().writeStreamingAll(io, "Sandbox unavailable; skipping sandbox support. Operations requiring isolation will be refused.\n");
+    return false;
+}
+
 /// A ready-to-spawn sandboxed command. Owns the argument list and the clean
 /// environment. On macOS it also owns a private temp directory that must be
 /// released with `releaseTempDir` once the child has exited.
@@ -402,7 +433,7 @@ pub fn verifyMacosSandbox(io: std.Io) !void {
 }
 
 fn shellTimeout(allocator: std.mem.Allocator, name: []const u8, arguments: []const u8) !u32 {
-    if (!std.mem.eql(u8, name, "shell")) return 180;
+    if (!std.mem.eql(u8, name, "bash") and !std.mem.eql(u8, name, "shell")) return 180;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArguments;
