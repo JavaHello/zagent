@@ -14,7 +14,7 @@ import tempfile
 import termios
 import threading
 import time
-from mock_api import handle_planning, send_response
+from mock_api import handle_planning, send_response, trust_workspace
 
 started = threading.Event()
 release = threading.Event()
@@ -59,6 +59,7 @@ try:
                    TERM='xterm-256color', AI_KEY='test', AI_MODEL='runtime-mock',
                    AI_MEMORY='0', AI_COMPACT_THRESHOLD='0', AI_MAX_VERIFICATIONS='1',
                    AI_URL=f'http://127.0.0.1:{server.server_port}/v1')
+        trust_workspace(directory, env)
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 16, 80, 0, 0))
         original = termios.tcgetattr(slave)

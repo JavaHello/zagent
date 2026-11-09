@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("test-integration", "Run CLI integration tests (Python 3 required)");
     var previous: *std.Build.Step = b.getInstallStep();
     for ([_][]const u8{
+        "tests/workspace_integration.py",
         "tests/streaming_integration.py",
         "tests/sandbox_integration.py",
         "tests/completion_integration.py",

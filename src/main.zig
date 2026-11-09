@@ -172,6 +172,31 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Trust must precede state loading, API requests and local MCP startup.
+    // Administrative commands do not operate in the current workspace.
+    if (!(args.items.len == 2 and std.mem.eql(u8, args.items[1], "models"))) {
+        const workspace = @import("workspace.zig");
+        if (!try workspace.isTrusted(allocator, io, env)) {
+            const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+            defer allocator.free(canonical);
+            try printToStderr(allocator, io, "Trust this directory?\n  {s}\nTrusted directories allow tool execution and local MCP servers.\n" ++
+                "Type yes to trust and continue; anything else exits. [yes/No] ", .{canonical});
+            var consent = Linenoise.init(allocator, io, env);
+            defer consent.deinit();
+            if (!consent.is_tty) {
+                try std.Io.File.stderr().writeStreamingAll(io, "\nNot trusted. Run interactively to approve this directory first.\n");
+                std.process.exit(1);
+            }
+            const answer = try consent.linenoise("");
+            defer if (answer) |value| allocator.free(value);
+            if (answer == null or !std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r\n"), "yes")) {
+                try std.Io.File.stderr().writeStreamingAll(io, "Not trusted. Exiting.\n");
+                std.process.exit(1);
+            }
+            try workspace.trust(allocator, io, env);
+        }
+    }
+
     const config = Config.load(allocator, io, env) catch |err| switch (err) {
         error.UnknownProvider => {
             const valid = try std.mem.join(allocator, ", ", provider.Provider.names());

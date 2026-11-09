@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A task must not exit successfully when its completion check rejects it."""
-from mock_api import send_response, handle_planning
+from mock_api import send_response, handle_planning, trust_workspace
 
 import http.server
 import json
@@ -73,6 +73,7 @@ try:
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_MODEL': 'mock',
                'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '5', 'AI_MAX_VERIFICATIONS': '1',
                'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0'}
+        trust_workspace(directory, env)
         for verdict, expected_ok in [
             (json.dumps({'complete': True, 'reason': 'Verified evidence'}), True),
             (json.dumps({'complete': False, 'reason': 'Missing behavior', 'next_step': 'Implement it'}), False),

@@ -8,7 +8,7 @@ import re
 import subprocess
 import tempfile
 import threading
-from mock_api import handle_planning, send_response
+from mock_api import handle_planning, send_response, trust_workspace
 
 requests = []
 
@@ -36,6 +36,7 @@ try:
                    TERM='dumb', AI_KEY='test', AI_MODEL='session-mock',
                    AI_MEMORY='0', AI_MAX_VERIFICATIONS='0', AI_COMPACT_THRESHOLD='0',
                    AI_URL=f'http://127.0.0.1:{server.server_port}/v1')
+        state = trust_workspace(directory, env)
         legacy_path = Path(directory) / 'ignored-session.json'
         legacy_path.write_text('not a valid snapshot')
         env['AI_SESSION_FILE'] = str(legacy_path)
@@ -51,7 +52,7 @@ try:
             return re.search(r'(?:Session\s+|Session: )([a-f0-9]{32})', output)[1]
 
         first = session_id(run('first-session-marker'))
-        path = Path(directory) / '.zagent/sessions' / f'{first}.json'
+        path = state / 'sessions' / f'{first}.json'
         old = path.read_bytes()
         second = session_id(run(stdin='/new\n/session\n/quit\n'))
         assert second != first

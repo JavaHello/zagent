@@ -1,5 +1,23 @@
 """Respond using the same buffered or SSE protocol the client requested."""
 import json
+import hashlib
+from pathlib import Path
+
+
+def workspace_state(directory, env):
+    canonical = str(Path(directory).resolve())
+    state = Path(env.get('XDG_STATE_HOME') or Path(env['HOME']) / '.local/state')
+    return state / 'zagent/workspaces' / hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def trust_workspace(directory, env):
+    """Explicitly authorize only the test's temporary directory, never the host cwd."""
+    # Inherited XDG state must never direct tests into the user's real state.
+    env['XDG_STATE_HOME'] = str(Path(env['HOME']) / 'state')
+    root = workspace_state(directory, env)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'trusted').write_text(str(Path(directory).resolve()))
+    return root
 
 
 PLAN_APPROACH = 'I will check the request and carry out the task.'

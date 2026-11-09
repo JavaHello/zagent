@@ -10,12 +10,11 @@ pub fn newId(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(bytes, .lower)});
 }
 
-pub fn pathForId(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
+pub fn validateId(id: []const u8) !void {
     if (id.len != 32) return error.InvalidSessionId;
     for (id) |c| {
         if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return error.InvalidSessionId;
     }
-    return std.fmt.allocPrint(allocator, ".zagent/sessions/{s}.json", .{id});
 }
 
 test "session IDs are unique and cannot escape the session directory" {
@@ -25,9 +24,9 @@ test "session IDs are unique and cannot escape the session directory" {
     const second = try newId(std.testing.io, a);
     defer a.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
-    const path = try pathForId(a, first);
-    defer a.free(path);
-    try std.testing.expectError(error.InvalidSessionId, pathForId(a, "../session"));
+    try validateId(first);
+    try std.testing.expectError(error.InvalidSessionId, validateId("../session"));
+    try std.testing.expectError(error.InvalidSessionId, validateId("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
 }
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages: []Message) !void {

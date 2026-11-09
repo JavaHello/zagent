@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import threading
 
-from mock_api import send_response, handle_planning, PLAN_APPROACH
+from mock_api import send_response, handle_planning, PLAN_APPROACH, trust_workspace
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 answer = ''
@@ -36,6 +36,7 @@ try:
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_KEY': 'test',
                'AI_MODEL': 'mock', 'AI_MAX_VERIFICATIONS': '0', 'AI_MEMORY': '0',
                'AI_COMPACT_THRESHOLD': '0'}
+        trust_workspace(directory, env)
         for answer in ('Plain answer', '中文与 emoji 😀', '# Heading\n\n**bold**\n',
                        'first\nsecond', '```zig\nconst n = 1;\n```'):
             result = subprocess.run([str(binary), 'Answer'], cwd=directory, env=env,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise ask_user through a real PTY and a local Responses API stub."""
-from mock_api import send_response, handle_planning
+from mock_api import send_response, handle_planning, trust_workspace
 
 import http.server
 import json
@@ -54,6 +54,7 @@ try:
                'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0',
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1',
                'AI_MAX_VERIFICATIONS': '1'}
+        trust_workspace(directory, env)
         cases = [
             (b'\r', None, 'recommended option: Beta'),
             (b'\x1b[A\r', None, 'User selected: Alpha'),

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Partial/failed Responses must never dispatch a function call or silently succeed."""
-from mock_api import send_response, handle_planning
+from mock_api import send_response, handle_planning, trust_workspace
 
 import http.server
 import json
@@ -56,6 +56,7 @@ try:
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1/', 'AI_MODEL': 'test-model',
                'AI_KEY': 'local-test', 'AI_MAX_VERIFICATIONS': '0',
                'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0'}
+        trust_workspace(directory, env)
         for response, expected_error in cases:
             requests.clear()
             reply.clear()

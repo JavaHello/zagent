@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the real API -> agent -> sandbox boundary without paid API calls."""
-from mock_api import send_response, handle_planning, PLAN_APPROACH
+from mock_api import send_response, handle_planning, PLAN_APPROACH, trust_workspace
 
 import http.server
 import json
@@ -104,10 +104,11 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
            'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0',
            'DEEPSEEK_API_KEY': 'must-not-reach-tools', 'OPENAI_API_KEY': 'must-not-reach-tools',
            'PRIVATE_SENTINEL': 'must-not-reach-tools'}
+    state = trust_workspace(workspace, env)
     try:
         result = subprocess.run([str(live_binary), 'Exercise the tools'], cwd=workspace, env=env,
                                 text=True, capture_output=True, timeout=120)
-        session_path, = (workspace / '.zagent/sessions').glob('*.json')
+        session_path, = (state / 'sessions').glob('*.json')
         resumed = subprocess.run([str(live_binary), '--resume', session_path.stem,
                                   'Continue the saved conversation'], cwd=workspace, env=env,
                                  text=True, capture_output=True, timeout=120)

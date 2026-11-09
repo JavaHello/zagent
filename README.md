@@ -84,10 +84,35 @@ AI_PROVIDER=deepseek zagent "Analyze this project and update its documentation"
 AI_TOOL_NETWORK=1 zagent "Download the public API documentation and summarize it"
 ```
 
+## Directory trust and global state
+
+On first use in a directory, zagent asks whether you trust it before loading
+workspace data, making API requests or starting MCP servers. Type `yes` in a
+terminal to approve; any other response exits. Piped input cannot grant trust.
+Later launches in that directory reuse the saved approval. Approve a directory
+interactively before using zagent there in scripts or pipelines.
+
+Trust, memory and sessions are stored globally, separated by canonical directory:
+
+```text
+$XDG_STATE_HOME/zagent/workspaces/<sha256-of-canonical-path>/
+  trusted             # full canonical path, checked when loading approval
+  memory.md
+  sessions/<id>.json
+```
+
+Without `XDG_STATE_HOME`, the base is `~/.local/state`. Symlink aliases share
+state; different directories do not. Moving a project gives it a new identity.
+Delete its `trusted` file to require approval again. Trust is consent to the
+execution policy below, not arbitrary-code isolation. Help, version and `models`
+management do not require workspace approval.
+
+Project-local `.zagent/` memory and sessions are not read or migrated.
+
 ## Durable conversations
 
-Every launch creates a fresh session ID, saved automatically in the current
-workspace's `.zagent/sessions/<id>.json`. The startup message and `/session`
+Every launch creates a fresh session ID, saved automatically in the directory's
+global state folder as `sessions/<id>.json`. The startup message and `/session`
 show the ID and resume command. `/new` creates another ID without overwriting
 the previous conversation; `/clear` empties only the current session.
 From the original working directory, restore a session with:
@@ -137,7 +162,7 @@ Set `AI_COMPACT_THRESHOLD=0` to disable automatic compaction.
 
 ## Memory
 
-zagent keeps durable notes between sessions in `.zagent/memory.md` inside the
+zagent keeps durable notes between sessions in the global `memory.md` scoped to the
 workspace — a plain markdown list the user can read and edit. A note is saved
 when the model calls the `remember` tool at a key point (a preferred convention,
 a project fact, a decision that future work must respect), when the user runs
@@ -156,8 +181,9 @@ AI_MEMORY_AUTO=0 zagent            # keep the remember tool, skip the per-turn e
 AI_MEMORY_FILE=/path/to/notes.md zagent
 ```
 
-The memory file is workspace-local. Add `.zagent/` to the project's `.gitignore`
-if the notes should not be committed; this repository does exactly that.
+The default memory file is stored outside the project, scoped to its canonical
+directory. `AI_MEMORY_FILE` explicitly overrides this location; protect custom
+memory files from accidental commits.
 
 ## Validation
 
@@ -202,7 +228,7 @@ All configuration is also supported through environment variables:
 | `AI_COMPACT_KEEP`  | `16`                             | Newest messages kept verbatim across a compaction |
 | `AI_MEMORY`        | `true`                           | Keep durable notes in the workspace and expose the `remember` tool |
 | `AI_MEMORY_AUTO`   | `true`                           | Ask the model after each turn whether anything should be remembered |
-| `AI_MEMORY_FILE`   | `<workspace>/.zagent/memory.md`  | Where the notes are stored |
+| `AI_MEMORY_FILE`   | Global workspace state: `memory.md` | Override where the notes are stored |
 
 Use `AI_` settings in both the config file and environment. An explicit value wins over the provider preset. Provider-specific API keys (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) are read from the environment; use `AI_KEY` in the config file.
 

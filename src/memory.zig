@@ -1,7 +1,7 @@
 //! Durable notes the agent keeps between sessions.
 //!
-//! Memory is a plain markdown list in the workspace (`.zagent/memory.md` by
-//! default), so the user can read, edit, or delete it with any editor. One
+//! Memory is a plain markdown list in global directory-scoped state by
+//! default, so the user can read, edit, or delete it with any editor. One
 //! entry per `- ` line; comments and blank lines are ignored. A failed read
 //! or write never takes the agent down: memory is an aid, not a dependency.
 const std = @import("std");
@@ -210,15 +210,7 @@ fn resolvePath(allocator: std.mem.Allocator, io: std.Io, env: *const std.process
             return chosen;
         }
     }
-    const cwd = std.Io.Dir.cwd();
-    const workspace = cwd.realPathFileAlloc(io, ".", allocator) catch null;
-    if (workspace) |root| {
-        defer allocator.free(root);
-        const chosen = try std.fmt.allocPrint(allocator, "{s}/.zagent/memory.md", .{root});
-        return chosen;
-    }
-    const fallback = try allocator.dupe(u8, ".zagent/memory.md");
-    return fallback;
+    return try @import("workspace.zig").filePath(allocator, io, env, "memory.md");
 }
 
 fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8, entries: *std.ArrayList([]u8)) !void {

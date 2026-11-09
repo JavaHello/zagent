@@ -277,7 +277,10 @@ pub const Agent = struct {
         const session = @import("session.zig");
         const id = if (resume_id) |value| try self.allocator.dupe(u8, value) else try session.newId(self.io, self.allocator);
         errdefer self.allocator.free(id);
-        const path = try session.pathForId(self.allocator, id);
+        try session.validateId(id);
+        const relative = try std.fmt.allocPrint(self.allocator, "sessions/{s}.json", .{id});
+        defer self.allocator.free(relative);
+        const path = try @import("workspace.zig").filePath(self.allocator, self.io, self.tool_env, relative);
         errdefer self.allocator.free(path);
         var loaded: std.ArrayList(Message) = .empty;
         defer {

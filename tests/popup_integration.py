@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import termios
 import time
+from mock_api import trust_workspace
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 ansi = re.compile(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|[78])')
@@ -32,6 +33,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
                XDG_STATE_HOME=str(root / 'state'),
                TERM='xterm-256color', AI_KEY='test', AI_MODEL='popup-mock',
                AI_MEMORY='0', AI_COMPACT_THRESHOLD='0')
+    trust_workspace(directory, env)
     process = subprocess.Popen([str(binary)], cwd=directory, env=env,
                                stdin=slave, stdout=slave, stderr=slave)
     transcript = bytearray()
