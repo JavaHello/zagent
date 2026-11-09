@@ -3,9 +3,7 @@ const std = @import("std");
 /// Defaults supplied by a built-in provider preset.
 ///
 /// A preset only fills in values that were not set explicitly; `config.zig`
-/// owns the precedence rules. Note that the `OPENAI_*` environment variable
-/// names are the legacy spelling of "the default endpoint" rather than a
-/// naming convention for new providers to extend.
+/// owns the precedence rules. Shared settings use the `AI_` prefix.
 pub const Spec = struct {
     /// Sent alongside "/responses", so it must not end in a slash.
     base_url: []const u8,

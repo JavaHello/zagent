@@ -51,6 +51,8 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         send(b'\x1b[B\r', '❯ /clear'.encode())
         assert b'Conversation history cleared.' not in transcript
         send(b'\r', b'Conversation history cleared.')
+        # The command message precedes raw-mode setup for the next prompt.
+        read_until(b'\x1b[?2004h', raw=True)
         send('check @ALPHA'.encode(), b'@src/alpha.zig  File')
         send(b'\t', '❯ check @src/alpha.zig'.encode())
         send(b'\x15$', b'Coming soon')

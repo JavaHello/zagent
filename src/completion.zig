@@ -1,7 +1,7 @@
 //! Candidate sources for the interactive prompt.
 const std = @import("std");
 const commands = @import("commands.zig");
-const Item = @import("linenoise").PopupItem;
+const Item = @import("editor/main.zig").PopupItem;
 const Allocator = std.mem.Allocator;
 
 pub const Trigger = struct { start: usize, kind: u8, query: []const u8 };

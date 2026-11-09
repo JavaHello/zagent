@@ -426,7 +426,10 @@ pub const Client = struct {
         }
 
         const final_body = completed orelse return error.ResponseNotCompleted;
-        const parsed = try parseResponse(self.allocator, final_body);
+        const parsed = parseResponse(self.allocator, final_body) catch |err| {
+            if (err == error.ApiError) self.recordHttpError(response.head.status, final_body);
+            return err;
+        };
         self.correctUsage(in_estimate, out_estimate, parsed.usage);
         return parsed;
     }

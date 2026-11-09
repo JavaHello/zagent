@@ -14,7 +14,7 @@ const spinner = @import("spinner.zig");
 const Screen = @import("screen.zig").Screen;
 const ScreenLogWriter = @import("screen.zig").LogWriter;
 const Config = @import("config.zig").Config;
-const Linenoise = @import("linenoise").Linenoise;
+const Linenoise = @import("editor/main.zig").Linenoise;
 
 const Message = openai.Message;
 const ToolCallData = openai.ToolCallData;
@@ -1384,7 +1384,12 @@ const AnswerStream = struct {
     fn finish(self: *AnswerStream) !void {
         if (self.finished) return;
         self.finished = true;
-        try self.flushPending();
+        if (self.renderer == null and self.pending.items.len > 0) {
+            try self.agent.writeLogOrStdout(self.pending.items);
+            self.pending.clearRetainingCapacity();
+        } else {
+            try self.flushPending();
+        }
         if (self.renderer) |*r| try r.finish();
         if (self.started) try self.agent.answerTrailer();
     }

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Exercise ask_user through a real PTY and a local Responses API stub."""
+from mock_api import send_response
+
 import http.server
 import json
 import os
@@ -37,12 +39,7 @@ class API(http.server.BaseHTTPRequestHandler):
             answers.append(results[-1]['output'])
             output = [{'type': 'message', 'role': 'assistant',
                        'content': [{'type': 'output_text', 'text': 'Choice received'}]}]
-        data = json.dumps({'status': 'completed', 'output': output}).encode()
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        send_response(self, body, {'status': 'completed', 'output': output})
 
 
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)

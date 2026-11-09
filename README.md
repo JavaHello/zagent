@@ -172,7 +172,7 @@ Configuration can be loaded from a config file and/or environment variables. The
 - `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
 - `~/.config/zagent` (fallback)
 
-The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS`, `AI_MARKDOWN`, `AI_COMPACT_THRESHOLD`, `AI_COMPACT_KEEP`, `AI_MEMORY`, `AI_MEMORY_AUTO`. The `AI_MAX_*` and URL/model/key settings also accept their `OPENAI_*` spelling. Environment variables override config file values.
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS`, `AI_MARKDOWN`, `AI_COMPACT_THRESHOLD`, `AI_COMPACT_KEEP`, `AI_MEMORY`, `AI_MEMORY_AUTO`. Environment variables override config file values.
 
 See `zagent.example.conf` for a complete example config file, and
 `mcp.example.json` for the MCP servers zagent can be given.
@@ -182,12 +182,13 @@ All configuration is also supported through environment variables:
 | Variable           | Default                          | Description                          |
 |--------------------|----------------------------------|--------------------------------------|
 | `AI_PROVIDER`      | *(autodetected)*                 | Select a built-in preset: `deepseek` or `openai` |
+| `AI_KEY`          | *(optional)*                    | API key for the selected endpoint |
 | `OPENAI_API_KEY`   | *(required for OpenAI)*          | Your OpenAI (or compatible) API key  |
-| `OPENAI_BASE_URL`  | `https://api.openai.com/v1`      | API base URL                         |
-| `OPENAI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
-| `OPENAI_MAX_TOKENS`| `8192`                           | Initial output token budget per response    |
-| `OPENAI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
-| `OPENAI_MAX_VERIFICATIONS` | `3`                     | Completion checks per query; `0` disables the check |
+| `AI_URL`  | `https://api.openai.com/v1`      | API base URL                         |
+| `AI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
+| `AI_MAX_TOKENS`| `8192`                           | Initial output token budget per response    |
+| `AI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
+| `AI_MAX_VERIFICATIONS` | `3`                     | Completion checks per query; `0` disables the check |
 | `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
 | `AI_COMPACT_THRESHOLD` | `48000`                      | Estimated tokens before older messages are summarized; `0` disables |
 | `AI_COMPACT_KEEP`  | `16`                             | Newest messages kept verbatim across a compaction |
@@ -195,7 +196,7 @@ All configuration is also supported through environment variables:
 | `AI_MEMORY_AUTO`   | `true`                           | Ask the model after each turn whether anything should be remembered |
 | `AI_MEMORY_FILE`   | `<workspace>/.zagent/memory.md`  | Where the notes are stored |
 
-Every one of these also has a shorter `AI_`-prefixed spelling that works in both the config file and the environment, so `AI_MODEL` and `OPENAI_MODEL` are interchangeable. An explicit value always wins over a value implied by `AI_PROVIDER`. `AI_MARKDOWN`, `AI_COMPACT_*` and `AI_MEMORY*` are the exceptions: they are not provider settings and have no `OPENAI_` spelling.
+Use `AI_` settings in both the config file and environment. An explicit value wins over the provider preset. Provider-specific API keys (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) are read from the environment; use `AI_KEY` in the config file.
 
 When a response hits `max_output_tokens`, both the main conversation and completion check retry the same input with a doubled token budget, up to three retries and a growth cap of 8192 tokens — the most DeepSeek's chat models accept. Since the default budget already equals that cap, the retry only grows a smaller configured `AI_MAX_TOKENS`. Partial tool calls are discarded and completed tool results are retained. If the reply is still cut off, zagent keeps the partial text and asks the model to continue exactly where it stopped, up to eight times; a cut-off tool call is instead re-asked as a request to work in smaller steps, twice. Only when that also fails does the turn end with `ResponseTruncated`, after printing what was produced.
 
@@ -603,9 +604,9 @@ These popups apply only to the REPL prompt.
 ### Using a custom Responses-compatible endpoint
 
 ```bash
-export OPENAI_BASE_URL=https://your-endpoint/v1
+export AI_URL=https://your-endpoint/v1
 export OPENAI_API_KEY=your-key
-export OPENAI_MODEL=your-model
+export AI_MODEL=your-model
 ./zig-out/bin/zagent
 ```
 
@@ -641,12 +642,17 @@ Protocol mapping follows the [official Responses migration guide](https://develo
 
 ```bash
 zig build test
+zig build test-integration
 ```
+
+The integration target builds the binary and runs all six Python 3 suites, covering streamed output, sandbox boundaries, completion checks, response failures, menus and prompt popups. On Linux, run it where bubblewrap can create user namespaces.
 
 ## Project structure
 
 ```
 src/
+  editor/      — Line editing, history, popup and raw terminal handling
+  unicode_width/ — Terminal character widths and Unicode tables
   main.zig     — CLI entry point, REPL loop
   config.zig   — Configuration loading from the config file and environment
   history.zig  — Prompt history: where it is stored, and when it is saved

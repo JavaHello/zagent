@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real API -> agent -> sandbox boundary without paid API calls."""
+from mock_api import send_response
+
 import http.server
 import json
 import os
@@ -88,12 +90,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
             else:
                 output = [reasoning, {'id': f'msg_{len(requests)}', 'type': 'message', 'role': 'assistant',
                     'status': 'completed', 'content': [{'type': 'output_text', 'text': 'BOUNDARY_TEST_COMPLETE', 'annotations': []}]}]
-            data = json.dumps({'id': f'resp_{len(requests)}', 'object': 'response', 'status': 'completed', 'error': None, 'output': output}).encode()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            send_response(self, body, {'id': f'resp_{len(requests)}', 'object': 'response', 'status': 'completed', 'error': None, 'output': output})
 
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
     calls[9] = ('shell', {'command': f"python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", {server.server_port}), timeout=1)'"})

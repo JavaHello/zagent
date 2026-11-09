@@ -9,7 +9,7 @@ const banner = @import("banner.zig");
 const term = @import("term.zig");
 const text = @import("text.zig");
 const Screen = @import("screen.zig").Screen;
-const Linenoise = @import("linenoise").Linenoise;
+const Linenoise = @import("editor/main.zig").Linenoise;
 
 // ANSI colour codes
 const RESET = "\x1b[0m";
@@ -39,7 +39,7 @@ const HELP =
 ;
 
 // Prompt passed to linenoise. Colour codes are fine here because
-// linenoize's width() implementation correctly ignores ANSI SGR sequences.
+// the editor's width() implementation correctly ignores ANSI SGR sequences.
 // The arrow is the whole prompt: the word it used to carry said nothing that
 // the colour and the position do not.
 const PROMPT = BOLD ++ GREEN ++ "\xe2\x9d\xaf" ++ RESET ++ " ";
@@ -451,6 +451,8 @@ fn printToStderr(
 // The other modules are only reachable from `main`, which a test build never
 // analyzes, so their tests would otherwise be dropped from `zig build test`.
 test {
+    _ = @import("editor/main.zig");
+    _ = @import("unicode_width/main.zig");
     _ = @import("agent.zig");
     _ = @import("sandbox.zig");
     _ = @import("session.zig");

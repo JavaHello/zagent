@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Partial/failed Responses must never dispatch a function call or silently succeed."""
+from mock_api import send_response
+
 import http.server
 import json
 from pathlib import Path
@@ -22,12 +24,7 @@ class API(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         requests.append(body)
         assert 'input' in body and 'messages' not in body
-        data = json.dumps(replies.pop(0) if replies else reply).encode()
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        send_response(self, body, replies.pop(0) if replies else reply)
 
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -93,6 +90,7 @@ try:
         # A call too large for the budget leaves no text to continue. The model
         # is asked instead to retry in smaller steps, and the partial call is
         # still never executed.
+        partial = cases[0][0]
         replies.extend([partial, completed_text('Split into chunks.')])
         requests.clear()
         result = subprocess.run([str(binary), 'Perform the task'], cwd=directory, env=env,
@@ -104,7 +102,6 @@ try:
                    for item in requests[1]['input']), requests[1]
         assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
 
-        partial = cases[0][0]
         replies.extend([
             {'status': 'completed', 'output': [{'type': 'function_call', 'call_id': 'read_evidence',
                 'name': 'read_file', 'arguments': json.dumps({'path': 'evidence.txt'})}]},

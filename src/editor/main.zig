@@ -399,6 +399,7 @@ pub const Linenoise = struct {
 };
 
 test "all" {
+    _ = @import("unicode.zig");
     _ = @import("history.zig");
     _ = @import("state.zig");
 }

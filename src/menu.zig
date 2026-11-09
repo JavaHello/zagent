@@ -1,7 +1,7 @@
 const std = @import("std");
 const term = @import("term.zig");
 const sanitize = @import("text.zig");
-const RawTerminal = @import("linenoise").RawTerminal;
+const RawTerminal = @import("editor/main.zig").RawTerminal;
 
 // ANSI colour codes
 const RESET = "\x1b[0m";

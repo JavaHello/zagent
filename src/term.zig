@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const wcwidth = @import("wcwidth").wcwidth;
+const wcwidth = @import("unicode_width/main.zig").wcwidth;
 const text = @import("text.zig");
 
 /// Used when the terminal size cannot be read, and on Windows.

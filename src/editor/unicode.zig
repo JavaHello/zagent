@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
-const wcwidth = @import("wcwidth").wcwidth;
+const wcwidth = @import("../unicode_width/main.zig").wcwidth;
 
 pub fn width(s: []const u8) usize {
     var result: usize = 0;
@@ -27,4 +27,16 @@ pub fn width(s: []const u8) usize {
     }
 
     return result;
+}
+
+test "editor measures colored multilingual prompts" {
+    try std.testing.expectEqual(@as(usize, 6), width("\x1b[1;32m❯\x1b[0m 中文"));
+    try std.testing.expectEqual(@as(usize, 1), width("e\u{301}"));
+    try std.testing.expectEqual(@as(usize, 2), width("😀"));
+    try std.testing.expectEqual(@as(usize, 0), width(""));
+}
+
+test "editor rejects invalid UTF8 and control widths" {
+    try std.testing.expectEqual(@as(usize, 0), width("\xff"));
+    try std.testing.expectEqual(@as(usize, 0), width("abc\t"));
 }

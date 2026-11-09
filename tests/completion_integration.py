@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """A task must not exit successfully when its completion check rejects it."""
+from mock_api import send_response
+
 import http.server
 import json
 from pathlib import Path
@@ -17,15 +19,11 @@ class API(http.server.BaseHTTPRequestHandler):
         pass
 
     def reply(self, payload):
-        data = json.dumps(payload).encode()
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        send_response(self, self.request_body, payload)
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        self.request_body = body
         assert self.path == '/v1/responses' and 'messages' not in body
         if not body.get('tools'):
             scenario['checks'] += 1

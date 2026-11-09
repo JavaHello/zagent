@@ -147,19 +147,19 @@ fn setString(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !voi
 }
 
 fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []const u8, value: []const u8) !void {
-    if (std.ascii.eqlIgnoreCase(key, "AI_PROVIDER") or std.ascii.eqlIgnoreCase(key, "PROVIDER")) {
+    if (std.ascii.eqlIgnoreCase(key, "AI_PROVIDER")) {
         try setString(allocator, &config.provider, value);
-    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_API_KEY") or std.ascii.eqlIgnoreCase(key, "AI_KEY")) {
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_KEY")) {
         try setString(allocator, &config.api_key, value);
-    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_BASE_URL") or std.ascii.eqlIgnoreCase(key, "AI_URL")) {
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_URL")) {
         try setString(allocator, &config.base_url, value);
-    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MODEL") or std.ascii.eqlIgnoreCase(key, "AI_MODEL")) {
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_MODEL")) {
         try setString(allocator, &config.model, value);
-    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_TOKENS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
-    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_ITERATIONS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
         config.max_iterations = std.fmt.parseInt(u32, value, 10) catch default_max_iterations;
-    } else if (std.ascii.eqlIgnoreCase(key, "OPENAI_MAX_VERIFICATIONS") or std.ascii.eqlIgnoreCase(key, "AI_MAX_VERIFICATIONS")) {
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_VERIFICATIONS")) {
         config.max_verifications = std.fmt.parseInt(u32, value, 10) catch default_max_verifications;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MARKDOWN")) {
         config.markdown = parseBool(value);
@@ -337,7 +337,7 @@ fn resolve(
     var base_url = try resolveSetting(
         allocator,
         env,
-        &.{ "OPENAI_BASE_URL", "AI_URL" },
+        &.{"AI_URL"},
         &file_config.base_url,
         spec.base_url,
     );
@@ -347,7 +347,7 @@ fn resolve(
     const model = try resolveSetting(
         allocator,
         env,
-        &.{ "OPENAI_MODEL", "AI_MODEL" },
+        &.{"AI_MODEL"},
         &file_config.model,
         spec.model,
     );
@@ -372,21 +372,21 @@ fn resolve(
     const max_tokens = try resolveU32(
         allocator,
         env,
-        &.{ "OPENAI_MAX_TOKENS", "AI_MAX_TOKENS" },
+        &.{"AI_MAX_TOKENS"},
         file_config.max_tokens,
         default_max_tokens,
     );
     const max_iterations = try resolveU32(
         allocator,
         env,
-        &.{ "OPENAI_MAX_ITERATIONS", "AI_MAX_ITERATIONS" },
+        &.{"AI_MAX_ITERATIONS"},
         file_config.max_iterations,
         default_max_iterations,
     );
     const max_verifications = try resolveU32(
         allocator,
         env,
-        &.{ "OPENAI_MAX_VERIFICATIONS", "AI_MAX_VERIFICATIONS" },
+        &.{"AI_MAX_VERIFICATIONS"},
         file_config.max_verifications,
         default_max_verifications,
     );
@@ -595,7 +595,7 @@ test "verification budget prefers the environment and keeps zero" {
         var env = try testEnv(allocator, &.{});
         defer env.deinit();
 
-        var file_config = try testFile(allocator, &.{.{ "OPENAI_MAX_VERIFICATIONS", "2" }});
+        var file_config = try testFile(allocator, &.{.{ "AI_MAX_VERIFICATIONS", "2" }});
         defer file_config.deinit(allocator);
 
         const config = try resolve(allocator, &file_config, &env);
@@ -750,8 +750,8 @@ test "explicit environment beats the preset" {
     const allocator = std.testing.allocator;
     var env = try testEnv(allocator, &.{
         .{ "AI_PROVIDER", "deepseek" },
-        .{ "OPENAI_BASE_URL", "https://proxy.example/v1/" },
-        .{ "OPENAI_MODEL", "deepseek-v4-pro" },
+        .{ "AI_URL", "https://proxy.example/v1/" },
+        .{ "AI_MODEL", "deepseek-v4-pro" },
     });
     defer env.deinit();
 
@@ -1037,4 +1037,78 @@ test "the config is read from the path itself or from a config file inside it" {
         defer allocator.free(contents);
         try std.testing.expect(std.mem.indexOf(u8, contents, "from-the-directory") != null);
     }
+}
+
+test "provider neutral settings win independently of obsolete environment aliases" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "AI_URL", "https://example.test/v1///" },
+        .{ "AI_MODEL", "current-model" },
+        .{ "AI_MAX_TOKENS", "1024" },
+        .{ "AI_MAX_ITERATIONS", "12" },
+        .{ "AI_MAX_VERIFICATIONS", "2" },
+        .{ "OPENAI_BASE_URL", "https://obsolete.test" },
+        .{ "OPENAI_MODEL", "obsolete-model" },
+        .{ "OPENAI_MAX_TOKENS", "1" },
+        .{ "OPENAI_MAX_ITERATIONS", "1" },
+        .{ "OPENAI_MAX_VERIFICATIONS", "1" },
+    });
+    defer env.deinit();
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("https://example.test/v1", config.base_url);
+    try std.testing.expectEqualStrings("current-model", config.model);
+    try std.testing.expectEqual(@as(u32, 1024), config.max_tokens);
+    try std.testing.expectEqual(@as(u32, 12), config.max_iterations);
+    try std.testing.expectEqual(@as(u32, 2), config.max_verifications);
+}
+
+test "obsolete config names do not populate current settings" {
+    const allocator = std.testing.allocator;
+    var file_config = try testFile(allocator, &.{
+        .{ "PROVIDER", "deepseek" },
+        .{ "OPENAI_API_KEY", "old-key" },
+        .{ "OPENAI_BASE_URL", "https://obsolete.test" },
+        .{ "OPENAI_MODEL", "old-model" },
+        .{ "OPENAI_MAX_TOKENS", "1" },
+        .{ "OPENAI_MAX_ITERATIONS", "1" },
+        .{ "OPENAI_MAX_VERIFICATIONS", "1" },
+    });
+    defer file_config.deinit(allocator);
+    try std.testing.expect(file_config.provider == null);
+    try std.testing.expect(file_config.api_key == null);
+    try std.testing.expect(file_config.base_url == null);
+    try std.testing.expect(file_config.model == null);
+    try std.testing.expect(file_config.max_tokens == null);
+    try std.testing.expect(file_config.max_iterations == null);
+    try std.testing.expect(file_config.max_verifications == null);
+}
+
+test "obsolete environment settings cannot override config values" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "OPENAI_BASE_URL", "https://obsolete.test" },
+        .{ "OPENAI_MODEL", "old-model" },
+        .{ "OPENAI_MAX_TOKENS", "1" },
+        .{ "OPENAI_MAX_ITERATIONS", "1" },
+        .{ "OPENAI_MAX_VERIFICATIONS", "1" },
+    });
+    defer env.deinit();
+    var file_config = try testFile(allocator, &.{
+        .{ "AI_URL", "https://current.test/v1" },
+        .{ "AI_MODEL", "current-model" },
+        .{ "AI_MAX_TOKENS", "2048" },
+        .{ "AI_MAX_ITERATIONS", "10" },
+        .{ "AI_MAX_VERIFICATIONS", "0" },
+    });
+    defer file_config.deinit(allocator);
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("https://current.test/v1", config.base_url);
+    try std.testing.expectEqualStrings("current-model", config.model);
+    try std.testing.expectEqual(@as(u32, 2048), config.max_tokens);
+    try std.testing.expectEqual(@as(u32, 10), config.max_iterations);
+    try std.testing.expectEqual(@as(u32, 0), config.max_verifications);
 }

@@ -1,5 +1,5 @@
 const std = @import("std");
-const Linenoise = @import("linenoise").Linenoise;
+const Linenoise = @import("editor/main.zig").Linenoise;
 
 /// Prompts are remembered between runs, so ↑ recalls what was asked in an
 /// earlier session and not just in this one. None of this is required for a

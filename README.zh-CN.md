@@ -84,12 +84,11 @@ zagent '继续完成，检查已有文件和测试结果'
 ```sh
 zig build
 zig build test
-python3 tests/sandbox_integration.py
-python3 tests/completion_integration.py
-python3 tests/responses_failure_integration.py
-python3 tests/menu_integration.py
+zig build test-integration
 ```
 
 端到端测试通过本地模拟 API 驱动真实 zagent，覆盖文件编辑、补丁、搜索、工作目录隔离、符号链接逃逸、环境变量隔离、网络隔离、服务错误重试、会话恢复、执行上限退出状态和运行期间替换二进制。
 
 完整工具及 MCP 配置说明见 [README.md](README.md)。
+
+单元测试覆盖应用、内置行编辑器和 Unicode 宽度计算；6 个集成测试脚本使用 Python 3、本地模拟 API 和真实终端，验证流式输出、沙箱、任务完成检查、响应错误、选择菜单与补全。行编辑器位于 `src/editor`，字符宽度实现位于 `src/unicode_width`，无需本地依赖包。配置文件与通用环境变量统一使用 `AI_*` 名称。

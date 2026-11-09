@@ -158,3 +158,41 @@ pub fn sliceWidth(s: []const u8) !isize {
 
     return width;
 }
+
+test "terminal widths cover controls combining marks CJK and emoji" {
+    const cases = .{
+        .{ @as(u21, 0), @as(isize, 0) },
+        .{ @as(u21, '\n'), @as(isize, -1) },
+        .{ @as(u21, 0x7f), @as(isize, -1) },
+        .{ @as(u21, 'A'), @as(isize, 1) },
+        .{ @as(u21, 0x301), @as(isize, 0) },
+        .{ @as(u21, 0x200d), @as(isize, 0) },
+        .{ @as(u21, '中'), @as(isize, 2) },
+        .{ @as(u21, 0x1f600), @as(isize, 2) },
+    };
+    inline for (cases) |case| try testing.expectEqual(case[1], wcwidth(case[0]));
+}
+
+test "string widths validate UTF8 and stop on controls" {
+    try testing.expectEqual(@as(isize, 0), try sliceWidth(""));
+    try testing.expectEqual(@as(isize, 5), try sliceWidth("Ae\u{301}中!"));
+    try testing.expectEqual(@as(isize, -1), try sliceWidth("hello\n世界"));
+    try testing.expectError(error.InvalidUtf8, sliceWidth("\xff"));
+    try testing.expectEqual(@as(isize, 3), wcswidth(&.{ 'A', '中', 0x301 }));
+    try testing.expectEqual(@as(isize, -1), wcswidth(&.{ 'A', '\t' }));
+}
+
+test "width tables have ordered nonoverlapping valid ranges" {
+    inline for (.{ &zero_width, &wide_eastasian }) |table| {
+        for (table, 0..) |range, i| {
+            try testing.expect(range[0] <= range[1]);
+            if (i > 0) try testing.expect(table[i - 1][1] < range[0]);
+            try testing.expect(tableBisearch(range[0], table));
+            try testing.expect(tableBisearch(range[1], table));
+        }
+    }
+    for (zero_width_cf, 0..) |cp, i| {
+        if (i > 0) try testing.expect(zero_width_cf[i - 1] < cp);
+        try testing.expect(listBisearch(cp, &zero_width_cf));
+    }
+}
