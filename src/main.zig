@@ -130,7 +130,9 @@ pub fn main(init: std.process.Init) !void {
         try std.Io.File.stdout().writeStreamingAll(io, "Usage: zagent [query ...]\n" ++
             "With no query, start an interactive conversation.\n\n" ++
             "  --help, -h          Show this help\n" ++
-            "  --version           Show version\n\n" ++
+            "  --version           Show version\n" ++
+            "  login / logout      Sign in with ChatGPT / remove local credentials\n" ++
+            "  models              List models for the selected provider\n\n" ++
             "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
             "AI_SESSION_FILE       Save and resume this workspace's conversation\n" ++
@@ -146,6 +148,18 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.items.len == 2 and std.mem.eql(u8, args.items[1], "--version")) {
         try std.Io.File.stdout().writeStreamingAll(io, "zagent 0.1.0 (Zig 0.17)\n");
+        return;
+    }
+
+    if (args.items.len == 2 and (std.mem.eql(u8, args.items[1], "login") or std.mem.eql(u8, args.items[1], "logout"))) {
+        const auth = @import("codex_auth.zig");
+        const auth_path = try auth.path(allocator, env);
+        defer allocator.free(auth_path);
+        if (std.mem.eql(u8, args.items[1], "login")) {
+            try auth.login(allocator, io, auth_path);
+        } else {
+            try auth.logout(io, auth_path);
+        }
         return;
     }
 
@@ -169,6 +183,16 @@ pub fn main(init: std.process.Init) !void {
         else => return err,
     };
     defer config.deinit();
+
+    if (args.items.len == 2 and std.mem.eql(u8, args.items[1], "models")) {
+        var client = @import("openai.zig").Client.init(allocator, io, config);
+        defer client.deinit();
+        const models = try client.listModels();
+        defer allocator.free(models);
+        try std.Io.File.stdout().writeStreamingAll(io, models);
+        try std.Io.File.stdout().writeStreamingAll(io, "\n");
+        return;
+    }
 
     // The terminal is created here rather than inside the REPL so that the
     // ask_user menu also works in single-query mode.
@@ -292,7 +316,7 @@ fn runRepl(
     }
     try writeOut(&screen, stdout, io, DIM ++ "  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
 
-    if (config.api_key.len == 0) {
+    if (config.api_key.len == 0 and config.provider != .codex) {
         // Name the variable that actually applies, so a provider user is not
         // told to export a key for some other service.
         const key_var = if (config.provider) |selected| selected.spec().api_key_env else "OPENAI_API_KEY";

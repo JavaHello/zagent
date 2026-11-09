@@ -20,6 +20,7 @@ pub const Spec = struct {
 pub const Provider = enum {
     openai,
     deepseek,
+    codex,
 
     /// Case-insensitive lookup. Returns null when the name is unknown or blank.
     pub fn fromName(name: []const u8) ?Provider {
@@ -37,6 +38,11 @@ pub const Provider = enum {
                 .base_url = "https://api.openai.com/v1",
                 .model = "gpt-4o-mini",
                 .api_key_env = "OPENAI_API_KEY",
+            },
+            .codex => .{
+                .base_url = @import("codex_auth.zig").base_url,
+                .model = "gpt-5.4",
+                .api_key_env = "ZAGENT_CODEX_UNUSED_API_KEY",
             },
             .deepseek => .{
                 .base_url = "https://api.deepseek.com",

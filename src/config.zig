@@ -470,15 +470,23 @@ pub const Config = struct {
     memory_auto: bool,
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
+    codex_auth_path: ?[]const u8 = null,
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Config {
         var file_config = try loadConfigFile(io, allocator, env);
         defer file_config.deinit(allocator);
 
-        return resolve(allocator, &file_config, env);
+        var config = try resolve(allocator, &file_config, env);
+        errdefer config.deinit();
+        if (config.provider == .codex) {
+            if (!std.mem.eql(u8, config.base_url, @import("codex_auth.zig").base_url)) return error.CodexEndpointMustBeOfficial;
+            config.codex_auth_path = try @import("codex_auth.zig").path(allocator, env);
+        }
+        return config;
     }
 
     pub fn deinit(self: Config) void {
+        if (self.codex_auth_path) |path| self.allocator.free(path);
         self.allocator.free(self.api_key);
         self.allocator.free(self.base_url);
         self.allocator.free(self.model);

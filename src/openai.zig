@@ -1,4 +1,5 @@
 const std = @import("std");
+const codex_auth = @import("codex_auth.zig");
 const Config = @import("config.zig").Config;
 
 // JSON schema for the tools exposed to the model.
@@ -109,6 +110,8 @@ pub const Client = struct {
     io: std.Io,
     http_client: std.http.Client,
     api_key: []const u8,
+    codex_auth_path: ?[]const u8 = null,
+    credentials: ?codex_auth.Credentials = null,
     base_url: []const u8,
     model: []const u8,
     max_tokens: u32,
@@ -131,11 +134,43 @@ pub const Client = struct {
             .io = io,
             .http_client = .{ .allocator = allocator, .io = io },
             .api_key = config.api_key,
+            .codex_auth_path = config.codex_auth_path,
             .base_url = config.base_url,
             .model = config.model,
             .max_tokens = config.max_tokens,
             .http_error = null,
         };
+    }
+
+    fn authenticate(self: *Client) !void {
+        const path = self.codex_auth_path orelse return;
+        const credentials = try codex_auth.load(self.allocator, self.io, path);
+        if (self.credentials) |previous| previous.deinit(self.allocator);
+        self.credentials = credentials;
+    }
+
+    pub fn listModels(self: *Client) ![]u8 {
+        try self.authenticate();
+        const key = if (self.credentials) |c| c.parsed.value.access_token else self.api_key;
+        const bearer = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
+        defer self.allocator.free(bearer);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/models{s}", .{ self.base_url, if (self.codex_auth_path != null) "?client_version=0.101.0" else "" });
+        defer self.allocator.free(url);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const headers = [_]std.http.Header{
+            .{ .name = "ChatGPT-Account-ID", .value = if (self.credentials) |c| c.account_id else "" },
+            .{ .name = "originator", .value = "codex_cli_rs" },
+        };
+        const result = try self.http_client.fetch(.{
+            .location = .{ .url = url }, .method = .GET,
+            .headers = .{ .authorization = .{ .override = bearer } },
+            .extra_headers = if (self.credentials != null) &headers else &.{},
+            .redirect_behavior = .unhandled,
+            .response_writer = &out.writer,
+        });
+        if (result.status != .ok) return error.ModelsRequestFailed;
+        return self.allocator.dupe(u8, out.written());
     }
 
     /// Forget the token totals of the previous query. Called when a new query
@@ -178,6 +213,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         if (self.http_error) |message| self.allocator.free(message);
+        if (self.credentials) |credentials| credentials.deinit(self.allocator);
         self.http_client.deinit();
     }
 
@@ -221,24 +257,30 @@ pub const Client = struct {
         const response_url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{std.mem.trimEnd(u8, self.base_url, "/")});
         defer self.allocator.free(response_url);
 
-        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key});
+        try self.authenticate();
+        const key = if (self.credentials) |c| c.parsed.value.access_token else self.api_key;
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
         defer self.allocator.free(auth_header);
 
         var max_tokens = self.max_tokens;
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
-            const req_json = try buildRequestWithTools(
+            const ordinary_json = try buildRequestWithTools(
                 self.allocator,
                 self.model,
                 messages,
                 max_tokens,
                 tools,
                 extra_tools,
-                sink != null,
+                sink != null or self.codex_auth_path != null,
             );
+            defer self.allocator.free(ordinary_json);
+            const req_json = if (self.codex_auth_path != null) try codexRequest(self.allocator, ordinary_json) else try self.allocator.dupe(u8, ordinary_json);
             defer self.allocator.free(req_json);
 
-            const response = if (sink) |stream_sink|
+            const response = if (self.codex_auth_path != null)
+                try self.performStreamWithRetry(response_url, auth_header, req_json, sink orelse .{ .context = self, .onText = discardText })
+            else if (sink) |stream_sink|
                 try self.performStreamWithRetry(response_url, auth_header, req_json, stream_sink)
             else
                 try self.performResponseWithRetry(response_url, auth_header, req_json);
@@ -339,12 +381,17 @@ pub const Client = struct {
             return parsed;
         }
 
+        const headers = [_]std.http.Header{
+            .{ .name = "ChatGPT-Account-ID", .value = if (self.credentials) |c| c.account_id else "" },
+            .{ .name = "originator", .value = "codex_cli_rs" },
+        };
         const uri = try std.Uri.parse(response_url);
         var req = try self.http_client.request(.POST, uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = auth_header },
             },
+            .extra_headers = if (self.credentials != null) &headers else &.{},
             .redirect_behavior = .unhandled,
         });
         defer req.deinit();
@@ -1035,4 +1082,35 @@ test "token estimates count cjk and ascii sensibly" {
     try std.testing.expectEqual(@as(u64, 2), estimateTokens("abcde"));
     // Each CJK codepoint is one token, not the three bytes it encodes as.
     try std.testing.expectEqual(@as(u64, 2), estimateTokens("你好"));
+}
+
+fn discardText(_: *anyopaque, _: []const u8) void {}
+
+/// Codex accepts streaming requests and instructions, but no output token cap.
+fn codexRequest(a: std.mem.Allocator, ordinary: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, ordinary, .{});
+    defer parsed.deinit();
+    _ = parsed.value.object.swapRemove("max_output_tokens");
+    const input = parsed.value.object.getPtr("input") orelse return error.InvalidRequest;
+    var instructions: std.Io.Writer.Allocating = .init(a);
+    defer instructions.deinit();
+    var i: usize = 0;
+    while (i < input.array.items.len) {
+        const item = input.array.items[i];
+        const role = if (item == .object) item.object.get("role") else null;
+        if (role != null and role.? == .string and (std.mem.eql(u8, role.?.string, "system") or std.mem.eql(u8, role.?.string, "developer"))) {
+            if (item.object.get("content")) |content| {
+                if (content == .string) try instructions.writer.writeAll(content.string);
+                if (content == .array) for (content.array.items) |block| {
+                    if (block == .object) if (block.object.get("text")) |v| {
+                        if (v == .string) try instructions.writer.writeAll(v.string);
+                    };
+                };
+                try instructions.writer.writeByte('\n');
+            }
+            _ = input.array.orderedRemove(i);
+        } else i += 1;
+    }
+    try parsed.value.object.put(parsed.arena.allocator(), "instructions", .{ .string = instructions.written() });
+    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }

@@ -92,3 +92,28 @@ zig build test-integration
 完整工具及 MCP 配置说明见 [README.md](README.md)。
 
 单元测试覆盖应用、内置行编辑器和 Unicode 宽度计算；6 个集成测试脚本使用 Python 3、本地模拟 API 和真实终端，验证流式输出、沙箱、任务完成检查、响应错误、选择菜单与补全。行编辑器位于 `src/editor`，字符宽度实现位于 `src/unicode_width`，无需本地依赖包。配置文件与通用环境变量统一使用 `AI_*` 名称。
+
+## 使用 ChatGPT / Codex 订阅登录
+
+无需安装 Codex CLI。运行已构建的 zagent：
+
+```sh
+zagent login
+# 在任意设备的浏览器打开提示的官方页面，输入一次性设备码。
+export AI_PROVIDER=codex
+zagent models
+# 从返回的模型列表选择账号有权使用的模型：
+export AI_MODEL=gpt-5.4
+zagent "查看这个项目"
+zagent logout
+```
+
+这是官方 Codex 设备码授权协议的独立客户端实现，并非 OpenAI 发布的客户端。账号需要允许设备码登录；若提示不可用，请检查 ChatGPT 的设备码授权设置。无需在低内存机器上启动浏览器。
+
+ChatGPT 订阅使用 `https://chatgpt.com/backend-api/codex/responses` 和 `/models`，不能把订阅令牌当作 `https://api.openai.com/v1` 的 API Key。`AI_PROVIDER=openai` 仍使用 API Key 访问 `/v1/responses`、`/v1/models`，计费和权限独立。Codex 模式禁止修改 `AI_URL`，`AI_KEY` 不用于该模式的认证。模型列表保持服务端原始 JSON 格式。
+
+凭据保存在 `$HOME/.config/zagent/codex-auth.json`（权限 `0600`），请求前检查访问令牌有效期，临近过期时刷新并保存轮换后的刷新令牌。请勿分享该文件。`logout` 删除本地凭据，不撤销服务端授权。刷新失败时重新执行 `zagent login`。不读写现有 Codex CLI 的凭据。避免多个进程同时登录或刷新同一个账号。
+
+Codex 请求使用流式响应，即使调用者只需要最终结果；系统提示转入 `instructions`，不发送该后端不支持的 `max_output_tokens`。订阅的可用模型和限额以账号及服务端返回为准；这些后端协议可能随官方客户端更新而变化。
+
+参考：[官方认证说明](https://developers.openai.com/codex/auth)、[官方网关路由说明](https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway?gateway-auth=api-key)。
