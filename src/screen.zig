@@ -121,11 +121,16 @@ pub const Screen = struct {
 
     /// Clear the editor's rows and put the cursor back where the log ended, so
     /// the answer that follows starts right above the prompt.
+    ///
+    /// The position to return to is the one `prepareInput` saved before the
+    /// editor took the cursor away. Saving it again here would save the
+    /// editor's cursor instead, and everything written next — the question,
+    /// the spinner, the answer — would land in the prompt rows and be erased
+    /// by the next draw.
     pub fn endInput(self: *Screen) !void {
         if (!self.active) return;
         var buf: [64]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try w.writeAll(SAVE_CURSOR);
         try w.print("\x1b[{d};1H\x1b[0J", .{self.inputTop()});
         try w.writeAll(RESTORE_CURSOR);
         try self.out.writeStreamingAll(self.io, w.buffered());
@@ -454,11 +459,61 @@ test "the conversation is drawn in a region above the reserved input row" {
     try expect(std.mem.indexOf(u8, repainted, "hello\r\nworld\r\n") != null);
 
     // Finishing the read clears the prompt rows and leaves the log cursor.
+    // `prepareInput` saves that cursor; `endInput` must restore it rather than
+    // save the editor's own position over it.
+    try s.prepareInput();
+    const saved = try readOutput(tmp.dir, allocator);
+    defer allocator.free(saved);
+    try expect(std.mem.endsWith(u8, saved, SAVE_CURSOR));
+    const mark = saved.len;
+
     try s.endInput();
     const after = try readOutput(tmp.dir, allocator);
     defer allocator.free(after);
-    // The rows of a three-row input block are handed back.
-    try expect(std.mem.endsWith(u8, after, "\x1b7\x1b[22;1H\x1b[0J\x1b8"));
+    const cleared = after[mark..];
+    // The rows of the input block are handed back, and the only cursor save is
+    // the one `prepareInput` wrote: saving here would strand the next write in
+    // the prompt rows, where the following draw erases it.
+    try expect(std.mem.indexOf(u8, cleared, SAVE_CURSOR) == null);
+    try expect(std.mem.endsWith(u8, cleared, "\x1b[24;1H\x1b[0J\x1b8"));
+
+    // The question is written straight after the restore, so it appears in the
+    // conversation immediately instead of waiting for a full repaint.
+    try s.writeLog("hello\n");
+    const echoed = try readOutput(tmp.dir, allocator);
+    defer allocator.free(echoed);
+    try expect(std.mem.endsWith(u8, echoed, "\x1b[24;1H\x1b[0J\x1b8hello\n"));
+}
+
+test "a multi-row input is handed back and the next write repaints the log" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+
+    var s = Screen.init(allocator, std.testing.io, true);
+    defer s.transcript.deinit(allocator);
+    s.out = file;
+    s.cols = 40;
+
+    try s.writeLog("question\n");
+    try s.reserveInput(3, false);
+    try s.endInput();
+
+    const cleared = try readOutput(tmp.dir, allocator);
+    defer allocator.free(cleared);
+    // The rows of the three-row input block are cleared.
+    try expect(std.mem.endsWith(u8, cleared, "\x1b[22;1H\x1b[0J\x1b8"));
+    try expect(s.dirty);
+
+    // The next write gives the rows back with a one-row prompt at the bottom.
+    try s.writeLog("answer\n");
+    const repainted = try readOutput(tmp.dir, allocator);
+    defer allocator.free(repainted);
+    try expect(std.mem.indexOf(u8, repainted, "\x1b[1;23r") != null);
+    try expect(std.mem.indexOf(u8, repainted, "question\r\n") != null);
+    try expect(std.mem.endsWith(u8, repainted, "answer\n"));
 }
 
 test "a taller input repaints the log in a shorter region" {
