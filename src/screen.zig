@@ -90,13 +90,15 @@ pub const Screen = struct {
         return true;
     }
 
-    pub fn scroll(self: *Screen, up: bool) !void {
+    /// Wheel events advance a few visual rows; keyboard paging keeps its
+    /// viewport-sized step. Wrapped lines count as separate visual rows.
+    pub fn scroll(self: *Screen, up: bool, page: bool) !void {
         _ = try self.drain();
-        const page = @max(@as(usize, 1), self.logBottom() -| 1);
+        const step = if (page) @max(@as(usize, 1), self.logBottom() -| 1) else 3;
         const total = try visualRows(self.allocator, self.transcript.items, self.cols);
         defer self.allocator.free(total);
         const limit = total.len -| self.logBottom();
-        self.scroll_rows = if (up) @min(limit, self.scroll_rows +| page) else self.scroll_rows -| page;
+        self.scroll_rows = if (up) @min(limit, self.scroll_rows +| step) else self.scroll_rows -| step;
         self.dirty = true;
     }
 
@@ -554,6 +556,33 @@ test "worker progress reserves a transient row above input without entering hist
     try std.testing.expectEqual(@as(usize, 14), s.inputTop());
 }
 
+test "wheel scrolls three visual rows while keyboard scrolls a page" {
+    var s = Screen.init(std.testing.allocator, std.testing.io, false);
+    defer s.deinit();
+    s.rows = 12;
+    for (0..40) |_| try s.transcript.appendSlice(s.allocator, "line\n");
+
+    try s.scroll(true, false);
+    try std.testing.expectEqual(@as(usize, 3), s.scroll_rows);
+    try s.scroll(true, false);
+    try std.testing.expectEqual(@as(usize, 6), s.scroll_rows);
+    try s.scroll(false, false);
+    try std.testing.expectEqual(@as(usize, 3), s.scroll_rows);
+    try s.scroll(true, true);
+    try std.testing.expectEqual(@as(usize, 13), s.scroll_rows);
+    try s.scroll(false, true);
+    try std.testing.expectEqual(@as(usize, 3), s.scroll_rows);
+    try s.scroll(false, true);
+    try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
+
+    for (0..20) |_| try s.scroll(true, false);
+    const offsets = try visualRows(s.allocator, s.transcript.items, s.cols);
+    defer s.allocator.free(offsets);
+    try std.testing.expectEqual(offsets.len - s.logBottom(), s.scroll_rows);
+    for (0..20) |_| try s.scroll(false, false);
+    try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
+}
+
 test "buffered output is drained by the UI and keeps a scrolled viewport anchored" {
     const a = std.testing.allocator;
     var s = Screen.init(a, std.testing.io, true);
@@ -565,13 +594,13 @@ test "buffered output is drained by the UI and keeps a scrolled viewport anchore
     try s.writeLog("one\ntwo\nthree\nfour\nfive\nsix");
     try std.testing.expectEqual(@as(usize, 0), s.transcript.items.len);
     try std.testing.expect(try s.drain());
-    try s.scroll(true);
+    try s.scroll(true, false);
     try std.testing.expectEqual(@as(usize, 2), s.scroll_rows);
     try s.writeLog("\nseven\neight");
     try std.testing.expect(try s.drain());
     try std.testing.expectEqual(@as(usize, 4), s.scroll_rows);
-    try s.scroll(false);
-    try s.scroll(false);
+    try s.scroll(false, false);
+    try s.scroll(false, false);
     try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
     try std.testing.expect(!try s.drain());
 }

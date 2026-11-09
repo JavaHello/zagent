@@ -539,9 +539,9 @@ fn tickRuntime(context: ?*anyopaque) anyerror!bool {
     return runtime.tick();
 }
 
-fn scrollRuntime(context: ?*anyopaque, up: bool) anyerror!void {
+fn scrollRuntime(context: ?*anyopaque, up: bool, page: bool) anyerror!void {
     const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
-    try runtime.screen.scroll(up);
+    try runtime.screen.scroll(up, page);
 }
 
 /// Says what is being waited for before each server is started. Written to

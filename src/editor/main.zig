@@ -208,7 +208,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                                 }
                                 if (mouseWheel(report[0..length])) |up| {
                                     if (ln.scroll_callback) |scroll| {
-                                        try scroll(ln.layout_context, up);
+                                        try scroll(ln.layout_context, up, false);
                                         // Scrolling must not reopen a dismissed popup.
                                         if (ln.bottom_anchor) try state.refreshBottom(false) else try state.refreshLine();
                                     }
@@ -236,7 +236,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                                         '4', '8' => try state.editMoveEnd(),
                                         '5', '6' => {
                                             if (ln.scroll_callback) |scroll| {
-                                                try scroll(ln.layout_context, num == '5');
+                                                try scroll(ln.layout_context, num == '5', true);
                                                 try state.refreshLine();
                                             }
                                         },
@@ -407,7 +407,8 @@ pub const Linenoise = struct {
     layout_callback: ?LayoutCallback = null,
     layout_context: ?*anyopaque = null,
     tick_callback: ?*const fn (?*anyopaque) anyerror!bool = null,
-    scroll_callback: ?*const fn (?*anyopaque, bool) anyerror!void = null,
+    /// Direction (up) and whether to scroll a page rather than wheel lines.
+    scroll_callback: ?*const fn (?*anyopaque, bool, bool) anyerror!void = null,
     /// The line being edited when Ctrl-Z suspended it, restored and freed by
     /// the next `linenoise` call.
     pending_input: ?[]u8 = null,
