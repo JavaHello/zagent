@@ -15,8 +15,8 @@ pub fn requiresSandbox(io: std.Io, allocator: std.mem.Allocator, name: []const u
         return dangerousCommand(value.string);
     }
     // Resolve symlinks and relative paths before checking file-writing tools.
-    const key: []const u8 = if (std.mem.eql(u8, name, "http_request")) "save_to" else "path";
-    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "http_request")) {
+    const key: []const u8 = if (std.mem.eql(u8, name, "http")) "save_to" else "path";
+    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "http")) {
         if (obj.get(key)) |value| {
             if (value != .string) return error.InvalidArguments;
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
@@ -111,6 +111,8 @@ test "ordinary development commands run directly; system changes require sandbox
     }
     try std.testing.expect(try requiresSandbox(std.testing.io, a, "write", "{\"path\":\"/etc/hosts\"}"));
     try std.testing.expect(!try requiresSandbox(std.testing.io, a, "write", "{\"path\":\"src/main.zig\"}"));
-    try std.testing.expect(!try requiresSandbox(std.testing.io, a, "http_request", "{\"url\":\"https://example.com\"}"));
+    try std.testing.expect(!try requiresSandbox(std.testing.io, a, "http", "{\"url\":\"https://example.com\"}"));
+    try std.testing.expect(try requiresSandbox(std.testing.io, a, "http", "{\"url\":\"https://example.com\",\"save_to\":\"/etc/hosts\"}"));
+    try std.testing.expect(!try requiresSandbox(std.testing.io, a, "http", "{\"url\":\"https://example.com\",\"save_to\":\"download.txt\"}"));
     try std.testing.expectError(error.InvalidArguments, requiresSandbox(std.testing.io, a, "bash", "{}"));
 }

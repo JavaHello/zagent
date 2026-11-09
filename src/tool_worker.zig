@@ -104,12 +104,12 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
             };
             defer args.deinit(allocator);
             break :blk try tools.find(io, allocator, search, args);
-        } else if (std.mem.eql(u8, name, "http_request")) {
+        } else if (std.mem.eql(u8, name, "http")) {
             const request = tools.parseHttpRequest(allocator, arguments) catch |err| {
                 break :blk .{
                     .content = try std.fmt.allocPrint(
                         allocator,
-                        "Error: http_request arguments are unusable ({s}); it needs a 'url', and a 'method', 'headers', 'body', and 'save_to' it can use",
+                        "Error: http arguments are unusable ({s}); it needs a 'url', and a 'method', 'headers', 'body', and 'save_to' it can use",
                         .{@errorName(err)},
                     ),
                     .is_error = true,
@@ -152,9 +152,19 @@ test "write creates overwrites and rejects mixed modes; legacy names are removed
     const unchanged = try tmp.dir.readFileAlloc(io, "new.txt", a, .limited(1024));
     defer a.free(unchanged);
     try std.testing.expectEqualStrings("", unchanged);
-    for ([_][]const u8{ "shell", "read_file", "write_file", "edit_file", "list_dir" }) |name| {
+    for ([_][]const u8{ "shell", "read_file", "write_file", "edit_file", "list_dir", "http_request" }) |name| {
         try std.testing.expectError(error.UnknownTool, execute(io, a, &env, name, "{}"));
     }
+}
+
+test "http dispatches to request argument validation" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const result = try execute(std.testing.io, a, &env, "http", "{}");
+    defer result.deinit(a);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.startsWith(u8, result.content, "Error: http arguments are unusable"));
 }
 
 test "read write and ls operate on an existing file" {

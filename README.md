@@ -16,7 +16,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `ls` — list directory contents
   - `rg` / `grep` — search file contents; dynamically advertise `rg` if installed on PATH, otherwise `grep`
   - `fd` / `find` — find files by name; dynamically advertise `fd` if installed on PATH, otherwise `find`; prompt guidance follows the selected tools
-  - `http_request` — fetch a URL or call an API, without shelling out to `curl`
+  - `http` — fetch a URL or call an API, without shelling out to `curl`
   - `ask_user` — put a question to you as an interactive selection menu
 - **MCP servers** — start servers described in `mcp.json` and give the tools they offer to the model beside the built-in ones
 - **Multi-turn tool chaining** — the agent loops until the task is complete
@@ -369,12 +369,12 @@ so. Interactive menus also work in single-query mode and render on stderr.
 
 ### HTTP requests
 
-`http_request` fetches a URL or calls an API without going through `curl`,
+`http` fetches a URL or calls an API without going through `curl`,
 returning the status line, the response headers, and the body:
 
 ```
 ❯ fetch https://httpbin.org/json and tell me the content type
-  ⚙ http_request {"url":"https://httpbin.org/json"}
+  ⚙ http {"url":"https://httpbin.org/json"}
   ✓ HTTP/1.1 200 OK
     Date: Mon, 28 Sep 2026 06:21:24 GMT
     Content-Type: application/json
@@ -562,7 +562,7 @@ and what each brought. Seven behaviours are worth knowing:
 - **Timeouts.** A subprocess server is read with a deadline, and a request that
   runs out of time is reported to the model as a failed call. `std.http` has no
   read timeout, so an HTTP server that takes a request and never answers holds
-  the agent until it is interrupted — the same limitation `http_request` has.
+  the agent until it is interrupted — the same limitation `http` has.
 - **Not implemented.** Servers may ask the client for something mid-call
   (elicitation, sampling, a root list); zagent reports that as a failed call
   saying so. The tool list is also a snapshot from startup: a server that
@@ -665,7 +665,7 @@ src/
   provider.zig — Built-in provider presets
   openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
   tools.zig   — Tool implementations (bash, read, write,
-                apply_patch, ls, rg/grep, fd/find, http_request)
+                apply_patch, ls, rg/grep, fd/find, http)
   diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
   compact.zig — Context budget, safe cut points, and summary requests

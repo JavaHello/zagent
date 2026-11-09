@@ -30,7 +30,7 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
         .{ .name = "apply_patch", .label = "apply_patch…" },
         .{ .name = "grep", .label = "grep…" },
         .{ .name = "find", .label = "find…" },
-        .{ .name = "http_request", .label = "http_request…" },
+        .{ .name = "http", .label = "http…" },
         .{ .name = "remember", .label = "remember…" },
     };
     for (labels) |entry| {
@@ -555,7 +555,7 @@ pub const HttpRequest = struct {
     }
 };
 
-/// Parse an http_request tool call's arguments.
+/// Parse an http tool call's arguments.
 pub fn parseHttpRequest(allocator: std.mem.Allocator, arguments_json: []const u8) !HttpRequest {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
     defer parsed.deinit();
@@ -1455,7 +1455,8 @@ test "finalize tool content truncates on utf8 boundary" {
 
 test "every tool that waits has a progress label, ask_user does not" {
     try std.testing.expect(progressLabel("shell") == null);
-    const labelled = [_][]const u8{ "bash", "read", "write", "ls", "rg", "fd", "apply_patch", "grep", "find", "http_request" };
+    try std.testing.expect(progressLabel("http_request") == null);
+    const labelled = [_][]const u8{ "bash", "read", "write", "ls", "rg", "fd", "apply_patch", "grep", "find", "http" };
     for (labelled) |name| {
         const label = progressLabel(name) orelse return error.TestUnexpectedResult;
         // The label names the tool, so a user watching the line knows what is

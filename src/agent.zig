@@ -63,7 +63,7 @@ const SYSTEM_PROMPT =
     \\- Be concise and direct in your responses.
     \\- Before executing a new user task, briefly explain the goal and practical approach if no initial plan has already been provided. Do not repeat a plan already present in the conversation.
     \\- Use the bash tool to run Bash commands, install packages, or perform system operations.
-    \\- Use http_request for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
+    \\- Use http for URLs and APIs instead of shelling out to curl, and its save_to argument when downloading a file.
     \\- Use read to read a file. Use write with old_text and new_text for an exact unique text replacement, or apply_patch for a unified diff with enough context to place it. Do not rewrite a whole file for a partial edit, and do not edit files through the shell.
     \\- Use write with content only for a new file or full replacement; never combine content with old_text/new_text. A new file can also be created with apply_patch and a '--- /dev/null' header.
     \\- Use ls to explore directories.
