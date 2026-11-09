@@ -131,6 +131,8 @@ pub const LinenoiseState = struct {
     popup_items: []@import("main.zig").PopupItem = &.{},
     popup_selected: usize = 0,
     popup_rows: usize = 0,
+    /// Ctrl-L asked the host to draw its log again.
+    force_repaint: bool = false,
 
     const Self = @This();
 
@@ -158,6 +160,12 @@ pub const LinenoiseState = struct {
     }
 
     fn clearPopup(self: *Self) !void {
+        // At the bottom of the screen the whole input block is drawn again on
+        // every refresh, so there is nothing to erase here.
+        if (self.ln.bottom_anchor) {
+            self.popup_rows = 0;
+            return;
+        }
         if (self.popup_rows == 0) return;
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
@@ -185,6 +193,8 @@ pub const LinenoiseState = struct {
     }
 
     fn drawPopup(self: *Self) !void {
+        // Drawn by refreshBottom, above the input: there is no room below it.
+        if (self.ln.bottom_anchor) return;
         if (self.popup_items.len == 0) return;
         const visible = @min(self.popup_items.len, 6);
         const first = @min(self.popup_selected -| (visible / 2), self.popup_items.len - visible);
@@ -216,11 +226,21 @@ pub const LinenoiseState = struct {
         const count = self.popup_items.len;
         if (count == 0) return;
         self.popup_selected = if (forward) (self.popup_selected + 1) % count else (self.popup_selected + count - 1) % count;
+        if (self.ln.bottom_anchor) {
+            // Keep the items: only the highlighted row moved.
+            self.popup_rows = 0;
+            return self.refreshBottom(false);
+        }
         try self.clearPopup();
         try self.drawPopup();
     }
 
     pub fn dismissPopup(self: *Self) !void {
+        if (self.ln.bottom_anchor) {
+            self.freePopup();
+            self.popup_rows = 0;
+            return self.refreshBottom(false);
+        }
         try self.clearPopup();
         self.freePopup();
     }
@@ -235,6 +255,14 @@ pub const LinenoiseState = struct {
         try replacement.appendSlice(self.allocator, value);
         try replacement.appendSlice(self.allocator, self.buf.items[self.pos..]);
         const new_pos = value.len;
+        if (self.ln.bottom_anchor) {
+            self.freePopup();
+            self.popup_rows = 0;
+            self.buf.deinit(self.allocator);
+            self.buf = replacement;
+            self.pos = new_pos;
+            return self.refreshBottom(false);
+        }
         try self.clearPopup();
         self.freePopup();
         self.buf.deinit(self.allocator);
@@ -451,6 +479,13 @@ pub const LinenoiseState = struct {
     }
 
     pub fn finishEdit(self: *Self) !void {
+        if (self.ln.bottom_anchor) {
+            // The host clears the input rows and owns the cursor; moving down
+            // here would overwrite the reserved area or scroll the layout.
+            self.freePopup();
+            self.popup_rows = 0;
+            return;
+        }
         try self.clearPopup();
         if (self.max_rows > self.cursor_row + 1) {
             var buf: [64]u8 = undefined;
@@ -504,7 +539,123 @@ pub const LinenoiseState = struct {
         try self.stdout.writeStreamingAll(self.ln.io, aw.written());
     }
 
+    /// Lay the input out into display rows and note where the cursor lands.
+    const BottomLayout = struct {
+        bytes: std.Io.Writer.Allocating,
+        cursor: Position,
+        total_rows: usize,
+    };
+
+    fn bottomLayout(self: *Self) !BottomLayout {
+        var layout: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer layout.deinit();
+        const columns = @max(self.cols -| 1, 2);
+        var position: Position = .{ .col = width(self.prompt) };
+        try layout.writer.writeAll(self.prompt);
+        try writeInput(&layout.writer, self.buf.items[0..self.pos], &position, columns, self.ln.mask_mode);
+        const cursor = position;
+        try writeInput(&layout.writer, self.buf.items[self.pos..], &position, columns, self.ln.mask_mode);
+        return .{ .bytes = layout, .cursor = cursor, .total_rows = position.row + 1 };
+    }
+
+    /// Draw the editor anchored to the bottom of the screen.
+    ///
+    /// Absolute cursor addressing is used throughout: the block may grow or
+    /// shrink, and relative movement would depend on where the previous draw
+    /// left the cursor, which the conversation scrolling above it can change.
+    /// `recompute_popup` is false when only the highlight moved or the popup
+    /// was just dismissed.
+    fn refreshBottom(self: *Self, recompute_popup: bool) !void {
+        const rows = @max(term.getRows(self.stdout), 2);
+        // The window can change while a line is being edited; the host repaints
+        // when it does, and the editor must wrap for the new width.
+        self.cols = @max(getColumns(self.ln.io, self.stdin, self.stdout) catch self.cols, 4);
+        if (recompute_popup) {
+            self.freePopup();
+            self.popup_rows = 0;
+        }
+
+        var layout = try self.bottomLayout();
+        defer layout.bytes.deinit();
+        const cursor = layout.cursor;
+        const total_rows = layout.total_rows;
+
+        // The popup only appears above a single, unwrapped line, as inline.
+        if (recompute_popup and !self.ln.mask_mode and total_rows == 1) {
+            if (self.ln.popup_callback) |callback| {
+                self.popup_items = try callback(self.allocator, self.ln.io, self.buf.items[0..self.pos]);
+                self.popup_selected = 0;
+            }
+        }
+        const popup_wanted: usize = if (self.popup_items.len > 0) @min(self.popup_items.len, 6) + 1 else 0;
+        // A short terminal may not have room for the whole popup; drop it
+        // rather than let the input block start above the screen.
+        const popup_visible = @min(popup_wanted, rows -| 2);
+
+        // Keep at least one row of conversation above the input.
+        const max_input = @max(rows -| 1 - popup_visible, 1);
+        const visible = @min(total_rows, max_input);
+        if (cursor.row < self.viewport_start) self.viewport_start = cursor.row;
+        if (cursor.row >= self.viewport_start + visible) self.viewport_start = cursor.row - visible + 1;
+        self.viewport_start = @min(self.viewport_start, total_rows -| visible);
+        const cursor_row = cursor.row - self.viewport_start;
+
+        const reserved = visible + popup_visible;
+        if (self.ln.layout_callback) |callback| {
+            try callback(self.ln.layout_context, reserved, self.force_repaint);
+        }
+        self.force_repaint = false;
+        const input_top = rows - reserved + 1;
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const writer = &aw.writer;
+
+        if (popup_visible > 0) {
+            const item_rows = popup_visible - 1;
+            if (item_rows > 0) {
+                const first = @min(self.popup_selected -| (item_rows / 2), self.popup_items.len - item_rows);
+                for (first..first + item_rows) |index| {
+                    try writer.print("\x1b[{d};1H\x1b[2K", .{input_top + index - first});
+                    const selected = index == self.popup_selected;
+                    if (selected) try writer.writeAll("\x1b[1;36m");
+                    var remaining = self.cols -| 1;
+                    try popupText(writer, if (selected) " > " else "   ", &remaining);
+                    try popupText(writer, self.popup_items[index].label, &remaining);
+                    try popupText(writer, "  ", &remaining);
+                    try popupText(writer, self.popup_items[index].description, &remaining);
+                    try writer.writeAll("\x1b[0m");
+                }
+            }
+            try writer.print("\x1b[{d};1H\x1b[2K", .{input_top + item_rows});
+            var remaining = self.cols -| 1;
+            try popupText(writer, " ↑/↓ select · Tab/Enter insert · Esc close", &remaining);
+            self.popup_rows = popup_visible;
+        }
+
+        var lines = std.mem.splitSequence(u8, layout.bytes.written(), "\r\n");
+        var row: usize = 0;
+        var drawn: usize = 0;
+        while (lines.next()) |line| : (row += 1) {
+            if (row < self.viewport_start) continue;
+            if (drawn == visible) break;
+            try writer.print("\x1b[{d};1H", .{input_top + popup_visible + drawn});
+            try writer.writeAll(line);
+            try writer.writeAll("\x1b[0K");
+            drawn += 1;
+        }
+        try writer.print("\x1b[{d};{d}H", .{
+            input_top + popup_visible + cursor_row,
+            @min(cursor.col + 1, self.cols),
+        });
+        try self.stdout.writeStreamingAll(self.ln.io, aw.written());
+
+        self.max_rows = visible;
+        self.cursor_row = cursor_row;
+    }
+
     pub fn refreshLine(self: *Self) !void {
+        if (self.ln.bottom_anchor) return self.refreshBottom(true);
         try self.clearPopup();
         self.freePopup();
         if (self.usesMultiLine()) {
@@ -810,4 +961,131 @@ test "large multiline input stays inside viewport and supports Unicode editing" 
     try state.editMoveHome();
     try std.testing.expectEqual(0, state.cursor_row);
     try std.testing.expectEqual(0, state.viewport_start);
+}
+
+const LayoutRecord = struct {
+    rows: usize = 0,
+    repaint: bool = false,
+    calls: usize = 0,
+};
+
+fn recordLayout(context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void {
+    const record: *LayoutRecord = @ptrCast(@alignCast(context));
+    record.rows = rows;
+    record.repaint = repaint;
+    record.calls += 1;
+}
+
+fn testPopup(allocator: Allocator, io: std.Io, input: []const u8) ![]@import("main.zig").PopupItem {
+    _ = io;
+    _ = input;
+    const items = try allocator.alloc(@import("main.zig").PopupItem, 2);
+    items[0] = .{
+        .value = try allocator.dupe(u8, "@a"),
+        .label = try allocator.dupe(u8, "alpha.zig"),
+        .description = try allocator.dupe(u8, "File"),
+    };
+    items[1] = .{
+        .value = try allocator.dupe(u8, "@b"),
+        .label = try allocator.dupe(u8, "beta.zig"),
+        .description = try allocator.dupe(u8, "File"),
+    };
+    return items;
+}
+
+test "a bottom anchored input is drawn on the last rows and asks for its height" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try tmp.dir.createFile(std.testing.io, "output", .{});
+    defer out.close(std.testing.io);
+
+    var ln: Linenoise = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .env = undefined,
+        .history = History.empty(allocator),
+        .multiline_mode = true,
+        .bottom_anchor = true,
+    };
+    defer ln.deinit();
+    var record = LayoutRecord{};
+    ln.layout_callback = recordLayout;
+    ln.layout_context = &record;
+
+    var state: LinenoiseState = .{
+        .allocator = allocator,
+        .ln = &ln,
+        .stdin = out,
+        .stdout = out,
+        .prompt = "> ",
+        .cols = 20,
+    };
+    defer state.buf.deinit(allocator);
+    try state.buf.appendSlice(allocator, "abc\ndef");
+    state.pos = state.buf.items.len;
+    try state.refreshLine();
+
+    // Two display rows, so the editor asks the host for two of them.
+    try std.testing.expectEqual(@as(usize, 2), record.rows);
+    try std.testing.expectEqual(@as(usize, 1), record.calls);
+    try std.testing.expectEqual(@as(usize, 2), state.max_rows);
+    try std.testing.expectEqual(@as(usize, 1), state.cursor_row);
+
+    const written = try tmp.dir.readFileAlloc(std.testing.io, "output", allocator, .limited(1 << 16));
+    defer allocator.free(written);
+    // getRows has no ioctl to read on a file and falls back to 24 rows.
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[23;1H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "> abc\x1b[0K") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[24;1Hdef\x1b[0K") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[24;4H") != null);
+}
+
+test "a bottom anchored popup sits above the input and keeps its items while moving" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try tmp.dir.createFile(std.testing.io, "output", .{});
+    defer out.close(std.testing.io);
+
+    var ln: Linenoise = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .env = undefined,
+        .history = History.empty(allocator),
+        .bottom_anchor = true,
+        .popup_callback = testPopup,
+    };
+    defer ln.deinit();
+    var record = LayoutRecord{};
+    ln.layout_callback = recordLayout;
+    ln.layout_context = &record;
+
+    var state: LinenoiseState = .{
+        .allocator = allocator,
+        .ln = &ln,
+        .stdin = out,
+        .stdout = out,
+        .prompt = "> ",
+        .cols = 20,
+    };
+    defer state.buf.deinit(allocator);
+    defer state.deinitPopup();
+    try state.buf.appendSlice(allocator, "@");
+    state.pos = 1;
+    try state.refreshLine();
+
+    // Two items plus the key hint, above one input row.
+    try std.testing.expectEqual(@as(usize, 4), record.rows);
+    try std.testing.expectEqual(@as(usize, 3), state.popup_rows);
+    try std.testing.expectEqual(@as(usize, 2), state.popup_items.len);
+
+    try state.movePopup(true);
+    try std.testing.expectEqual(@as(usize, 2), record.calls);
+    try std.testing.expectEqual(@as(usize, 1), state.popup_selected);
+    try std.testing.expectEqual(@as(usize, 4), record.rows);
+
+    try state.dismissPopup();
+    try std.testing.expectEqual(@as(usize, 1), record.rows);
+    try std.testing.expectEqual(@as(usize, 0), state.popup_items.len);
 }

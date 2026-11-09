@@ -45,13 +45,13 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         read_until(expected)
 
     try:
-        read_until('you ❯ '.encode())
+        read_until('❯ '.encode())
         send(b'/', b'/help  Show this help')
-        send(b'\x1b[B\r', 'you ❯ /clear'.encode())
+        send(b'\x1b[B\r', '❯ /clear'.encode())
         assert b'Conversation history cleared.' not in transcript
         send(b'\r', b'Conversation history cleared.')
         send('check @ALPHA'.encode(), b'@src/alpha.zig  File')
-        send(b'\t', 'you ❯ check @src/alpha.zig'.encode())
+        send(b'\t', '❯ check @src/alpha.zig'.encode())
         send(b'\x15$', b'Coming soon')
         transcript.clear()
         os.write(master, b'\x1b')
@@ -59,10 +59,10 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         send(b'\x15@missing', b'No matching files')
         send(b'\x15@hidden', b'No matching files')
         send('\x15@中文'.encode(), '@src/中文 file.zig  File'.encode())
-        send(b'\t', 'you ❯ @"src/中文 file.zig"'.encode())
+        send(b'\t', '❯ @"src/中文 file.zig"'.encode())
         # Complete in the middle of a line and retain its suffix.
         send(b'\x15check @alpha tail\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D', b'@src/alpha.zig  File')
-        send(b'\t', 'you ❯ check @src/alpha.zig tail'.encode())
+        send(b'\t', '❯ check @src/alpha.zig tail'.encode())
         send(b'\x05\x15/qu\t\r', b'Goodbye!')
         assert process.wait(timeout=5) == 0
         assert termios.tcgetattr(slave) == original

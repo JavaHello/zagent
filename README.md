@@ -6,7 +6,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 
 ## Features
 
-- **Interactive REPL** — conversational chat loop, with a prompt history that ↑/↓ recall across runs
+- **Interactive REPL** — a full-screen conversation with the prompt pinned to the bottom, and a prompt history that ↑/↓ recall across runs; `Ctrl+Z` suspends and `fg` redraws the whole record
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use (function calling)** — the agent can execute tools to help you:
   - `shell` — run shell commands
@@ -207,9 +207,9 @@ export OPENAI_API_KEY=sk-...
   ✦ an AI agent in your terminal
 
   Model  gpt-4o-mini · openai
-  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+D to exit. /help for commands.
+  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.
 
-you ❯ list all .zig files in the current directory
+❯ list all .zig files in the current directory
   ⚙ shell {"command":"find . -name '*.zig' -type f"}
   ✓ ./src/agent.zig
 ./src/config.zig
@@ -221,6 +221,19 @@ Here are all the .zig files in the current directory: ...
   ⟳ checking completion…
   ✓ completion check passed
 ```
+
+In a terminal, the interactive session takes the whole screen over: the banner
+and the conversation scroll above, and the prompt stays on the last row with
+the input area growing upward for multi-line text. The alternate screen is
+used, so the shell's own scrollback comes back untouched when zagent exits.
+
+`Ctrl+Z` suspends the session the way it suspends any other foreground program:
+the terminal is handed back to the shell first, and `fg` resumes zagent, redraws
+the whole conversation and restores the line you were typing. The same works
+while an answer is streaming.
+
+When stdout is not a terminal (a pipe or a file), the layout stays inline and
+the answer is written straight to stdout, so `zagent "q" > notes.md` is clean.
 
 ### Prompt history
 
@@ -301,7 +314,7 @@ so. Interactive menus also work in single-query mode and render on stderr.
 returning the status line, the response headers, and the body:
 
 ```
-you ❯ fetch https://httpbin.org/json and tell me the content type
+❯ fetch https://httpbin.org/json and tell me the content type
   ⚙ http_request {"url":"https://httpbin.org/json"}
   ✓ HTTP/1.1 200 OK
     Date: Mon, 28 Sep 2026 06:21:24 GMT
@@ -340,7 +353,7 @@ body. Four behaviours are worth knowing:
 `grep` searches file contents and `find` finds files and directories by name:
 
 ```
-you ❯ where is progressLabel defined?
+❯ where is progressLabel defined?
   ⚙ grep {"pattern":"fn progressLabel"}
   ✓ ./src/tools.zig:21:pub fn progressLabel(name: []const u8) ?[]const u8 {
     ./src/tools.zig:1330:        const label = progressLabel(name) orelse return error.TestUnexpectedResult;
@@ -382,7 +395,7 @@ format `git diff` and `diff -u` produce — applies it to the working tree, and
 prints the change as it goes, in the terminal's own red and green:
 
 ```
-you ❯ rename the greeting in greet.txt to hello
+❯ rename the greeting in greet.txt to hello
   ⚙ apply_patch
   --- a/greet.txt
   +++ b/greet.txt
@@ -461,7 +474,7 @@ every HTTP request, `timeoutMs` says how long a request waits for an answer
   ⚙ mcp: starting "filesystem"…
   ✓ mcp: filesystem — 11 tools, 2025-06-18
 
-you ❯ what is in /tmp?
+❯ what is in /tmp?
   ⚙ mcp__filesystem__list_directory {"path":"/tmp"}
   ✓ [FILE] notes.md
     [DIR] projects
@@ -512,12 +525,14 @@ and what each brought. Seven behaviours are worth knowing:
 | `/mcp`        | List the MCP servers and their tools |
 | `/quit`       | Exit                             |
 | `Tab` / `Enter` | Insert the selected candidate   |
+| `Ctrl+Z`      | Suspend; resume with `fg`        |
 | `Ctrl+D`      | Exit                             |
 
 The prompt supports multiple lines: Enter submits; Alt+Enter or Ctrl+J inserts
-a newline. In terminals supporting bracketed paste, pasted newlines stay in
-the editor until you press Enter to send. Multiline entries can be recalled
-during the current session but are omitted from the on-disk input history.
+a newline, and the input area grows upward while the conversation moves up.
+In terminals supporting bracketed paste, pasted newlines stay in the editor
+until you press Enter to send. Multiline entries can be recalled during the
+current session but are omitted from the on-disk input history.
 
 Typing `/` at the start of the prompt opens system command candidates. Typing
 `@` at a word boundary searches project file paths, and `$` shows a reserved

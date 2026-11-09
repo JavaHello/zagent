@@ -9,6 +9,8 @@ const mcp = @import("mcp.zig");
 const render = @import("render.zig");
 const term = @import("term.zig");
 const spinner = @import("spinner.zig");
+const Screen = @import("screen.zig").Screen;
+const ScreenLogWriter = @import("screen.zig").LogWriter;
 const Config = @import("config.zig").Config;
 const Linenoise = @import("linenoise").Linenoise;
 
@@ -125,6 +127,10 @@ pub const Agent = struct {
     current_task: []const u8 = "",
     query_started: ?std.Io.Timestamp = null,
     progress_prompt: ?[]const u8 = null,
+    /// Where the conversation is drawn when the interactive session owns the
+    /// screen. Null for a single query: answers then go straight to stdout, so
+    /// `zagent "q" > notes.md` stays clean.
+    screen: ?*Screen = null,
     /// The MCP servers and the tools they brought. Borrowed rather than owned:
     /// whoever started the agent outlives it, and the agent only reads this and
     /// calls through it.
@@ -196,6 +202,26 @@ pub const Agent = struct {
         if (self.session_path) |path| self.allocator.free(path);
     }
 
+    /// Draw the conversation on `screen` instead of on the files the progress
+    /// lines normally use.
+    pub fn attachScreen(self: *Agent, screen: ?*Screen) void {
+        self.screen = screen;
+    }
+
+    /// One status or answer line: into the conversation when a screen owns it,
+    /// and to `file` otherwise. The file still matters for a redirected run,
+    /// where stdout belongs to another program and stderr carries progress.
+    fn emit(self: *Agent, file: std.Io.File, comptime fmt: []const u8, args: anytype) !void {
+        if (self.screen) |screen| {
+            if (screen.isActive()) {
+                const message = try std.fmt.allocPrint(self.allocator, fmt, args);
+                defer self.allocator.free(message);
+                return screen.writeLog(message);
+            }
+        }
+        try printFmt(file, self.io, self.allocator, fmt, args);
+    }
+
     /// Clear conversation history (keeps the system prompt).
     pub fn clearHistory(self: *Agent) void {
         for (self.history.items[1..]) |msg| msg.deinit(self.allocator);
@@ -212,6 +238,7 @@ pub const Agent = struct {
     pub fn processQuery(self: *Agent, query: []const u8) !void {
         self.query_started = std.Io.Timestamp.now(self.io, .awake);
         defer self.query_started = null;
+        self.client.resetTokenCounters();
         self.current_task = query;
         defer self.current_task = "";
         self.terminal_title.update("thinking…", query);
@@ -221,8 +248,12 @@ pub const Agent = struct {
         };
         self.terminal_title.update("ready", query);
         const elapsed_ms = self.query_started.?.untilNow(self.io, .awake).toMilliseconds();
-        try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  Worked for {d}.{d}s\n" ++ RESET, .{
-            @divTrunc(elapsed_ms, 1000), @divTrunc(@mod(elapsed_ms, 1000), 100),
+        const counts = self.client.tokenCounts();
+        try self.emit(std.Io.File.stderr(), DIM ++ "  Worked for {d}.{d}s · in {d} · out {d} tokens\n" ++ RESET, .{
+            @divTrunc(elapsed_ms, 1000),
+            @divTrunc(@mod(elapsed_ms, 1000), 100),
+            counts.input,
+            counts.output,
         });
     }
 
@@ -232,6 +263,8 @@ pub const Agent = struct {
             .started = self.query_started,
             .prompt = self.progress_prompt,
             .first_frame_delay_ms = 0,
+            .in_tokens = &self.client.input_tokens,
+            .out_tokens = &self.client.output_tokens,
         };
     }
 
@@ -256,7 +289,7 @@ pub const Agent = struct {
             if (self.max_verifications == 0) return;
 
             if (verifications == self.max_verifications) {
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ completion check budget ({d}) spent; task remains unverified\n" ++ RESET, .{self.max_verifications});
+                try self.emit(std.Io.File.stderr(), DIM ++ "  ⟳ completion check budget ({d}) spent; task remains unverified\n" ++ RESET, .{self.max_verifications});
                 return error.CompletionUnverified;
             }
 
@@ -275,28 +308,28 @@ pub const Agent = struct {
                 judged = try self.judgeTurn(turn_start);
             }
             const verdict = judged orelse {
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ✗ no usable completion verdict in {d} checks; the answer above stands unverified\n" ++ RESET, .{verifications});
+                try self.emit(std.Io.File.stderr(), DIM ++ "  ✗ no usable completion verdict in {d} checks; the answer above stands unverified\n" ++ RESET, .{verifications});
                 return error.CompletionUnverified;
             };
             defer verdict.deinit(self.allocator);
 
             if (verdict.complete) {
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ✓ completion check passed\n" ++ RESET, .{});
+                try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ completion check passed\n" ++ RESET, .{});
                 return;
             }
 
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, YELLOW ++ "  ↻ not done: {s}\n" ++ RESET, .{verdict.reason});
+            try self.emit(std.Io.File.stderr(), YELLOW ++ "  ↻ not done: {s}\n" ++ RESET, .{verdict.reason});
 
             // The judge can hand the open question back as a menu of its own
             // making, for the turns the model never got around to asking about.
             if (verdict.options.items.len > 0) {
                 const question = verdict.question orelse "How should I proceed?";
                 const answer = (try self.askChoice(question, verdict.options.items)) orelse {
-                    try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  stopped without an answer\n" ++ RESET, .{});
+                    try self.emit(std.Io.File.stderr(), DIM ++ "  stopped without an answer\n" ++ RESET, .{});
                     return;
                 };
                 defer self.allocator.free(answer);
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  → {s}\n" ++ RESET, .{answer});
+                try self.emit(std.Io.File.stderr(), DIM ++ "  → {s}\n" ++ RESET, .{answer});
                 try self.appendUserMessage(answer);
             } else {
                 const follow_up = try verifier.buildFollowUp(self.allocator, verdict);
@@ -313,11 +346,15 @@ pub const Agent = struct {
     /// them: a `defer` in the loop body would still be in force while the tool
     /// results are printed, and the next frame of the animation would erase
     /// what was just printed. Here it ends before the caller writes a byte.
-    fn chatAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
+    fn chatAnimated(self: *Agent, messages: []const Message, stream: *AnswerStream) !openai.ApiResponse {
         self.terminal_title.update("thinking…", self.current_task);
         var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "thinking…", self.progressOptions());
         defer spin.stop();
-        return self.client.respond(messages, self.mcp_registry.functionJson()) catch |err| {
+        // The streamer stops the animation as soon as the first text arrives,
+        // so the answer and the spinner never fight over the same line.
+        stream.spin = &spin;
+        defer stream.spin = null;
+        return self.client.respondStreaming(messages, self.mcp_registry.functionJson(), stream.sink()) catch |err| {
             spin.stop();
             try self.reportHttpError();
             return err;
@@ -331,7 +368,7 @@ pub const Agent = struct {
         self.terminal_title.update("checking completion…", self.current_task);
         var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking completion…", self.progressOptions());
         if (!spin.animating()) {
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⟳ checking completion…\n" ++ RESET, .{});
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⟳ checking completion…\n" ++ RESET, .{});
         }
         defer spin.stop();
         return self.client.respondWithoutTools(messages) catch |err| {
@@ -347,7 +384,7 @@ pub const Agent = struct {
     fn reportHttpError(self: *Agent) !void {
         const message = self.client.takeHttpError() orelse return;
         defer self.allocator.free(message);
-        try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "  ✗ {s}\n" ++ RESET, .{message});
+        try self.emit(std.Io.File.stderr(), RED ++ "  ✗ {s}\n" ++ RESET, .{message});
     }
 
     const Turn = struct {
@@ -367,6 +404,11 @@ pub const Agent = struct {
         // they were meant to be instead of several half-rendered documents.
         var carried: std.ArrayList(u8) = .empty;
         defer carried.deinit(self.allocator);
+        // The answer streams into this for as long as the loop runs, so a
+        // reply cut short by the token limit keeps painting one document and
+        // tool-call commentary is shown as the model writes it.
+        const stream = try AnswerStream.init(self);
+        defer stream.deinit();
         var continuations: usize = 0;
         var empty_continuations: usize = 0;
         // Where this turn's continuation fragments start in the history. When
@@ -375,11 +417,12 @@ pub const Agent = struct {
         var continuation_start: ?usize = null;
 
         while (iteration < self.max_iterations) : (iteration += 1) {
-            const response = self.chatAnimated(self.history.items) catch |err| {
+            const response = self.chatAnimated(self.history.items, stream) catch |err| {
                 // Do not leave a continuation prompt as the last message for
                 // the next request to answer.
                 self.settleContinuations(&continuation_start, carried.items) catch {};
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
+                stream.flushPending() catch {};
+                try self.emit(std.Io.File.stderr(), RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
                 return err;
             };
             defer response.deinit(self.allocator);
@@ -390,31 +433,31 @@ pub const Agent = struct {
                 // produced and ask for the rest, rather than lose the turn.
                 if (response.content) |partial| {
                     if (continuations >= max_continuations) {
-                        try self.reportTruncation(&continuation_start, carried.items, partial);
+                        try self.reportTruncation(stream, &continuation_start, carried.items, partial);
                         return error.ResponseTruncated;
                     }
                     continuations += 1;
                     if (continuation_start == null) continuation_start = self.history.items.len;
                     try carried.appendSlice(self.allocator, partial);
                     try self.appendAssistantText(partial);
-                    try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  … reply cut off by the output limit; continuing where it stopped\n" ++ RESET, .{});
+                    try self.emit(std.Io.File.stderr(), DIM ++ "  … reply cut off by the output limit; continuing where it stopped\n" ++ RESET, .{});
                     try self.appendUserMessage(continue_prompt);
                     continue;
                 }
                 if (empty_continuations >= max_empty_continuations) {
-                    try self.reportTruncation(&continuation_start, carried.items, "");
+                    try self.reportTruncation(stream, &continuation_start, carried.items, "");
                     return error.ResponseTruncated;
                 }
                 empty_continuations += 1;
                 if (continuation_start == null) continuation_start = self.history.items.len;
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  … reply cut off before any text; asking for a smaller step\n" ++ RESET, .{});
+                try self.emit(std.Io.File.stderr(), DIM ++ "  … reply cut off before any text; asking for a smaller step\n" ++ RESET, .{});
                 try self.appendUserMessage(if (carried.items.len > 0) continue_prompt else restart_prompt);
                 continue;
             }
             if (std.mem.eql(u8, response.finish_reason, "tool_calls")) {
                 const tool_calls = response.tool_calls orelse {
                     self.settleContinuations(&continuation_start, carried.items) catch {};
-                    try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});
+                    try self.emit(std.Io.File.stderr(), RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});
                     return error.InvalidResponse;
                 };
 
@@ -422,6 +465,9 @@ pub const Agent = struct {
                 // drop its fragments before the call joins the conversation.
                 try self.settleContinuations(&continuation_start, "");
                 carried.clearRetainingCapacity();
+                // Any commentary the model streamed before the call is shown;
+                // finish its last line so the tool announcement starts fresh.
+                stream.flushPending() catch {};
 
                 // Clone tool calls so the assistant message can own them
                 const owned_calls = try cloneToolCalls(self.allocator, tool_calls);
@@ -488,10 +534,17 @@ pub const Agent = struct {
                         combined = try std.mem.concat(self.allocator, u8, &.{ carried.items, content });
                         break :blk combined.?;
                     } else content;
-                    const stdout = std.Io.File.stdout();
-                    if (stdout.isTty(self.io) catch false) try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
-                    try self.writeAnswer(printed);
-                    try stdout.writeStreamingAll(self.io, "\n");
+                    if (stream.started) {
+                        // The answer was already painted as it streamed; all
+                        // that is left is the pending line, table and trailer.
+                        try stream.finish();
+                    } else {
+                        // No stream reached the caller (a test transport, say):
+                        // render the whole answer at once as before.
+                        try self.answerHeader();
+                        try self.writeAnswer(printed);
+                        try self.answerTrailer();
+                    }
 
                     if (continuation_start != null) {
                         // Fold the pieces and prompts into the one reply they
@@ -525,7 +578,8 @@ pub const Agent = struct {
             // Keep whatever the cut-off replies had produced, but not the
             // prompts that asked for it.
             try self.settleContinuations(&continuation_start, carried.items);
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
+            stream.flushPending() catch {};
+            try self.emit(std.Io.File.stderr(), RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
         }
 
         return turn;
@@ -549,7 +603,7 @@ pub const Agent = struct {
         };
 
         const response = self.judgeAnimated(&messages) catch |err| {
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
             return null;
         };
         defer response.deinit(self.allocator);
@@ -557,17 +611,17 @@ pub const Agent = struct {
         // A verdict cut off by the token limit cannot be trusted, even when
         // the fragment happens to parse: the outer loop asks again.
         if (std.mem.eql(u8, response.finish_reason, "length")) {
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: the reply was truncated\n" ++ RESET, .{});
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ completion check skipped: the reply was truncated\n" ++ RESET, .{});
             return null;
         }
 
         const content = response.content orelse {
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: the reply was empty\n" ++ RESET, .{});
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ completion check skipped: the reply was empty\n" ++ RESET, .{});
             return null;
         };
 
         return verifier.parseVerdict(self.allocator, content) catch |err| {
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
             return null;
         };
     }
@@ -585,14 +639,14 @@ pub const Agent = struct {
             var aw: std.Io.Writer.Allocating = .init(self.allocator);
             defer aw.deinit();
             try menu.writeMenu(&aw.writer, question, options);
-            try std.Io.File.stdout().writeStreamingAll(self.io, aw.written());
+            try self.writeLogOrStdout(aw.written());
             // Nothing to read a choice from. Taking the recommendation keeps a
             // piped or single-query run moving instead of stalling it.
             if (recommended) |index| {
-                try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  no terminal to read an answer from; taking the recommended option\n" ++ RESET, .{});
+                try self.emit(std.Io.File.stderr(), DIM ++ "  no terminal to read an answer from; taking the recommended option\n" ++ RESET, .{});
                 return try menu.describeAnswer(self.allocator, .{ .option = index }, options);
             }
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  no terminal to read an answer from\n" ++ RESET, .{});
+            try self.emit(std.Io.File.stderr(), DIM ++ "  no terminal to read an answer from\n" ++ RESET, .{});
             return null;
         }
 
@@ -615,17 +669,43 @@ pub const Agent = struct {
             self.linenoise.popup_callback = saved_popup;
         }
 
-        const raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {
-            error.CtrlC => return null,
-            else => return err,
-        };
-
+        var raw_line: ?[]const u8 = null;
+        while (true) {
+            if (self.screen) |screen| try screen.prepareInput();
+            raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {
+                error.CtrlC => {
+                    if (self.screen) |screen| try screen.endInput();
+                    return null;
+                },
+                error.Suspend => {
+                    // The custom-answer read is a normal line edit; suspension
+                    // gives the terminal back and resumes on the same text.
+                    if (self.screen) |screen| {
+                        try screen.suspendProcess();
+                    } else {
+                        @import("screen.zig").stopProcess();
+                    }
+                    continue;
+                },
+                else => return err,
+            };
+            if (self.screen) |screen| try screen.endInput();
+            break;
+        }
         const line = raw_line orelse {
             // End of input: fall back to the recommendation, if any.
             if (recommended) |index| return try menu.describeAnswer(self.allocator, .{ .option = index }, options);
             return null;
         };
         defer self.allocator.free(line);
+
+        // The question is part of the record even though the editor's rows are
+        // cleared once the answer is read.
+        if (self.screen) |screen| {
+            const echo = try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ CHOICE_PROMPT, line });
+            defer self.allocator.free(echo);
+            try screen.writeLog(echo);
+        }
 
         const answer = std.mem.trim(u8, line, " \t\r\n");
         if (answer.len == 0) return null;
@@ -698,17 +778,20 @@ pub const Agent = struct {
     /// Give up on a reply the token limit keeps cutting short. What was
     /// produced before is still worth printing: losing it would be worse than
     /// the error that ends the turn.
-    fn reportTruncation(self: *Agent, start: *?usize, carried: []const u8, partial: []const u8) !void {
+    fn reportTruncation(self: *Agent, stream: *AnswerStream, start: *?usize, carried: []const u8, partial: []const u8) !void {
         const answer = try std.mem.concat(self.allocator, u8, &.{ carried, partial });
         defer self.allocator.free(answer);
         try self.settleContinuations(start, answer);
         if (answer.len > 0) {
-            const stdout = std.Io.File.stdout();
-            if (stdout.isTty(self.io) catch false) try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
-            try self.writeAnswer(answer);
-            try stdout.writeStreamingAll(self.io, "\n");
+            if (stream.started) {
+                try stream.finish();
+            } else {
+                try self.answerHeader();
+                try self.writeAnswer(answer);
+                try self.answerTrailer();
+            }
         }
-        try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "Error: model output still exceeds the token budget after automatic retries and continuations; split the task into smaller steps, or raise AI_MAX_TOKENS if the endpoint accepts more than DeepSeek's 8192.\n" ++ RESET, .{});
+        try self.emit(std.Io.File.stderr(), RED ++ "Error: model output still exceeds the token budget after automatic retries and continuations; split the task into smaller steps, or raise AI_MAX_TOKENS if the endpoint accepts more than DeepSeek's 8192.\n" ++ RESET, .{});
     }
 
     /// Announce a tool call on the line above whatever it prints.
@@ -718,15 +801,25 @@ pub const Agent = struct {
     /// nobody anything — so it is drawn instead, line by line, in the colours
     /// the change would be read in.
     fn announceToolCall(self: *Agent, call: ToolCallData) !void {
-        const stderr = std.Io.File.stderr();
-
         // Written through a fixed buffer rather than built up in memory first:
         // a patch is read as it is drawn, and a long one never has to be held
         // whole to be shown.
         var buf: [4096]u8 = undefined;
-        var file_writer = stderr.writerStreaming(self.io, &buf);
-        const w = &file_writer.interface;
 
+        if (self.screen) |screen| {
+            if (screen.isActive()) {
+                var log_writer = screen.logWriter(&buf);
+                try self.writeToolCall(&log_writer.writer, call);
+                return log_writer.writer.flush();
+            }
+        }
+
+        var file_writer = std.Io.File.stderr().writerStreaming(self.io, &buf);
+        try self.writeToolCall(&file_writer.interface, call);
+        try file_writer.interface.flush();
+    }
+
+    fn writeToolCall(self: *Agent, w: *std.Io.Writer, call: ToolCallData) !void {
         if (!std.mem.eql(u8, call.name, "apply_patch")) {
             try w.writeAll(YELLOW ++ "  ⚙ ");
             // A tool name and its arguments are model output like any other, so
@@ -736,7 +829,7 @@ pub const Agent = struct {
             try w.writeAll(RESET ++ " ");
             try text.writeSanitized(w, call.arguments);
             try w.writeByte('\n');
-            return file_writer.interface.flush();
+            return;
         }
 
         const patch_text = openai.extractStringArg(self.allocator, call.arguments, "patch") catch {
@@ -745,13 +838,12 @@ pub const Agent = struct {
             try w.writeAll(YELLOW ++ "  ⚙ apply_patch" ++ RESET ++ " ");
             try text.writeSanitized(w, call.arguments);
             try w.writeByte('\n');
-            return file_writer.interface.flush();
+            return;
         };
         defer self.allocator.free(patch_text);
 
         try w.writeAll(YELLOW ++ "  ⚙ apply_patch\n" ++ RESET);
         try diff.render(w, patch_text);
-        try file_writer.interface.flush();
     }
 
     fn executeTool(self: *Agent, call: ToolCallData) !tools.ToolResult {
@@ -788,11 +880,11 @@ pub const Agent = struct {
         const preview_len = @min(result.content.len, 200);
         const truncated = result.content.len > preview_len;
         if (result.is_error) {
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, RED ++ "  ✗ {s}\n" ++ RESET, .{result.content});
+            try self.emit(std.Io.File.stderr(), RED ++ "  ✗ {s}\n" ++ RESET, .{result.content});
         } else if (truncated) {
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ✓ {s}...\n" ++ RESET, .{result.content[0..preview_len]});
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ {s}...\n" ++ RESET, .{result.content[0..preview_len]});
         } else {
-            try printFmt(std.Io.File.stderr(), self.io, self.allocator, DIM ++ "  ✓ {s}\n" ++ RESET, .{result.content});
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ {s}\n" ++ RESET, .{result.content});
         }
 
         return result;
@@ -806,19 +898,167 @@ pub const Agent = struct {
     /// markers would quietly cost a `| tee answer.md` user their structure.
     fn writeAnswer(self: *Agent, content: []const u8) !void {
         const stdout = std.Io.File.stdout();
-        if (!self.render_markdown) return stdout.writeStreamingAll(self.io, content);
+        if (!self.render_markdown) return self.writeLogOrStdout(content);
 
         // A fixed buffer rather than `Writer.Allocating`: for a long answer the
         // latter would hold the entire styled document in memory before
         // printing a byte of it. This buffer is the renderer's only memory,
         // whatever the size of the document.
         var buf: [8192]u8 = undefined;
+
+        if (self.screen) |screen| {
+            if (screen.isActive()) {
+                var log_writer = screen.logWriter(&buf);
+                try render.render(&log_writer.writer, content, .{
+                    .width = term.usableWidth(term.columns(stdout)),
+                });
+                return log_writer.writer.flush();
+            }
+        }
+
         var file_writer = stdout.writerStreaming(self.io, &buf);
 
         try render.render(&file_writer.interface, content, .{
             .width = term.usableWidth(term.columns(stdout)),
         });
         try file_writer.interface.flush();
+    }
+
+    /// Send finished bytes to the conversation, or to stdout when the
+    /// interactive screen is not in use.
+    fn writeLogOrStdout(self: *Agent, bytes: []const u8) !void {
+        if (self.screen) |screen| {
+            if (screen.isActive()) return screen.writeLog(bytes);
+        }
+        return std.Io.File.stdout().writeStreamingAll(self.io, bytes);
+    }
+
+    fn answerHeader(self: *Agent) !void {
+        if (self.screen) |screen| {
+            if (screen.isActive()) return screen.writeLog("\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+        }
+        const stdout = std.Io.File.stdout();
+        if (stdout.isTty(self.io) catch false) {
+            try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+        }
+    }
+
+    fn answerTrailer(self: *Agent) !void {
+        try self.writeLogOrStdout("\n");
+    }
+};
+
+/// Paints the answer as it streams from the model. The markdown renderer is
+/// fed one complete line at a time, so bold, fences, lists and tables render
+/// as they are written instead of appearing all at once when the request ends.
+///
+/// The struct is heap-allocated because the renderer holds a pointer to the
+/// writer that lives inside this struct; a copy would invalidate it.
+const AnswerStream = struct {
+    agent: *Agent,
+    allocator: std.mem.Allocator,
+    pending: std.ArrayList(u8) = .empty,
+    buf: [8192]u8 = undefined,
+    log_writer: ?ScreenLogWriter = null,
+    file_writer: ?std.Io.File.Writer = null,
+    renderer: ?render.Renderer = null,
+    /// Set once the first text delta has been shown, which is when the
+    /// "Assistant" header is printed and the spinner is given its line back.
+    started: bool = false,
+    finished: bool = false,
+    /// The spinner animating the wait for this turn. Stopped on the first
+    /// delta so it does not draw over the answer.
+    spin: ?*spinner.Spinner = null,
+
+    fn init(agent: *Agent) !*AnswerStream {
+        const allocator = agent.allocator;
+        const self = try allocator.create(AnswerStream);
+        self.* = .{ .agent = agent, .allocator = allocator };
+        errdefer self.deinit();
+
+        if (agent.render_markdown) {
+            const width = term.usableWidth(term.columns(std.Io.File.stdout()));
+            if (agent.screen) |screen| {
+                if (screen.isActive()) {
+                    self.log_writer = screen.logWriter(&self.buf);
+                    self.renderer = render.Renderer.init(&self.log_writer.?.writer, .{ .width = width });
+                }
+            }
+            if (self.renderer == null) {
+                self.file_writer = std.Io.File.stdout().writerStreaming(agent.io, &self.buf);
+                self.renderer = render.Renderer.init(&self.file_writer.?.interface, .{ .width = width });
+            }
+        }
+        return self;
+    }
+
+    fn deinit(self: *AnswerStream) void {
+        self.pending.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    fn sink(self: *AnswerStream) openai.StreamSink {
+        return .{ .context = self, .onText = onText };
+    }
+
+    fn onText(context: *anyopaque, delta: []const u8) void {
+        const self: *AnswerStream = @ptrCast(@alignCast(context));
+        self.feed(delta) catch {};
+    }
+
+    fn feed(self: *AnswerStream, delta: []const u8) !void {
+        if (delta.len == 0) return;
+        if (!self.started) {
+            self.started = true;
+            // The spinner owns the terminal's line until the first text is
+            // ready; stop it before anything else is written.
+            if (self.spin) |spin| spin.stop();
+            try self.agent.answerHeader();
+        }
+        try self.pending.appendSlice(self.allocator, delta);
+        try self.drainLines();
+    }
+
+    fn drainLines(self: *AnswerStream) !void {
+        while (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |nl| {
+            const line = self.pending.items[0..nl];
+            try self.emitLine(line);
+            const rest = self.pending.items[nl + 1 ..];
+            std.mem.copyForwards(u8, self.pending.items[0..rest.len], rest);
+            self.pending.shrinkRetainingCapacity(rest.len);
+        }
+    }
+
+    fn emitLine(self: *AnswerStream, line: []const u8) !void {
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
+        if (self.renderer) |*r| {
+            try r.feedLine(trimmed);
+            // Push the line to the terminal now rather than waiting for the
+            // writer's buffer to fill; that is what makes the answer stream.
+            try r.flushWriter();
+        } else {
+            try self.agent.writeLogOrStdout(trimmed);
+            try self.agent.writeLogOrStdout("\n");
+        }
+    }
+
+    /// Emit the partial line still waiting for a newline, if there is one.
+    /// Called when a turn ends without a final answer so its last line does
+    /// not run into what is printed next.
+    fn flushPending(self: *AnswerStream) !void {
+        if (self.pending.items.len == 0) return;
+        try self.emitLine(self.pending.items);
+        self.pending.clearRetainingCapacity();
+    }
+
+    /// End the answer: flush any partial line and buffered table, then the
+    /// trailing blank line. Idempotent, so the defers in callers are safe.
+    fn finish(self: *AnswerStream) !void {
+        if (self.finished) return;
+        self.finished = true;
+        try self.flushPending();
+        if (self.renderer) |*r| try r.finish();
+        if (self.started) try self.agent.answerTrailer();
     }
 };
 

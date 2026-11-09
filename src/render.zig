@@ -876,6 +876,22 @@ pub const Renderer = struct {
         if (self.table.count > 0) try self.flushTable();
     }
 
+    /// Push everything fed so far out of the underlying writer, without
+    /// flushing the table buffer (which must wait for a non-table line or the
+    /// end of the document). A streaming caller calls this after each line so
+    /// the terminal shows it before the next one arrives.
+    pub fn flushWriter(self: *Renderer) !void {
+        try self.wrap.w.flush();
+    }
+
+    /// Flush the table held back while it was being recognised, and then the
+    /// underlying writer. A streaming caller calls this once after its last
+    /// line; a caller using `feed` never has to.
+    pub fn finish(self: *Renderer) !void {
+        if (self.table.count > 0) try self.flushTable();
+        try self.wrap.w.flush();
+    }
+
     pub fn feedLine(self: *Renderer, raw: []const u8) !void {
         // A stray carriage return would send the cursor back to column zero.
         const line = std.mem.trimEnd(u8, raw, " \t\r");

@@ -7,6 +7,8 @@ const commands = @import("commands.zig");
 const mcp = @import("mcp.zig");
 const banner = @import("banner.zig");
 const term = @import("term.zig");
+const text = @import("text.zig");
+const Screen = @import("screen.zig").Screen;
 const Linenoise = @import("linenoise").Linenoise;
 
 // ANSI colour codes
@@ -27,13 +29,16 @@ const HELP =
     \\  /quit, /exit Exit zagent
     \\  /, @, $      Command / project file / reserved candidates
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
+    \\  Ctrl+Z       Suspend; resume with fg
     \\  Ctrl+D       Exit zagent
     \\
 ;
 
 // Prompt passed to linenoise. Colour codes are fine here because
 // linenoize's width() implementation correctly ignores ANSI SGR sequences.
-const PROMPT = BOLD ++ GREEN ++ "you" ++ RESET ++ " \xe2\x9d\xaf ";
+// The arrow is the whole prompt: the word it used to carry said nothing that
+// the colour and the position do not.
+const PROMPT = BOLD ++ GREEN ++ "\xe2\x9d\xaf" ++ RESET ++ " ";
 
 /// Process arguments are borrowed from the OS (or from an iterator's internal
 /// buffer), so copy the ones we keep around for the lifetime of `main`.
@@ -229,8 +234,29 @@ fn runRepl(
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
 
+    // The interactive session owns the whole terminal: the conversation fills
+    // it and the prompt sits at the bottom. A piped or `TERM=dumb` run keeps
+    // the old inline layout, where the output is what the consumer reads.
+    var screen = Screen.init(allocator, io, ln.is_tty and ln.term_supported and
+        (stdout.isTty(io) catch false));
+    agent.attachScreen(if (screen.isActive()) &screen else null);
+    defer agent.attachScreen(null);
+    try screen.enter();
+    defer screen.deinit();
+
     ln.multiline_mode = true;
-    agent.progress_prompt = if (ln.is_tty) PROMPT else null;
+    ln.bottom_anchor = screen.isActive();
+    ln.layout_callback = layoutScreen;
+    ln.layout_context = &screen;
+    // The editor must not keep pointing at a screen that is about to go away.
+    defer {
+        ln.bottom_anchor = false;
+        ln.layout_callback = null;
+        ln.layout_context = null;
+    }
+    // Fullscreen keeps its own blank prompt row at the bottom, so the
+    // animation must not draw a second prompt above it.
+    agent.progress_prompt = if (ln.is_tty and !screen.isActive()) PROMPT else null;
 
     {
         // The wordmark is drawn through an allocating writer because a
@@ -240,10 +266,10 @@ fn runRepl(
         defer aw.deinit();
         try banner.write(&aw.writer, .{
             .mode = banner.detect(env, ln.term_supported and (stdout.isTty(io) catch false)),
-            .columns = term.columns(stdout),
+            .columns = if (screen.isActive()) screen.cols else term.columns(stdout),
         });
         try aw.writer.writeByte('\n');
-        try stdout.writeStreamingAll(io, aw.written());
+        try writeOut(&screen, stdout, io, aw.written());
     }
     {
         // The label is dim and the model name is not, so the eye lands on the
@@ -253,9 +279,9 @@ fn runRepl(
         else
             try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}\n", .{config.model});
         defer allocator.free(model_line);
-        try stdout.writeStreamingAll(io, model_line);
+        try writeOut(&screen, stdout, io, model_line);
     }
-    try stdout.writeStreamingAll(io, DIM ++ "  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
+    try writeOut(&screen, stdout, io, DIM ++ "  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
 
     if (config.api_key.len == 0) {
         // Name the variable that actually applies, so a provider user is not
@@ -267,21 +293,30 @@ fn runRepl(
             .{ key_var, key_var },
         );
         defer allocator.free(msg);
-        try stderr.writeStreamingAll(io, msg);
+        try writeOut(&screen, stderr, io, msg);
     }
 
     while (true) {
         // linenoise handles raw-mode input, Unicode width, and multi-byte
         // character deletion correctly (including Chinese/CJK characters).
-        // Returns null on EOF (Ctrl+D); error.CtrlC on Ctrl+C.
-        const raw_line = (ln.linenoise(PROMPT) catch |err| switch (err) {
-            error.CtrlC => {
-                try stdout.writeStreamingAll(io, "\n");
-                break;
+        // Returns null on EOF (Ctrl+D); error.CtrlC on Ctrl+C, error.Suspend on
+        // Ctrl+Z. The rows the prompt needs are reserved before every read: the
+        // conversation is drawn above them, never under them.
+        try screen.prepareInput();
+        const maybe_line = ln.linenoise(PROMPT) catch |err| switch (err) {
+            error.CtrlC => null,
+            error.Suspend => {
+                // Hand the terminal back, stop, and come back to the same
+                // line: the editor hands the typed text over in
+                // `pending_input`, so the retry opens on it.
+                try screen.suspendProcess();
+                continue;
             },
             else => return err,
-        }) orelse {
-            try stdout.writeStreamingAll(io, "\n");
+        };
+        try screen.endInput();
+        const raw_line = maybe_line orelse {
+            try writeOut(&screen, stdout, io, "\n");
             break;
         };
         defer allocator.free(raw_line);
@@ -289,6 +324,18 @@ fn runRepl(
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
 
         if (line.len == 0) continue;
+
+        // The editor's rows are cleared once the line is read; the question
+        // still belongs in the record, with the prompt it was typed after. An
+        // inline run keeps the prompt line on screen already.
+        if (screen.isActive()) {
+            var aw: std.Io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            try aw.writer.writeAll(PROMPT);
+            try text.writeSanitized(&aw.writer, line);
+            try aw.writer.writeByte('\n');
+            try screen.writeLog(aw.written());
+        }
 
         // Add non-empty lines to history so the user can navigate with ↑/↓.
         // The file, when there is one, makes that outlive the process; it is
@@ -298,32 +345,46 @@ fn runRepl(
         if (history_path) |path| history.save(io, ln, path);
 
         if (std.mem.eql(u8, line, "/quit") or std.mem.eql(u8, line, "/exit")) {
-            try stdout.writeStreamingAll(io, DIM ++ "Goodbye!\n" ++ RESET);
+            try writeOut(&screen, stdout, io, DIM ++ "Goodbye!\n" ++ RESET);
             break;
         } else if (std.mem.eql(u8, line, "/help")) {
-            try stdout.writeStreamingAll(io, HELP);
+            try writeOut(&screen, stdout, io, HELP);
         } else if (std.mem.eql(u8, line, "/clear") or std.mem.eql(u8, line, "/new")) {
             agent.clearHistory();
-            try stdout.writeStreamingAll(io, DIM ++ "Conversation history cleared.\n" ++ RESET);
+            try writeOut(&screen, stdout, io, DIM ++ "Conversation history cleared.\n" ++ RESET);
         } else if (std.mem.eql(u8, line, "/model")) {
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\n", .{config.model});
             defer allocator.free(msg);
-            try stdout.writeStreamingAll(io, msg);
+            try writeOut(&screen, stdout, io, msg);
         } else if (std.mem.eql(u8, line, "/mcp")) {
             var aw: std.Io.Writer.Allocating = .init(allocator);
             defer aw.deinit();
             try registry.writeStatus(&aw.writer);
-            try stdout.writeStreamingAll(io, aw.written());
+            try writeOut(&screen, stdout, io, aw.written());
         } else {
             agent.processQuery(line) catch |err| {
                 const errmsg = try std.fmt.allocPrint(allocator, "\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
                 defer allocator.free(errmsg);
-                try stderr.writeStreamingAll(io, errmsg);
+                try writeOut(&screen, stderr, io, errmsg);
             };
         }
 
-        try stdout.writeStreamingAll(io, "\n");
+        try writeOut(&screen, stdout, io, "\n");
     }
+}
+
+/// Send finished bytes to the conversation, or straight to `file` when the
+/// session does not own the screen.
+fn writeOut(screen: *Screen, file: std.Io.File, io: std.Io, bytes: []const u8) !void {
+    if (screen.isActive()) return screen.writeLog(bytes);
+    try file.writeStreamingAll(io, bytes);
+}
+
+/// The editor reports how many rows it needs at the bottom. Reserving them is
+/// what repaints the conversation when the prompt grows.
+fn layoutScreen(context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void {
+    const screen: *Screen = @ptrCast(@alignCast(context));
+    try screen.reserveInput(rows, repaint);
 }
 
 /// Says what is being waited for before each server is started. Written to
@@ -374,6 +435,7 @@ test {
     _ = @import("verifier.zig");
     _ = @import("style.zig");
     _ = @import("term.zig");
+    _ = @import("screen.zig");
     _ = @import("banner.zig");
     _ = @import("text.zig");
     _ = @import("render.zig");

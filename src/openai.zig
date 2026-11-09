@@ -61,12 +61,20 @@ pub const Message = struct {
     }
 };
 
+/// Token usage the server reported for one request. Optional because a failed
+/// or cut-off request may not carry it.
+pub const Usage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+};
+
 pub const ApiResponse = struct {
     content: ?[]const u8,
     reasoning_content: ?[]const u8,
     tool_calls: ?[]ToolCallData,
     finish_reason: []const u8,
     response_items: ?[]const u8 = null,
+    usage: ?Usage = null,
 
     pub fn deinit(self: ApiResponse, allocator: std.mem.Allocator) void {
         if (self.content) |c| allocator.free(c);
@@ -88,6 +96,13 @@ pub const Transport = struct {
     send: *const fn (context: *anyopaque, allocator: std.mem.Allocator, request: []const u8) anyerror![]u8,
 };
 
+/// Receives text as it streams from a Responses request. `delta` is borrowed
+/// from the parser's buffer and must be consumed before returning.
+pub const StreamSink = struct {
+    context: *anyopaque,
+    onText: *const fn (context: *anyopaque, delta: []const u8) void,
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -104,6 +119,10 @@ pub const Client = struct {
     retryable_http_error: bool = false,
     /// Set only by tests; see `Transport`.
     transport: ?Transport = null,
+    /// Live token accounting, read by the spinner while a request is in
+    /// flight. These are totals for the current query, not per request.
+    input_tokens: std.atomic.Value(u64) = .init(0),
+    output_tokens: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Client {
         return .{
@@ -116,6 +135,44 @@ pub const Client = struct {
             .max_tokens = config.max_tokens,
             .http_error = null,
         };
+    }
+
+    /// Forget the token totals of the previous query. Called when a new query
+    /// starts, so the counts the spinner shows belong to this query only.
+    pub fn resetTokenCounters(self: *Client) void {
+        self.input_tokens.store(0, .monotonic);
+        self.output_tokens.store(0, .monotonic);
+    }
+
+    pub fn tokenCounts(self: *Client) struct { input: u64, output: u64 } {
+        return .{
+            .input = self.input_tokens.load(.monotonic),
+            .output = self.output_tokens.load(.monotonic),
+        };
+    }
+
+    fn addUsage(self: *Client, usage: ?Usage) void {
+        const u = usage orelse return;
+        _ = self.input_tokens.fetchAdd(u.input_tokens, .monotonic);
+        _ = self.output_tokens.fetchAdd(u.output_tokens, .monotonic);
+    }
+
+    /// Replace the live estimates made for one streaming request with the real
+    /// numbers the server reported once it finished. The estimates were added
+    /// to the running totals as they were made; the difference is all that is
+    /// left to apply.
+    fn correctUsage(self: *Client, in_estimate: u64, out_estimate: u64, usage: ?Usage) void {
+        const u = usage orelse return;
+        if (u.input_tokens >= in_estimate) {
+            _ = self.input_tokens.fetchAdd(u.input_tokens - in_estimate, .monotonic);
+        } else {
+            _ = self.input_tokens.fetchSub(in_estimate - u.input_tokens, .monotonic);
+        }
+        if (u.output_tokens >= out_estimate) {
+            _ = self.output_tokens.fetchAdd(u.output_tokens - out_estimate, .monotonic);
+        } else {
+            _ = self.output_tokens.fetchSub(out_estimate - u.output_tokens, .monotonic);
+        }
     }
 
     pub fn deinit(self: *Client) void {
@@ -137,13 +194,20 @@ pub const Client = struct {
     /// object each, from the MCP servers that are connected. They are offered
     /// beside the built-in ones, so the model can call either.
     pub fn respond(self: *Client, messages: []const Message, extra_tools: []const []const u8) !ApiResponse {
-        return self.respondWith(messages, .included, extra_tools);
+        return self.respondWith(messages, .included, extra_tools, null);
+    }
+
+    /// Same as `respond`, but the request is streamed and every text delta is
+    /// handed to `sink.onText` as it arrives, so the caller can paint the
+    /// answer while the model is still writing it.
+    pub fn respondStreaming(self: *Client, messages: []const Message, extra_tools: []const []const u8, sink: StreamSink) !ApiResponse {
+        return self.respondWith(messages, .included, extra_tools, sink);
     }
 
     /// Send a request that advertises no tools, for the completion judge. It
     /// must not be able to answer with a tool call, MCP ones included.
     pub fn respondWithoutTools(self: *Client, messages: []const Message) !ApiResponse {
-        return self.respondWith(messages, .omitted, &.{});
+        return self.respondWith(messages, .omitted, &.{}, null);
     }
 
     fn respondWith(
@@ -151,6 +215,7 @@ pub const Client = struct {
         messages: []const Message,
         tools: Tools,
         extra_tools: []const []const u8,
+        sink: ?StreamSink,
     ) !ApiResponse {
         const response_url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{std.mem.trimEnd(u8, self.base_url, "/")});
         defer self.allocator.free(response_url);
@@ -168,10 +233,14 @@ pub const Client = struct {
                 max_tokens,
                 tools,
                 extra_tools,
+                sink != null,
             );
             defer self.allocator.free(req_json);
 
-            const response = try self.performResponseWithRetry(response_url, auth_header, req_json);
+            const response = if (sink) |stream_sink|
+                try self.performStreamWithRetry(response_url, auth_header, req_json, stream_sink)
+            else
+                try self.performResponseWithRetry(response_url, auth_header, req_json);
             if (!std.mem.eql(u8, response.finish_reason, "length")) return response;
             // Discard this attempt's partial output and retry the same input,
             // so completed tools are not repeated and incomplete calls are
@@ -196,13 +265,27 @@ pub const Client = struct {
         }
     }
 
+    fn performStreamWithRetry(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink) !ApiResponse {
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            return self.performResponseStream(response_url, auth_header, req_json, sink) catch |err| {
+                if (attempt >= 2 or (!isRecoverableFetchError(err) and !self.retryable_http_error)) return err;
+                self.resetHttpClient();
+                try self.io.sleep(.fromMilliseconds(1000 * (@as(i64, 1) << @intCast(attempt))), .awake);
+                continue;
+            };
+        }
+    }
+
     fn performResponseFetch(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8) !ApiResponse {
         if (self.transport) |transport| {
             const body = try transport.send(transport.context, self.allocator, req_json);
             defer self.allocator.free(body);
             if (self.http_error) |message| self.allocator.free(message);
             self.http_error = null;
-            return parseResponse(self.allocator, body);
+            const parsed = try parseResponse(self.allocator, body);
+            self.addUsage(parsed.usage);
+            return parsed;
         }
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -231,10 +314,183 @@ pub const Client = struct {
 
         if (self.http_error) |message| self.allocator.free(message);
         self.http_error = null;
-        return parseResponse(self.allocator, aw.written()) catch |err| {
+        const parsed = parseResponse(self.allocator, aw.written()) catch |err| {
             if (err == error.ApiError) self.recordHttpError(fetch_result.status, aw.written());
             return err;
         };
+        self.addUsage(parsed.usage);
+        return parsed;
+    }
+
+    /// A streaming Responses request. The body is an SSE stream: every event
+    /// is a `data:` line carrying one JSON object. Text deltas are forwarded
+    /// to `sink` as they arrive, and the final event carries the complete
+    /// response object, which is parsed exactly like a non-streaming reply.
+    fn performResponseStream(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink) !ApiResponse {
+        if (self.transport) |transport| {
+            // Tests drive the buffered path; streaming is a network detail.
+            const body = try transport.send(transport.context, self.allocator, req_json);
+            defer self.allocator.free(body);
+            if (self.http_error) |message| self.allocator.free(message);
+            self.http_error = null;
+            const parsed = try parseResponse(self.allocator, body);
+            self.addUsage(parsed.usage);
+            return parsed;
+        }
+
+        const uri = try std.Uri.parse(response_url);
+        var req = try self.http_client.request(.POST, uri, .{
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+                .authorization = .{ .override = auth_header },
+            },
+            .redirect_behavior = .unhandled,
+        });
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = req_json.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(req_json);
+        try body.end();
+        try req.connection.?.flush();
+
+        var redirect_buffer: [8192]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buffer);
+
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+            .identity => &.{},
+            .zstd => try self.allocator.alloc(u8, std.compress.zstd.default_window_len),
+            .deflate, .gzip => try self.allocator.alloc(u8, std.compress.flate.max_window_len),
+            .compress => return error.UnsupportedCompressionMethod,
+        };
+        defer if (decompress_buffer.len > 0) self.allocator.free(decompress_buffer);
+
+        var transfer_buffer: [4096]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+
+        self.retryable_http_error = false;
+        if (response.head.status != .ok) {
+            self.retryable_http_error = switch (@backingInt(response.head.status)) {
+                408, 429, 500, 502, 503, 504 => true,
+                else => false,
+            };
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer aw.deinit();
+            _ = reader.streamRemaining(&aw.writer) catch {};
+            self.recordHttpError(response.head.status, aw.written());
+            return error.ApiError;
+        }
+
+        if (self.http_error) |message| self.allocator.free(message);
+        self.http_error = null;
+
+        // Estimate the request size so the spinner has an input-token count
+        // before the server reports the real one. The real number replaces
+        // this estimate once the final event arrives.
+        const in_estimate = estimateTokens(req_json);
+        _ = self.input_tokens.fetchAdd(in_estimate, .monotonic);
+
+        var out_estimate: u64 = 0;
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.allocator);
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(self.allocator);
+        var completed: ?[]u8 = null;
+        defer if (completed) |c| self.allocator.free(c);
+
+        while (true) {
+            const avail = reader.buffered();
+            if (avail.len == 0) {
+                reader.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    error.ReadFailed => return response.bodyErr() orelse err,
+                };
+                continue;
+            }
+            var i: usize = 0;
+            while (i < avail.len) : (i += 1) {
+                const byte = avail[i];
+                if (byte == '\n') {
+                    try self.handleSseLine(line.items, &data, sink, &completed, &out_estimate);
+                    line.clearRetainingCapacity();
+                } else if (byte != '\r') {
+                    try line.append(self.allocator, byte);
+                }
+            }
+            reader.toss(avail.len);
+        }
+        if (line.items.len > 0) {
+            try self.handleSseLine(line.items, &data, sink, &completed, &out_estimate);
+        }
+
+        const final_body = completed orelse return error.ResponseNotCompleted;
+        const parsed = try parseResponse(self.allocator, final_body);
+        self.correctUsage(in_estimate, out_estimate, parsed.usage);
+        return parsed;
+    }
+
+    fn handleSseLine(
+        self: *Client,
+        line: []const u8,
+        data: *std.ArrayList(u8),
+        sink: StreamSink,
+        completed: *?[]u8,
+        out_estimate: *u64,
+    ) !void {
+        if (line.len == 0) {
+            // A blank line ends the event. Dispatch on the JSON object's own
+            // `type` field rather than the SSE `event:` name, which the proxy
+            // may not always set.
+            if (data.items.len == 0) return;
+            defer data.clearRetainingCapacity();
+            try self.dispatchSse(data.items, sink, completed, out_estimate);
+            return;
+        }
+        if (line[0] == ':') return;
+        if (std.mem.startsWith(u8, line, "data:")) {
+            var value = line["data:".len..];
+            if (value.len > 0 and value[0] == ' ') value = value[1..];
+            if (data.items.len > 0) try data.append(self.allocator, '\n');
+            try data.appendSlice(self.allocator, value);
+        }
+        // `event:` and `id:` lines carry nothing the caller needs.
+    }
+
+    fn dispatchSse(
+        self: *Client,
+        data: []const u8,
+        sink: StreamSink,
+        completed: *?[]u8,
+        out_estimate: *u64,
+    ) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) return;
+
+        if (root.object.get("type")) |kind| {
+            if (kind == .string and (std.mem.eql(u8, kind.string, "response.output_text.delta") or
+                std.mem.eql(u8, kind.string, "response.refusal.delta")))
+            {
+                const delta = root.object.get("delta") orelse return;
+                if (delta != .string) return;
+                sink.onText(sink.context, delta.string);
+                const estimate = estimateTokens(delta.string);
+                out_estimate.* += estimate;
+                _ = self.output_tokens.fetchAdd(estimate, .monotonic);
+                return;
+            }
+        }
+
+        // The terminal events (completed, incomplete, failed) all carry the
+        // full `response` object, which is exactly what the buffered parser
+        // expects.
+        const response_obj = root.object.get("response") orelse return;
+        if (response_obj == .null) return;
+        const encoded = std.json.Stringify.valueAlloc(self.allocator, response_obj, .{}) catch return;
+        if (completed.*) |old| self.allocator.free(old);
+        completed.* = encoded;
     }
 
     fn resetHttpClient(self: *Client) void {
@@ -276,16 +532,16 @@ pub const Tools = enum { included, omitted };
 
 /// Build a stateless Responses API request, replaying typed output items.
 pub fn buildRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools) ![]u8 {
-    return buildRequestWithTools(allocator, model, messages, max_tokens, tools, &.{});
+    return buildRequestWithTools(allocator, model, messages, max_tokens, tools, &.{}, false);
 }
 
-pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8) ![]u8 {
+pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8, stream: bool) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     const w = &aw.writer;
     try w.writeAll("{\"model\":");
     try std.json.Stringify.encodeJsonString(model, .{}, w);
-    try w.print(",\"max_output_tokens\":{d},\"store\":false,\"include\":[\"reasoning.encrypted_content\"],\"input\":[", .{max_tokens});
+    try w.print(",\"max_output_tokens\":{d},\"store\":false,\"stream\":{},\"include\":[\"reasoning.encrypted_content\"],\"input\":[", .{ max_tokens, stream });
     var first = true;
     for (messages) |message| {
         if (message.response_items) |items| {
@@ -458,12 +714,22 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     errdefer if (raw_items) |items| allocator.free(items);
     const reason = try allocator.dupe(u8, if (truncated) "length" else if (calls.items.len > 0) "tool_calls" else "stop");
     errdefer allocator.free(reason);
+    const usage: ?Usage = if (root.object.get("usage")) |usage_value| blk: {
+        if (usage_value != .object) break :blk null;
+        const input = usage_value.object.get("input_tokens");
+        const out = usage_value.object.get("output_tokens");
+        break :blk .{
+            .input_tokens = if (input) |v| if (v == .integer) @intCast(v.integer) else 0 else 0,
+            .output_tokens = if (out) |v| if (v == .integer) @intCast(v.integer) else 0 else 0,
+        };
+    } else null;
     return .{
         .content = text,
         .reasoning_content = null,
         .response_items = raw_items,
         .tool_calls = if (calls.items.len > 0) try calls.toOwnedSlice(allocator) else null,
         .finish_reason = reason,
+        .usage = usage,
     };
 }
 
@@ -495,6 +761,41 @@ fn isRecoverableFetchError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+/// Rough token count for the live status line, before the server reports the
+/// real usage. It approximates OpenAI's tokenizer well enough to watch a reply
+/// stream: ASCII text is about four bytes per token, and each non-ASCII
+/// codepoint (CJK included) counts as one. The real numbers replace this at
+/// the end of the request.
+fn estimateTokens(bytes: []const u8) u64 {
+    var tokens: u64 = 0;
+    var ascii_run: u64 = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const byte = bytes[i];
+        if (byte < 0x80) {
+            ascii_run += 1;
+            i += 1;
+            continue;
+        }
+        tokens += (ascii_run + 3) / 4;
+        ascii_run = 0;
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            tokens += 1;
+            i += 1;
+            continue;
+        };
+        if (i + len > bytes.len) {
+            tokens += 1;
+            i += 1;
+            continue;
+        }
+        tokens += 1;
+        i += len;
+    }
+    tokens += (ascii_run + 3) / 4;
+    return @max(tokens, 1);
 }
 
 test "extract string arg" {
@@ -549,7 +850,7 @@ test "Responses request uses typed items and flat non-strict function schemas" {
         .{ .role = "tool", .content = "result", .reasoning_content = null, .tool_calls = null, .tool_call_id = "call_1" },
     };
     const borrowed = [_][]const u8{"{\"type\":\"function\",\"function\":{\"name\":\"mcp__test__search\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}"};
-    const encoded = try buildRequestWithTools(a, "provider/model-name", &messages, 1234, .included, &borrowed);
+    const encoded = try buildRequestWithTools(a, "provider/model-name", &messages, 1234, .included, &borrowed, false);
     defer a.free(encoded);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
     defer parsed.deinit();
@@ -626,4 +927,50 @@ test "Responses refuses nonterminal, malformed and ambiguous outputs" {
     const refusal = try parseResponse(a, "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"Cannot do that\"}]}]}");
     defer refusal.deinit(a);
     try std.testing.expectEqualStrings("Cannot do that", refusal.content.?);
+}
+
+test "sse deltas stream to the sink and the final event is captured" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const config = try Config.load(allocator, std.testing.io, &env);
+    defer config.deinit();
+    var client = Client.init(allocator, std.testing.io, config);
+    defer client.deinit();
+
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        seen: std.ArrayList(u8),
+        fn onText(context: *anyopaque, delta: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.seen.appendSlice(self.allocator, delta) catch {};
+        }
+    };
+    var capture = Capture{ .allocator = allocator, .seen = .empty };
+    defer capture.seen.deinit(allocator);
+    const sink = StreamSink{ .context = &capture, .onText = Capture.onText };
+
+    var completed: ?[]u8 = null;
+    defer if (completed) |c| allocator.free(c);
+    var out_estimate: u64 = 0;
+
+    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}", sink, &completed, &out_estimate);
+    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"world\"}", sink, &completed, &out_estimate);
+    try client.dispatchSse("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}", sink, &completed, &out_estimate);
+
+    try std.testing.expectEqualStrings("Hello world", capture.seen.items);
+    try std.testing.expect(completed != null);
+    const parsed = try parseResponse(allocator, completed.?);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("Hello world", parsed.content.?);
+    try std.testing.expectEqual(@as(u64, 12), parsed.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u64, 3), parsed.usage.?.output_tokens);
+}
+
+test "token estimates count cjk and ascii sensibly" {
+    try std.testing.expectEqual(@as(u64, 1), estimateTokens(""));
+    try std.testing.expectEqual(@as(u64, 1), estimateTokens("abcd"));
+    try std.testing.expectEqual(@as(u64, 2), estimateTokens("abcde"));
+    // Each CJK codepoint is one token, not the three bytes it encodes as.
+    try std.testing.expectEqual(@as(u64, 2), estimateTokens("你好"));
 }

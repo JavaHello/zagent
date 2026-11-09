@@ -38,6 +38,11 @@ pub const Options = struct {
     started: ?std.Io.Timestamp = null,
     /// Keep an empty input prompt below the status while work is running.
     prompt: ?[]const u8 = null,
+    /// Live token counters, read by the animation every frame and shown next
+    /// to the elapsed time. Pointers into the client's atomics, which outlive
+    /// the animation task.
+    in_tokens: ?*std.atomic.Value(u64) = null,
+    out_tokens: ?*std.atomic.Value(u64) = null,
     /// Whether the caller's terminal can carry an animated line. The caller
     /// decides, because only it knows whether something else — a pager, a
     /// redirected stdout — is using the terminal too.
@@ -133,6 +138,8 @@ fn animate(
             label,
             @divTrunc(elapsed_ms, std.time.ms_per_s),
             budget,
+            if (options.in_tokens) |p| p.load(.monotonic) else null,
+            if (options.out_tokens) |p| p.load(.monotonic) else null,
         ) catch return;
         // Either of these can observe the cancelation; both end the loop.
         var display_buf: [512]u8 = undefined;
@@ -146,8 +153,9 @@ fn animate(
     }
 }
 
-/// The bytes of one frame: the line cleared, the frame, the label, and how long
-/// the query has been running.
+/// The bytes of one frame: the line cleared, the frame, the label, how long
+/// the query has been running, and the live token totals when counters are
+/// provided.
 ///
 /// The label is shortened to fit `budget`, so the line never wraps. A wrapped
 /// line would be half erased by the next frame, leaving the rest of it on
@@ -158,9 +166,18 @@ fn formatLine(
     label: []const u8,
     seconds: i64,
     budget: usize,
+    in_tokens: ?u64,
+    out_tokens: ?u64,
 ) ![]const u8 {
-    var tail_buf: [32]u8 = undefined;
-    const tail = try std.fmt.bufPrint(&tail_buf, " {d}s", .{seconds});
+    var tail_buf: [96]u8 = undefined;
+    const tail = if (in_tokens != null or out_tokens != null)
+        try std.fmt.bufPrint(&tail_buf, " {d}s · in {d} · out {d}", .{
+            seconds,
+            in_tokens orelse 0,
+            out_tokens orelse 0,
+        })
+    else
+        try std.fmt.bufPrint(&tail_buf, " {d}s", .{seconds});
 
     const taken = indent_width + term.width(tail);
     const room = if (budget > taken) budget - taken else 1;
@@ -176,17 +193,17 @@ test "a frame clears its line and names what is being waited for" {
     var buf: [256]u8 = undefined;
     try expectEqualStrings(
         "\r\x1b[2K\x1b[2m  ⠋ thinking… 0s\x1b[0m",
-        try formatLine(&buf, "⠋", "thinking…", 0, 80),
+        try formatLine(&buf, "⠋", "thinking…", 0, 80, null, null),
     );
     try expectEqualStrings(
         "\r\x1b[2K\x1b[2m  ⠙ checking completion… 1s\x1b[0m",
-        try formatLine(&buf, "⠙", "checking completion…", 1, 80),
+        try formatLine(&buf, "⠙", "checking completion…", 1, 80, null, null),
     );
 }
 
 test "a frame is shortened to fit rather than allowed to wrap" {
     var buf: [256]u8 = undefined;
-    const line = try formatLine(&buf, "⠋", "checking completion…", 3600, 24);
+    const line = try formatLine(&buf, "⠋", "checking completion…", 3600, 24, null, null);
 
     // Everything after the erasure is what lands on the line. (`\r` counts as
     // a cell here: term.width measures bytes, so that nothing can hide width.)

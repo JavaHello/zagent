@@ -204,6 +204,27 @@ pub fn columns(file: std.Io.File) usize {
     };
 }
 
+/// Terminal height in rows, or 24 when it cannot be determined.
+///
+/// The screen layout needs this as well as the width: the input line is pinned
+/// to the last row and the conversation is scrolled in the rows above it.
+pub fn rows(file: std.Io.File) usize {
+    return switch (builtin.os.tag) {
+        .windows => 24,
+        else => blk: {
+            var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+            const rc = std.posix.system.ioctl(
+                file.handle,
+                std.posix.T.IOCGWINSZ,
+                @intFromPtr(&ws),
+            );
+            if (std.posix.errno(rc) != .SUCCESS) break :blk 24;
+            if (ws.row == 0) break :blk 24;
+            break :blk @min(@as(usize, ws.row), 1000);
+        },
+    };
+}
+
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 

@@ -29,6 +29,13 @@ pub const PopupItem = struct {
 };
 pub const PopupCallback = *const fn (Allocator, Io, []const u8) Allocator.Error![]PopupItem;
 
+/// Tells the host how many rows the editor needs at the bottom of the screen.
+///
+/// The host repaints the conversation above them when the number changes, or
+/// when `repaint` is set (Ctrl-L and a resize). It also remembers where the
+/// log ended, because the editor moves the cursor away from it.
+pub const LayoutCallback = *const fn (context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void;
+
 /// A scoped raw terminal for widgets that do not edit a line.
 pub const RawTerminal = struct {
     io: Io,
@@ -67,6 +74,7 @@ const key_ctrl_p = 16;
 const key_ctrl_t = 20;
 const key_ctrl_u = 21;
 const key_ctrl_w = 23;
+const key_ctrl_z = 26;
 const key_esc = 27;
 const key_backspace = 127;
 
@@ -75,6 +83,15 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
     defer state.buf.deinit(state.allocator);
     defer state.deinitPopup();
     defer state.finishEdit() catch {};
+
+    // A line suspended with Ctrl-Z comes back with the editor, so the user
+    // does not lose what they had typed while looking at the shell.
+    if (ln.pending_input) |pending| {
+        defer ln.allocator.free(pending);
+        ln.pending_input = null;
+        try state.buf.appendSlice(state.allocator, pending);
+        state.pos = pending.len;
+    }
 
     try state.ln.history.add("");
     state.ln.history.current = state.ln.history.hist.items.len - 1;
@@ -127,10 +144,16 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             key_ctrl_f => try state.editMoveRight(),
             key_ctrl_k => try state.editKillLineForward(),
             key_ctrl_l => {
-                try term.clearScreen(ln.io);
-                state.cursor_row = 0;
-                state.max_rows = 0;
-                state.popup_rows = 0;
+                if (ln.bottom_anchor) {
+                    // The host owns the screen; ask it to draw the log again
+                    // instead of clearing the terminal behind its back.
+                    state.force_repaint = true;
+                } else {
+                    try term.clearScreen(ln.io);
+                    state.cursor_row = 0;
+                    state.max_rows = 0;
+                    state.popup_rows = 0;
+                }
                 try state.refreshLine();
             },
             10 => try state.editInsert("\n"), // Ctrl+J
@@ -143,6 +166,16 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             key_ctrl_t => try state.editSwapPrev(),
             key_ctrl_u => try state.editKillLineBackward(),
             key_ctrl_w => try state.editDeletePrevWord(),
+            key_ctrl_z => {
+                // Suspend through the caller: it knows how to hand the
+                // terminal back and draw the conversation again on resume.
+                // Popping the placeholder keeps the abandoned line out of the
+                // history, the same way Ctrl+C and Ctrl+D do.
+                state.ln.history.pop();
+                if (state.ln.pending_input) |old| state.ln.allocator.free(old);
+                state.ln.pending_input = try state.ln.allocator.dupe(u8, state.buf.items);
+                return error.Suspend;
+            },
             key_esc => {
                 if ((try term.readEscape(ln.io, in, &input_buf)) < 1) {
                     try state.dismissPopup();
@@ -219,7 +252,10 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
 /// Read a line with custom line editing mechanics. This includes hints,
 /// completions and history
 fn linenoiseRaw(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]const u8 {
-    defer out.writeStreamingAll(ln.io, "\n") catch {};
+    // At the bottom of the screen a newline would scroll the whole layout, and
+    // the caller clears the input rows itself. Inline, it is what finishes the
+    // line the user just submitted.
+    defer if (!ln.bottom_anchor) out.writeStreamingAll(ln.io, "\n") catch {};
 
     const orig = try enableRawMode(in, out);
     defer disableRawMode(in, out, orig);
@@ -307,6 +343,15 @@ pub const Linenoise = struct {
     hints_callback: ?HintsCallback = null,
     completions_callback: ?CompletionsCallback = null,
     popup_callback: ?PopupCallback = null,
+    /// Keep the prompt and input at the last rows of the screen, with the
+    /// conversation scrolling above them, instead of drawing at the cursor.
+    bottom_anchor: bool = false,
+    /// How the host is told how many bottom rows the editor needs.
+    layout_callback: ?LayoutCallback = null,
+    layout_context: ?*anyopaque = null,
+    /// The line being edited when Ctrl-Z suspended it, restored and freed by
+    /// the next `linenoise` call.
+    pending_input: ?[]u8 = null,
 
     const Self = @This();
 
@@ -325,6 +370,7 @@ pub const Linenoise = struct {
     /// Free all resources occupied by this struct
     pub fn deinit(self: *Self) void {
         self.history.deinit();
+        if (self.pending_input) |pending| self.allocator.free(pending);
     }
 
     /// Re-examine (currently) stdin and environment variables to
