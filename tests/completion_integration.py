@@ -85,6 +85,25 @@ try:
             assert (result.returncode == 0) == expected_ok, result.stderr
             if not expected_ok:
                 assert 'CompletionUnverified' in result.stderr, result.stderr
+            if 'Missing behavior' in verdict:
+                # The final rejection must not run an extra, uncheckable
+                # repair round (which used to print a second answer).
+                assert result.stdout.count('Candidate answer') == 1, result.stdout
+                assert 'Next step: Implement it' in result.stderr, result.stderr
+                assert 'AI_MAX_VERIFICATIONS' in result.stderr, result.stderr
+
+        # The default three-check budget permits two repair rounds, not a
+        # third repair after the final rejection with no checks left.
+        scenario.update(verdict=json.dumps({'complete': False, 'reason': 'Still missing',
+                                           'next_step': 'Implement the missing behavior'}),
+                        checks=0, rounds=0)
+        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
+                                env=dict(env, AI_MAX_VERIFICATIONS='3'),
+                                capture_output=True, text=True, timeout=30)
+        assert scenario['checks'] == 3, result.stderr
+        assert result.stdout.count('Candidate answer') == 3, result.stdout
+        assert result.returncode != 0 and 'CompletionUnverified' in result.stderr, result.stderr
+        assert 'Next step: Implement the missing behavior' in result.stderr, result.stderr
 
         # A turn whose summary exceeds the judge's budget must still show the
         # judge how it ended. When the opening work was kept and the tail

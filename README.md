@@ -318,7 +318,11 @@ agent keeps working. Up to `AI_MAX_VERIFICATIONS` checks are made per query
 turns the check off. A turn that used no tools is never checked. A reported
 blocker, partial implementation or a plan is not a completed task. If the
 verification budget runs out while the task remains unfinished, the process
-returns `CompletionUnverified`.
+returns `CompletionUnverified`. The final rejection does not start another repair
+round with no checks left. It prints the rejection reason, the suggested next
+step (when supplied), and a configuration hint. Continue that step in a new
+query, or raise `AI_MAX_VERIFICATIONS` before starting a task that needs more
+repair rounds; a larger budget alone does not establish completion.
 
 Two things worth knowing:
 

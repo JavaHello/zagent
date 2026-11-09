@@ -638,11 +638,6 @@ pub const Agent = struct {
             if (!worked) return;
             if (self.max_verifications == 0) return;
 
-            if (verifications == self.max_verifications) {
-                try self.emit(std.Io.File.stderr(), DIM ++ "  ⟳ completion check budget ({d}) spent; task remains unverified\n" ++ RESET, .{self.max_verifications});
-                return error.CompletionUnverified;
-            }
-
             // A check that fails to produce a verdict — the request errored,
             // the reply was truncated, or it was not JSON — says nothing about
             // the work, so it is asked again while budget remains. The answer
@@ -669,6 +664,18 @@ pub const Agent = struct {
             }
 
             try self.emit(std.Io.File.stderr(), YELLOW ++ "  ↻ not done: {s}\n" ++ RESET, .{verdict.reason});
+
+            // Do not start another round that cannot be checked. In particular,
+            // the last rejection used to trigger more tools and print a new
+            // answer, only to fail unconditionally at the top of this loop.
+            if (verifications == self.max_verifications) {
+                try self.emit(std.Io.File.stderr(), DIM ++ "  ⟳ completion check budget ({d}) spent; task remains unverified\n" ++ RESET, .{self.max_verifications});
+                if (verdict.next_step) |step| {
+                    try self.emit(std.Io.File.stderr(), "  Next step: {s}\n", .{step});
+                }
+                try self.emit(std.Io.File.stderr(), "  Continue with the next step in a new query, or increase AI_MAX_VERIFICATIONS for tasks needing more repair rounds.\n", .{});
+                return error.CompletionUnverified;
+            }
 
             // The judge can hand the open question back as a menu of its own
             // making, for the turns the model never got around to asking about.

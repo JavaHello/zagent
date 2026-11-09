@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
         ('edit_file', {'path': 'notes.md', 'old_text': 'Analysis verified.', 'new_text': 'Analysis checked.'}),
         ('edit_file', {'path': 'notes.md', 'old_text': 'not present', 'new_text': 'MUST_NOT_APPEAR'}),
         ('edit_file', {'path': 'escape', 'old_text': 'SHOULD_NOT_ESCAPE', 'new_text': 'DIRECT_EDIT_WORKED'}),
-        ('shell', {'command': 'echo DANGEROUS_HOST_WRITE > /etc/zagent-policy-test-must-not-exist'}),
+        ('shell', {'command': 'echo DANGEROUS_HOST_WRITE > /etc/zagent-policy-test-must-not-exist && echo SANDBOX_PRIVATE_WRITE'}),
     ])
     observed = []
     requests = []
@@ -135,7 +135,10 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     assert outside.read_text() == 'DIRECT_EDIT_WORKED\n', (outside.read_text(), observed[6:14])
     assert 'SECRET_OUTSIDE_WORKSPACE_9c18' in observed[5]
     assert not Path('/etc/zagent-policy-test-must-not-exist').exists()
-    assert 'stderr:' in observed[14] or 'failed' in observed[14].lower(), observed[14]
+    # Linux exposes a private /etc directory: a write there may succeed, but
+    # must never reach the host. Other sandbox backends may deny it outright.
+    assert ('SANDBOX_PRIVATE_WRITE' in observed[14] or
+            'stderr:' in observed[14] or 'failed' in observed[14].lower()), observed[14]
     assert 'Replaced one exact text block' in observed[11], observed[11]
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
