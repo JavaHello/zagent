@@ -25,6 +25,7 @@ pub const all = [_]Command{
     .{ .name = "/remember", .description = "Save a note to memory: /remember <text>" },
     .{ .name = "/forget", .description = "Remove a saved note: /forget <n|all>" },
     .{ .name = "/model", .description = "Show current model" },
+    .{ .name = "/status", .description = "Show token usage and account quota" },
     .{ .name = "/mcp", .description = "List the MCP servers and their tools" },
     .{ .name = "/quit", .description = "Exit zagent" },
     .{ .name = "/exit", .description = "Exit zagent" },
@@ -108,6 +109,17 @@ test "complete offers every command matching the prefix" {
     defer freeCompletions(allocator, e);
     try std.testing.expectEqual(@as(usize, 1), e.len);
     try std.testing.expectEqualStrings("/exit", e[0]);
+}
+
+test "status has a unique completion and hint" {
+    const a = std.testing.allocator;
+    const matches = try complete(a, "/st");
+    defer freeCompletions(a, matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("/status", matches[0]);
+    const suggestion = (try hint(a, "/status")).?;
+    defer a.free(suggestion);
+    try std.testing.expect(std.mem.indexOf(u8, suggestion, "account quota") != null);
 }
 
 test "complete leaves ordinary text and finished commands alone" {

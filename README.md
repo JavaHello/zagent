@@ -580,6 +580,7 @@ and what each brought. Seven behaviours are worth knowing:
 | `/remember <text>` | Save a note to memory        |
 | `/forget <n\|all>` | Remove a saved note, or all of them |
 | `/model`      | Show the current model           |
+| `/status`     | Show token usage and account quota |
 | `/mcp`        | List the MCP servers and their tools |
 | `/quit`       | Exit                             |
 | `Tab` / `Enter` | Insert the selected candidate   |
@@ -684,6 +685,8 @@ zagent logout
 ```
 
 Open the official device authorization URL printed by `login` in a browser on any device and enter the displayed code. Device authorization must be enabled for the account. This is an independent implementation of the official Codex protocol, not an OpenAI-published client.
+
+`/status` shows the current model and the last turn's input/output tokens (server usage or local estimates). With `AI_PROVIDER=codex`, it also fetches ChatGPT subscription usage windows, showing used/remaining percentages and reset countdowns. Other providers' account quotas must be checked in their billing dashboards. This command does not make a model request; quota lookup failures do not interrupt the conversation.
 
 ChatGPT credentials use `https://chatgpt.com/backend-api/codex/responses` and `/models`; they are not API keys for `https://api.openai.com/v1`. The existing `openai` provider continues to use separately billed API keys. The `codex` provider rejects custom `AI_URL` values and does not use `AI_KEY` for authentication. `models` prints the server's original JSON.
 

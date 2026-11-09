@@ -163,7 +163,8 @@ pub const Client = struct {
             .{ .name = "originator", .value = "codex_cli_rs" },
         };
         const result = try self.http_client.fetch(.{
-            .location = .{ .url = url }, .method = .GET,
+            .location = .{ .url = url },
+            .method = .GET,
             .headers = .{ .authorization = .{ .override = bearer } },
             .extra_headers = if (self.credentials != null) &headers else &.{},
             .redirect_behavior = .unhandled,
@@ -175,6 +176,27 @@ pub const Client = struct {
 
     /// Forget the token totals of the previous query. Called when a new query
     /// starts, so the counts the spinner shows belong to this query only.
+    /// Query subscription limits without making a model request.
+    pub fn quotaStatus(self: *Client) ![]u8 {
+        if (self.codex_auth_path == null) return self.allocator.dupe(u8, "Account quota: unavailable for this provider; check its billing dashboard.\n");
+        try self.authenticate();
+        const credentials = self.credentials.?;
+        const bearer = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{credentials.parsed.value.access_token});
+        defer self.allocator.free(bearer);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const result = try self.http_client.fetch(.{
+            .location = .{ .url = "https://chatgpt.com/backend-api/wham/usage" },
+            .headers = .{ .authorization = .{ .override = bearer } },
+            .extra_headers = &.{.{ .name = "ChatGPT-Account-ID", .value = credentials.account_id }},
+            .redirect_behavior = .unhandled,
+            .response_writer = &out.writer,
+        });
+        if (result.status == .unauthorized) return error.CodexLoginRequired;
+        if (result.status != .ok) return error.QuotaRequestFailed;
+        return @import("status.zig").formatQuota(self.allocator, out.written());
+    }
+
     pub fn resetTokenCounters(self: *Client) void {
         self.input_tokens.store(0, .monotonic);
         self.output_tokens.store(0, .monotonic);

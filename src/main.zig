@@ -29,6 +29,7 @@ const HELP =
     \\  /remember <text>  Save a note to memory
     \\  /forget <n|all>   Remove a saved note
     \\  /model       Show current model
+    \\  /status      Show token usage and account quota
     \\  /mcp         List the MCP servers and their tools
     \\  /quit, /exit Exit zagent
     \\  /, @, $      Command / project file / reserved candidates
@@ -395,6 +396,17 @@ fn runRepl(
         } else if (std.mem.eql(u8, line, "/forget") or std.mem.startsWith(u8, line, "/forget ")) {
             const argument = std.mem.trim(u8, line["/forget".len..], " \t");
             agent.forgetCommand(argument) catch |err| try reportCommandError(allocator, &screen, io, "forget", err);
+        } else if (std.mem.eql(u8, line, "/status")) {
+            const counts = agent.client.tokenCounts();
+            const msg = try std.fmt.allocPrint(allocator, "Model: {s}\nLast turn tokens (server usage or estimate): input {d}, output {d}\n", .{ config.model, counts.input, counts.output });
+            defer allocator.free(msg);
+            try writeOut(&screen, stdout, io, msg);
+            const quota = agent.client.quotaStatus() catch |err| {
+                try reportCommandError(allocator, &screen, io, "status: quota unavailable", err);
+                continue;
+            };
+            defer allocator.free(quota);
+            try writeOut(&screen, stdout, io, quota);
         } else if (std.mem.eql(u8, line, "/model")) {
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\n", .{config.model});
             defer allocator.free(msg);
@@ -478,6 +490,7 @@ test {
     _ = @import("editor/main.zig");
     _ = @import("unicode_width/main.zig");
     _ = @import("agent.zig");
+    _ = @import("status.zig");
     _ = @import("sandbox.zig");
     _ = @import("session.zig");
     _ = @import("tool_worker.zig");
