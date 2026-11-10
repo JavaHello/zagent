@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A task must not exit successfully when its completion check rejects it."""
+"""Rejected checks fail; known external blockers settle without claiming completion."""
 from mock_api import send_response, handle_planning, trust_workspace
 
 import http.server
@@ -93,7 +93,7 @@ try:
                 assert 'Next step: Implement it' in result.stderr, result.stderr
                 assert 'AI_MAX_VERIFICATIONS' in result.stderr, result.stderr
 
-        # An external blocker is not a repair loop or a successful completion.
+        # An external blocker settles normally, without retries or a success claim.
         scenario.update(verdict=json.dumps({'complete': False, 'blocked': True,
                                            'reason': 'Authentication unavailable',
                                            'next_step': 'Provide credentials'}),
@@ -103,9 +103,30 @@ try:
                                 capture_output=True, text=True, timeout=30)
         assert scenario['checks'] == 1, result.stderr
         assert result.stdout.count('Candidate answer') == 1, result.stdout
-        assert result.returncode != 0 and 'CompletionUnverified' in result.stderr, result.stderr
-        assert 'external prerequisite unavailable' in result.stderr, result.stderr
+        assert result.returncode == 0, result.stderr
+        assert 'CompletionUnverified' not in result.stderr, result.stderr
+        assert '⏸ blocked: Authentication unavailable' in result.stderr, result.stderr
         assert 'Next step: Provide credentials' in result.stderr, result.stderr
+        assert 'Task blocked' in result.stderr, result.stderr
+        assert 'Task completed' not in result.stderr, result.stderr
+        assert '↻ not done' not in result.stderr, result.stderr
+
+        # A private parent POM blocks full validation even when a narrow check
+        # passed. The blocker must take precedence over an exhausted budget.
+        scenario.update(verdict=json.dumps({
+            'complete': False, 'blocked': True,
+            'reason': 'storeId whitespace validation passed; module tests could not run: '
+                      'private parent POM com.paylabs:parent:2.2.0-SNAPSHOT unavailable',
+            'next_step': 'Configure the private Maven repository or supply a local parent POM',
+        }), checks=0, rounds=0)
+        result = subprocess.run([str(binary), 'Validate the storeId fix'], cwd=directory,
+                                env=env, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0 and scenario['checks'] == 1, result.stderr
+        assert 'com.paylabs:parent:2.2.0-SNAPSHOT' in result.stderr, result.stderr
+        assert 'Next step: Configure the private Maven repository' in result.stderr, result.stderr
+        assert 'Task blocked' in result.stderr, result.stderr
+        for unwanted in ('CompletionUnverified', 'Task completed', 'budget (1) spent'):
+            assert unwanted not in result.stderr, result.stderr
 
         # The default three-check budget permits two repair rounds, not a
         # third repair after the final rejection with no checks left.

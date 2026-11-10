@@ -333,7 +333,13 @@ An unfinished verdict is printed and fed back into the conversation, and the
 agent keeps working. Up to `AI_MAX_VERIFICATIONS` checks are made per query
 (3 by default); the budget is printed when it runs out, and `AI_MAX_VERIFICATIONS=0`
 turns the check off. A turn that used no tools is never checked. A reported
-blocker, partial implementation or a plan is not a completed task. If the
+blocker, partial implementation or a plan is not a completed task.
+When the checker identifies an unavailable external prerequisite (such as
+private Maven dependencies or authentication), the turn ends normally with
+`Task blocked`, the reason and the next step. It does not retry, throw
+`CompletionUnverified`, or print `Task completed`. This settled blocked state
+exits with code 0; it does **not** certify that implementation or tests passed.
+Resume with a new query once the prerequisite is available. If the
 verification budget runs out while the task remains unfinished, the process
 returns `CompletionUnverified`. The final rejection does not start another repair
 round with no checks left. It prints the rejection reason, the suggested next

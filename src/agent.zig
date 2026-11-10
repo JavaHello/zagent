@@ -638,7 +638,7 @@ pub const Agent = struct {
         self.terminal_title.update("planning…", "");
         var task_title: ?[]u8 = null;
         defer if (task_title) |title| self.allocator.free(title);
-        self.processQueryInner(query, &task_title) catch |err| {
+        const outcome = self.processQueryInner(query, &task_title) catch |err| {
             self.terminal_title.update("error", self.current_task);
             return err;
         };
@@ -656,7 +656,11 @@ pub const Agent = struct {
         try self.checkInterrupted();
         self.extractMemories(query) catch {};
         try self.checkInterrupted();
-        try self.emit(std.Io.File.stderr(), BOLD ++ GREEN ++ "  ✓ Task completed" ++ RESET ++ "\n", .{});
+        switch (outcome) {
+            .completed => try self.emit(std.Io.File.stderr(), BOLD ++ GREEN ++ "  ✓ Task completed" ++ RESET ++ "\n", .{}),
+            .blocked => try self.emit(std.Io.File.stderr(), YELLOW ++ "  ⏸ Task blocked · resume when the prerequisite is available" ++ RESET ++ "\n", .{}),
+            .paused => try self.emit(std.Io.File.stderr(), DIM ++ "  Task paused" ++ RESET ++ "\n", .{}),
+        }
     }
 
     fn progressOptions(self: *Agent) spinner.Options {
@@ -706,7 +710,11 @@ pub const Agent = struct {
         return owned;
     }
 
-    fn processQueryInner(self: *Agent, query: []const u8, task_title: *?[]u8) !void {
+    // A known external blocker is a settled turn, not a failed checker or a
+    // completed task. Keep that distinction through final status reporting.
+    const QueryOutcome = enum { completed, blocked, paused };
+
+    fn processQueryInner(self: *Agent, query: []const u8, task_title: *?[]u8) !QueryOutcome {
         try self.appendUserMessage(query);
         try self.checkpoint();
         // A conversation that has grown past the budget is compacted before
@@ -731,8 +739,8 @@ pub const Agent = struct {
             // claims the work is finished still has to pass the check.
             worked = worked or turn.tool_calls > 0;
             // A query that never touched a tool is a conversation, not a task.
-            if (!worked) return;
-            if (self.max_verifications == 0) return;
+            if (!worked) return .completed;
+            if (self.max_verifications == 0) return .completed;
 
             // A check that fails to produce a verdict — the request errored,
             // the reply was truncated, or it was not JSON — says nothing about
@@ -757,18 +765,18 @@ pub const Agent = struct {
 
             if (verdict.complete) {
                 try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ completion check passed\n" ++ RESET, .{});
-                return;
+                return .completed;
             }
 
-            try self.emit(std.Io.File.stderr(), YELLOW ++ "  ↻ not done: {s}\n" ++ RESET, .{verdict.reason});
-
             if (verdict.blocked and !verdict.needs_user_decision) {
-                try self.emit(std.Io.File.stderr(), YELLOW ++ "  stopped: external prerequisite unavailable\n" ++ RESET, .{});
+                try self.emit(std.Io.File.stderr(), YELLOW ++ "  ⏸ blocked: {s}\n" ++ RESET, .{verdict.reason});
                 if (verdict.next_step) |step| {
                     try self.emit(std.Io.File.stderr(), "  Next step: {s}\n", .{step});
                 }
-                return error.CompletionUnverified;
+                return .blocked;
             }
+
+            try self.emit(std.Io.File.stderr(), YELLOW ++ "  ↻ not done: {s}\n" ++ RESET, .{verdict.reason});
 
             // Do not start another round that cannot be checked. In particular,
             // the last rejection used to trigger more tools and print a new
@@ -788,7 +796,7 @@ pub const Agent = struct {
                 const question = verdict.question orelse "How should I proceed?";
                 const answer = (try self.askChoice(question, verdict.options.items)) orelse {
                     try self.emit(std.Io.File.stderr(), DIM ++ "  stopped without an answer\n" ++ RESET, .{});
-                    return;
+                    return .paused;
                 };
                 defer self.allocator.free(answer);
                 try self.emit(std.Io.File.stderr(), DIM ++ "  → {s}\n" ++ RESET, .{answer});
