@@ -541,15 +541,26 @@ Five behaviours are worth knowing:
 ### MCP servers
 
 zagent is an MCP client. Servers described in `mcp.json` are started at
-startup, their tools are listed, and the model is offered them beside the
-built-in ones — a tool called `read_file` on a server called `filesystem` is
-offered as `mcp__filesystem__read_file`. The file lives next to the config
+startup and their tools are discovered locally, but their tool descriptions
+and parameter schemas are **not** sent to the model yet. Initially the model
+sees only a service directory (names and short descriptions) and the
+`load_mcp_tools` tool. When a user request needs a service, the model loads it
+by name; only that service's tools are added to subsequent model requests.
+Loaded services stay available for the lifetime of the process. This is
+context lazy loading, not deferred server startup or connection.
+
+Use the optional `description` field to explain when a service is useful.
+Without it, the directory falls back to the server's instructions, if any;
+directory descriptions are capped at 320 bytes. Full service instructions are
+returned when loading. A tool called `read_file` on `filesystem` is offered
+as `mcp__filesystem__read_file` after loading. The file lives next to the config
 file, and `mcp.example.json` shows every member it takes:
 
 ```json
 {
   "mcpServers": {
     "filesystem": {
+      "description": "Read and browse files under /tmp",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
     },
@@ -572,6 +583,8 @@ every HTTP request, `timeoutMs` says how long a request waits for an answer
   ✓ mcp: filesystem — 11 tools, 2025-06-18
 
 ❯ what is in /tmp?
+  ⚙ load_mcp_tools {"server":"filesystem"}
+  ✓ Loaded 11 tools from MCP server 'filesystem'.
   ⚙ mcp__filesystem__list_directory {"path":"/tmp"}
   ✓ [FILE] notes.md
     [DIR] projects

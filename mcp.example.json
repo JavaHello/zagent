@@ -12,6 +12,7 @@
     "sees: a tool called 'read_file' on the server 'filesystem' is offered as",
     "mcp__filesystem__read_file.",
     "",
+    "  description  short service summary shown before tools are lazy-loaded",
     "  command  start this program and speak MCP over its standard streams",
     "  args     the arguments for that program",
     "  env      variables added to or overriding the server's inherited host environment",
@@ -25,11 +26,13 @@
 
   "mcpServers": {
     "filesystem": {
+      "description": "Read and browse local files under /tmp",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
     },
 
     "github": {
+      "description": "Work with GitHub repositories, issues and pull requests",
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_..." },

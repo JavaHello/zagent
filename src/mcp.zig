@@ -85,6 +85,8 @@ pub const HttpServer = struct {
 /// One server as `mcp.json` describes it. Owns its strings.
 pub const ServerConfig = struct {
     name: []const u8,
+    /// Short service-level description for lazy discovery by the model.
+    description: ?[]const u8 = null,
     transport: union(enum) {
         stdio: StdioServer,
         http: HttpServer,
@@ -96,6 +98,7 @@ pub const ServerConfig = struct {
 
     pub fn deinit(self: ServerConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
+        if (self.description) |text| allocator.free(text);
         switch (self.transport) {
             .stdio => |stdio| {
                 allocator.free(stdio.command);
@@ -278,6 +281,8 @@ fn parseServer(
 
     const owned_name = try allocator.dupe(u8, name);
     errdefer allocator.free(owned_name);
+    const description = try stringMember(allocator, entry.get("description"));
+    errdefer if (description) |text| allocator.free(text);
 
     if (command) |program| {
         const args = try stringList(allocator, entry.get("args"));
@@ -290,6 +295,7 @@ fn parseServer(
 
         return .{
             .name = owned_name,
+            .description = description,
             .transport = .{ .stdio = .{
                 .command = try allocator.dupe(u8, program),
                 .args = args,
@@ -305,6 +311,7 @@ fn parseServer(
 
     return .{
         .name = owned_name,
+        .description = description,
         .transport = .{ .http = .{
             .url = try allocator.dupe(u8, url.?),
             .headers = headers,
@@ -1313,6 +1320,7 @@ const Server = struct {
     /// is where a token lives.
     summary: []u8,
     tool_count: usize = 0,
+    loaded: bool = false,
 
     fn deinit(self: *Server, allocator: std.mem.Allocator) void {
         if (self.connection) |*connection| connection.deinit();
@@ -1323,6 +1331,10 @@ const Server = struct {
 };
 
 pub const Registry = struct {
+    pub const loader_name = "load_mcp_tools";
+    const loader_json =
+        \\{"name":"load_mcp_tools","description":"Load a relevant MCP server's tools before using them. Choose an exact server name from the MCP service directory only when needed for the user's request. Loaded tools become available on the next request.","parameters":{"type":"object","properties":{"server":{"type":"string","description":"Exact MCP server name from the directory"}},"required":["server"],"additionalProperties":false}}
+    ;
     allocator: std.mem.Allocator,
     io: std.Io,
     servers: []Server,
@@ -1482,10 +1494,7 @@ pub const Registry = struct {
             self.allocator.free(self.tools);
         }
 
-        const views = try self.allocator.alloc([]const u8, self.tools.len);
-        errdefer self.allocator.free(views);
-        for (self.tools, 0..) |tool, index| views[index] = tool.function;
-        self.tool_json = views;
+        try self.refreshFunctions();
 
         for (self.tools, 0..) |tool, index| {
             try self.by_alias.put(self.allocator, tool.alias, index);
@@ -1517,6 +1526,47 @@ pub const Registry = struct {
         return self.tool_json;
     }
 
+    fn refreshFunctions(self: *Registry) !void {
+        var views: std.ArrayList([]const u8) = .empty;
+        errdefer views.deinit(self.allocator);
+        if (self.tools.len > 0) try views.append(self.allocator, loader_json);
+        for (self.tools) |tool| {
+            if (self.servers[tool.server].loaded) try views.append(self.allocator, tool.function);
+        }
+        const replacement = try views.toOwnedSlice(self.allocator);
+        self.allocator.free(self.tool_json);
+        self.tool_json = replacement;
+    }
+
+    /// Activate one service, without copying its schemas into conversation history.
+    pub fn loadTools(self: *Registry, allocator: std.mem.Allocator, arguments_json: []const u8) !tools.ToolResult {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch {
+            return errorResult(allocator, "Expected an object with a server name.", .{});
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return errorResult(allocator, "Expected an object with a server name.", .{});
+        const name = parsed.value.object.get("server") orelse return errorResult(allocator, "Missing server name.", .{});
+        if (name != .string) return errorResult(allocator, "Server name must be a string.", .{});
+        for (self.servers) |*server| {
+            if (!std.mem.eql(u8, server.config.name, name.string)) continue;
+            if (server.failure != null or server.connection == null or server.tool_count == 0)
+                return errorResult(allocator, "MCP server '{s}' has no available tools.", .{name.string});
+            const was_loaded = server.loaded;
+            server.loaded = true;
+            self.refreshFunctions() catch |err| {
+                server.loaded = was_loaded;
+                return err;
+            };
+            const note = server.connection.?.instructions orelse "";
+            return .{ .is_error = false, .content = try std.fmt.allocPrint(
+                allocator,
+                "Loaded {d} tools from MCP server '{s}'. They are now available.\nService instructions:\n{s}",
+                .{ server.tool_count, name.string, note },
+            ) };
+        }
+        return errorResult(allocator, "Unknown MCP server '{s}'. Use an exact name from the service directory.", .{name.string});
+    }
+
     /// The progress line for a call, or null for anything that is not one of
     /// these tools — including a name the model made up.
     pub fn progressLabel(self: *const Registry, name: []const u8) ?[]const u8 {
@@ -1540,6 +1590,9 @@ pub const Registry = struct {
         };
         const tool = self.tools[index];
         const server = &self.servers[tool.server];
+        if (!server.loaded) {
+            return errorResult(allocator, "Load MCP server '{s}' with load_mcp_tools before calling its tools.", .{server.config.name});
+        }
 
         if (server.failure) |reason| {
             return errorResult(
@@ -1592,17 +1645,21 @@ pub const Registry = struct {
         };
     }
 
-    /// What the servers say about using them, for the system prompt.
+    /// Compact service directory, not full instructions, for the system prompt.
     pub fn instructions(self: *const Registry, allocator: std.mem.Allocator) !?[]u8 {
         var aw: std.Io.Writer.Allocating = .init(allocator);
         errdefer aw.deinit();
 
         for (self.servers) |server| {
             const connection = server.connection orelse continue;
-            const note = connection.instructions orelse continue;
+            if (server.failure != null or server.tool_count == 0) continue;
+            const note = server.config.description orelse connection.instructions orelse "No description provided.";
+            // Keep the startup directory small even when a server returns a manual.
+            var end = @min(note.len, 320);
+            while (end > 0 and end < note.len and (note[end] & 0xc0) == 0x80) : (end -= 1) {}
             try aw.writer.print(
-                "\n\nFrom the MCP server \"{s}\":\n{s}",
-                .{ server.config.name, note },
+                "\n- MCP server \"{s}\": {s}{s}",
+                .{ server.config.name, note[0..end], if (end < note.len) "…" else "" },
             );
         }
 
@@ -1971,11 +2028,12 @@ test "mcp.json is read into servers" {
         \\  "mcpServers": {
         \\    "filesystem": {
         \\      "command": "npx",
+        \\      "description": "Browse local files",
         \\      "args": ["-y", "server-filesystem", "/tmp"],
         \\      "env": {"TOKEN": "secret"},
         \\      "timeoutMs": 5000
         \\    },
-        \\    "remote": {"url": "https://example.com/mcp", "headers": {"Authorization": "Bearer t"}},
+        \\    "remote": {"url": "https://example.com/mcp", "description": "Remote service", "headers": {"Authorization": "Bearer t"}},
         \\    "off": {"command": "slow", "disabled": true},
         \\    "broken": {"command": "a", "url": "b"},
         \\    "nameless": {"timeoutMs": 100}
@@ -2004,6 +2062,8 @@ test "mcp.json is read into servers" {
     try std.testing.expectEqual(@as(usize, 2), problems.items.len);
 
     try std.testing.expectEqualStrings("filesystem", servers[0].name);
+    try std.testing.expectEqualStrings("Browse local files", servers[0].description.?);
+    try std.testing.expectEqualStrings("Remote service", servers[1].description.?);
     try std.testing.expectEqualStrings("npx", servers[0].transport.stdio.command);
     try std.testing.expectEqual(@as(usize, 3), servers[0].transport.stdio.args.len);
     try std.testing.expectEqualStrings("/tmp", servers[0].transport.stdio.args[2]);
@@ -2389,12 +2449,18 @@ test "the registry connects what mcp.json names, end to end" {
     // has to be written for it but the configuration itself.
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    try aw.writer.writeAll("{\"mcpServers\":{\"demo\":{\"command\":\"sh\",\"args\":[");
-    for ([_][]const u8{ "-c", fake_server_script, "demo", "modern" }, 0..) |arg, index| {
-        if (index > 0) try aw.writer.writeByte(',');
-        try std.json.Stringify.encodeJsonString(arg, .{}, &aw.writer);
+    try aw.writer.writeAll("{\"mcpServers\":{");
+    for ([_][]const u8{ "demo", "other" }, 0..) |name, server_index| {
+        if (server_index > 0) try aw.writer.writeByte(',');
+        try std.json.Stringify.encodeJsonString(name, .{}, &aw.writer);
+        try aw.writer.writeAll(":{\"description\":\"Echo service\",\"command\":\"sh\",\"args\":[");
+        for ([_][]const u8{ "-c", fake_server_script, "demo", "modern" }, 0..) |arg, index| {
+            if (index > 0) try aw.writer.writeByte(',');
+            try std.json.Stringify.encodeJsonString(arg, .{}, &aw.writer);
+        }
+        try aw.writer.writeAll("]}");
     }
-    try aw.writer.writeAll("]}}}");
+    try aw.writer.writeAll("}}");
     try tmp.dir.writeFile(io, .{ .sub_path = "zagent/mcp.json", .data = aw.written() });
 
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -2414,14 +2480,41 @@ test "the registry connects what mcp.json names, end to end" {
     defer registry.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), problems.items.len);
-    try std.testing.expectEqual(@as(usize, 1), registry.servers.len);
+    try std.testing.expectEqual(@as(usize, 2), registry.servers.len);
     try std.testing.expectEqual(@as(usize, 1), registry.functionJson().len);
-    try std.testing.expectEqual(@as(usize, 1), registry.tools.len);
+    try std.testing.expectEqual(@as(usize, 2), registry.tools.len);
     try std.testing.expectEqualStrings("mcp__demo__echo", registry.tools[0].alias);
 
-    // What the model is offered is a function object with the server's schema.
-    try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[0], "\"name\":\"mcp__demo__echo\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[0], "\"required\":[\"text\"]") != null);
+    const directory = (try registry.instructions(allocator)).?;
+    defer allocator.free(directory);
+    try std.testing.expect(std.mem.indexOf(u8, directory, "Echo service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, directory, "Say it back.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, directory, "mcp__demo__echo") == null);
+
+    // Initially only the loader is advertised, not remote descriptions/schemas.
+    try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[0], "\"name\":\"load_mcp_tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[0], "mcp__demo__echo") == null);
+    const premature = try registry.call(allocator, "mcp__demo__echo", "{}");
+    defer premature.deinit(allocator);
+    try std.testing.expect(premature.is_error);
+    const missing = try registry.loadTools(allocator, "{\"server\":\"missing\"}");
+    defer missing.deinit(allocator);
+    try std.testing.expect(missing.is_error);
+    const invalid = try registry.loadTools(allocator, "[]");
+    defer invalid.deinit(allocator);
+    try std.testing.expect(invalid.is_error);
+    const loaded = try registry.loadTools(allocator, "{\"server\":\"demo\"}");
+    defer loaded.deinit(allocator);
+    try std.testing.expect(!loaded.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, loaded.content, "Say it back.") != null);
+    try std.testing.expectEqual(@as(usize, 2), registry.functionJson().len);
+    try std.testing.expect(!registry.servers[1].loaded);
+    try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[1], "\"name\":\"mcp__demo__echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[1], "\"required\":[\"text\"]") != null);
+    const again = try registry.loadTools(allocator, "{\"server\":\"demo\"}");
+    defer again.deinit(allocator);
+    try std.testing.expect(!again.is_error);
+    try std.testing.expectEqual(@as(usize, 2), registry.functionJson().len);
 
     // A label the spinner may show, and nothing at all for a name it invented.
     try std.testing.expectEqualStrings("demo/echo…", registry.progressLabel("mcp__demo__echo").?);
