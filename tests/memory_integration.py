@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import threading
 
-from mock_api import handle_planning, send_response, trust_workspace
+from mock_api import send_response, trust_workspace
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 requests = []
@@ -30,8 +30,6 @@ class API(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        if handle_planning(self, body):
-            return
         if 'You maintain the durable memory' in json.dumps(body['input']):
             extractions.append(body)
             text = '{"remember":[]}'

@@ -20,23 +20,6 @@ def trust_workspace(directory, env):
     return root
 
 
-PLAN_APPROACH = 'I will check the request and carry out the task.'
-
-
-def handle_planning(handler, request):
-    """Answer the tool-free preflight without consuming a scenario reply."""
-    items = request.get('input', [])
-    if not items or items[-1].get('role') != 'developer':
-        return False
-    if 'Before executing the latest user request' not in str(items[-1].get('content')):
-        return False
-    send_response(handler, request, {'status': 'completed', 'output': [
-        {'type': 'message', 'role': 'assistant', 'content': [
-            {'type': 'output_text', 'text': json.dumps({
-                'title': 'Carry out the task', 'approach': PLAN_APPROACH})}]}]})
-    return True
-
-
 def send_response(handler, request, payload):
     if request.get('stream'):
         events = []

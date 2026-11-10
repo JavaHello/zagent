@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise ask_user through a real PTY and a local Responses API stub."""
-from mock_api import send_response, handle_planning, trust_workspace
+from mock_api import send_response, trust_workspace
 
 import http.server
 import json
@@ -19,6 +19,10 @@ import fcntl
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 answers = []
+requests = []
+task_title = 'Carry out the task · ' + '题' * 58
+assert len(task_title) == 79
+task_description = '先明确方案，再按选择执行。'
 
 
 class API(http.server.BaseHTTPRequestHandler):
@@ -27,15 +31,14 @@ class API(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        if handle_planning(self, body):
-            return
+        requests.append(body)
+        assert body.get('tools'), 'unexpected separate planning or summarization request'
         results = [m for m in body['input'] if m.get('type') == 'function_call_output']
-        if not body.get('tools'):
-            content = json.dumps({'complete': True, 'reason': 'Choice received'})
-            output = [{'type': 'message', 'role': 'assistant',
-                       'content': [{'type': 'output_text', 'text': content}]}]
-        elif not results:
-            output = [{'type': 'function_call', 'call_id': 'choice', 'name': 'ask_user',
+        if not results:
+            output = [{'type': 'function_call', 'call_id': 'task', 'name': 'set_task',
+                       'arguments': json.dumps({'title': task_title,
+                                                'description': task_description})},
+                      {'type': 'function_call', 'call_id': 'choice', 'name': 'ask_user',
                        'arguments': json.dumps({'question': '选择方案？', 'options': [
                            {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]})}]
         else:
@@ -63,6 +66,7 @@ try:
         ]
         for keys, custom, expected in cases:
             previous_answers = len(answers)
+            previous_requests = len(requests)
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
             original = termios.tcgetattr(slave)
@@ -88,6 +92,8 @@ try:
                         custom_sent = True
                 assert process.returncode == 0, transcript.decode(errors='replace')
                 assert len(answers) == previous_answers + 1, answers
+                assert len(requests) == previous_requests + 2, requests
+                assert task_description.encode() in transcript, transcript
                 assert expected in answers[-1], answers
                 assert termios.tcgetattr(slave) == original, 'raw terminal was not restored'
                 titles = re.findall(rb'\x1b\]2;([^\x07]*)\x07', transcript)
@@ -105,6 +111,8 @@ try:
         assert piped.returncode == 0, piped.stderr
         assert 'recommended option: Beta' in answers[-1], answers
         assert 'Enter confirm' not in piped.stdout + piped.stderr
+        assert piped.stdout.count(task_description) == 1, piped.stdout
+        assert '\x1b]2;' not in piped.stderr, piped.stderr
         print('PASS: recommendation, arrows, number keys, custom text, cancellation, terminal restoration and piped fallback')
 finally:
     server.shutdown()

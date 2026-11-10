@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import threading
 
-from mock_api import send_response, handle_planning, PLAN_APPROACH, trust_workspace
+from mock_api import send_response, trust_workspace
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 answer = ''
@@ -19,8 +19,6 @@ class API(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        if handle_planning(self, body):
-            return
         assert body['stream'] is True
         assert self.path == '/v1/responses'
         send_response(self, body, {'status': 'completed', 'output': [
@@ -41,7 +39,7 @@ try:
             result = subprocess.run([str(binary), 'Answer'], cwd=directory, env=env,
                                     capture_output=True, text=True, timeout=15)
             assert result.returncode == 0, result.stderr
-            assert result.stdout == PLAN_APPROACH + '\n\n' + answer + '\n', repr(result.stdout)
+            assert result.stdout == answer + '\n', repr(result.stdout)
         print('PASS: streamed plain text, Unicode, multiline markdown, fences and trailing newlines')
 finally:
     server.shutdown()

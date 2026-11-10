@@ -14,7 +14,7 @@ import tempfile
 import termios
 import threading
 import time
-from mock_api import handle_planning, send_response, trust_workspace
+from mock_api import send_response, trust_workspace
 
 requests = []
 
@@ -25,8 +25,6 @@ class API(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        if handle_planning(self, body):
-            return
         requests.append(body)
         if ('first-session-marker' in json.dumps(body.get('input', []))
                 and not any(item.get('type') == 'function_call_output'

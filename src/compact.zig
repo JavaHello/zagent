@@ -13,9 +13,6 @@ const Message = openai.Message;
 /// model needs the gist, not a second copy of every file it already read.
 pub const max_message_bytes: usize = 2_000;
 pub const max_tool_result_bytes: usize = 600;
-/// Largest transcript sent in one summarization request. Longer ranges are
-/// summarized in several passes, each carrying the summary so far.
-pub const max_chunk_bytes: usize = 24_000;
 /// Longest summary kept in the history. A summary longer than this would
 /// defeat the purpose of compacting.
 pub const max_summary_bytes: usize = 6_000;
@@ -91,24 +88,6 @@ fn readKey(allocator: std.mem.Allocator, call: openai.ToolCallData, content: []c
     hash.update(content);
     return hash.finalResult();
 }
-
-pub const SUMMARY_SYSTEM_PROMPT =
-    \\You compress the earlier part of a conversation between a user and
-    \\zagent, a command-line AI coding agent. You are given a summary so far
-    \\(possibly empty) and the next segment of the conversation. Return an
-    \\updated summary that preserves everything needed to continue the work.
-    \\
-    \\Keep:
-    \\- the user's goals, constraints, preferences and decisions
-    \\- file paths, commands, code changes, errors and their outcomes
-    \\- open tasks and the single next concrete step
-    \\- durable facts the user asked to remember
-    \\Drop:
-    \\- greetings, repetition, and tool output whose details no longer matter
-    \\
-    \\Write compact prose or bullets. Reply with the summary only, no preamble,
-    \\and keep it under about 400 words.
-;
 
 /// Estimate exactly the history projection sent by Responses, not the local
 /// duplicate text/call fields beside response_items. JSON framing and escaping
@@ -257,44 +236,6 @@ pub fn sanitizeSummary(allocator: std.mem.Allocator, content: []const u8) ![]u8 
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed.len == 0) return error.EmptySummary;
     return allocator.dupe(u8, truncateUtf8(trimmed, max_summary_bytes));
-}
-
-/// The two messages that ask for the next summary. The segment is owned by the
-/// caller; `freeSummaryMessages` releases what is allocated here.
-pub fn buildSummaryMessages(
-    allocator: std.mem.Allocator,
-    previous: ?[]const u8,
-    segment: []const u8,
-) ![]Message {
-    const prompt = if (previous) |summary|
-        try std.fmt.allocPrint(allocator, "Summary so far:\n{s}\n\nNext part of the conversation:\n{s}", .{ summary, segment })
-    else
-        try std.fmt.allocPrint(allocator, "Next part of the conversation:\n{s}", .{segment});
-    errdefer allocator.free(prompt);
-
-    const messages = try allocator.alloc(Message, 2);
-    errdefer allocator.free(messages);
-    messages[0] = .{
-        .role = "system",
-        .content = try allocator.dupe(u8, SUMMARY_SYSTEM_PROMPT),
-        .reasoning_content = null,
-        .tool_calls = null,
-        .tool_call_id = null,
-    };
-    errdefer allocator.free(messages[0].content.?);
-    messages[1] = .{
-        .role = "user",
-        .content = prompt,
-        .reasoning_content = null,
-        .tool_calls = null,
-        .tool_call_id = null,
-    };
-    return messages;
-}
-
-pub fn freeSummaryMessages(allocator: std.mem.Allocator, messages: []Message) void {
-    for (messages) |message| message.deinit(allocator);
-    allocator.free(messages);
 }
 
 /// Replace `history[1..cut]` with one assistant message carrying `summary`.
@@ -506,27 +447,4 @@ test "transcript renders only the requested range and preserves tool arguments" 
     const empty = try renderTranscript(allocator, &messages, 2, 2);
     defer allocator.free(empty);
     try std.testing.expectEqualStrings("", empty);
-}
-
-test "summary requests include previous context only when supplied" {
-    const allocator = std.testing.allocator;
-    const fresh = try buildSummaryMessages(allocator, null, "new segment");
-    defer freeSummaryMessages(allocator, fresh);
-    try std.testing.expectEqual(@as(usize, 2), fresh.len);
-    try std.testing.expectEqualStrings("system", fresh[0].role);
-    try std.testing.expectEqualStrings(SUMMARY_SYSTEM_PROMPT, fresh[0].content.?);
-    try std.testing.expectEqualStrings("user", fresh[1].role);
-    try std.testing.expectEqualStrings("Next part of the conversation:\nnew segment", fresh[1].content.?);
-    const continued = try buildSummaryMessages(allocator, "earlier facts", "new segment");
-    defer freeSummaryMessages(allocator, continued);
-    try std.testing.expectEqualStrings("Summary so far:\nearlier facts\n\nNext part of the conversation:\nnew segment", continued[1].content.?);
-}
-
-fn checkSummaryAllocationFailures(allocator: std.mem.Allocator) !void {
-    const messages = try buildSummaryMessages(allocator, "previous", "segment");
-    defer freeSummaryMessages(allocator, messages);
-}
-
-test "summary request construction releases allocations on every failure path" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSummaryAllocationFailures, .{});
 }

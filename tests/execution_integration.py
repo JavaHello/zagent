@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise real API -> agent -> host tool execution without paid API calls."""
-from mock_api import send_response, handle_planning, PLAN_APPROACH, trust_workspace
+from mock_api import send_response, trust_workspace
 
 import http.server
 import json
@@ -68,8 +68,6 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-            if handle_planning(self, body):
-                return
             requests.append(body)
             if len(requests) == 1:
                 os.replace(replacement, live_binary)
@@ -127,7 +125,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     finally:
         server.shutdown()
     assert result.returncode == 0, result.stderr
-    assert result.stdout == PLAN_APPROACH + '\n\nBOUNDARY_TEST_COMPLETE\n', result.stderr
+    assert result.stdout == 'BOUNDARY_TEST_COMPLETE\n', result.stderr
     assert resumed.returncode == 0, resumed.stderr
     assert len(observed) == len(calls) + 1, observed
     assert len([m for m in requests[-2]['input'] if m.get('role') == 'user']) == 2
@@ -144,13 +142,12 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert statuses[9] == {'is_error': False, 'exit_code': 0,
                            'timed_out': False, 'truncated': False}, statuses[9]
     assert statuses[12]['is_error'], statuses[12]
-    # The preflight stores its public approach as a plain assistant message;
-    # execution responses must still retain their exact replay items.
+    # All model responses retain their exact replay items; no preflight runs.
     assert all(m['response_items'] for m in snapshot['messages']
-               if m['role'] == 'assistant' and m['content'] != PLAN_APPROACH)
+               if m['role'] == 'assistant')
     assert any(i.get('type') == 'reasoning' for i in requests[-2]['input'])
     assert snapshot['workspace'] == os.path.realpath(str(workspace))
-    assert len(snapshot['messages']) == 2 * len(calls) + 6
+    assert len(snapshot['messages']) == 2 * len(calls) + 4
     assert 'ENV_INHERITED' in observed[0], observed[0]
     assert (workspace / 'notes.md').read_text() == '# Report\nAnalysis checked.\n'
     assert 'notes.md' in observed[3] and 'verified' in observed[3], observed[3]

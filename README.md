@@ -20,7 +20,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `ask_user` — put a question to you as an interactive selection menu
 - **MCP servers** — start servers described in `mcp.json` and give the tools they offer to the model beside the built-in ones
 - **Multi-turn tool chaining** — the agent loops until the task is complete
-- **Plan before execution** — a tool-free model request first identifies the goal and a brief approach; terminal titles use the generated summary, never the raw input, with the entire title kept below 80 Unicode characters. If planning fails, execution continues with a generic title.
+- **Task metadata from the main model** — the built-in `set_task` call provides a `title` and `description` of the goal and approach, without a separate planning request. The description is displayed to the user; terminal titles use the generated title, never raw input. Both the submitted title and the entire terminal title stay below 80 Unicode characters.
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
 - **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
 - **Live progress** — waiting for the model, and running a tool, each get one animated line (`⠋ shell… 8s`) with the time so far, so a long wait never looks like a hang. Off unless both stdout and stderr are a terminal, where the line can be taken and given back
@@ -144,13 +144,14 @@ the current tool batch finishes. Older messages are replaced by one summary,
 with the model choosing the recent-message retention target through the tool's
 `keep_messages` argument (default 16, minimum 2).
 
-The summary is produced by the model in bounded chunks, each one carrying the
-summary so far, so compacting a very large history never needs a single
-oversized request. The split always falls on a boundary that keeps each tool
-result attached to the assistant call that produced it. If the model cannot
-produce a usable summary, the history is left untouched and the turn continues;
-losing the conversation is worse than one turn over budget. `/compact` runs the
-same operation on demand.
+The main model supplies the `summary` directly in the tool call (non-empty,
+at most 6000 UTF-8 bytes); no separate summarization request or summary system
+prompt runs. Include goals, constraints, decisions, relevant paths and commands,
+changes, errors, outcomes, open tasks and next steps. The split keeps each tool
+result attached to its assistant call. Invalid summaries or no safe range leave
+history untouched. The first valid call in a batch sets summary and retention.
+`/compact` asks the main model to call the same tool on demand, retaining a
+target of 16 recent messages.
 
 ## Memory
 
@@ -690,7 +691,7 @@ src/
                 apply_patch, ls, rg/grep, fd/find, http)
   diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
-  compact.zig — Context budget, safe cut points, and summary requests
+  compact.zig — Context budget, safe cut points, and summary installation
   memory.zig  — Durable notes: file format, prompt section, extraction
   banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer

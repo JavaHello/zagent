@@ -121,11 +121,19 @@ pub const ask_user = ToolDefinition{
     ,
 };
 
+pub const set_task = ToolDefinition{
+    .name = "set_task",
+    .description = "Set the current task title and describe its goal and practical approach in the user's language before execution. The description is displayed to the user. The title is sent to the terminal title; summarize the task rather than copying raw input. Use the main model's context; no separate planning request runs.",
+    .parameters_json =
+    \\{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":79,"description":"Concise task title, fewer than 80 Unicode characters"},"description":{"type":"string","minLength":1,"description":"Brief goal and practical approach shown to the user"}},"required":["title","description"],"additionalProperties":false}
+    ,
+};
+
 pub const compact_context = ToolDefinition{
     .name = "compact_context",
-    .description = "Summarize older conversation messages to free context while preserving recent messages. You decide when this is useful and how many recent messages to retain with keep_messages (default 16, minimum 2). No automatic token threshold runs. Compaction happens after all calls in this batch finish; the first valid request sets retention for the batch. If there is no safe range or summarization fails, history stays unchanged.",
+    .description = "Replace older conversation messages with a summary you provide, preserving recent messages. Include goals, constraints, decisions, relevant paths, commands, changes, errors, outcomes, open tasks and next steps. No separate summarization request runs. Choose keep_messages (default 16, minimum 2). Compaction happens after the whole tool batch; the first valid request sets summary and retention. No safe range or invalid summary leaves history unchanged.",
     .parameters_json =
-    \\{"type":"object","properties":{"keep_messages":{"type":"integer","minimum":2,"maximum":4294967295,"description":"Recent messages to preserve verbatim; choose based on current work. Defaults to 16. Safe tool boundaries may retain fewer messages."}},"required":[],"additionalProperties":false}
+    \\{"type":"object","properties":{"summary":{"type":"string","minLength":1,"description":"Your summary of the earlier conversation, at most 6000 UTF-8 bytes; preserve everything needed to continue"},"keep_messages":{"type":"integer","minimum":2,"maximum":4294967295,"description":"Recent messages to preserve verbatim; defaults to 16. Safe tool boundaries may retain fewer messages."}},"required":["summary"],"additionalProperties":false}
     ,
 };
 
@@ -140,9 +148,9 @@ pub const remember = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,            read,     write, apply_patch, ls,
-    rg,            fd,              grep,     find,  http,        ask_user,
-    remember,      compact_context, temp_dir,
+    memory_search, bash,            read,     write,    apply_patch, ls,
+    rg,            fd,              grep,     find,     http,        ask_user,
+    remember,      compact_context, temp_dir, set_task,
 };
 
 test "built-in definitions have valid schemas and unique names" {

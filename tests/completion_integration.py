@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The main model settles turns; completion never sends a judge request."""
-from mock_api import send_response, handle_planning, trust_workspace
+from mock_api import send_response, trust_workspace
 import http.server
 import json
 from pathlib import Path
@@ -17,8 +17,6 @@ class API(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        if handle_planning(self, body):
-            return
         scenario['requests'] += 1
         if not body.get('tools'):
             scenario['checks'] += 1
