@@ -759,7 +759,7 @@ pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs, backends: SearchBa
         if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--include", glob });
         if (args.ignore_case) try argv.append(allocator, "-i");
         // `-e` rather than a bare pattern, for the same reason as `--` above.
-        try argv.appendSlice(allocator, &.{ "-e", args.pattern, args.path });
+        try argv.appendSlice(allocator, &.{ "-e", args.pattern, "--", args.path });
     }
 
     return argv.toOwnedSlice(allocator);
@@ -910,6 +910,21 @@ fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, s
 pub fn grep(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, args: GrepArgs) !ToolResult {
     const argv = try grepArgv(allocator, args, backends);
     defer freeGrepArgv(allocator, argv);
+    if (std.mem.indexOfAny(u8, args.path, "*?[") != null) {
+        // Match the shell's pathname expansion, not rg's recursive --glob
+        // filter: README* must only select entries in the current directory.
+        // Pass all user input as positional arguments, never as shell source.
+        // Empty IFS prevents splitting paths containing spaces; expansion does
+        // not evaluate substitutions/operators contained in the path. An
+        // unmatched glob stays literal, preserving the backend's error.
+        var expanded: std.ArrayList([]const u8) = .empty;
+        defer expanded.deinit(allocator);
+        try expanded.appendSlice(allocator, &.{
+            "sh", "-c", "path=$1; shift; IFS=; exec \"$@\" $path", "zagent-search", args.path,
+        });
+        try expanded.appendSlice(allocator, argv[0 .. argv.len - 1]);
+        return runSearch(io, allocator, expanded.items, true, args.offset);
+    }
     return runSearch(io, allocator, argv, true, args.offset);
 }
 
@@ -1422,13 +1437,13 @@ test "grep argv falls back to grep" {
     // `-E` is what makes the fallback read the same regular expressions as
     // ripgrep; without it `|`, `+` and `()` would be literals.
     try expectArgv(
-        &.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git", "--include", "*.zig", "-i", "-e", "fn main", "src" },
+        &.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git", "--include", "*.zig", "-i", "-e", "fn main", "--", "src" },
         argv,
     );
 
     const plain = try grepArgv(allocator, .{ .pattern = "needle", .path = ".", .glob = null, .ignore_case = false }, .{});
     defer allocator.free(plain);
-    try expectArgv(&.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git", "-e", "needle", "." }, plain);
+    try expectArgv(&.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git", "-e", "needle", "--", "." }, plain);
 }
 
 test "find argv picks fd when it is installed" {
@@ -1498,6 +1513,62 @@ test "grep finds a line and the file it is in" {
 
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "note.txt:2:the needle is here") != null);
+}
+
+test "grep expands path globs without interpreting user input as shell source" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "docs space", .default_dir);
+    try tmp.dir.createDir(io, "nested", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs space/README.md", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs space/README zh.md", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs space/README $(printf INJECTED).md", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "nested/README.md", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.md", .data = "needle\n" });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    // Always exercise grep; also exercise rg when available on the test host.
+    const probe = std.process.run(allocator, io, .{ .argv = &.{ "rg", "--version" } }) catch null;
+    defer if (probe) |result| {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    };
+    const have_rg = if (probe) |result| switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    } else false;
+    for ([_]bool{ false, true }) |use_rg| {
+        if (use_rg and !have_rg) continue;
+        const path = try std.fmt.allocPrint(allocator, "{s}/docs */README*", .{dir});
+        defer allocator.free(path);
+        const result = try grep(io, allocator, .{ .rg = use_rg }, .{
+            .pattern = "needle",
+            .path = path,
+            .glob = null,
+            .ignore_case = false,
+        });
+        defer result.deinit(allocator);
+        try std.testing.expect(!result.is_error);
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "README.md:1:needle") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "README zh.md:1:needle") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "README $(printf INJECTED).md:1:needle") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "nested/") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "other.md") == null);
+
+        const missing_path = try std.fmt.allocPrint(allocator, "{s}/missing*", .{dir});
+        defer allocator.free(missing_path);
+        const missing = try grep(io, allocator, .{ .rg = use_rg }, .{
+            .pattern = "needle",
+            .path = missing_path,
+            .glob = null,
+            .ignore_case = false,
+        });
+        defer missing.deinit(allocator);
+        try std.testing.expect(missing.is_error);
+    }
 }
 
 test "a search that matched nothing is an answer" {
