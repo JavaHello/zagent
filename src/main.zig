@@ -620,7 +620,6 @@ test {
     _ = @import("menu.zig");
     _ = @import("completion.zig");
     _ = @import("commands.zig");
-    _ = @import("verifier.zig");
     _ = @import("compact.zig");
     _ = @import("memory.zig");
     _ = @import("style.zig");

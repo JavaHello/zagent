@@ -695,7 +695,6 @@ src/
   memory.zig  — Durable notes: file format, prompt section, extraction
   banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer
-  verifier.zig — Legacy completion utilities (not used by the agent loop)
 build.zig     — Zig build script
 ```
 
