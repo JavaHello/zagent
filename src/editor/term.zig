@@ -81,9 +81,10 @@ pub fn enableRawMode(in: File, out: File) !termios {
         raw.lflag.IEXTEN = false;
         raw.lflag.ISIG = false;
 
-        // FIXME
-        // raw.cc[std.os.VMIN] = 1;
-        // raw.cc[std.os.VTIME] = 0;
+        // Do not inherit timed reads: a timeout returns zero bytes, which
+        // callers interpret as EOF. Escape lookahead sets its own timeout.
+        raw.cc[@backingInt(std.posix.V.MIN)] = 1;
+        raw.cc[@backingInt(std.posix.V.TIME)] = 0;
 
         try std.posix.tcsetattr(in.handle, std.posix.TCSA.FLUSH, raw);
 

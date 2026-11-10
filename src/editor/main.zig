@@ -99,7 +99,15 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
 
     while (true) {
         if (ln.tick_callback) |tick| {
-            if (try tick(ln.layout_context)) try state.refreshLine();
+            if (try tick(ln.layout_context)) {
+                // Background repaint is not an edit: do not reopen a popup
+                // just accepted/dismissed between consecutive key presses.
+                if (ln.bottom_anchor) {
+                    try state.refreshBottom(false);
+                } else {
+                    try state.refreshLine();
+                }
+            }
             if (@import("builtin").os.tag != .windows) {
                 var fds = [_]std.posix.pollfd{.{ .fd = in.handle, .events = std.posix.POLL.IN, .revents = 0 }};
                 if (try std.posix.poll(&fds, 100) == 0) continue;

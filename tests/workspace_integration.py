@@ -7,14 +7,21 @@ import pty
 import select
 import subprocess
 import tempfile
+import termios
 import time
 from mock_api import workspace_state
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 
 
-def interact(directory, env, answer):
+def interact(directory, env, answer, inherited_timeout=False):
     master, slave = pty.openpty()
+    if inherited_timeout:
+        # A parent's timed terminal read must not become menu EOF.
+        attributes = termios.tcgetattr(slave)
+        attributes[6][termios.VMIN] = 0
+        attributes[6][termios.VTIME] = 1
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
     process = subprocess.Popen([str(binary)], cwd=directory, env=env,
                                stdin=slave, stdout=slave, stderr=slave)
     output = bytearray()
@@ -28,6 +35,8 @@ def interact(directory, env, answer):
         assert b"Don't trust and exit" in output, output
         assert b'Trust and continue' in output, output
         assert b'Other /' not in output, output
+        if inherited_timeout:
+            time.sleep(.25)  # Longer than the inherited 0.1-second timeout.
         os.write(master, answer)
         if answer == b'\x1b[B\r':
             # Wait until raw-mode selection has ended before queuing lines.
@@ -81,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-trust-') as temporary:
     session_id = 'a' * 32
     snapshot = {'version': 1, 'workspace': str(first.resolve()), 'messages': []}
     (legacy / 'sessions' / f'{session_id}.json').write_text(json.dumps(snapshot))
-    code, output = interact(first, env, b'\x1b[B\r')
+    code, output = interact(first, env, b'\x1b[B\r', inherited_timeout=True)
     assert code == 0, output
     assert b'legacy durable note' not in output, output
     assert (state / 'trusted').read_text() == str(first.resolve())

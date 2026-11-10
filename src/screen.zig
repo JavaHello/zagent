@@ -379,7 +379,7 @@ pub const Screen = struct {
         var file_writer = self.out.writerStreaming(self.io, &buf);
         const w = &file_writer.interface;
 
-        try w.writeAll(HIDE_CURSOR);
+        try w.writeAll(HIDE_CURSOR ++ RESET);
         try w.print("\x1b[1;{d}r", .{bottom});
         try w.writeAll("\x1b[1;1H\x1b[0J");
         // The editor turns off output post-processing, so a bare newline would
@@ -394,6 +394,7 @@ pub const Screen = struct {
         const view_end = if (end_row < offsets.len) offsets[end_row] else self.transcript.items.len;
         const end = if (end_row < offsets.len and view_end > view_start and self.transcript.items[view_end - 1] == '\n') view_end - 1 else view_end;
         const view = self.transcript.items[view_start..end];
+        try restoreRendition(w, self.transcript.items[0..view_start]);
         var index: usize = 0;
         var inverse = false;
         while (index < view.len) {
@@ -477,6 +478,25 @@ pub const Screen = struct {
         handler_input_rows = self.input_rows;
     }
 };
+
+/// A viewport can start inside a styled span (including a soft-wrapped line).
+/// Reconstruct its SGR state, but never replay cursor movement or OSC commands
+/// from the hidden history. Start from defaults so redraws are deterministic.
+fn restoreRendition(w: *std.Io.Writer, prefix: []const u8) !void {
+    try w.writeAll(RESET);
+    var i: usize = 0;
+    while (i < prefix.len) {
+        if (prefix[i] != 0x1b) {
+            i += 1;
+            continue;
+        }
+        const next = @import("text.zig").skipAnsiEscape(prefix, i);
+        if (next >= i + 3 and prefix[i + 1] == '[' and prefix[next - 1] == 'm') {
+            try w.writeAll(prefix[i..next]);
+        }
+        i = next;
+    }
+}
 
 /// A `std.Io.Writer` over the screen's log, so the markdown renderer can stream
 /// into the conversation through its own small buffer.
@@ -820,6 +840,40 @@ test "streamed output appends without clearing and history still replays" {
     try std.testing.expect(std.mem.startsWith(u8, redraw, SYNC_BEGIN));
     try std.testing.expect(std.mem.endsWith(u8, redraw, SYNC_END));
     try std.testing.expect(std.mem.indexOf(u8, redraw, "initial\r\nnew\r\ntext") != null);
+}
+
+test "viewport restores hidden SGR state without replaying terminal commands" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try restoreRendition(&w, "\x1b[31mred\x1b[1mbold\x1b[2J\x1b]52;c;ignored\x07");
+    try std.testing.expectEqualStrings(RESET ++ "\x1b[31m\x1b[1m", w.buffered());
+    w.end = 0;
+    try restoreRendition(&w, "plain history");
+    try std.testing.expectEqualStrings(RESET, w.buffered());
+}
+
+test "replay restores color when viewport begins inside a wrapped span" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.out = file;
+    s.input_rows = 22; // File output falls back to a 24-row, 80-column terminal.
+    try s.transcript.appendSlice(a, "\x1b[31m");
+    try s.transcript.appendNTimes(a, 'x', 80);
+    try s.transcript.appendNTimes(a, 'y', 80);
+    try s.transcript.appendNTimes(a, 'z', 80);
+    try s.transcript.appendSlice(a, RESET);
+    try s.replay();
+    const output = try readOutput(tmp.dir, a);
+    defer a.free(output);
+    // Only the last two wrapped rows fit; their opening red code is hidden.
+    try std.testing.expect(std.mem.indexOf(u8, output, RESET ++ "\x1b[31myyyy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "xxxx") == null);
 }
 
 test "wheel scrolls three visual rows while keyboard scrolls a page" {
