@@ -129,7 +129,6 @@ pub fn main(init: std.process.Init) !void {
             "  models              List models for the selected provider\n\n" ++
             "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
-            "AI_COMPACT_THRESHOLD  Estimated token budget before older messages are summarized\n" ++
             "AI_COMPACT_KEEP       Newest messages kept verbatim across a compaction\n" ++
             "AI_MEMORY=0           Disable durable memory for this workspace\n" ++
             "AI_MEMORY_AUTO=0      Keep the remember tool, skip the per-turn extractor\n" ++

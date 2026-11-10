@@ -57,9 +57,8 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-memory-') as directory:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1',
-               'AI_MODEL': 'mock', 'AI_KEY': 'test', 'AI_MAX_VERIFICATIONS': '0',
-               'AI_MAX_ITERATIONS': '12', 'AI_MEMORY_AUTO': '1', 'AI_MEMORY': '1',
-               'AI_COMPACT_THRESHOLD': '0'}
+               'AI_MODEL': 'mock', 'AI_KEY': 'test',
+               'AI_MAX_ITERATIONS': '12', 'AI_MEMORY_AUTO': '1', 'AI_MEMORY': '1'}
         state = trust_workspace(directory, env)
         relevant = '中文 tmux clipboard workaround'
         unrelated = 'UNRELATED_SECRET_SENTINEL build command'

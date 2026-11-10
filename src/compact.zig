@@ -122,13 +122,6 @@ pub fn estimateTokens(messages: []const Message) u64 {
     return openai.estimateTokens(aw.written());
 }
 
-/// Whether the conversation has grown past the configured budget. A zero
-/// threshold switches automatic compaction off.
-pub fn needsCompaction(messages: []const Message, threshold_tokens: u32) bool {
-    if (threshold_tokens == 0) return false;
-    return estimateTokens(messages) >= threshold_tokens;
-}
-
 /// True when a conversation may be split before `index` without separating a
 /// tool result from its assistant call.
 fn safeBoundary(messages: []const Message, index: usize) bool {
@@ -397,17 +390,6 @@ test "estimation uses authoritative response items and counts escaped wire input
     try std.testing.expectEqual(@as(u64, 0), estimateTokens(&.{}));
 }
 
-test "a conversation under budget needs no compaction" {
-    var messages = [_]Message{
-        .{ .role = "system", .content = "sys", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
-        .{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
-    };
-    try std.testing.expect(!needsCompaction(&messages, 10_000));
-    // Zero disables automatic compaction rather than meaning "always".
-    try std.testing.expect(!needsCompaction(&messages, 0));
-    try std.testing.expect(needsCompaction(&messages, 1));
-}
-
 test "a cut never separates a tool result from its call" {
     var calls = [_]openai.ToolCallData{.{ .id = "1", .name = "shell", .arguments = "{}" }};
     const messages = [_]Message{
@@ -462,15 +444,6 @@ test "a transcript keeps both sides and truncates long tool output" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "User: fix it") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[truncated]") != null);
     try std.testing.expect(rendered.len < long.len);
-}
-
-test "compaction triggers exactly at the token budget" {
-    const messages = [_]Message{.{ .role = "user", .content = "hello", .reasoning_content = null, .tool_calls = null, .tool_call_id = null }};
-    const tokens: u32 = @intCast(estimateTokens(&messages));
-    try std.testing.expect(tokens > 0);
-    try std.testing.expect(needsCompaction(&messages, tokens));
-    try std.testing.expect(!needsCompaction(&messages, tokens + 1));
-    try std.testing.expectEqual(@as(u64, 0), estimateTokens(&.{}));
 }
 
 test "short histories and keeping the entire history cannot be compacted" {

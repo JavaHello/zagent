@@ -51,9 +51,8 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-menu-') as directory:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'TERM': 'xterm-256color', 'AI_KEY': 'test', 'AI_MODEL': 'mock',
-               'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0',
-               'AI_URL': f'http://127.0.0.1:{server.server_port}/v1',
-               'AI_MAX_VERIFICATIONS': '1'}
+               'AI_MEMORY': '0',
+               'AI_URL': f'http://127.0.0.1:{server.server_port}/v1'}
         trust_workspace(directory, env)
         cases = [
             (b'\r', None, 'recommended option: Beta'),

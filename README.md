@@ -137,12 +137,11 @@ bounded continuations, return an error instead of reporting completion.
 
 ## Context compaction
 
-A long conversation eventually costs more context than the model has. zagent
-estimates the size of the conversation before every request (and between tool
-iterations, where output can grow it fastest). Once it crosses
-`AI_COMPACT_THRESHOLD` estimated tokens — 48,000 by default — the older messages
-are replaced by one summary and the newest `AI_COMPACT_KEEP` messages (16 by
-default) are kept verbatim.
+A long conversation eventually costs more context than the model has. The main
+model decides when to call `compact_context`; there is no automatic token
+threshold or separate compaction-decision request. The operation runs after
+the current tool batch finishes. Older messages are replaced by one summary,
+with `AI_COMPACT_KEEP` (16 by default) as the recent-message retention target.
 
 The summary is produced by the model in bounded chunks, each one carrying the
 summary so far, so compacting a very large history never needs a single
@@ -153,11 +152,9 @@ losing the conversation is worse than one turn over budget. `/compact` runs the
 same operation on demand.
 
 ```sh
-# Summarize sooner, keeping only the last two turns verbatim
-AI_COMPACT_THRESHOLD=20000 AI_COMPACT_KEEP=4 zagent
+# Keep a smaller recent-message tail when the model requests compaction
+AI_COMPACT_KEEP=4 zagent
 ```
-
-Set `AI_COMPACT_THRESHOLD=0` to disable automatic compaction.
 
 ## Memory
 
@@ -212,7 +209,7 @@ Configuration can be loaded from a config file and/or environment variables. The
 - `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
 - `~/.config/zagent` (fallback)
 
-The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MAX_VERIFICATIONS`, `AI_MARKDOWN`, `AI_COMPACT_THRESHOLD`, `AI_COMPACT_KEEP`, `AI_MEMORY`, `AI_MEMORY_AUTO`. Environment variables override config file values.
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MARKDOWN`, `AI_COMPACT_KEEP`, `AI_MEMORY`, `AI_MEMORY_AUTO`. Environment variables override config file values.
 
 See `zagent.example.conf` for a complete example config file, and
 `mcp.example.json` for the MCP servers zagent can be given.
@@ -228,9 +225,7 @@ All configuration is also supported through environment variables:
 | `AI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
 | `AI_MAX_TOKENS`| `8192`                           | Initial output token budget per response    |
 | `AI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
-| `AI_MAX_VERIFICATIONS` | `3`                     | Legacy compatibility option; ignored (no independent checker) |
 | `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
-| `AI_COMPACT_THRESHOLD` | `48000`                      | Estimated tokens before older messages are summarized; `0` disables |
 | `AI_COMPACT_KEEP`  | `16`                             | Newest messages kept verbatim across a compaction |
 | `AI_MEMORY`        | `true`                           | Keep durable notes in the workspace and expose the `remember` tool |
 | `AI_MEMORY_AUTO`   | `true`                           | Ask the model after each turn whether anything should be remembered |
@@ -361,10 +356,6 @@ non-success statuses end the turn normally (exit code 0), explain the situation
 and next step, and do not print `Task completed`. Transport errors, truncation
 and iteration limits still return errors. Completion is a model assertion, not
 a substitute for running real tests.
-
-Legacy `task_complete` calls remain supported without extra requests; further
-tool work invalidates them, and explicit final status takes priority.
-`AI_MAX_VERIFICATIONS` is accepted for configuration compatibility but ignored.
 
 ### Choices
 

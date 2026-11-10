@@ -54,8 +54,8 @@ try:
         ]
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1/', 'AI_MODEL': 'test-model',
-               'AI_KEY': 'local-test', 'AI_MAX_VERIFICATIONS': '0',
-               'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0'}
+               'AI_KEY': 'local-test',
+               'AI_MEMORY': '0'}
         trust_workspace(directory, env)
         for response, expected_error in cases:
             requests.clear()
@@ -115,16 +115,14 @@ try:
 
         replies.extend([
             {'status': 'completed', 'output': [{'type': 'function_call', 'call_id': 'read_evidence',
-                'name': 'read', 'arguments': json.dumps({'path': 'evidence.txt'})},
-                {'type': 'function_call', 'call_id': 'complete',
-                 'name': 'task_complete', 'arguments': '{}'}]},
+                'name': 'read', 'arguments': json.dumps({'path': 'evidence.txt'})}]},
             partial, partial, completed_text('Recovered answer\n[task_status: completed]'),
         ])
         requests.clear()
         # Growth is only possible from below the cap, so this case lowers the
         # budget to exercise the doubling up to the DeepSeek ceiling.
         result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
-                                env=dict(env, AI_MAX_VERIFICATIONS='1', AI_MAX_TOKENS='2048'),
+                                env=dict(env, AI_MAX_TOKENS='2048'),
                                 capture_output=True, text=True, timeout=15)
         assert result.returncode == 0 and 'Recovered answer' in result.stdout, result.stderr
         assert not replies, replies

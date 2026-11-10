@@ -48,7 +48,7 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-sessions-') as directory:
         env = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory,
                    TERM='dumb', AI_KEY='test', AI_MODEL='session-mock',
-                   AI_MEMORY='0', AI_MAX_VERIFICATIONS='0', AI_COMPACT_THRESHOLD='0',
+                   AI_MEMORY='0',
                    AI_URL=f'http://127.0.0.1:{server.server_port}/v1')
         state = trust_workspace(directory, env)
         legacy_path = Path(directory) / 'ignored-session.json'

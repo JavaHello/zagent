@@ -121,9 +121,9 @@ pub const ask_user = ToolDefinition{
     ,
 };
 
-pub const task_complete = ToolDefinition{
-    .name = "task_complete",
-    .description = "Legacy optional completion declaration by the main model; no independent check runs. Prefer a final answer ending with [task_status: completed] without calling this tool. Never declare completion for failures, blocked work or questions. Further tool work invalidates the declaration.",
+pub const compact_context = ToolDefinition{
+    .name = "compact_context",
+    .description = "Summarize older conversation messages to free context while preserving recent messages. You decide when this is useful; no automatic token threshold runs. Compaction happens after all calls in this batch finish. If there is no safe range or summarization fails, history stays unchanged.",
     .parameters_json =
     \\{"type":"object","properties":{},"required":[],"additionalProperties":false}
     ,
@@ -140,9 +140,9 @@ pub const remember = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,          read,     write, apply_patch, ls,
-    rg,            fd,            grep,     find,  http,        ask_user,
-    remember,      task_complete, temp_dir,
+    memory_search, bash,            read,     write, apply_patch, ls,
+    rg,            fd,              grep,     find,  http,        ask_user,
+    remember,      compact_context, temp_dir,
 };
 
 test "built-in definitions have valid schemas and unique names" {

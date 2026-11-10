@@ -12,11 +12,7 @@ pub const max_output_tokens_ceiling: u32 = 8192;
 /// ceiling needs a larger value, which `AI_MAX_TOKENS` still provides.
 const default_max_tokens: u32 = max_output_tokens_ceiling;
 const default_max_iterations: u32 = 200;
-const default_max_verifications: u32 = 3;
 const default_markdown = true;
-/// Estimated tokens at which older messages are summarized. 0 switches
-/// automatic compaction off.
-const default_compact_threshold: u32 = 48_000;
 /// Newest messages kept verbatim when the rest of the conversation is
 /// summarized.
 const default_compact_keep: u32 = 16;
@@ -32,9 +28,7 @@ const ConfigFile = struct {
     service_tier: ?[]u8 = null,
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
-    max_verifications: ?u32 = null,
     markdown: ?bool = null,
-    compact_threshold: ?u32 = null,
     compact_keep: ?u32 = null,
     memory: ?bool = null,
     memory_auto: ?bool = null,
@@ -167,12 +161,8 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
         config.max_iterations = std.fmt.parseInt(u32, value, 10) catch default_max_iterations;
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_VERIFICATIONS")) {
-        config.max_verifications = std.fmt.parseInt(u32, value, 10) catch default_max_verifications;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MARKDOWN")) {
         config.markdown = parseBool(value);
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_COMPACT_THRESHOLD")) {
-        config.compact_threshold = std.fmt.parseInt(u32, value, 10) catch default_compact_threshold;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_COMPACT_KEEP")) {
         config.compact_keep = std.fmt.parseInt(u32, value, 10) catch default_compact_keep;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MEMORY")) {
@@ -410,26 +400,12 @@ fn resolve(
         file_config.max_iterations,
         default_max_iterations,
     );
-    const max_verifications = try resolveU32(
-        allocator,
-        env,
-        &.{"AI_MAX_VERIFICATIONS"},
-        file_config.max_verifications,
-        default_max_verifications,
-    );
     const markdown = try resolveBool(
         allocator,
         env,
         &.{"AI_MARKDOWN"},
         file_config.markdown,
         default_markdown,
-    );
-    const compact_threshold = try resolveU32(
-        allocator,
-        env,
-        &.{"AI_COMPACT_THRESHOLD"},
-        file_config.compact_threshold,
-        default_compact_threshold,
     );
     const compact_keep = @max(
         try resolveU32(
@@ -465,9 +441,7 @@ fn resolve(
         .service_tier = service_tier,
         .max_tokens = max_tokens,
         .max_iterations = max_iterations,
-        .max_verifications = max_verifications,
         .markdown = markdown,
-        .compact_threshold = compact_threshold,
         .compact_keep = compact_keep,
         .memory = memory,
         .memory_auto = memory_auto,
@@ -484,14 +458,9 @@ pub const Config = struct {
     service_tier: ?[]const u8 = null,
     max_tokens: u32,
     max_iterations: u32,
-    /// Legacy configuration compatibility; no independent checker runs.
-    max_verifications: u32,
     /// Render assistant markdown for a terminal instead of printing it raw.
     /// A stdout that is not a terminal always prints raw, whatever this says.
     markdown: bool,
-    /// Estimated token budget. Older messages are summarized when the
-    /// conversation is about to exceed it. 0 disables automatic compaction.
-    compact_threshold: u32,
     /// Newest messages kept verbatim across a compaction.
     compact_keep: u32,
     /// Keep durable notes between sessions, and expose the remember tool.
@@ -582,9 +551,7 @@ test "config defaults" {
     try std.testing.expectEqualStrings("", config.api_key);
     try std.testing.expectEqual(@as(u32, 8192), config.max_tokens);
     try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
-    try std.testing.expectEqual(@as(u32, 3), config.max_verifications);
     try std.testing.expect(config.markdown);
-    try std.testing.expectEqual(default_compact_threshold, config.compact_threshold);
     try std.testing.expectEqual(default_compact_keep, config.compact_keep);
     try std.testing.expect(config.memory);
     try std.testing.expect(config.memory_auto);
@@ -637,43 +604,11 @@ test "parseBool accepts the documented spellings" {
     try std.testing.expectEqual(@as(?bool, null), parseBool("2"));
 }
 
-test "verification budget prefers the environment and keeps zero" {
-    const allocator = std.testing.allocator;
-
-    {
-        var env = try testEnv(allocator, &.{.{ "AI_MAX_VERIFICATIONS", "0" }});
-        defer env.deinit();
-
-        var file_config = try testFile(allocator, &.{.{ "AI_MAX_VERIFICATIONS", "5" }});
-        defer file_config.deinit(allocator);
-
-        const config = try resolve(allocator, &file_config, &env);
-        defer config.deinit();
-
-        // Preserve legacy configuration values, including zero.
-        try std.testing.expectEqual(@as(u32, 0), config.max_verifications);
-    }
-
-    {
-        var env = try testEnv(allocator, &.{});
-        defer env.deinit();
-
-        var file_config = try testFile(allocator, &.{.{ "AI_MAX_VERIFICATIONS", "2" }});
-        defer file_config.deinit(allocator);
-
-        const config = try resolve(allocator, &file_config, &env);
-        defer config.deinit();
-
-        try std.testing.expectEqual(@as(u32, 2), config.max_verifications);
-    }
-}
-
 test "compaction and memory settings prefer the environment and keep zero" {
     const allocator = std.testing.allocator;
 
     {
         var env = try testEnv(allocator, &.{
-            .{ "AI_COMPACT_THRESHOLD", "0" },
             .{ "AI_COMPACT_KEEP", "4" },
             .{ "AI_MEMORY", "false" },
             .{ "AI_MEMORY_AUTO", "off" },
@@ -681,7 +616,6 @@ test "compaction and memory settings prefer the environment and keep zero" {
         defer env.deinit();
 
         var file_config = try testFile(allocator, &.{
-            .{ "AI_COMPACT_THRESHOLD", "12000" },
             .{ "AI_COMPACT_KEEP", "8" },
             .{ "AI_MEMORY", "true" },
             .{ "AI_MEMORY_AUTO", "true" },
@@ -691,9 +625,6 @@ test "compaction and memory settings prefer the environment and keep zero" {
         const config = try resolve(allocator, &file_config, &env);
         defer config.deinit();
 
-        // A zero threshold is a value, not a missing setting: it turns
-        // automatic compaction off.
-        try std.testing.expectEqual(@as(u32, 0), config.compact_threshold);
         try std.testing.expectEqual(@as(u32, 4), config.compact_keep);
         try std.testing.expect(!config.memory);
         try std.testing.expect(!config.memory_auto);
@@ -704,7 +635,6 @@ test "compaction and memory settings prefer the environment and keep zero" {
         defer env.deinit();
 
         var file_config = try testFile(allocator, &.{
-            .{ "AI_COMPACT_THRESHOLD", "12000" },
             .{ "AI_COMPACT_KEEP", "1" },
             .{ "AI_MEMORY", "0" },
         });
@@ -713,7 +643,6 @@ test "compaction and memory settings prefer the environment and keep zero" {
         const config = try resolve(allocator, &file_config, &env);
         defer config.deinit();
 
-        try std.testing.expectEqual(@as(u32, 12000), config.compact_threshold);
         // Fewer than two kept messages would make every cut unsafe.
         try std.testing.expectEqual(@as(u32, 2), config.compact_keep);
         try std.testing.expect(!config.memory);
@@ -1109,12 +1038,10 @@ test "provider neutral settings win independently of obsolete environment aliase
         .{ "AI_MODEL", "current-model" },
         .{ "AI_MAX_TOKENS", "1024" },
         .{ "AI_MAX_ITERATIONS", "12" },
-        .{ "AI_MAX_VERIFICATIONS", "2" },
         .{ "OPENAI_BASE_URL", "https://obsolete.test" },
         .{ "OPENAI_MODEL", "obsolete-model" },
         .{ "OPENAI_MAX_TOKENS", "1" },
         .{ "OPENAI_MAX_ITERATIONS", "1" },
-        .{ "OPENAI_MAX_VERIFICATIONS", "1" },
     });
     defer env.deinit();
     var file_config = ConfigFile{};
@@ -1125,7 +1052,6 @@ test "provider neutral settings win independently of obsolete environment aliase
     try std.testing.expectEqualStrings("current-model", config.model);
     try std.testing.expectEqual(@as(u32, 1024), config.max_tokens);
     try std.testing.expectEqual(@as(u32, 12), config.max_iterations);
-    try std.testing.expectEqual(@as(u32, 2), config.max_verifications);
 }
 
 test "obsolete config names do not populate current settings" {
@@ -1137,7 +1063,6 @@ test "obsolete config names do not populate current settings" {
         .{ "OPENAI_MODEL", "old-model" },
         .{ "OPENAI_MAX_TOKENS", "1" },
         .{ "OPENAI_MAX_ITERATIONS", "1" },
-        .{ "OPENAI_MAX_VERIFICATIONS", "1" },
     });
     defer file_config.deinit(allocator);
     try std.testing.expect(file_config.provider == null);
@@ -1146,7 +1071,6 @@ test "obsolete config names do not populate current settings" {
     try std.testing.expect(file_config.model == null);
     try std.testing.expect(file_config.max_tokens == null);
     try std.testing.expect(file_config.max_iterations == null);
-    try std.testing.expect(file_config.max_verifications == null);
 }
 
 test "obsolete environment settings cannot override config values" {
@@ -1156,7 +1080,6 @@ test "obsolete environment settings cannot override config values" {
         .{ "OPENAI_MODEL", "old-model" },
         .{ "OPENAI_MAX_TOKENS", "1" },
         .{ "OPENAI_MAX_ITERATIONS", "1" },
-        .{ "OPENAI_MAX_VERIFICATIONS", "1" },
     });
     defer env.deinit();
     var file_config = try testFile(allocator, &.{
@@ -1164,7 +1087,6 @@ test "obsolete environment settings cannot override config values" {
         .{ "AI_MODEL", "current-model" },
         .{ "AI_MAX_TOKENS", "2048" },
         .{ "AI_MAX_ITERATIONS", "10" },
-        .{ "AI_MAX_VERIFICATIONS", "0" },
     });
     defer file_config.deinit(allocator);
     const config = try resolve(allocator, &file_config, &env);
@@ -1173,5 +1095,4 @@ test "obsolete environment settings cannot override config values" {
     try std.testing.expectEqualStrings("current-model", config.model);
     try std.testing.expectEqual(@as(u32, 2048), config.max_tokens);
     try std.testing.expectEqual(@as(u32, 10), config.max_iterations);
-    try std.testing.expectEqual(@as(u32, 0), config.max_verifications);
 }

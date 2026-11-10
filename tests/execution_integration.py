@@ -110,8 +110,8 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     threading.Thread(target=server.serve_forever, daemon=True).start()
     env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'XDG_CONFIG_HOME': str(root),
            'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_MODEL': 'test-model',
-           'AI_KEY': 'local-test', 'AI_MAX_VERIFICATIONS': '0', 'AI_MAX_ITERATIONS': '20',
-           'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0',
+           'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '20',
+           'AI_MEMORY': '0',
            'DEEPSEEK_API_KEY': 'must-not-reach-tools', 'OPENAI_API_KEY': 'must-not-reach-tools',
            'PRIVATE_SENTINEL': 'must-not-reach-tools'}
     state = trust_workspace(workspace, env)

@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-trust-') as temporary:
     second.mkdir()
     env = dict(PATH='/usr/bin:/bin', HOME=str(home), XDG_STATE_HOME=str(home / 'state'),
                XDG_CONFIG_HOME=str(home), TERM='dumb', AI_KEY='test', AI_MODEL='mock',
-               AI_MEMORY_AUTO='0', AI_MAX_VERIFICATIONS='0')
+               AI_MEMORY_AUTO='0')
     state = workspace_state(first, env)
 
     def run(directory, *args, stdin='/quit\n'):

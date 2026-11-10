@@ -31,7 +31,7 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 
 工具定义使用 Responses 的扁平结构，工具结果通过 `call_id` 关联。请求设置 `store: false`，保留并回放全部输出 items（包括加密推理数据）；会话恢复也保留这些数据。旧版会话的消息、函数调用和结果会转换为 Responses 输入，旧的自由文本 `reasoning_content` 不会作为推理 item 发送。
 
-配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_MAX_VERIFICATIONS`、`AI_MARKDOWN`、`AI_COMPACT_THRESHOLD`、`AI_COMPACT_KEEP`、`AI_MEMORY`、`AI_MEMORY_AUTO`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。
+配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_MARKDOWN`、`AI_COMPACT_KEEP`、`AI_MEMORY`、`AI_MEMORY_AUTO`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。
 
 ## 复制文本
 
@@ -77,7 +77,7 @@ zagent --resume <会话id> "继续任务"
 
 ## 上下文压缩与记忆
 
-对话变长后，上下文会超出模型能容纳的范围。zagent 在每次请求前（以及工具循环的每次迭代之间）估算对话大小；超过 `AI_COMPACT_THRESHOLD`（默认 48000 个估算 token）时，把较早的消息替换为一段模型生成的摘要，并原样保留最新的 `AI_COMPACT_KEEP` 条消息（默认 16 条）。摘要按大小分块生成，每块都带上已有摘要，因此压缩很长的历史也不需要一次超大请求。切分点只会落在不会拆散“工具调用 + 工具结果”的位置；如果模型没能给出可用摘要，历史保持不变，本轮继续运行。`/compact` 可手动触发同样的操作。设置 `AI_COMPACT_THRESHOLD=0` 可关闭自动压缩。
+主模型自行决定何时调用 `compact_context` 压缩上下文，不再按固定 token 阈值触发，也不额外请求模型判断是否需要压缩。压缩在当前整批工具调用完成后执行，把较早的消息替换为模型生成的摘要，以 `AI_COMPACT_KEEP`（默认 16 条）为近期原文保留目标。摘要按大小分块生成，每块都带上已有摘要，因此压缩很长的历史也不需要一次超大请求。切分点只会落在不会拆散“工具调用 + 工具结果”的位置；如果没有安全切分点或模型没能给出可用摘要，历史保持不变，工具结果会说明未压缩。`/compact` 仍可手动触发同样的操作。
 
 全局工作区状态目录中的 `memory.md` 保存按目录关联的跨会话长期记忆，格式是可直接阅读和编辑的 Markdown 列表。模型在关键点调用 `remember` 工具、用户执行 `/remember <文本>`，或每轮结束后的保守提取器判断出现了值得长期保存的信息时，都会写入一条笔记。重复内容会被忽略，最多保留 200 条，每条 500 字节。记忆正文不再注入系统提示；模型在需要历史偏好、项目约定、决策或已知解决方案时，通过 `memory_search` 按需查询。本地关键词检索支持英文忽略大小写及中文无空格短语（相邻字符匹配），按相关性排序、同分优先较新记录；默认最多返回 5 条，可指定 1–10 条，总量不超过 4,000 字节。这不是语义搜索，无匹配时可换用短关键词或同义词。每轮自动提取也仅接收与当前请求相关的笔记，保存时仍忽略完全重复项。`remember` 支持新增及精确替换、删除笔记。`/memory` 列出笔记，`/forget <序号>` 或 `/forget all` 删除。记忆文件读写失败不会影响正常对话；`AI_MEMORY=0` 关闭该功能，`AI_MEMORY_AUTO=0` 只关闭每轮自动提取，`AI_MEMORY_FILE` 可指定其它文件。
 
@@ -97,7 +97,7 @@ zagent --resume <会话id> "继续任务"
 
 达到工具迭代上限或模型输出被截断时返回错误。临时网络错误及 HTTP 408/429/500/502/503/504 最多尝试三次。完成与否由主模型自行判断，不再额外调用 verifier，也不在最终回答后自动启动修复回合。最终回答以独立状态行结尾：`[task_status: completed]`、`[task_status: blocked]`、`[task_status: failed]`、`[task_status: needs_user]` 或 `[task_status: paused]`。只有完成实际工作及必要验证后才能声明 completed；失败、无权限、缺少依赖、部分完成和等待用户确认都不算完成。没有工具调用的最终回答也必须明确声明状态，缺失或无效状态按 paused 处理。
 
-阻塞、失败、等待用户输入和暂停分别显示不同状态，正常结束当前回合（退出码 0），不显示 `Task completed`；模型应说明原因和下一步。完成声明不能替代实际测试。旧 `task_complete` 工具仍兼容，但不触发额外请求；后续工具调用使旧声明失效，最终回答中的显式状态优先。`AI_MAX_VERIFICATIONS` 仅为旧配置兼容而保留，不再生效。
+阻塞、失败、等待用户输入和暂停分别显示不同状态，正常结束当前回合（退出码 0），不显示 `Task completed`；模型应说明原因和下一步。完成声明不能替代实际测试。
 
 ## 验证
 

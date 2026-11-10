@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
     env = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory,
                XDG_STATE_HOME=str(root / 'state'),
                TERM='xterm-256color', AI_KEY='test', AI_MODEL='popup-mock',
-               AI_MEMORY='0', AI_COMPACT_THRESHOLD='0')
+               AI_MEMORY='0')
     trust_workspace(directory, env)
     process = subprocess.Popen([str(binary)], cwd=directory, env=env,
                                stdin=slave, stdout=slave, stderr=slave)
@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         transcript.clear()
         os.write(master, b'\x1b[<0;1;1M\x1b[<32;70;10M\x1b[<0;70;10m')
         read_until(b'\x1b]52;c;', raw=True)
-        read_until('已复制 '.encode())
+        read_until('已请求复制 '.encode())
         assert b'\x1b[7m' in transcript
         send(b'draft', '❯ draft'.encode())
         # Recalled slash commands must not capture arrows in a completion menu.
