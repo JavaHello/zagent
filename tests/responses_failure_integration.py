@@ -72,7 +72,7 @@ try:
             assert [r['max_output_tokens'] for r in requests] == expected_budgets, requests
 
         # Recover after a completed tool without losing its result or replaying
-        # its execution. The completion judge uses the same recovery path.
+        # its execution. Final completion does not send a judge request.
         (Path(directory) / 'evidence.txt').write_text('retained-tool-evidence')
         def completed_text(text):
             return {'status': 'completed', 'output': [{'type': 'message', 'role': 'assistant',
@@ -118,8 +118,7 @@ try:
                 'name': 'read', 'arguments': json.dumps({'path': 'evidence.txt'})},
                 {'type': 'function_call', 'call_id': 'complete',
                  'name': 'task_complete', 'arguments': '{}'}]},
-            partial, partial, completed_text('Recovered answer'),
-            partial, completed_text(json.dumps({'complete': True, 'reason': 'Verified evidence'})),
+            partial, partial, completed_text('Recovered answer\n[task_status: completed]'),
         ])
         requests.clear()
         # Growth is only possible from below the cap, so this case lowers the
@@ -129,12 +128,11 @@ try:
                                 capture_output=True, text=True, timeout=15)
         assert result.returncode == 0 and 'Recovered answer' in result.stdout, result.stderr
         assert not replies, replies
-        assert [r['max_output_tokens'] for r in requests] == [2048, 2048, 4096, 8192, 2048, 4096]
+        assert [r['max_output_tokens'] for r in requests] == [2048, 2048, 4096, 8192]
         assert requests[1]['input'] == requests[2]['input'] == requests[3]['input']
         assert any(item.get('type') == 'function_call_output' and 'retained-tool-evidence' in item['output']
                    for item in requests[1]['input']), requests[1]
-        assert requests[4]['input'] == requests[5]['input']
-        assert 'tools' not in requests[4] and 'tools' not in requests[5]
+        assert all('tools' in request for request in requests), requests
         assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
 
         # The growth cap must not loop or lower a larger configured budget.

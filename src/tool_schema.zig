@@ -123,7 +123,7 @@ pub const ask_user = ToolDefinition{
 
 pub const task_complete = ToolDefinition{
     .name = "task_complete",
-    .description = "Declare that the requested task is finished and request an independent completion check after your final answer. Call only after doing and validating the work, not for progress updates, questions, or blocked work. If you do more tool work afterward, call again when finished.",
+    .description = "Legacy optional completion declaration by the main model; no independent check runs. Prefer a final answer ending with [task_status: completed] without calling this tool. Never declare completion for failures, blocked work or questions. Further tool work invalidates the declaration.",
     .parameters_json =
     \\{"type":"object","properties":{},"required":[],"additionalProperties":false}
     ,

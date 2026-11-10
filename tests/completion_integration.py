@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Rejected checks fail; known external blockers settle without claiming completion."""
+"""The main model settles turns; completion never sends a judge request."""
 from mock_api import send_response, handle_planning, trust_workspace
-
 import http.server
 import json
 from pathlib import Path
@@ -10,71 +9,36 @@ import tempfile
 import threading
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
-scenario = {'verdict': None, 'checks': 0, 'rounds': 0, 'judge_replies': [],
-            'require': None, 'command': None, 'declare': True, 'after_declare': False}
-judge_prompts = []
+scenario = {}
 
 class API(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
-    def reply(self, payload):
-        send_response(self, self.request_body, payload)
-
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        self.request_body = body
         if handle_planning(self, body):
             return
-        assert self.path == '/v1/responses' and 'messages' not in body
+        scenario['requests'] += 1
         if not body.get('tools'):
             scenario['checks'] += 1
-            judge_prompts.append(body['input'][1]['content'])
-            # A canned reply stands in for a check that fails outright: a
-            # truncated response, or an HTTP error.
-            if scenario['judge_replies']:
-                return self.reply(scenario['judge_replies'].pop(0))
-            # A check whose evidence is the tail of a tool result: it answers
-            # "complete" only when the summary it was given contains the line
-            # that proves the work is done.
-            if scenario['require'] is not None:
-                seen = scenario['require'] in body['input'][1]['content']
-                verdict = {'complete': seen,
-                           'reason': 'The test result is in the summary.' if seen
-                                     else 'The summary does not contain the test result.',
-                           'next_step': None if seen else 'Run the tests and show the result.'}
-                return self.reply({'status': 'completed', 'output': [
-                    {'type': 'message', 'role': 'assistant',
-                     'content': [{'type': 'output_text', 'text': json.dumps(verdict)}]}]})
-            content = scenario['verdict']
-            return self.reply({'status': 'completed', 'output': [
-                {'type': 'message', 'role': 'assistant',
-                 'content': [{'type': 'output_text', 'text': content}]}]})
-        answered = sum(m.get('type') == 'function_call_output' and m.get('call_id', '').startswith('probe-') for m in body['input'])
-        if answered < scenario['rounds'] or answered == 0:
-            if scenario['command'] is not None:
-                command = scenario['command']
-            elif scenario['rounds'] == 0:
-                command = 'printf task-evidence'
-            else:
-                command = f'printf round-{answered}-' + 'x' * 400
-            return self.reply({'status': 'completed', 'output': [
-                {'type': 'function_call', 'call_id': f'probe-{answered}', 'name': 'bash',
-                 'arguments': json.dumps({'command': command})}]})
-        last = body['input'][-1]
-        declared = last.get('type') == 'function_call_output' and last.get('call_id', '').startswith('complete-')
-        if scenario['declare'] and not declared:
-            return self.reply({'status': 'completed', 'output': [
-                {'type': 'function_call', 'call_id': f'complete-{len(body["input"])}',
-                 'name': 'task_complete', 'arguments': '{}'}]})
-        if declared and scenario['after_declare']:
-            scenario['declare'] = False
-            return self.reply({'status': 'completed', 'output': [
-                {'type': 'function_call', 'call_id': 'late-work', 'name': 'bash',
-                 'arguments': json.dumps({'command': 'printf more-work'})}]})
-        return self.reply({'status': 'completed', 'output': [
-            {'type': 'message', 'role': 'assistant',
-             'content': [{'type': 'output_text', 'text': 'Candidate answer'}]}]})
+        assert self.path == '/v1/responses'
+        calls = [m for m in body['input'] if m.get('type') == 'function_call_output']
+        commands = []
+        if scenario['work']:
+            commands.append(('probe', 'bash', {'command': 'printf task-evidence'}))
+        if scenario['legacy']:
+            commands.append(('complete', 'task_complete', {}))
+        if scenario['late_work']:
+            commands.append(('late', 'bash', {'command': 'printf more-work'}))
+        if len(calls) < len(commands):
+            call_id, name, args = commands[len(calls)]
+            output = [{'type': 'function_call', 'call_id': call_id,
+                       'name': name, 'arguments': json.dumps(args)}]
+        else:
+            output = [{'type': 'message', 'role': 'assistant', 'content': [
+                {'type': 'output_text', 'text': scenario['answer']}]}]
+        send_response(self, body, {'status': 'completed', 'output': output})
 
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -82,149 +46,47 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-completion-') as directory:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_MODEL': 'mock',
-               'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '5', 'AI_MAX_VERIFICATIONS': '1',
+               'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '8', 'AI_MAX_VERIFICATIONS': '3',
                'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0'}
         trust_workspace(directory, env)
-        # Ordinary tool replies and progress reports must not spend judge tokens.
-        for declare, after_declare in [(False, False), (True, True)]:
-            scenario.update(declare=declare, after_declare=after_declare, checks=0)
-            result = subprocess.run([str(binary), 'Report progress'], cwd=directory, env=env,
-                                    capture_output=True, text=True, timeout=30)
-            assert result.returncode == 0, result.stderr
-            assert scenario['checks'] == 0, result.stderr
-            assert 'Task paused' in result.stderr, result.stderr
-            assert 'Task completed' not in result.stderr, result.stderr
-        scenario.update(declare=True, after_declare=False, checks=0)
-        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
-                                env=dict(env, AI_MAX_VERIFICATIONS='0'),
-                                capture_output=True, text=True, timeout=30)
-        assert result.returncode == 0 and scenario['checks'] == 0, result.stderr
-        assert 'Task completed' in result.stderr, result.stderr
-        for verdict, expected_ok in [
-            (json.dumps({'complete': True, 'reason': 'Verified evidence'}), True),
-            (json.dumps({'complete': False, 'reason': 'Missing behavior', 'next_step': 'Implement it'}), False),
-            ('unreadable verdict', False),
-        ]:
-            scenario.update(verdict=verdict, checks=0, rounds=0)
-            result = subprocess.run([str(binary), 'Perform the task'], cwd=directory, env=env,
-                                    capture_output=True, text=True, timeout=30)
-            assert scenario['checks'] == 1, result.stderr
-            assert (result.returncode == 0) == expected_ok, result.stderr
-            if not expected_ok:
-                assert 'CompletionUnverified' in result.stderr, result.stderr
-            if 'Missing behavior' in verdict:
-                # The final rejection must not run an extra, uncheckable
-                # repair round (which used to print a second answer).
-                assert result.stdout.count('Candidate answer') == 1, result.stdout
-                assert 'Next step: Implement it' in result.stderr, result.stderr
-                assert 'AI_MAX_VERIFICATIONS' in result.stderr, result.stderr
-
-        # An external blocker settles normally, without retries or a success claim.
-        scenario.update(verdict=json.dumps({'complete': False, 'blocked': True,
-                                           'reason': 'Authentication unavailable',
-                                           'next_step': 'Provide credentials'}),
-                        checks=0, rounds=0)
-        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
-                                env=dict(env, AI_MAX_VERIFICATIONS='3'),
-                                capture_output=True, text=True, timeout=30)
-        assert scenario['checks'] == 1, result.stderr
-        assert result.stdout.count('Candidate answer') == 1, result.stdout
-        assert result.returncode == 0, result.stderr
-        assert 'CompletionUnverified' not in result.stderr, result.stderr
-        assert '⏸ blocked: Authentication unavailable' in result.stderr, result.stderr
-        assert 'Next step: Provide credentials' in result.stderr, result.stderr
-        assert 'Task blocked' in result.stderr, result.stderr
-        assert 'Task completed' not in result.stderr, result.stderr
-        assert '↻ not done' not in result.stderr, result.stderr
-
-        # A private parent POM blocks full validation even when a narrow check
-        # passed. The blocker must take precedence over an exhausted budget.
-        scenario.update(verdict=json.dumps({
-            'complete': False, 'blocked': True,
-            'reason': 'storeId whitespace validation passed; module tests could not run: '
-                      'private parent POM com.paylabs:parent:2.2.0-SNAPSHOT unavailable',
-            'next_step': 'Configure the private Maven repository or supply a local parent POM',
-        }), checks=0, rounds=0)
-        result = subprocess.run([str(binary), 'Validate the storeId fix'], cwd=directory,
-                                env=env, capture_output=True, text=True, timeout=30)
-        assert result.returncode == 0 and scenario['checks'] == 1, result.stderr
-        assert 'com.paylabs:parent:2.2.0-SNAPSHOT' in result.stderr, result.stderr
-        assert 'Next step: Configure the private Maven repository' in result.stderr, result.stderr
-        assert 'Task blocked' in result.stderr, result.stderr
-        for unwanted in ('CompletionUnverified', 'Task completed', 'budget (1) spent'):
-            assert unwanted not in result.stderr, result.stderr
-
-        # The default three-check budget permits two repair rounds, not a
-        # third repair after the final rejection with no checks left.
-        scenario.update(verdict=json.dumps({'complete': False, 'reason': 'Still missing',
-                                           'next_step': 'Implement the missing behavior'}),
-                        checks=0, rounds=0)
-        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
-                                env=dict(env, AI_MAX_VERIFICATIONS='3'),
-                                capture_output=True, text=True, timeout=30)
-        assert scenario['checks'] == 3, result.stderr
-        assert result.stdout.count('Candidate answer') == 3, result.stdout
-        assert result.returncode != 0 and 'CompletionUnverified' in result.stderr, result.stderr
-        assert 'Next step: Implement the missing behavior' in result.stderr, result.stderr
-
-        # A turn whose summary exceeds the judge's budget must still show the
-        # judge how it ended. When the opening work was kept and the tail
-        # dropped, the answer never reached the check, finished work was
-        # rejected, and the run ended with CompletionUnverified.
-        judge_prompts.clear()
-        scenario.update(verdict=json.dumps({'complete': True, 'reason': 'Saw the answer'}),
-                        checks=0, rounds=18)
-        long_env = dict(env, AI_MAX_ITERATIONS='30')
-        result = subprocess.run([str(binary), 'Perform the long task'], cwd=directory, env=long_env,
-                                capture_output=True, text=True, timeout=120)
-        assert scenario['checks'] == 1, result.stderr
-        prompt = judge_prompts[0]
-        assert 'answer: Candidate answer' in prompt, prompt[-500:]
-        assert 'round-0-' not in prompt, prompt[:500]
-        assert result.returncode == 0, result.stderr
-
-        # One unusable reply from the judge says nothing about the work: a
-        # check that was truncated must be asked again while budget lasts,
-        # not turn a finished turn into CompletionUnverified.
-        truncated = {'status': 'incomplete',
-                     'incomplete_details': {'reason': 'max_output_tokens'}, 'output': []}
-        scenario.update(verdict=json.dumps({'complete': True, 'reason': 'Readable now'}),
-                        checks=0, rounds=0, judge_replies=[dict(truncated)])
-        retry_env = dict(env, AI_MAX_VERIFICATIONS='2')
-        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory, env=retry_env,
-                                capture_output=True, text=True, timeout=30)
-        assert scenario['checks'] == 2, result.stderr
-        assert result.returncode == 0, result.stderr
-        assert 'CompletionUnverified' not in result.stderr, result.stderr
-
-        # When every attempt fails, the run still ends unverified, on the same
-        # bounded budget as a judge that keeps rejecting the work.
-        scenario.update(verdict=json.dumps({'complete': True, 'reason': 'never asked'}),
-                        checks=0, rounds=0, judge_replies=[dict(truncated), dict(truncated)])
-        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory, env=retry_env,
-                                capture_output=True, text=True, timeout=30)
-        assert scenario['checks'] == 2, result.stderr
-        assert result.returncode != 0 and 'CompletionUnverified' in result.stderr, result.stderr
-
-        # A finished task must pass the check on the evidence it produced. The
-        # proof here is the last line of a long test run, which the summary has
-        # to carry: keeping only the head of a result shows the setup and hides
-        # the verdict, so genuinely finished work is rejected.
-        scenario.update(verdict=None, checks=0, rounds=0, judge_replies=[],
-                        require='42 tests, 0 failures',
-                        # The proof is produced by the command, not spelled in
-                        # it, so an echoed command cannot stand in for a result.
-                        command="N=42; R=0; printf 'running the suite...\\n'; "
-                                "printf '%600s' '' | tr ' ' x; "
-                                "printf '\\n%s tests, %s failures\\n' \"$N\" \"$R\"")
-        result = subprocess.run([str(binary), 'Run the tests'], cwd=directory, env=env,
-                                capture_output=True, text=True, timeout=60)
-        assert scenario['checks'] == 1, result.stderr
-        assert '42 tests, 0 failures' in judge_prompts[-1], judge_prompts[-1]
-        assert result.returncode == 0, result.stderr
-        print('PASS: accepted, rejected and invalid verdicts have correct exit status; '
-              'a turn longer than the summary budget still shows its answer to the judge; '
-              'an unusable verdict is retried before the run is called unverified; '
-              'a long tool result keeps the tail that proves the work is done')
+        cases = [
+            ('completed', 'Task completed'), ('blocked', 'Task blocked'),
+            ('failed', 'Task failed'), ('needs_user', 'Task awaiting user input'),
+            ('paused', 'Task paused'),
+        ]
+        for work in (False, True):
+            for status, expected in cases:
+                scenario.update(work=work, legacy=False, late_work=False, checks=0, requests=0,
+                                answer=f'Candidate answer: {status}\n[task_status: {status}]')
+                result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
+                                        env=env, capture_output=True, text=True, timeout=30)
+                assert result.returncode == 0, result.stderr
+                assert scenario['checks'] == 0, result.stderr
+                assert scenario['requests'] == (2 if work else 1), scenario
+                assert expected in result.stderr, result.stderr
+                assert ('Task completed' in result.stderr) == (status == 'completed'), result.stderr
+        # Missing/malformed/non-final declarations are conservative, even without tools.
+        for answer in ('Candidate answer', '[task_status: unknown]',
+                       '[task_status: completed]\nStill working',
+                       'Quoted [task_status: completed]'):
+            scenario.update(work=False, legacy=False, late_work=False, checks=0, requests=0,
+                            answer=answer)
+            result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
+                                    env=env, capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0 and scenario['checks'] == 0, result.stderr
+            assert 'Task paused' in result.stderr and 'Task completed' not in result.stderr
+        # Legacy callers remain supported, but explicit final non-success takes priority.
+        for late, answer, expected in (
+            (False, 'Candidate answer', 'Task completed'),
+            (True, 'Candidate answer', 'Task paused'),
+            (False, 'No access\n[task_status: blocked]', 'Task blocked'),
+        ):
+            scenario.update(work=True, legacy=True, late_work=late, checks=0, requests=0,
+                            answer=answer)
+            result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
+                                    env=env, capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0 and scenario['checks'] == 0, result.stderr
+            assert expected in result.stderr, result.stderr
 finally:
     server.shutdown()
+print('main-model completion integration passed')

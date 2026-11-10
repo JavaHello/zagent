@@ -30,7 +30,7 @@ class API(http.server.BaseHTTPRequestHandler):
         if handle_planning(self, body):
             return
         requests.append(body)
-        text = 'Recovery complete'
+        text = 'Recovery complete\n[task_status: completed]'
         output = None
         if not body.get('tools'):
             text = json.dumps({'complete': True, 'reason': 'done'})

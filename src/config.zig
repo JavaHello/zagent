@@ -484,8 +484,7 @@ pub const Config = struct {
     service_tier: ?[]const u8 = null,
     max_tokens: u32,
     max_iterations: u32,
-    /// How many completion checks one user query may cost. 0 turns the check
-    /// off entirely.
+    /// Legacy configuration compatibility; no independent checker runs.
     max_verifications: u32,
     /// Render assistant markdown for a terminal instead of printing it raw.
     /// A stdout that is not a terminal always prints raw, whatever this says.
@@ -651,8 +650,7 @@ test "verification budget prefers the environment and keeps zero" {
         const config = try resolve(allocator, &file_config, &env);
         defer config.deinit();
 
-        // A configured zero is a value, not a missing setting — it has to
-        // survive as a way to switch the completion check off.
+        // Preserve legacy configuration values, including zero.
         try std.testing.expectEqual(@as(u32, 0), config.max_verifications);
     }
 

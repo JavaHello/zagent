@@ -45,7 +45,7 @@ class API(http.server.BaseHTTPRequestHandler):
         else:
             answers.append(results[-1]['output'])
             output = [{'type': 'message', 'role': 'assistant', 'content': [
-                {'type': 'output_text', 'text': 'Background answer complete'}]}]
+                {'type': 'output_text', 'text': 'Background answer complete\n[task_status: completed]'}]}]
         send_response(self, body, {'status': 'completed', 'output': output})
 
 

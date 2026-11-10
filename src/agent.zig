@@ -4,7 +4,6 @@ const tools = @import("tools.zig");
 const diff = @import("diff.zig");
 const text = @import("text.zig");
 const menu = @import("menu.zig");
-const verifier = @import("verifier.zig");
 const compact = @import("compact.zig");
 const memory_mod = @import("memory.zig");
 const mcp = @import("mcp.zig");
@@ -28,9 +27,6 @@ const CYAN = sgr.CYAN;
 const GREEN = sgr.GREEN;
 const YELLOW = sgr.YELLOW;
 const RED = sgr.RED;
-
-/// Longest transcript the completion judge is shown.
-const summary_max_bytes = 8000;
 
 /// How many times one reply may be continued after the output limit cut it
 /// short. Each continuation buys another full budget of text, so a handful is
@@ -78,7 +74,7 @@ const SYSTEM_PROMPT =
     \\- When you learn something durable — a user preference, a project fact, a decision, or a constraint — call remember with a short, self-contained note. Do not save transient details, secrets, or anything the user asked you to forget.
     \\- When the conversation grows long, earlier messages may be replaced by a summary. Treat that summary as part of the conversation, and keep your own replies concise so it stays useful.
     \\- When the request is ambiguous, or when a decision only the user can make is blocking you, call ask_user with two to four concrete options and mark the one you recommend. Ask only when the answer changes what you do next; decide routine details yourself.
-    \\- When a tool-based task is truly finished, call task_complete after all work and validation, then give your final answer. Only this explicit declaration requests an independent completion check; ordinary replies do not. Do not call it for progress updates, questions, or blocked work. If you use other tools afterward, declare completion again. If the check reports unfinished work, fix it and call task_complete again when ready.
+    \\- You alone judge whether the user's request is finished; no independent completion checker will run. End every final answer with exactly one status line: [task_status: completed], [task_status: blocked], [task_status: failed], [task_status: needs_user], or [task_status: paused]. Use completed only when the requested work and necessary validation really succeeded (including fully answered questions). Failures, missing permissions/dependencies, partial work, plans, and requests for confirmation are NOT completion. Explain blockers/failures and the next step; use needs_user when awaiting a decision. Once finished, give the final answer without tool calls and stop. No task_complete call is needed.
 ;
 
 /// The system prompt as the model is given it: the constant above, plus what
@@ -125,8 +121,6 @@ pub const Agent = struct {
     client: openai.Client,
     history: std.ArrayList(Message),
     max_iterations: u32,
-    /// How many completion checks one user query may cost.
-    max_verifications: u32,
     /// The terminal ask_user and the choice menus read from.
     linenoise: *Linenoise,
     choice_context: ?*anyopaque = null,
@@ -206,7 +200,6 @@ pub const Agent = struct {
             .client = client,
             .history = history,
             .max_iterations = config.max_iterations,
-            .max_verifications = config.max_verifications,
             .linenoise = linenoise,
             .search = search,
             .tool_env = env,
@@ -673,8 +666,7 @@ pub const Agent = struct {
         try self.emit(std.Io.File.stderr(), DIM ++ "  ✧ remembered {d} note{s}\n" ++ RESET, .{ added, if (added == 1) "" else "s" });
     }
 
-    /// Process a single user query: work on it until the model answers and the
-    /// completion check agrees that the request is done.
+    /// Settle unanswered calls after an interrupted query.
     /// Called only after the worker has joined. Preserve completed tool results
     /// and explicitly settle any calls that cancellation left unanswered.
     pub fn finishInterruption(self: *Agent) !void {
@@ -743,6 +735,8 @@ pub const Agent = struct {
         switch (outcome) {
             .completed => try self.emit(std.Io.File.stderr(), BOLD ++ GREEN ++ "  ✓ Task completed" ++ RESET ++ "\n", .{}),
             .blocked => try self.emit(std.Io.File.stderr(), YELLOW ++ "  ⏸ Task blocked · resume when the prerequisite is available" ++ RESET ++ "\n", .{}),
+            .failed => try self.emit(std.Io.File.stderr(), RED ++ "  ✗ Task failed" ++ RESET ++ "\n", .{}),
+            .needs_user => try self.emit(std.Io.File.stderr(), YELLOW ++ "  Task awaiting user input" ++ RESET ++ "\n", .{}),
             .paused => try self.emit(std.Io.File.stderr(), DIM ++ "  Task paused" ++ RESET ++ "\n", .{}),
         }
     }
@@ -796,7 +790,20 @@ pub const Agent = struct {
 
     // A known external blocker is a settled turn, not a failed checker or a
     // completed task. Keep that distinction through final status reporting.
-    const QueryOutcome = enum { completed, blocked, paused };
+    const QueryOutcome = enum { completed, blocked, failed, needs_user, paused };
+
+    // Only a standalone final line counts, never quoted text or a tool result.
+    fn parseTaskOutcome(content: []const u8) ?QueryOutcome {
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        const start = if (std.mem.lastIndexOfScalar(u8, trimmed, '\n')) |pos| pos + 1 else 0;
+        const line = std.mem.trim(u8, trimmed[start..], " \t\r");
+        inline for ([_]QueryOutcome{ .completed, .blocked, .failed, .needs_user, .paused }) |outcome| {
+            if (std.mem.eql(u8, line, "[task_status: " ++ @tagName(outcome) ++ "]")) {
+                return outcome;
+            }
+        }
+        return null;
+    }
 
     fn processQueryInner(self: *Agent, query: []const u8, task_title: *?[]u8) !QueryOutcome {
         try self.appendUserMessage(query);
@@ -807,91 +814,14 @@ pub const Agent = struct {
         task_title.* = try self.planTask();
         self.current_task = task_title.* orelse "Task";
         self.terminal_title.update("thinking…", self.current_task);
-        // The judge is shown only what this turn produced, so remember where
-        // the request it is checking starts. Compaction during the turn moves
-        // this index down; `runToolLoop` updates it.
+        // Compaction during the turn moves this history boundary down;
+        // `runToolLoop` updates it.
         var turn_start = self.history.items.len;
 
-        var verifications: u32 = 0;
-        var worked = false;
-
-        while (true) {
-            try self.checkInterrupted();
-            const turn = try self.runToolLoop(&turn_start);
-            if (!turn.completed) return error.IterationLimitReached;
-            // Counted across the whole query, not per round: a round that only
-            // claims the work is finished still has to pass the check.
-            worked = worked or turn.tool_calls > 0;
-            // A query that never touched a tool is a conversation, not a task.
-            if (!worked) return .completed;
-            if (!turn.completion_requested) return .paused;
-            if (self.max_verifications == 0) return .completed;
-
-            // A check that fails to produce a verdict — the request errored,
-            // the reply was truncated, or it was not JSON — says nothing about
-            // the work, so it is asked again while budget remains. The answer
-            // is already printed and the turn is over; throwing it away over
-            // one unusable reply is the worst of both outcomes. Each attempt
-            // spends a check, so a judge that can never be read is still
-            // bounded.
-            var judged: ?verifier.Verdict = null;
-            while (judged == null and verifications < self.max_verifications) {
-                try self.checkInterrupted();
-                verifications += 1;
-                // The check announces itself from inside `judgeAnimated`, where
-                // it can be animated for as long as the judge is thinking.
-                judged = try self.judgeTurn(query, turn_start);
-            }
-            const verdict = judged orelse {
-                try self.emit(std.Io.File.stderr(), DIM ++ "  ✗ no usable completion verdict in {d} checks; the answer above stands unverified\n" ++ RESET, .{verifications});
-                return error.CompletionUnverified;
-            };
-            defer verdict.deinit(self.allocator);
-
-            if (verdict.complete) {
-                try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ completion check passed\n" ++ RESET, .{});
-                return .completed;
-            }
-
-            if (verdict.blocked and !verdict.needs_user_decision) {
-                try self.emit(std.Io.File.stderr(), YELLOW ++ "  ⏸ blocked: {s}\n" ++ RESET, .{verdict.reason});
-                if (verdict.next_step) |step| {
-                    try self.emit(std.Io.File.stderr(), "  Next step: {s}\n", .{step});
-                }
-                return .blocked;
-            }
-
-            try self.emit(std.Io.File.stderr(), YELLOW ++ "  ↻ not done: {s}\n" ++ RESET, .{verdict.reason});
-
-            // Do not start another round that cannot be checked. In particular,
-            // the last rejection used to trigger more tools and print a new
-            // answer, only to fail unconditionally at the top of this loop.
-            if (verifications == self.max_verifications) {
-                try self.emit(std.Io.File.stderr(), DIM ++ "  ⟳ completion check budget ({d}) spent; task remains unverified\n" ++ RESET, .{self.max_verifications});
-                if (verdict.next_step) |step| {
-                    try self.emit(std.Io.File.stderr(), "  Next step: {s}\n", .{step});
-                }
-                try self.emit(std.Io.File.stderr(), "  Continue with the next step in a new query, or increase AI_MAX_VERIFICATIONS for tasks needing more repair rounds.\n", .{});
-                return error.CompletionUnverified;
-            }
-
-            // The judge can hand the open question back as a menu of its own
-            // making, for the turns the model never got around to asking about.
-            if (verdict.needs_user_decision and verdict.options.items.len > 0) {
-                const question = verdict.question orelse "How should I proceed?";
-                const answer = (try self.askChoice(question, verdict.options.items)) orelse {
-                    try self.emit(std.Io.File.stderr(), DIM ++ "  stopped without an answer\n" ++ RESET, .{});
-                    return .paused;
-                };
-                defer self.allocator.free(answer);
-                try self.emit(std.Io.File.stderr(), DIM ++ "  → {s}\n" ++ RESET, .{answer});
-                try self.appendUserMessage(answer);
-            } else {
-                const follow_up = try verifier.buildFollowUp(self.allocator, verdict);
-                defer self.allocator.free(follow_up);
-                try self.appendUserMessage(follow_up);
-            }
-        }
+        try self.checkInterrupted();
+        const turn = try self.runToolLoop(&turn_start);
+        if (!turn.completed) return error.IterationLimitReached;
+        return turn.outcome orelse if (turn.completion_requested) .completed else .paused;
     }
 
     /// Send the conversation and wait, with the progress line animated for the
@@ -917,24 +847,6 @@ pub const Agent = struct {
         };
     }
 
-    /// Ask the completion judge, animated the same way. Without a terminal to
-    /// animate, the plain line it replaces is printed instead, so a redirected
-    /// run still records that the check happened.
-    fn judgeAnimated(self: *Agent, messages: []const Message) !openai.ApiResponse {
-        try self.checkInterrupted();
-        self.terminal_title.update("checking completion…", self.current_task);
-        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking completion…", self.progressOptions());
-        if (!spin.animating()) {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ⟳ checking completion…\n" ++ RESET, .{});
-        }
-        defer spin.stop();
-        return self.client.respondWithoutTools(messages) catch |err| {
-            spin.stop();
-            try self.reportHttpError();
-            return err;
-        };
-    }
-
     /// Report what the server said about a request that failed. The client
     /// keeps it instead of printing it, so that it can be said here — after
     /// the animation has given the line back.
@@ -951,6 +863,7 @@ pub const Agent = struct {
         completed: bool,
         /// Explicit model declaration, invalidated by subsequent tool work.
         completion_requested: bool = false,
+        outcome: ?QueryOutcome = null,
     };
 
     /// Run the tool-call loop until the model answers or the iteration budget
@@ -1112,6 +1025,7 @@ pub const Agent = struct {
                         combined = try std.mem.concat(self.allocator, u8, &.{ carried.items, content });
                         break :blk combined.?;
                     } else content;
+                    turn.outcome = parseTaskOutcome(printed);
                     if (stream.started) {
                         // The answer was already painted as it streamed; all
                         // that is left is the pending line, table and trailer.
@@ -1161,46 +1075,6 @@ pub const Agent = struct {
         }
 
         return turn;
-    }
-
-    /// Ask the judge whether the turn that started at `turn_start` finished the
-    /// user's request. Returns null when the judge could not be consulted or
-    /// its reply could not be read: an unjudgeable turn keeps the answer it
-    /// already printed rather than looping on a check that cannot pass.
-    fn judgeTurn(self: *Agent, request: []const u8, turn_start: usize) !?verifier.Verdict {
-        const summary = try verifier.summarize(self.allocator, self.history.items[turn_start..], summary_max_bytes);
-        defer self.allocator.free(summary);
-        const prompt = try verifier.buildPrompt(self.allocator, request, summary);
-        defer self.allocator.free(prompt);
-
-        // The request only serialises these, so borrowed content is enough.
-        const messages = [_]Message{
-            .{ .role = "system", .content = verifier.SYSTEM_PROMPT, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
-            .{ .role = "user", .content = prompt, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
-        };
-
-        const response = self.judgeAnimated(&messages) catch |err| {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
-            return null;
-        };
-        defer response.deinit(self.allocator);
-
-        // A verdict cut off by the token limit cannot be trusted, even when
-        // the fragment happens to parse: the outer loop asks again.
-        if (std.mem.eql(u8, response.finish_reason, "length")) {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ completion check skipped: the reply was truncated\n" ++ RESET, .{});
-            return null;
-        }
-
-        const content = response.content orelse {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ completion check skipped: the reply was empty\n" ++ RESET, .{});
-            return null;
-        };
-
-        return verifier.parseVerdict(self.allocator, content) catch |err| {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ completion check skipped: {s}\n" ++ RESET, .{@errorName(err)});
-            return null;
-        };
     }
 
     /// Show the offered options and return one line describing what the user
@@ -1460,7 +1334,7 @@ pub const Agent = struct {
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "task_complete")) {
-                break :blk .{ .content = try self.allocator.dupe(u8, "Completion declared. Give your final answer; an independent check will run if enabled. Further tool work requires a new declaration."), .is_error = false };
+                break :blk .{ .content = try self.allocator.dupe(u8, "Completion declared by the main model. Give your final answer with a task_status line; no independent check will run. Further tool work invalidates this declaration."), .is_error = false };
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
             } else if (std.mem.eql(u8, call.name, mcp.Registry.loader_name)) {

@@ -228,7 +228,7 @@ All configuration is also supported through environment variables:
 | `AI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
 | `AI_MAX_TOKENS`| `8192`                           | Initial output token budget per response    |
 | `AI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
-| `AI_MAX_VERIFICATIONS` | `3`                     | Checks per query, requested by `task_complete`; `0` disables checking |
+| `AI_MAX_VERIFICATIONS` | `3`                     | Legacy compatibility option; ignored (no independent checker) |
 | `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
 | `AI_COMPACT_THRESHOLD` | `48000`                      | Estimated tokens before older messages are summarized; `0` disables |
 | `AI_COMPACT_KEEP`  | `16`                             | Newest messages kept verbatim across a compaction |
@@ -238,7 +238,7 @@ All configuration is also supported through environment variables:
 
 Use `AI_` settings in both the config file and environment. An explicit value wins over the provider preset. Provider-specific API keys (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) are read from the environment; use `AI_KEY` in the config file.
 
-When a response hits `max_output_tokens`, both the main conversation and completion check retry the same input with a doubled token budget, up to three retries and a growth cap of 8192 tokens — the most DeepSeek's chat models accept. Since the default budget already equals that cap, the retry only grows a smaller configured `AI_MAX_TOKENS`. Partial tool calls are discarded and completed tool results are retained. If the reply is still cut off, zagent keeps the partial text and asks the model to continue exactly where it stopped, up to eight times; a cut-off tool call is instead re-asked as a request to work in smaller steps, twice. Only when that also fails does the turn end with `ResponseTruncated`, after printing what was produced.
+When a response hits `max_output_tokens`, the main conversation retries the same input with a doubled token budget, up to three retries and a growth cap of 8192 tokens — the most DeepSeek's chat models accept. Since the default budget already equals that cap, the retry only grows a smaller configured `AI_MAX_TOKENS`. Partial tool calls are discarded and completed tool results are retained. If the reply is still cut off, zagent keeps the partial text and asks the model to continue exactly where it stopped, up to eight times; a cut-off tool call is instead re-asked as a request to work in smaller steps, twice. Only when that also fails does the turn end with `ResponseTruncated`, after printing what was produced.
 
 ## Rendering
 
@@ -313,7 +313,7 @@ Assistant
 Here are all the .zig files in the current directory: ...
 
   ⟳ checking completion…
-  ✓ completion check passed
+  ✓ Task completed
 ```
 
 In a terminal, the interactive session takes the whole screen over: the banner
@@ -345,52 +345,26 @@ export OPENAI_API_KEY=sk-...
 ./zig-out/bin/zagent "what is the current date and time?"
 ```
 
-### Completion check
+### Completion status
 
-Completion checks are explicitly requested by the AI, not automatically triggered
-by tool use. Once the work and validation are finished, the AI calls
-`task_complete` and gives its final answer. Only then does zagent send the user's
-request plus a summary of the work (tool calls, short tool results, the final
-answer) to an independent model request with no tools advertised, and expect
+The main model judges completion itself. No independent checker request or
+automatic repair round runs after its final answer. The final answer ends with
+one explicit status line: `[task_status: completed]`, `[task_status: blocked]`,
+`[task_status: failed]`, `[task_status: needs_user]`, or `[task_status: paused]`.
+Only a standalone last line is accepted. Missing or invalid status means paused,
+not success, even for a reply without tool calls.
 
-```json
-{"complete": false, "reason": "The tests were never run.", "next_step": "Run zig build test."}
-```
+The model may declare completion only after the requested work and necessary
+validation succeed. Failures, missing permissions/dependencies, partial work,
+and waiting for user confirmation must not be called completed. These settled
+non-success statuses end the turn normally (exit code 0), explain the situation
+and next step, and do not print `Task completed`. Transport errors, truncation
+and iteration limits still return errors. Completion is a model assertion, not
+a substitute for running real tests.
 
-An unfinished verdict is printed and fed back into the conversation, and the
-agent keeps working. Up to `AI_MAX_VERIFICATIONS` checks are made per query
-(3 by default); the budget is printed when it runs out, and `AI_MAX_VERIFICATIONS=0`
-turns the check off. Without `task_complete`, no judge request is made: tool-using
-turns end as `Task paused`, while plain conversation ends normally. Further tool
-work after a declaration invalidates it; the AI must declare completion again.
-A reported blocker, partial implementation or a plan is not a completed task.
-When the checker identifies an unavailable external prerequisite (such as
-private Maven dependencies or authentication), the turn ends normally with
-`Task blocked`, the reason and the next step. It does not retry, throw
-`CompletionUnverified`, or print `Task completed`. This settled blocked state
-exits with code 0; it does **not** certify that implementation or tests passed.
-Resume with a new query once the prerequisite is available. If the
-verification budget runs out while the task remains unfinished, the process
-returns `CompletionUnverified`. The final rejection does not start another repair
-round with no checks left. It prints the rejection reason, the suggested next
-step (when supplied), and a configuration hint. Continue that step in a new
-query, or raise `AI_MAX_VERIFICATIONS` before starting a task that needs more
-repair rounds; a larger budget alone does not establish completion.
-
-Two things worth knowing:
-
-- Each explicit completion check costs an extra request, and it re-sends a
-  summary of that turn rather than the whole history. A turn too long for that
-  summary keeps its most recent work — the answer, or the failure that stopped
-  it — and omits the beginning, so the judge always sees how the turn ended.
-  Long tool results are shortened in the middle rather than at the end: a test
-  run's verdict, or a command's last lines, are the evidence the check rules
-  on, so they travel with the command that produced them.
-- If the judge request fails or its reply cannot be read, the check is asked
-  again while the budget lasts, because such a reply says nothing about the
-  work; every attempt spends a check. When no usable verdict can be read, the
-  candidate answer remains visible, but the process returns
-  `CompletionUnverified`.
+Legacy `task_complete` calls remain supported without extra requests; further
+tool work invalidates them, and explicit final status takes priority.
+`AI_MAX_VERIFICATIONS` is accepted for configuration compatibility but ignored.
 
 ### Choices
 
@@ -704,7 +678,7 @@ item IDs; durable sessions preserve them across restarts. Older sessions are
 converted to Responses input messages and call/output pairs. Legacy free-form
 `reasoning_content` strings are not sent as a Responses reasoning item.
 
-The main agent and the completion checker both use Responses. There is no
+The main agent uses Responses. There is no
 automatic fallback to Chat Completions. `AI_URL` is the API base URL (for
 example `https://api.openai.com/v1` or `https://api.deepseek.com`), without the
 `/responses` suffix. A Chat Completions-only endpoint must be replaced with a
@@ -719,7 +693,7 @@ zig build test
 zig build test-integration
 ```
 
-The integration target builds the binary and runs the Python 3 suites, covering streamed output, host tool execution, completion checks, response failures, menus and prompt popups. No isolation backend is required.
+The integration target builds the binary and runs the Python 3 suites, covering streamed output, host tool execution, main-model completion statuses, response failures, menus and prompt popups. No isolation backend is required.
 
 ## Project structure
 
@@ -740,7 +714,7 @@ src/
   memory.zig  — Durable notes: file format, prompt section, extraction
   banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer
-  verifier.zig — Completion judge: prompt, turn summary, verdict parsing
+  verifier.zig — Legacy completion utilities (not used by the agent loop)
 build.zig     — Zig build script
 ```
 

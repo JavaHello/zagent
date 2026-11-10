@@ -102,7 +102,10 @@ pub fn parseVerdict(allocator: std.mem.Allocator, content: []const u8) !Verdict 
 
     // A malformed options list must not sink an otherwise readable verdict.
     const options = if (root.object.get("options")) |value|
-        menu.parseOptions(allocator, value) catch menu.Options.none()
+        menu.parseOptions(allocator, value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => menu.Options.none(),
+        }
     else
         menu.Options.none();
 
@@ -167,52 +170,68 @@ fn extractJsonObject(text: []const u8) ?[]const u8 {
 /// judge the opening tool calls and hide the outcome, and it would keep
 /// answering "not done" about work that is finished.
 pub fn summarize(allocator: std.mem.Allocator, messages: []const openai.Message, max_bytes: usize) ![]u8 {
-    // Rendered first, so that the lines that do not fit can be chosen from the
-    // end rather than as they are produced.
-    var lines: std.ArrayList([]u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
-    }
-    for (messages) |message| {
-        var line: std.Io.Writer.Allocating = .init(allocator);
-        defer line.deinit();
-        if (!try writeLine(&line.writer, message)) continue;
-        try lines.append(allocator, try line.toOwnedSlice());
-    }
+    // All writers below either count bytes or write to allocator-backed memory;
+    // their only possible write failure is allocation failure.
+    return summarizeInner(allocator, messages, max_bytes) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => return err,
+    };
+}
 
-    var total: usize = 0;
-    for (lines.items) |line| total += line.len;
+fn summarizeInner(allocator: std.mem.Allocator, messages: []const openai.Message, max_bytes: usize) ![]u8 {
+    if (max_bytes == 0) return allocator.dupe(u8, "");
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-
-    if (total <= max_bytes) {
-        for (lines.items) |line| try out.writer.writeAll(line);
-        return out.toOwnedSlice();
-    }
-
-    // The marker is part of the budget, so the summary never grows past it.
-    const kept_budget = if (max_bytes > omission_marker.len) max_bytes - omission_marker.len else 0;
-    var first_kept = lines.items.len;
+    // Count backwards without allocating rendered lines. Once the budget is
+    // exceeded, older messages cannot affect the selected suffix.
+    var first_kept = messages.len;
     var kept: usize = 0;
+    var omitted = false;
     while (first_kept > 0) {
-        const line = lines.items[first_kept - 1];
-        if (kept + line.len > kept_budget) break;
-        kept += line.len;
+        const len = try lineLength(messages[first_kept - 1]);
+        if (len > max_bytes - kept) {
+            omitted = true;
+            break;
+        }
+        kept += len;
         first_kept -= 1;
     }
 
-    try out.writer.writeAll(omission_marker[0..@min(omission_marker.len, max_bytes)]);
-    if (first_kept == lines.items.len and lines.items.len > 0) {
-        // Not even the newest line fits whole. Show as much of it as the
-        // budget allows, so its outcome is still what the judge reads.
-        try out.writer.writeAll(truncateUtf8(lines.items[lines.items.len - 1], kept_budget));
-    } else {
-        for (lines.items[first_kept..]) |line| try out.writer.writeAll(line);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    if (!omitted) {
+        for (messages) |message| _ = try writeLine(&out.writer, message);
+        return out.toOwnedSlice();
     }
 
+    // Reserving the marker can evict a few more messages from the suffix.
+    const kept_budget = max_bytes -| omission_marker.len;
+    while (kept > kept_budget) {
+        kept -= try lineLength(messages[first_kept]);
+        first_kept += 1;
+    }
+    try out.writer.writeAll(omission_marker[0..@min(omission_marker.len, max_bytes)]);
+    if (kept > 0) {
+        for (messages[first_kept..]) |message| _ = try writeLine(&out.writer, message);
+    } else if (kept_budget > 0) {
+        // Ignore non-rendering messages when locating the newest evidence.
+        var i = messages.len;
+        while (i > 0) {
+            i -= 1;
+            if (try lineLength(messages[i]) == 0) continue;
+            var line: std.Io.Writer.Allocating = .init(allocator);
+            defer line.deinit();
+            _ = try writeLine(&line.writer, messages[i]);
+            try out.writer.writeAll(truncateUtf8(line.written(), kept_budget));
+            break;
+        }
+    }
     return out.toOwnedSlice();
+}
+
+fn lineLength(message: openai.Message) !usize {
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    _ = try writeLine(&counter.writer, message);
+    return @intCast(counter.fullCount());
 }
 
 /// Stands in for the earliest part of a turn too long for the judge's budget.
@@ -499,6 +518,64 @@ test "truncating never splits a utf8 character" {
     const text = "你好世界";
     try std.testing.expectEqualStrings("你好", truncateUtf8(text, 7));
     try std.testing.expectEqualStrings(text, truncateUtf8(text, 12));
+}
+
+test "summary budgets include the marker and ignore non-rendering messages" {
+    const a = std.testing.allocator;
+    const messages = [_]openai.Message{
+        .{ .role = "system", .content = "ignored", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = "你好世界", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const full = "answer: 你好世界\n";
+    for (0..full.len + omission_marker.len + 2) |budget| {
+        const summary = try summarize(a, &messages, budget);
+        defer a.free(summary);
+        try std.testing.expect(summary.len <= budget);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(summary));
+        if (budget >= full.len) {
+            try std.testing.expectEqualStrings(full, summary);
+        } else {
+            try std.testing.expectEqualStrings(omission_marker[0..@min(budget, omission_marker.len)], summary);
+        }
+    }
+    const empty = try summarize(a, messages[0..1], 100);
+    defer a.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+}
+
+test "marker reservation can evict previously fitting messages" {
+    const a = std.testing.allocator;
+    const messages = [_]openai.Message{
+        .{ .role = "assistant", .content = "older", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = "middle", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = "newest", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const summary = try summarize(a, &messages, omission_marker.len + "answer: newest\n".len);
+    defer a.free(summary);
+    try std.testing.expectEqualStrings(omission_marker ++ "answer: newest\n", summary);
+}
+
+fn checkVerifierAllocationFailures(a: std.mem.Allocator) !void {
+    const verdict = try parseVerdict(a,
+        \\{"complete":false,"reason":"Choose","next_step":"Ask","question":"Which?",
+        \\ "options":[{"label":"a","description":"first"},"b"]}
+    );
+    defer verdict.deinit(a);
+    const messages = [_]openai.Message{
+        .{ .role = "assistant", .content = "An answer longer than the selected summary budget.", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    for ([_]usize{ 0, 30, 100 }) |budget| {
+        const summary = try summarize(a, &messages, budget);
+        defer a.free(summary);
+    }
+}
+
+test "verifier propagates allocation failures without leaking" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkVerifierAllocationFailures, .{});
+    const verdict = try parseVerdict(std.testing.allocator, "{\"complete\":false,\"options\":42}");
+    defer verdict.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), verdict.options.items.len);
 }
 
 test "the follow up names the next step" {
