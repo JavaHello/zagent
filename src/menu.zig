@@ -4,9 +4,10 @@ const sanitize = @import("text.zig");
 const RawTerminal = @import("editor/main.zig").RawTerminal;
 
 // ANSI colour codes
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const DIM = "\x1b[2m";
+const sgr = @import("style.zig");
+const RESET = sgr.RESET;
+const BOLD = sgr.BOLD;
+const DIM = sgr.DIM;
 
 /// One choice offered to the user. Whoever holds the `Options` owns the slices.
 pub const Option = struct {
@@ -206,7 +207,7 @@ fn writeRow(w: *std.Io.Writer, allocator: std.mem.Allocator, raw: []const u8, co
     const limit = @max(columns -| 1, 1);
     const end = term.takeFit(bytes, limit);
     try w.writeAll(bytes[0..end]);
-    try w.writeAll(RESET ++ "\x1b[K\r\n");
+    try w.writeAll(RESET ++ sgr.ERASE_LINE_END ++ "\r\n");
 }
 
 /// Returns options.len for the custom-answer row, or null on cancellation.
@@ -225,8 +226,8 @@ fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, op
     const out = std.Io.File.stderr();
     var raw = try RawTerminal.init(io, std.Io.File.stdin(), out);
     defer raw.deinit();
-    try out.writeStreamingAll(io, "\x1b[?25l");
-    defer out.writeStreamingAll(io, RESET ++ "\x1b[?25h") catch {};
+    try out.writeStreamingAll(io, sgr.HIDE_CURSOR);
+    defer out.writeStreamingAll(io, RESET ++ sgr.SHOW_CURSOR) catch {};
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -239,7 +240,7 @@ fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, op
     var drawn = false;
     while (true) {
         aw.clearRetainingCapacity();
-        if (drawn) try aw.writer.print("\x1b[{d}A\r", .{visible + 1});
+        if (drawn) try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{visible + 1});
         const first = @min(state.selected -| (visible / 2), state.count - visible);
         for (first..first + visible) |i| {
             var row: std.Io.Writer.Allocating = .init(allocator);
@@ -251,7 +252,7 @@ fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, op
                 if (recommendedIndex(options) == i) try row.writer.writeAll(" (recommended)");
                 if (option.description.len > 0) try row.writer.print("  {s}", .{option.description});
             } else try row.writer.writeAll("Other / 自定义回答");
-            if (i == state.selected) try aw.writer.writeAll("\x1b[1;36m");
+            if (i == state.selected) try aw.writer.writeAll(sgr.BOLD_CYAN);
             try writeRow(&aw.writer, allocator, row.written(), term.columns(out));
         }
         try writeRow(&aw.writer, allocator, "  ↑/↓ select · Enter confirm · Ctrl+C cancel", term.columns(out));

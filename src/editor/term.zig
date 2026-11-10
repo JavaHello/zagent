@@ -1,4 +1,5 @@
 const std = @import("std");
+const ansi = @import("../style.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const File = std.Io.File;
@@ -129,7 +130,7 @@ fn getCursorPosition(io: Io, in: File, out: File) !usize {
     var file_reader = in.reader(io, &file_buffer);
 
     // Tell terminal to report cursor to in
-    try out.writeStreamingAll(io, "\x1B[6n");
+    try out.writeStreamingAll(io, ansi.QUERY_CURSOR);
 
     // Read answer
     const answer = file_reader.interface.takeDelimiterExclusive('R') catch |err| switch (err) {
@@ -138,7 +139,7 @@ fn getCursorPosition(io: Io, in: File, out: File) !usize {
     };
 
     // Parse answer
-    if (!std.mem.startsWith(u8, "\x1B[", answer))
+    if (!std.mem.startsWith(u8, ansi.CSI, answer))
         return error.CursorPos;
 
     var iter = std.mem.splitScalar(u8, answer[2..], ';');
@@ -154,10 +155,10 @@ fn getColumnsFallback(io: Io, in: File, out: File) !usize {
     const writer = &file_writer.interface;
     const orig_cursor_pos = try getCursorPosition(io, in, out);
 
-    try writer.print("\x1B[999C", .{});
+    try writer.writeAll(ansi.RIGHT_MARGIN);
     const cols = try getCursorPosition(io, in, out);
 
-    try writer.print("\x1B[{}D", .{orig_cursor_pos});
+    try writer.print(ansi.CURSOR_LEFT, .{orig_cursor_pos});
     try writer.flush();
 
     return cols;
@@ -202,7 +203,7 @@ pub fn getRows(file: File) usize {
 }
 
 pub fn clearScreen(io: Io) !void {
-    try File.stderr().writeStreamingAll(io, "\x1b[H\x1b[2J");
+    try File.stderr().writeStreamingAll(io, ansi.HOME ++ ansi.CLEAR_SCREEN);
 }
 
 pub fn beep(io: Io) !void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ansi = @import("../style.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ArrayList = std.ArrayList;
@@ -332,15 +333,15 @@ fn linenoiseRaw(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]con
 
     const orig = try enableRawMode(in, out);
     defer disableRawMode(in, out, orig);
-    try out.writeStreamingAll(ln.io, "\x1b[?2004h");
-    defer out.writeStreamingAll(ln.io, "\x1b[?2004l") catch {};
+    try out.writeStreamingAll(ln.io, ansi.PASTE_ON);
+    defer out.writeStreamingAll(ln.io, ansi.PASTE_OFF) catch {};
 
     return try linenoiseEdit(ln, in, out, prompt);
 }
 
 /// Consume a bracketed paste as text, never as editor commands.
 fn readPaste(ln: *Linenoise, input: File) ![]u8 {
-    const end = "\x1b[201~";
+    const end = ansi.PASTE_END;
     var bytes: ArrayList(u8) = .empty;
     defer bytes.deinit(ln.allocator);
     var matched: usize = 0;

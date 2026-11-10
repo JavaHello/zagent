@@ -1,4 +1,5 @@
 const std = @import("std");
+const ansi = @import("../style.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const File = std.Io.File;
@@ -171,9 +172,9 @@ pub const LinenoiseState = struct {
         if (self.popup_rows == 0) return;
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        try aw.writer.writeAll("\x1b7");
-        for (0..self.popup_rows) |_| try aw.writer.writeAll("\r\n\x1b[2K");
-        try aw.writer.writeAll("\x1b8");
+        try aw.writer.writeAll(ansi.SAVE_CURSOR);
+        for (0..self.popup_rows) |_| try aw.writer.writeAll("\r\n" ++ ansi.CLEAR_LINE);
+        try aw.writer.writeAll(ansi.RESTORE_CURSOR);
         try self.stdout.writeStreamingAll(self.ln.io, aw.written());
         self.popup_rows = 0;
     }
@@ -203,20 +204,20 @@ pub const LinenoiseState = struct {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         for (first..first + visible) |index| {
-            try aw.writer.writeAll("\r\n\x1b[2K");
+            try aw.writer.writeAll("\r\n" ++ ansi.CLEAR_LINE);
             const selected = index == self.popup_selected;
-            if (selected) try aw.writer.writeAll("\x1b[1;36m");
+            if (selected) try aw.writer.writeAll(ansi.BOLD_CYAN);
             var remaining = self.cols -| 1;
             try popupText(&aw.writer, if (selected) " > " else "   ", &remaining);
             try popupText(&aw.writer, self.popup_items[index].label, &remaining);
             try popupText(&aw.writer, "  ", &remaining);
             try popupText(&aw.writer, self.popup_items[index].description, &remaining);
-            try aw.writer.writeAll("\x1b[0m");
+            try aw.writer.writeAll(ansi.RESET);
         }
-        try aw.writer.writeAll("\r\n\x1b[2K");
+        try aw.writer.writeAll("\r\n" ++ ansi.CLEAR_LINE);
         var remaining = self.cols -| 1;
         try popupText(&aw.writer, " ↑/↓ select · Tab/Enter insert · Esc close", &remaining);
-        try aw.writer.print("\x1b[{d}A\r", .{visible + 1});
+        try aw.writer.print(ansi.CURSOR_UP ++ "\r", .{visible + 1});
         try self.stdout.writeStreamingAll(self.ln.io, aw.written());
         self.popup_rows = visible + 1;
         // Redraw the input after relative movement, including when the popup
@@ -432,11 +433,11 @@ pub const LinenoiseState = struct {
         }
 
         // Erase to the right
-        try writer.writeAll("\x1b[0K");
+        try writer.writeAll(ansi.CLEAR_LINE_END);
 
         // Move cursor to original position
         const cursor_pos = if (pos > avail_space) self.cols - display_hint_width - 1 else display_prompt_width + pos;
-        try writer.print("\r\x1b[{}C", .{cursor_pos});
+        try writer.print("\r" ++ ansi.CURSOR_RIGHT, .{cursor_pos});
 
         // Write buffer
         try writer.flush();
@@ -491,7 +492,7 @@ pub const LinenoiseState = struct {
         try self.clearPopup();
         if (self.max_rows > self.cursor_row + 1) {
             var buf: [64]u8 = undefined;
-            const move = try std.fmt.bufPrint(&buf, "\x1b[{d}B", .{self.max_rows - self.cursor_row - 1});
+            const move = try std.fmt.bufPrint(&buf, ansi.CURSOR_DOWN, .{self.max_rows - self.cursor_row - 1});
             try self.stdout.writeStreamingAll(self.ln.io, move);
         }
     }
@@ -500,13 +501,13 @@ pub const LinenoiseState = struct {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         const writer = &aw.writer;
-        if (self.cursor_row > 0) try writer.print("\x1b[{d}A", .{self.cursor_row});
+        if (self.cursor_row > 0) try writer.print(ansi.CURSOR_UP, .{self.cursor_row});
         try writer.writeAll("\r");
         for (0..self.max_rows) |row| {
-            try writer.writeAll("\x1b[2K");
-            if (row + 1 < self.max_rows) try writer.writeAll("\x1b[1B");
+            try writer.writeAll(ansi.CLEAR_LINE);
+            if (row + 1 < self.max_rows) try writer.writeAll(ansi.DOWN_ONE);
         }
-        if (self.max_rows > 1) try writer.print("\x1b[{d}A", .{self.max_rows - 1});
+        if (self.max_rows > 1) try writer.print(ansi.CURSOR_UP, .{self.max_rows - 1});
 
         // Lay out the full input, then show only a screenful around the cursor.
         // This keeps a large pasted file from moving above the terminal screen.
@@ -533,9 +534,9 @@ pub const LinenoiseState = struct {
             visible += 1;
         }
         const cursor_row = cursor.row - self.viewport_start;
-        if (visible > cursor_row + 1) try writer.print("\x1b[{d}A", .{visible - cursor_row - 1});
+        if (visible > cursor_row + 1) try writer.print(ansi.CURSOR_UP, .{visible - cursor_row - 1});
         try writer.writeAll("\r");
-        if (cursor.col > 0) try writer.print("\x1b[{d}C", .{cursor.col});
+        if (cursor.col > 0) try writer.print(ansi.CURSOR_RIGHT, .{cursor.col});
         self.cursor_row = cursor_row;
         self.max_rows = visible;
         try self.stdout.writeStreamingAll(self.ln.io, aw.written());
@@ -607,8 +608,8 @@ pub const LinenoiseState = struct {
         // and only show again once the input cursor is in its final position.
         // Publish the host repaint and input together, never a hidden cursor
         // between them. The host must not end this synchronized frame early.
-        try self.stdout.writeStreamingAll(self.ln.io, "\x1b[?2026h\x1b[?25l");
-        errdefer self.stdout.writeStreamingAll(self.ln.io, "\x1b[?25h\x1b[?2026l") catch {};
+        try self.stdout.writeStreamingAll(self.ln.io, ansi.SYNC_BEGIN ++ ansi.HIDE_CURSOR);
+        errdefer self.stdout.writeStreamingAll(self.ln.io, ansi.SHOW_CURSOR ++ ansi.SYNC_END) catch {};
         if (self.ln.layout_callback) |callback| {
             try callback(self.ln.layout_context, reserved, self.force_repaint);
         }
@@ -624,18 +625,18 @@ pub const LinenoiseState = struct {
             if (item_rows > 0) {
                 const first = @min(self.popup_selected -| (item_rows / 2), self.popup_items.len - item_rows);
                 for (first..first + item_rows) |index| {
-                    try writer.print("\x1b[{d};1H\x1b[2K", .{input_top + index - first});
+                    try writer.print(ansi.ROW_START ++ ansi.CLEAR_LINE, .{input_top + index - first});
                     const selected = index == self.popup_selected;
-                    if (selected) try writer.writeAll("\x1b[1;36m");
+                    if (selected) try writer.writeAll(ansi.BOLD_CYAN);
                     var remaining = self.cols -| 1;
                     try popupText(writer, if (selected) " > " else "   ", &remaining);
                     try popupText(writer, self.popup_items[index].label, &remaining);
                     try popupText(writer, "  ", &remaining);
                     try popupText(writer, self.popup_items[index].description, &remaining);
-                    try writer.writeAll("\x1b[0m");
+                    try writer.writeAll(ansi.RESET);
                 }
             }
-            try writer.print("\x1b[{d};1H\x1b[2K", .{input_top + item_rows});
+            try writer.print(ansi.ROW_START ++ ansi.CLEAR_LINE, .{input_top + item_rows});
             var remaining = self.cols -| 1;
             try popupText(writer, " ↑/↓ select · Tab/Enter insert · Esc close", &remaining);
             self.popup_rows = popup_visible;
@@ -647,16 +648,16 @@ pub const LinenoiseState = struct {
         while (lines.next()) |line| : (row += 1) {
             if (row < self.viewport_start) continue;
             if (drawn == visible) break;
-            try writer.print("\x1b[{d};1H", .{input_top + popup_visible + drawn});
+            try writer.print(ansi.ROW_START, .{input_top + popup_visible + drawn});
             try writer.writeAll(line);
-            try writer.writeAll("\x1b[0K");
+            try writer.writeAll(ansi.CLEAR_LINE_END);
             drawn += 1;
         }
-        try writer.print("\x1b[{d};{d}H", .{
+        try writer.print(ansi.CURSOR_POSITION, .{
             input_top + popup_visible + cursor_row,
             @min(cursor.col + 1, self.cols),
         });
-        try writer.writeAll("\x1b[?25h\x1b[?2026l");
+        try writer.writeAll(ansi.SHOW_CURSOR ++ ansi.SYNC_END);
         try self.stdout.writeStreamingAll(self.ln.io, aw.written());
 
         self.max_rows = visible;

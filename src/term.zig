@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const wcwidth = @import("unicode_width/main.zig").wcwidth;
 const text = @import("text.zig");
+const ansi = @import("style.zig");
 
 /// Used when the terminal size cannot be read, and on Windows.
 pub const default_columns: usize = 80;
@@ -28,13 +29,13 @@ pub const Title = struct {
             .io = io,
             .enabled = supported and (std.Io.File.stderr().isTty(io) catch false),
         };
-        if (self.enabled) std.Io.File.stderr().writeStreamingAll(io, "\x1b[22;2t") catch {};
+        if (self.enabled) std.Io.File.stderr().writeStreamingAll(io, ansi.SAVE_TITLE) catch {};
         self.update("ready", "");
         return self;
     }
 
     pub fn deinit(self: Title) void {
-        if (self.enabled) std.Io.File.stderr().writeStreamingAll(self.io, "\x1b[23;2t") catch {};
+        if (self.enabled) std.Io.File.stderr().writeStreamingAll(self.io, ansi.RESTORE_TITLE) catch {};
     }
 
     pub fn update(self: Title, activity: []const u8, task: []const u8) void {
@@ -47,7 +48,7 @@ pub const Title = struct {
 
 fn formatTitle(buf: []u8, activity: []const u8, task: []const u8) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
-    try w.writeAll("\x1b]2;");
+    try w.writeAll(ansi.TITLE_PREFIX);
     const start = w.buffered().len;
     try w.writeAll("zagent · ");
     try writeTitleText(&w, activity, 24);
@@ -58,7 +59,7 @@ fn formatTitle(buf: []u8, activity: []const u8, task: []const u8) ![]const u8 {
         // title, including application name and activity, stays below 80.
         try writeTitleText(&w, task, 78 - used);
     }
-    try w.writeByte(0x07);
+    try w.writeAll(ansi.OSC_END);
     return w.buffered();
 }
 

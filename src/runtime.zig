@@ -1,5 +1,6 @@
 //! The terminal has one owner. Workers only enqueue output and request answers.
 const std = @import("std");
+const sgr = @import("style.zig");
 const Agent = @import("agent.zig").Agent;
 const Screen = @import("screen.zig").Screen;
 const menu = @import("menu.zig");
@@ -43,7 +44,7 @@ pub const Runtime = struct {
         self.queue.clearRetainingCapacity();
         try self.agent.finishInterruption();
         _ = try self.screen.drain();
-        try self.screen.writeLog("\x1b[33mTask interrupted (Esc). Queued input cleared.\x1b[0m\n");
+        try self.screen.writeLog(sgr.YELLOW ++ "Task interrupted (Esc). Queued input cleared." ++ sgr.RESET ++ "\n");
         _ = try self.screen.drain();
     }
 
@@ -57,7 +58,7 @@ pub const Runtime = struct {
         const owned = try self.agent.allocator.dupe(u8, line);
         errdefer self.agent.allocator.free(owned);
         try self.queue.append(self.agent.allocator, owned);
-        if (self.busy()) try self.screen.writeLog("\x1b[2mInput queued for the next turn.\x1b[0m\n");
+        if (self.busy()) try self.screen.writeLog(sgr.DIM ++ "Input queued for the next turn." ++ sgr.RESET ++ "\n");
         _ = try self.tick();
     }
 
@@ -83,7 +84,7 @@ pub const Runtime = struct {
         defer self.agent.allocator.free(line);
         self.agent.processQuery(line) catch |err| {
             if (self.agent.interrupted.load(.acquire)) return;
-            const message = std.fmt.allocPrint(self.agent.allocator, "\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)}) catch return;
+            const message = std.fmt.allocPrint(self.agent.allocator, sgr.RED ++ "Error: {s}" ++ sgr.RESET ++ "\n", .{@errorName(err)}) catch return;
             defer self.agent.allocator.free(message);
             self.screen.writeLog(message) catch {};
         };

@@ -3,8 +3,9 @@ const Allocator = std.mem.Allocator;
 
 // Dim, so the hint reads as a suggestion rather than typed text. linenoise's
 // width() skips SGR sequences, so the colours cost no columns.
-const DIM = "\x1b[2m";
-const RESET = "\x1b[0m";
+const sgr = @import("style.zig");
+const DIM = sgr.DIM;
+const RESET = sgr.RESET;
 
 /// One REPL command offered to the user.
 pub const Command = struct {

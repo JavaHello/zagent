@@ -29,7 +29,7 @@ const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "
 /// line rather than as much as was written means a frame that is wider than it
 /// measures — a braille cell on a CJK terminal, say — still cannot leave
 /// residue behind.
-const erase = "\r\x1b[2K";
+const erase = "\r" ++ sgr.CLEAR_LINE;
 
 /// Columns the two spaces and the frame take before the label.
 const indent_width = 4;
@@ -120,7 +120,7 @@ fn animate(
     defer if (options.screen) |screen|
         screen.setProgress("")
     else if (drawn) file.writeStreamingAll(io, if (options.prompt != null)
-        "\x1b[1A" ++ erase ++ "\r\n" ++ erase ++ "\x1b[1A\r"
+        sgr.UP_ONE ++ erase ++ "\r\n" ++ erase ++ sgr.UP_ONE ++ "\r"
     else
         erase) catch {};
 
@@ -156,7 +156,7 @@ fn animate(
         }
         var display_buf: [512]u8 = undefined;
         const display = if (options.prompt) |prompt|
-            std.fmt.bufPrint(&display_buf, "{s}{s}\r\n" ++ erase ++ "{s}", .{ if (index > 0) "\x1b[1A" else "", line, prompt }) catch return
+            std.fmt.bufPrint(&display_buf, "{s}{s}\r\n" ++ erase ++ "{s}", .{ if (index > 0) sgr.UP_ONE else "", line, prompt }) catch return
         else
             line;
         file.writeStreamingAll(io, display) catch return;

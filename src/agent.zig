@@ -20,13 +20,14 @@ const Message = openai.Message;
 const ToolCallData = openai.ToolCallData;
 
 // ANSI colour codes
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const DIM = "\x1b[2m";
-const CYAN = "\x1b[36m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const RED = "\x1b[31m";
+const sgr = @import("style.zig");
+const RESET = sgr.RESET;
+const BOLD = sgr.BOLD;
+const DIM = sgr.DIM;
+const CYAN = sgr.CYAN;
+const GREEN = sgr.GREEN;
+const YELLOW = sgr.YELLOW;
+const RED = sgr.RED;
 
 /// Longest transcript the completion judge is shown.
 const summary_max_bytes = 8000;

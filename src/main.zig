@@ -11,13 +11,13 @@ const text = @import("text.zig");
 const Screen = @import("screen.zig").Screen;
 const Linenoise = @import("editor/main.zig").Linenoise;
 
-// ANSI colour codes
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const DIM = "\x1b[2m";
-const RED = "\x1b[31m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
+const sgr = @import("style.zig");
+const RESET = sgr.RESET;
+const BOLD = sgr.BOLD;
+const DIM = sgr.DIM;
+const RED = sgr.RED;
+const GREEN = sgr.GREEN;
+const YELLOW = sgr.YELLOW;
 
 const HELP =
     \\Commands:
@@ -529,7 +529,7 @@ fn runRepl(
             try runtime.submit(line);
         } else {
             agent.processQuery(line) catch |err| {
-                const errmsg = try std.fmt.allocPrint(allocator, "\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
+                const errmsg = try std.fmt.allocPrint(allocator, RED ++ "Error: {s}" ++ RESET ++ "\n", .{@errorName(err)});
                 defer allocator.free(errmsg);
                 try writeOut(&screen, stderr, io, errmsg);
             };

@@ -19,15 +19,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const term = @import("term.zig");
 
-const RESET = "\x1b[0m";
-const HIDE_CURSOR = "\x1b[?25l";
-const SHOW_CURSOR = "\x1b[?25h";
-const SAVE_CURSOR = "\x1b7";
-const RESTORE_CURSOR = "\x1b8";
-const SYNC_BEGIN = "\x1b[?2026h";
-const SYNC_END = "\x1b[?2026l";
-const ALT_ON = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const ALT_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l";
+const ansi = @import("style.zig");
+const RESET = ansi.RESET;
+const HIDE_CURSOR = ansi.HIDE_CURSOR;
+const SHOW_CURSOR = ansi.SHOW_CURSOR;
+const SAVE_CURSOR = ansi.SAVE_CURSOR;
+const RESTORE_CURSOR = ansi.RESTORE_CURSOR;
+const SYNC_BEGIN = ansi.SYNC_BEGIN;
+const SYNC_END = ansi.SYNC_END;
+const ALT_ON = ansi.ALT_ON;
+const ALT_OFF = ansi.ALT_OFF;
 const selection = @import("selection.zig");
 
 pub const Screen = struct {
@@ -117,7 +118,7 @@ pub const Screen = struct {
         defer self.allocator.free(encoded);
         _ = encoder.encode(encoded, plain);
         // OSC 52 works locally and over SSH; the terminal controls permission.
-        try self.out.writeStreamingAll(self.io, "\x1b]52;c;");
+        try self.out.writeStreamingAll(self.io, ansi.CLIPBOARD_PREFIX);
         try self.out.writeStreamingAll(self.io, encoded);
         try self.out.writeStreamingAll(self.io, "\x07");
         const count = try std.unicode.utf8CountCodepoints(plain);
@@ -219,7 +220,7 @@ pub const Screen = struct {
         if (builtin.os.tag != .windows) {
             handler_termios = std.posix.tcgetattr(self.out.handle) catch null;
         }
-        try self.out.writeStreamingAll(self.io, ALT_ON ++ HIDE_CURSOR ++ "\x1b[1;1H\x1b[0J" ++ SHOW_CURSOR);
+        try self.out.writeStreamingAll(self.io, ALT_ON ++ HIDE_CURSOR ++ ansi.HOME_POSITION ++ ansi.CLEAR_SCREEN_END ++ SHOW_CURSOR);
         self.dirty = true;
         installSignals();
     }
@@ -228,7 +229,7 @@ pub const Screen = struct {
     pub fn leave(self: *Screen) void {
         if (!self.active) return;
         uninstallSignals();
-        self.out.writeStreamingAll(self.io, SYNC_END ++ RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF) catch {};
+        self.out.writeStreamingAll(self.io, SYNC_END ++ RESET ++ ansi.RESET_SCROLL_REGION ++ SHOW_CURSOR ++ ALT_OFF) catch {};
         self.active = false;
     }
 
@@ -284,7 +285,7 @@ pub const Screen = struct {
         if (!self.active) return;
         var buf: [64]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try w.print("\x1b[{d};1H\x1b[0J", .{self.inputTop()});
+        try w.print(ansi.ROW_START ++ ansi.CLEAR_SCREEN_END, .{self.inputTop()});
         try w.writeAll(RESTORE_CURSOR);
         try self.out.writeStreamingAll(self.io, w.buffered());
 
@@ -319,7 +320,7 @@ pub const Screen = struct {
         var w = std.Io.Writer.fixed(&buf);
         if (!self.editor_frame) try w.writeAll(SYNC_BEGIN);
         try w.writeAll(HIDE_CURSOR);
-        try w.print("\x1b[{d};1H\x1b[2K", .{self.logBottom() + 1});
+        try w.print(ansi.ROW_START ++ ansi.CLEAR_LINE, .{self.logBottom() + 1});
         try self.writeStatus(&w);
         // The editor owns the visible cursor. Keep it hidden at the log
         // position until refreshBottom has redrawn and positioned the input.
@@ -341,7 +342,7 @@ pub const Screen = struct {
         const gap: usize = if (progress_width > 0) 1 else 0;
         if (notice.len > 0 and progress_width + gap + notice_width <= self.cols) {
             try w.writeAll(RESET);
-            try w.print("\x1b[{d};{d}H", .{ self.logBottom() + 1, self.cols - notice_width + 1 });
+            try w.print(ansi.CURSOR_POSITION, .{ self.logBottom() + 1, self.cols - notice_width + 1 });
             try w.writeAll(notice);
         }
         try w.writeAll(RESET);
@@ -404,8 +405,8 @@ pub const Screen = struct {
         const w = &file_writer.interface;
 
         try w.writeAll(HIDE_CURSOR ++ RESET);
-        try w.print("\x1b[1;{d}r", .{bottom});
-        try w.writeAll("\x1b[1;1H\x1b[0J");
+        try w.print(ansi.SCROLL_REGION, .{bottom});
+        try w.writeAll(ansi.HOME_POSITION ++ ansi.CLEAR_SCREEN_END);
         // The editor turns off output post-processing, so a bare newline would
         // leave the column where it was. Writing CRLF keeps the replay correct
         // both while a line is being edited and between turns.
@@ -425,16 +426,16 @@ pub const Screen = struct {
             if (view[index] == 0x1b) {
                 const next = @import("text.zig").skipAnsiEscape(view, index);
                 try w.writeAll(view[index..next]);
-                if (inverse) try w.writeAll("\x1b[7m");
+                if (inverse) try w.writeAll(ansi.INVERSE);
                 index = next;
                 continue;
             }
             const selected = view_start + index >= self.selection_start and view_start + index < self.selection_end;
-            if (selected != inverse) try w.writeAll(if (selected) "\x1b[7m" else "\x1b[27m");
+            if (selected != inverse) try w.writeAll(if (selected) ansi.INVERSE else ansi.NO_INVERSE);
             inverse = selected;
             const cp = term.decodeAt(view, index);
             if (view[index] == '\n') {
-                if (inverse) try w.writeAll("\x1b[27m");
+                if (inverse) try w.writeAll(ansi.NO_INVERSE);
                 inverse = false;
                 try w.writeAll("\r\n");
             } else {
@@ -442,9 +443,9 @@ pub const Screen = struct {
             }
             index += cp.len;
         }
-        if (inverse) try w.writeAll("\x1b[27m");
+        if (inverse) try w.writeAll(ansi.NO_INVERSE);
         try w.writeAll(SAVE_CURSOR);
-        try w.print("\x1b[{d};1H\x1b[0J", .{top});
+        try w.print(ansi.ROW_START ++ ansi.CLEAR_SCREEN_END, .{top});
         try self.writeStatus(w);
         try w.writeAll(RESTORE_CURSOR);
         try w.flush();
@@ -673,7 +674,7 @@ fn setDisposition(sig: std.posix.SIG, handler: ?std.posix.Sigaction.handler_fn) 
 }
 
 fn onExitSignal(sig: std.posix.SIG) callconv(.c) void {
-    writeRaw(SYNC_END ++ RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF);
+    writeRaw(SYNC_END ++ RESET ++ ansi.RESET_SCROLL_REGION ++ SHOW_CURSOR ++ ALT_OFF);
     if (handler_termios) |attributes| {
         std.posix.tcsetattr(handler_fd, .NOW, attributes) catch {};
     }
@@ -696,7 +697,7 @@ fn onTstp(_: std.posix.SIG) callconv(.c) void {
     if (handler_termios) |original| {
         std.posix.tcsetattr(handler_fd, .NOW, original) catch {};
     }
-    writeRaw(SYNC_END ++ RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF);
+    writeRaw(SYNC_END ++ RESET ++ ansi.RESET_SCROLL_REGION ++ SHOW_CURSOR ++ ALT_OFF);
 
     // Stop with the default action: the handler must not run again, or the
     // process would never stop. NODEFER makes the re-raise effective.
@@ -711,7 +712,7 @@ fn onTstp(_: std.posix.SIG) callconv(.c) void {
     var buf: [48]u8 = undefined;
     if (handler_input_rows > 0 and handler_rows > handler_input_rows) {
         const bottom = handler_rows - handler_input_rows;
-        const sequence = std.fmt.bufPrint(&buf, "\x1b[1;{d}r", .{bottom}) catch "";
+        const sequence = std.fmt.bufPrint(&buf, ansi.SCROLL_REGION, .{bottom}) catch "";
         writeRaw(sequence);
     }
     pending.store(true, .release);
