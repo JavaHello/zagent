@@ -216,6 +216,7 @@ pub const Client = struct {
     http_client: std.http.Client,
     api_key: []const u8,
     codex_auth_path: ?[]const u8 = null,
+    codex_options: CodexOptions = .{},
     credentials: ?codex_auth.Credentials = null,
     base_url: []const u8,
     model: []const u8,
@@ -244,6 +245,7 @@ pub const Client = struct {
             .http_client = .{ .allocator = allocator, .io = io },
             .api_key = config.api_key,
             .codex_auth_path = config.codex_auth_path,
+            .codex_options = .{ .reasoning_effort = config.reasoning_effort, .service_tier = config.service_tier },
             .base_url = config.base_url,
             .model = config.model,
             .max_tokens = config.max_tokens,
@@ -384,7 +386,7 @@ pub const Client = struct {
         const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, .{ .builtin = self.builtin_tools, .extra = extra_tools }, true, self.search);
         defer self.allocator.free(ordinary);
         if (self.codex_auth_path != null) {
-            const adapted = try codexRequest(self.allocator, ordinary);
+            const adapted = try codexRequest(self.allocator, ordinary, self.codex_options);
             defer self.allocator.free(adapted);
             return estimateTokens(adapted);
         }
@@ -419,7 +421,7 @@ pub const Client = struct {
                 self.search,
             );
             defer self.allocator.free(ordinary_json);
-            const req_json = if (self.codex_auth_path != null) try codexRequest(self.allocator, ordinary_json) else try self.allocator.dupe(u8, ordinary_json);
+            const req_json = if (self.codex_auth_path != null) try codexRequest(self.allocator, ordinary_json, self.codex_options) else try self.allocator.dupe(u8, ordinary_json);
             defer self.allocator.free(req_json);
 
             const response = if (self.codex_auth_path != null)
@@ -1141,13 +1143,13 @@ test "preflight estimate uses full wire request including schemas and Codex proj
     try std.testing.expectEqual(estimateTokens(ordinary), try client.estimateRequestTokens(&messages, &extra));
     try std.testing.expect(try client.estimateRequestTokens(&messages, &extra) > try client.estimateRequestTokens(&messages, &.{}));
     client.codex_auth_path = "unused";
-    const adapted = try codexRequest(a, ordinary);
+    const adapted = try codexRequest(a, ordinary, client.codex_options);
     defer a.free(adapted);
     try std.testing.expectEqual(estimateTokens(adapted), try client.estimateRequestTokens(&messages, &extra));
     client.builtin_tools = &.{ tool_schema.read, tool_schema.ls };
     const subset = try buildRequestWithToolSelection(a, client.model, &messages, client.max_tokens, .{ .builtin = client.builtin_tools, .extra = &extra }, true, client.search);
     defer a.free(subset);
-    const adapted_subset = try codexRequest(a, subset);
+    const adapted_subset = try codexRequest(a, subset, client.codex_options);
     defer a.free(adapted_subset);
     try std.testing.expectEqual(estimateTokens(adapted_subset), try client.estimateRequestTokens(&messages, &extra));
     try std.testing.expect(estimateTokens(adapted_subset) < estimateTokens(adapted));
@@ -1295,10 +1297,52 @@ test "token estimates count cjk and ascii sensibly" {
 
 fn discardText(_: *anyopaque, _: []const u8) void {}
 
-/// Codex accepts streaming requests and instructions, but no output token cap.
-fn codexRequest(a: std.mem.Allocator, ordinary: []const u8) ![]u8 {
+test "Codex request includes only configured options" {
+    const a = std.testing.allocator;
+    const ordinary = try buildRequest(a, "test", &.{}, 100, .omitted);
+    defer a.free(ordinary);
+    const cases = [_]CodexOptions{
+        .{},
+        .{ .reasoning_effort = "", .service_tier = "" },
+        .{ .reasoning_effort = "high" },
+        .{ .service_tier = "fast" },
+        .{ .reasoning_effort = "high", .service_tier = "fast" },
+    };
+    for (cases) |options| {
+        const body = try codexRequest(a, ordinary, options);
+        defer a.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        const reasoning = parsed.value.object.get("reasoning");
+        const tier = parsed.value.object.get("service_tier");
+        if (options.reasoning_effort != null and options.reasoning_effort.?.len > 0) {
+            try std.testing.expectEqualStrings(options.reasoning_effort.?, reasoning.?.object.get("effort").?.string);
+        } else try std.testing.expect(reasoning == null);
+        if (options.service_tier != null and options.service_tier.?.len > 0) {
+            try std.testing.expectEqualStrings(options.service_tier.?, tier.?.string);
+        } else try std.testing.expect(tier == null);
+    }
+}
+
+const CodexOptions = struct {
+    reasoning_effort: ?[]const u8 = null,
+    service_tier: ?[]const u8 = null,
+};
+
+fn codexRequest(a: std.mem.Allocator, ordinary: []const u8, options: CodexOptions) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, ordinary, .{});
     defer parsed.deinit();
+    const arena = parsed.arena.allocator();
+    if (options.reasoning_effort) |effort| {
+        if (effort.len > 0) {
+            var reasoning: std.json.ObjectMap = .{};
+            try reasoning.put(arena, "effort", .{ .string = effort });
+            try parsed.value.object.put(arena, "reasoning", .{ .object = reasoning });
+        }
+    }
+    if (options.service_tier) |tier| {
+        if (tier.len > 0) try parsed.value.object.put(arena, "service_tier", .{ .string = tier });
+    }
     _ = parsed.value.object.swapRemove("max_output_tokens");
     const input = parsed.value.object.getPtr("input") orelse return error.InvalidRequest;
     var instructions: std.Io.Writer.Allocating = .init(a);

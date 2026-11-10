@@ -136,4 +136,13 @@ ChatGPT 订阅使用 `https://chatgpt.com/backend-api/codex/responses` 和 `/mod
 
 Codex 请求使用流式响应，即使调用者只需要最终结果；系统提示转入 `instructions`，不发送该后端不支持的 `max_output_tokens`。订阅的可用模型和限额以账号及服务端返回为准；这些后端协议可能随官方客户端更新而变化。
 
+Codex 模式可在配置文件或环境变量中设置以下可选项（环境变量优先）：
+
+```ini
+AI_REASONING_EFFORT=high
+AI_SERVICE_TIER=fast
+```
+
+分别透传为 `"reasoning":{"effort":"high"}` 和 `"service_tier":"fast"`。未配置或有效值为空时不发送对应字段，其他服务商不发送这两个选项。具体值是否可用由模型和服务端决定。
+
 参考：[官方认证说明](https://developers.openai.com/codex/auth)、[官方网关路由说明](https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway?gateway-auth=api-key)。

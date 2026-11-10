@@ -28,6 +28,8 @@ const ConfigFile = struct {
     api_key: ?[]u8 = null,
     base_url: ?[]u8 = null,
     model: ?[]u8 = null,
+    reasoning_effort: ?[]u8 = null,
+    service_tier: ?[]u8 = null,
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
     max_verifications: ?u32 = null,
@@ -42,6 +44,8 @@ const ConfigFile = struct {
         if (self.api_key) |value| allocator.free(value);
         if (self.base_url) |value| allocator.free(value);
         if (self.model) |value| allocator.free(value);
+        if (self.reasoning_effort) |value| allocator.free(value);
+        if (self.service_tier) |value| allocator.free(value);
         self.* = .{};
     }
 };
@@ -155,6 +159,10 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         try setString(allocator, &config.base_url, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MODEL")) {
         try setString(allocator, &config.model, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_REASONING_EFFORT")) {
+        try setString(allocator, &config.reasoning_effort, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_SERVICE_TIER")) {
+        try setString(allocator, &config.service_tier, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
@@ -261,6 +269,20 @@ fn resolveSetting(
     return allocator.dupe(u8, fallback);
 }
 
+fn resolveOptionalSetting(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    name: []const u8,
+    file_value: *?[]u8,
+) !?[]u8 {
+    if (try firstEnv(allocator, env, &.{name})) |value| return value;
+    if (takeOwnedString(file_value)) |value| {
+        if (value.len > 0) return value;
+        allocator.free(value);
+    }
+    return null;
+}
+
 fn resolveU32(
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
@@ -353,6 +375,11 @@ fn resolve(
     );
     errdefer allocator.free(model);
 
+    const reasoning_effort = try resolveOptionalSetting(allocator, env, "AI_REASONING_EFFORT", &file_config.reasoning_effort);
+    errdefer if (reasoning_effort) |value| allocator.free(value);
+    const service_tier = try resolveOptionalSetting(allocator, env, "AI_SERVICE_TIER", &file_config.service_tier);
+    errdefer if (service_tier) |value| allocator.free(value);
+
     const api_key = blk: {
         // AI_KEY is the provider-agnostic spelling and wins outright.
         if (try firstEnv(allocator, env, &.{"AI_KEY"})) |value| break :blk value;
@@ -434,6 +461,8 @@ fn resolve(
         .api_key = api_key,
         .base_url = base_url,
         .model = model,
+        .reasoning_effort = reasoning_effort,
+        .service_tier = service_tier,
         .max_tokens = max_tokens,
         .max_iterations = max_iterations,
         .max_verifications = max_verifications,
@@ -451,6 +480,8 @@ pub const Config = struct {
     api_key: []const u8,
     base_url: []const u8,
     model: []const u8,
+    reasoning_effort: ?[]const u8 = null,
+    service_tier: ?[]const u8 = null,
     max_tokens: u32,
     max_iterations: u32,
     /// How many completion checks one user query may cost. 0 turns the check
@@ -487,6 +518,8 @@ pub const Config = struct {
 
     pub fn deinit(self: Config) void {
         if (self.codex_auth_path) |path| self.allocator.free(path);
+        if (self.reasoning_effort) |value| self.allocator.free(value);
+        if (self.service_tier) |value| self.allocator.free(value);
         self.allocator.free(self.api_key);
         self.allocator.free(self.base_url);
         self.allocator.free(self.model);
@@ -507,6 +540,30 @@ fn testFile(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !ConfigF
     errdefer file_config.deinit(allocator);
     for (pairs) |pair| try applyConfigValue(allocator, &file_config, pair[0], pair[1]);
     return file_config;
+}
+
+test "Codex options resolve from environment and file, or remain absent" {
+    const a = std.testing.allocator;
+    var env = try testEnv(a, &.{.{ "AI_REASONING_EFFORT", "high" }});
+    defer env.deinit();
+    var file = try testFile(a, &.{
+        .{ "AI_PROVIDER", "codex" },
+        .{ "AI_REASONING_EFFORT", "low" },
+        .{ "AI_SERVICE_TIER", "fast" },
+    });
+    defer file.deinit(a);
+    const config = try resolve(a, &file, &env);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("high", config.reasoning_effort.?);
+    try std.testing.expectEqualStrings("fast", config.service_tier.?);
+    var empty_env = try testEnv(a, &.{.{ "AI_SERVICE_TIER", "" }});
+    defer empty_env.deinit();
+    var empty_file = try testFile(a, &.{.{ "AI_REASONING_EFFORT", "" }});
+    defer empty_file.deinit(a);
+    const empty = try resolve(a, &empty_file, &empty_env);
+    defer empty.deinit();
+    try std.testing.expect(empty.reasoning_effort == null);
+    try std.testing.expect(empty.service_tier == null);
 }
 
 test "config defaults" {
