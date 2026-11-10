@@ -1019,6 +1019,279 @@ fn lineStyle(line: []const u8) []const u8 {
 
 const testing = std.testing;
 
+/// Use git as the patch producer, not a second implementation of unified diff.
+/// Only file headers are retargeted to the fixture; hunk headers, bodies, EOF
+/// markers and git metadata are kept verbatim. No cwd changes or user git
+/// configuration are needed. Hosts without git skip only these producer tests.
+fn gitFixturePatch(allocator: std.mem.Allocator, tmp: *testing.TmpDir, before: ?[]const u8, after: ?[]const u8, context: []const u8) ![]u8 {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(tmp, &buf);
+    const old_path = try std.fmt.allocPrint(allocator, "{s}/old.txt", .{dir});
+    defer allocator.free(old_path);
+    const new_path = try std.fmt.allocPrint(allocator, "{s}/new.txt", .{dir});
+    defer allocator.free(new_path);
+    if (before) |data| try tmp.dir.writeFile(testing.io, .{ .sub_path = "old.txt", .data = data });
+    if (after) |data| try tmp.dir.writeFile(testing.io, .{ .sub_path = "new.txt", .data = data });
+    const result = std.process.run(allocator, testing.io, .{
+        .argv = &.{ "git", "--no-pager", "diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", context, "--", if (before != null) old_path else "/dev/null", if (after != null) new_path else "/dev/null" },
+        .stdout_limit = .limited(max_patch_bytes),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    var patch: std.ArrayList(u8) = .empty;
+    errdefer patch.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    var in_hunk = false;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "@@ ")) in_hunk = true;
+        if (!in_hunk and (std.mem.startsWith(u8, line, "--- ") or std.mem.startsWith(u8, line, "+++ "))) {
+            const absent = if (line[0] == '-') before == null else after == null;
+            const header = if (absent)
+                try std.fmt.allocPrint(allocator, "{s}/dev/null", .{line[0..4]})
+            else
+                try std.fmt.allocPrint(allocator, "{s}{s}/target.txt", .{ line[0..4], dir });
+            defer allocator.free(header);
+            try patch.appendSlice(allocator, header);
+        } else {
+            try patch.appendSlice(allocator, line);
+        }
+        if (lines.peek() != null) try patch.append(allocator, '\n');
+    }
+    return patch.toOwnedSlice(allocator);
+}
+
+test "git generated patches round trip text changes with full and zero context" {
+    const Case = struct {
+        name: []const u8,
+        before: ?[]const u8,
+        after: ?[]const u8,
+        added: usize,
+        removed: usize,
+    };
+    const cases = [_]Case{
+        .{ .name = "replace one line", .before = "old\n", .after = "new\n", .added = 1, .removed = 1 },
+        .{ .name = "prepend", .before = "one\ntwo\n", .after = "zero\none\ntwo\n", .added = 1, .removed = 0 },
+        .{ .name = "append", .before = "one\ntwo\n", .after = "one\ntwo\nthree\n", .added = 1, .removed = 0 },
+        .{ .name = "insert in middle", .before = "one\nthree\n", .after = "one\ntwo\nthree\n", .added = 1, .removed = 0 },
+        .{ .name = "remove first", .before = "one\ntwo\n", .after = "two\n", .added = 0, .removed = 1 },
+        .{ .name = "remove last", .before = "one\ntwo\n", .after = "one\n", .added = 0, .removed = 1 },
+        .{ .name = "remove middle", .before = "one\ntwo\nthree\n", .after = "one\nthree\n", .added = 0, .removed = 1 },
+        .{ .name = "empty existing file", .before = "one\ntwo\n", .after = "", .added = 0, .removed = 2 },
+        .{ .name = "populate empty file", .before = "", .after = "one\ntwo\n", .added = 2, .removed = 0 },
+        .{ .name = "create text file", .before = null, .after = "one\ntwo\n", .added = 2, .removed = 0 },
+        .{ .name = "delete file", .before = "one\ntwo\n", .after = null, .added = 0, .removed = 2 },
+        .{ .name = "create unterminated file", .before = null, .after = "one", .added = 1, .removed = 0 },
+        .{ .name = "delete unterminated file", .before = "one", .after = null, .added = 0, .removed = 1 },
+        .{ .name = "both sides unterminated", .before = "one\ntwo", .after = "one\nTWO", .added = 1, .removed = 1 },
+        .{ .name = "add final newline", .before = "one", .after = "one\n", .added = 1, .removed = 1 },
+        .{ .name = "remove final newline", .before = "one\n", .after = "one", .added = 1, .removed = 1 },
+        .{ .name = "append after unterminated line", .before = "one", .after = "one\ntwo\n", .added = 2, .removed = 1 },
+        .{ .name = "CRLF", .before = "one\r\ntwo\r\n", .after = "one\r\nTWO\r\nthree\r\n", .added = 2, .removed = 1 },
+        .{ .name = "UTF8", .before = "你好\n旧值🙂\n", .after = "你好\n新值🚀\n", .added = 1, .removed = 1 },
+        .{ .name = "significant whitespace", .before = "\told  \n\nend\n", .after = "\tnew \t\n\nend\n", .added = 1, .removed = 1 },
+        .{ .name = "header like payload", .before = "-- old\n++ old\n@@ old\n", .after = "-- new\n++ new\n@@ new\n", .added = 3, .removed = 3 },
+        .{ .name = "blank lines", .before = "start\n\nend\n", .after = "start\n\n\nend\n", .added = 1, .removed = 0 },
+        .{ .name = "separated growing and shrinking hunks", .before = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\n", .after = "a\nB\nextra\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\ns\nt\n", .added = 2, .removed = 2 },
+    };
+    const allocator = testing.allocator;
+    for (cases) |case| {
+        for ([_][]const u8{ "--unified=3", "--unified=0" }) |context| {
+            errdefer std.debug.print("git patch case: {s}, {s}\n", .{ case.name, context });
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            if (case.before) |data| try tmp.dir.writeFile(testing.io, .{ .sub_path = "target.txt", .data = data });
+            const patch = try gitFixturePatch(allocator, &tmp, case.before, case.after, context);
+            defer allocator.free(patch);
+            const outcome = try applyOk(allocator, patch);
+            defer outcome.deinit(allocator);
+            const stats = outcome.applied;
+            try testing.expectEqual(@as(usize, 1), stats.len);
+            try testing.expectEqual(if (case.before == null) Action.created else if (case.after == null) Action.deleted else Action.modified, stats[0].action);
+            try testing.expectEqual(case.added, stats[0].added);
+            try testing.expectEqual(case.removed, stats[0].removed);
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const expected_path = try std.fmt.allocPrint(allocator, "{s}/target.txt", .{try fixturePath(&tmp, &buf)});
+            defer allocator.free(expected_path);
+            try testing.expectEqualStrings(expected_path, stats[0].path);
+            if (case.after) |data| {
+                try expectFileContent(allocator, &tmp, "target.txt", data);
+            } else {
+                try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "target.txt", allocator, .limited(1024)));
+            }
+        }
+    }
+}
+
+test "multi file patches plan all changes before creating modifying or deleting" {
+    const allocator = testing.allocator;
+    // The last file is invalid on the first pass, then valid on the second.
+    for ([_]bool{ false, true }) |valid| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "edit.txt", .data = "old\n" });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "delete.txt", .data = "gone\n" });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "last.txt", .data = if (valid) "expected\n" else "different\n" });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try fixturePath(&tmp, &buf);
+        const patch = try patchFor(allocator, dir,
+            \\--- /dev/null
+            \\+++ {0s}/nested/new.txt
+            \\@@ -0,0 +1 @@
+            \\+created
+            \\--- {0s}/edit.txt
+            \\+++ {0s}/edit.txt
+            \\@@ -1 +1 @@
+            \\-old
+            \\+new
+            \\--- {0s}/delete.txt
+            \\+++ /dev/null
+            \\@@ -1 +0,0 @@
+            \\-gone
+            \\--- {0s}/last.txt
+            \\+++ {0s}/last.txt
+            \\@@ -1 +1 @@
+            \\-expected
+            \\+done
+        );
+        defer allocator.free(patch);
+        if (valid) {
+            const outcome = try applyOk(allocator, patch);
+            defer outcome.deinit(allocator);
+            try testing.expectEqual(@as(usize, 4), outcome.applied.len);
+            for (outcome.applied, [_]Action{ .created, .modified, .deleted, .modified }) |stat, action| {
+                try testing.expectEqual(action, stat.action);
+            }
+            try expectFileContent(allocator, &tmp, "nested/new.txt", "created\n");
+            try expectFileContent(allocator, &tmp, "edit.txt", "new\n");
+            try expectFileContent(allocator, &tmp, "last.txt", "done\n");
+            try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "delete.txt", allocator, .limited(1024)));
+        } else {
+            const message = try applyRefused(allocator, patch);
+            defer allocator.free(message);
+            try testing.expect(std.mem.indexOf(u8, message, "last.txt") != null);
+            try expectFileContent(allocator, &tmp, "edit.txt", "old\n");
+            try expectFileContent(allocator, &tmp, "delete.txt", "gone\n");
+            try expectFileContent(allocator, &tmp, "last.txt", "different\n");
+            try testing.expectError(error.FileNotFound, tmp.dir.openDir(testing.io, "nested", .{}));
+        }
+    }
+}
+
+test "malformed and unsupported patches fail without touching files" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "note.txt", .data = "original\n" });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+    const cases = .{
+        "--- {0s}/note.txt\n",
+        "--- {0s}/note.txt\nnot a plus header\n",
+        "--- /dev/null\n+++ /dev/null\n@@ -0,0 +1 @@\n+oops\n",
+        "--- {0s}/note.txt\n+++ {0s}/other.txt\n@@ -1 +1 @@\n-original\n+new\n",
+        "--- /dev/null\n+++ {0s}/note.txt\n@@ -0,0 +1 @@\n+overwrite\n",
+        "--- {0s}/note.txt\n+++ {0s}/note.txt\n@@ invalid @@\n-original\n+new\n",
+        "--- {0s}/note.txt\n+++ {0s}/note.txt\n@@ -1 +1 @@\n",
+        "--- {0s}/note.txt\n+++ {0s}/note.txt\n@@ -999999999999999999999999999999 +1 @@\n-original\n+new\n",
+        "--- {0s}/note.txt\n+++ {0s}/note.txt\n@@ -1 +1 @@\n-original \n+new\n",
+        "--- {0s}/note.txt\n+++ /dev/null\n@@ -0,0 +1 @@\n+not a deletion\n",
+        "diff --git a/note.txt b/note.txt\nGIT binary patch\nliteral 3\nKcmZQzWC8#H2mk;8\n",
+        "diff --git a/note.txt b/other.txt\nsimilarity index 100%\nrename from note.txt\nrename to other.txt\n",
+    };
+    inline for (cases) |body| {
+        const patch = if (comptime std.mem.indexOf(u8, body, "{0s}") != null)
+            try patchFor(allocator, dir, body)
+        else
+            try allocator.dupe(u8, body);
+        defer allocator.free(patch);
+        const message = try applyRefused(allocator, patch);
+        defer allocator.free(message);
+        try testing.expect(message.len > 0);
+        try expectFileContent(allocator, &tmp, "note.txt", "original\n");
+        try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "other.txt", allocator, .limited(1024)));
+    }
+}
+
+test "patch byte and file count limits are refused before any write" {
+    const allocator = testing.allocator;
+    const oversized = try allocator.alloc(u8, max_patch_bytes + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, ' ');
+    const message = try applyRefused(allocator, oversized);
+    defer allocator.free(message);
+    try testing.expect(std.mem.indexOf(u8, message, "at most") != null);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+    var patch: std.ArrayList(u8) = .empty;
+    defer patch.deinit(allocator);
+    for (0..max_files + 1) |i| {
+        const part = try std.fmt.allocPrint(allocator, "--- /dev/null\n+++ {s}/file-{d}.txt\n@@ -0,0 +1 @@\n+new\n", .{ dir, i });
+        defer allocator.free(part);
+        try patch.appendSlice(allocator, part);
+    }
+    const count_message = try applyRefused(allocator, patch.items);
+    defer allocator.free(count_message);
+    try testing.expect(std.mem.indexOf(u8, count_message, "more than") != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "file-0.txt", allocator, .limited(1024)));
+}
+
+test "oversized source files are refused without truncating the original" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = try allocator.alloc(u8, max_file_bytes + 1);
+    defer allocator.free(content);
+    @memset(content, 'x');
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "large.txt", .data = content });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const patch = try patchFor(allocator, try fixturePath(&tmp, &buf),
+        \\--- {0s}/large.txt
+        \\+++ {0s}/large.txt
+        \\@@ -0,0 +1 @@
+        \\+new
+    );
+    defer allocator.free(patch);
+    const message = try applyRefused(allocator, patch);
+    defer allocator.free(message);
+    try testing.expect(std.mem.indexOf(u8, message, "larger than") != null);
+    const unchanged = try tmp.dir.readFileAlloc(testing.io, "large.txt", allocator, .limited(max_file_bytes + 2));
+    defer allocator.free(unchanged);
+    try testing.expectEqualSlices(u8, content, unchanged);
+}
+
+test "overlapping hunks cannot reuse already consumed original text" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "note.txt", .data = "one\ntwo\nthree\n" });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const patch = try patchFor(allocator, try fixturePath(&tmp, &buf),
+        \\--- {0s}/note.txt
+        \\+++ {0s}/note.txt
+        \\@@ -1,2 +1,2 @@
+        \\-one
+        \\+ONE
+        \\ two
+        \\@@ -2,2 +2,2 @@
+        \\-two
+        \\+TWO
+        \\ three
+    );
+    defer allocator.free(patch);
+    const message = try applyRefused(allocator, patch);
+    defer allocator.free(message);
+    try testing.expect(message.len > 0);
+    try expectFileContent(allocator, &tmp, "note.txt", "one\ntwo\nthree\n");
+}
+
 fn fixturePath(tmp: *testing.TmpDir, buf: []u8) ![]const u8 {
     return buf[0..try tmp.dir.realPath(testing.io, buf)];
 }
