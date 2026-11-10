@@ -316,13 +316,30 @@ pub const Screen = struct {
         var w = std.Io.Writer.fixed(&buf);
         try w.writeAll(SYNC_BEGIN ++ HIDE_CURSOR);
         try w.print("\x1b[{d};1H\x1b[2K", .{self.logBottom() + 1});
-        try w.writeAll(RESET);
-        try w.writeAll(if (self.notice_len > 0) self.notice[0..self.notice_len] else self.progress[0..self.progress_len]);
+        try self.writeStatus(&w);
         // The editor owns the visible cursor. Keep it hidden at the log
         // position until refreshBottom has redrawn and positioned the input.
         try w.writeAll(RESTORE_CURSOR ++ SYNC_END);
         try self.out.writeStreamingAll(self.io, w.buffered());
         self.status_dirty = false;
+    }
+
+    /// Keep the current status on the left; notices never overwrite it.
+    fn writeStatus(self: *const Screen, w: *std.Io.Writer) !void {
+        try w.writeAll(RESET);
+        const progress = self.progress[0..self.progress_len];
+        const end = selection.offset(progress, self.cols, false);
+        try w.writeAll(progress[0..end]);
+        const progress_width = statusWidth(progress[0..end]);
+        const notice = self.notice[0..self.notice_len];
+        const notice_width = statusWidth(notice);
+        const gap: usize = if (progress_width > 0) 1 else 0;
+        if (notice.len > 0 and progress_width + gap + notice_width <= self.cols) {
+            try w.writeAll(RESET);
+            try w.print("\x1b[{d};{d}H", .{ self.logBottom() + 1, self.cols - notice_width + 1 });
+            try w.writeAll(notice);
+        }
+        try w.writeAll(RESET);
     }
 
     /// Stream new bytes into the existing scrolling region. Full replay is
@@ -423,11 +440,7 @@ pub const Screen = struct {
         if (inverse) try w.writeAll("\x1b[27m");
         try w.writeAll(SAVE_CURSOR);
         try w.print("\x1b[{d};1H\x1b[0J", .{top});
-        if (self.notice_len > 0 or self.progress_len > 0) {
-            try w.writeAll(RESET);
-            try w.writeAll(if (self.notice_len > 0) self.notice[0..self.notice_len] else self.progress[0..self.progress_len]);
-            try w.writeAll("\r\n");
-        }
+        try self.writeStatus(w);
         try w.writeAll(RESTORE_CURSOR);
         try w.flush();
 
@@ -461,7 +474,7 @@ pub const Screen = struct {
     }
 
     fn logBottom(self: *const Screen) usize {
-        const reserved = self.input_rows + @as(usize, if (self.progress_len > 0 or self.notice_len > 0) 1 else 0);
+        const reserved = self.input_rows + 1;
         return self.rows -| @min(reserved, self.rows -| 1);
     }
 
@@ -479,6 +492,21 @@ pub const Screen = struct {
         handler_input_rows = self.input_rows;
     }
 };
+
+fn statusWidth(bytes: []const u8) usize {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (bytes[i] == 0x1b) {
+            i = @import("text.zig").skipAnsiEscape(bytes, i);
+            continue;
+        }
+        const cp = term.decodeAt(bytes, i);
+        width += term.codepointWidth(cp);
+        i += cp.len;
+    }
+    return width;
+}
 
 /// A viewport can start inside a styled span (including a soft-wrapped line).
 /// Reconstruct its SGR state, but never replay cursor movement or OSC commands
@@ -744,14 +772,14 @@ test "visual history rows count wrapping, CJK and ANSI without splitting UTF-8" 
     try std.testing.expectEqualSlices(usize, &.{ 0, 11, 18, 23 }, rows);
 }
 
-test "worker progress reserves a transient row above input without entering history" {
+test "status row stays reserved with or without worker progress" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var s = Screen.init(a, io, false);
     defer s.deinit();
     s.rows = 16;
     s.input_rows = 3;
-    try std.testing.expectEqual(@as(usize, 13), s.logBottom());
+    try std.testing.expectEqual(@as(usize, 12), s.logBottom());
     s.setProgress("thinking… 1s · in 10 · out 0");
     try std.testing.expectEqual(@as(usize, 0), s.progress_len);
     try std.testing.expect(try s.drain());
@@ -763,8 +791,44 @@ test "worker progress reserves a transient row above input without entering hist
     s.setProgress("");
     try std.testing.expect(try s.drain());
     try std.testing.expectEqual(@as(usize, 0), s.progress_len);
-    try std.testing.expectEqual(@as(usize, 13), s.logBottom());
+    try std.testing.expectEqual(@as(usize, 12), s.logBottom());
     try std.testing.expectEqual(@as(usize, 14), s.inputTop());
+}
+
+test "copy notice is right aligned beside status and yields in narrow windows" {
+    var s = Screen.init(std.testing.allocator, std.testing.io, false);
+    defer s.deinit();
+    const progress = "thinking…";
+    @memcpy(s.progress[0..progress.len], progress);
+    s.progress_len = progress.len;
+    const notice = "已复制 2 个字符";
+    @memcpy(s.notice[0..notice.len], notice);
+    s.notice_len = notice.len;
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try s.writeStatus(&w);
+    try std.testing.expectEqualStrings(RESET ++ "thinking…" ++ RESET ++ "\x1b[23;66H已复制 2 个字符" ++ RESET, w.buffered());
+
+    s.cols = 20;
+    w = std.Io.Writer.fixed(&buf);
+    try s.writeStatus(&w);
+    try std.testing.expectEqualStrings(RESET ++ "thinking…" ++ RESET, w.buffered());
+
+    // Long UTF-8 status text is clipped on cell boundaries, never wrapped.
+    s.cols = 3;
+    const wide = "你好";
+    @memcpy(s.progress[0..wide.len], wide);
+    s.progress_len = wide.len;
+    w = std.Io.Writer.fixed(&buf);
+    try s.writeStatus(&w);
+    try std.testing.expectEqualStrings(RESET ++ "你" ++ RESET, w.buffered());
+
+    // The same positioning is used by a full repaint and a status-only update.
+    s.cols = 80;
+    s.progress_len = 0;
+    w = std.Io.Writer.fixed(&buf);
+    try s.writeStatus(&w);
+    try std.testing.expectEqualStrings(RESET ++ RESET ++ "\x1b[23;66H已复制 2 个字符" ++ RESET, w.buffered());
 }
 
 test "animation frames repaint only status and keep the saved log cursor" {
@@ -799,10 +863,10 @@ test "animation frames repaint only status and keep the saved log cursor" {
     try std.testing.expect(std.mem.indexOf(u8, after, SHOW_CURSOR) == null);
     try std.testing.expect(std.mem.endsWith(u8, frame, RESTORE_CURSOR ++ SYNC_END));
 
-    // Removing the row really changes the layout and must still replay.
+    // Clearing status keeps the layout stable and only repaints the row.
     s.setProgress("");
     try std.testing.expect(try s.drain());
-    try std.testing.expect(s.dirty);
+    try std.testing.expect(!s.dirty);
     try s.reserveInput(1, false);
     try std.testing.expect(!s.dirty);
 }
@@ -865,7 +929,7 @@ test "replay restores color when viewport begins inside a wrapped span" {
     defer s.transcript.deinit(a);
     defer s.queued.deinit(a);
     s.out = file;
-    s.input_rows = 22; // File output falls back to a 24-row, 80-column terminal.
+    s.input_rows = 21; // Leave two log rows plus the permanent status row.
     try s.transcript.appendSlice(a, "\x1b[31m");
     try s.transcript.appendNTimes(a, 'x', 80);
     try s.transcript.appendNTimes(a, 'y', 80);
@@ -892,7 +956,7 @@ test "wheel scrolls three visual rows while keyboard scrolls a page" {
     try s.scroll(false, false);
     try std.testing.expectEqual(@as(usize, 3), s.scroll_rows);
     try s.scroll(true, true);
-    try std.testing.expectEqual(@as(usize, 13), s.scroll_rows);
+    try std.testing.expectEqual(@as(usize, 12), s.scroll_rows);
     try s.scroll(false, true);
     try std.testing.expectEqual(@as(usize, 3), s.scroll_rows);
     try s.scroll(false, true);
@@ -918,10 +982,10 @@ test "buffered output is drained by the UI and keeps a scrolled viewport anchore
     try std.testing.expectEqual(@as(usize, 0), s.transcript.items.len);
     try std.testing.expect(try s.drain());
     try s.scroll(true, false);
-    try std.testing.expectEqual(@as(usize, 2), s.scroll_rows);
+    try std.testing.expectEqual(@as(usize, 3), s.scroll_rows);
     try s.writeLog("\nseven\neight");
     try std.testing.expect(try s.drain());
-    try std.testing.expectEqual(@as(usize, 4), s.scroll_rows);
+    try std.testing.expectEqual(@as(usize, 5), s.scroll_rows);
     try s.scroll(false, false);
     try s.scroll(false, false);
     try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
@@ -932,7 +996,7 @@ test "the log region keeps at least one row above the input" {
     var s: Screen = .{ .allocator = std.testing.allocator, .io = std.testing.io, .out = undefined, .active = false };
     s.rows = 24;
     s.input_rows = 1;
-    try expectEqual(23, s.logBottom());
+    try expectEqual(22, s.logBottom());
     try expectEqual(24, s.inputTop());
     s.input_rows = 23;
     try expectEqual(1, s.logBottom());
@@ -963,10 +1027,10 @@ test "the conversation is drawn in a region above the reserved input row" {
 
     const written = try readOutput(tmp.dir, allocator);
     defer allocator.free(written);
-    // The log lives in rows 1..23 of a 24-row screen; row 24 is the prompt.
-    try expect(std.mem.indexOf(u8, written, "\x1b[1;23r") != null);
+    // Rows 1..22 are the log, row 23 is status, row 24 is the prompt.
+    try expect(std.mem.indexOf(u8, written, "\x1b[1;22r") != null);
     try expect(std.mem.indexOf(u8, written, "hello\nworld\n") != null);
-    try expect(std.mem.indexOf(u8, written, "\x1b[24;1H\x1b[0J") != null);
+    try expect(std.mem.indexOf(u8, written, "\x1b[23;1H\x1b[0J") != null);
 
     // A later repaint writes the transcript with CRLF: the editor turns off
     // output post-processing, so a bare newline would not return to column 1.
@@ -1028,7 +1092,7 @@ test "a multi-row input is handed back and the next write repaints the log" {
     try s.writeLog("answer\n");
     const repainted = try readOutput(tmp.dir, allocator);
     defer allocator.free(repainted);
-    try expect(std.mem.indexOf(u8, repainted, "\x1b[1;23r") != null);
+    try expect(std.mem.indexOf(u8, repainted, "\x1b[1;22r") != null);
     try expect(std.mem.indexOf(u8, repainted, "question\r\n") != null);
     try expect(std.mem.endsWith(u8, repainted, "answer\n"));
 }
@@ -1050,9 +1114,9 @@ test "a taller input repaints the log in a shorter region" {
 
     const written = try readOutput(tmp.dir, allocator);
     defer allocator.free(written);
-    try expect(std.mem.indexOf(u8, written, "\x1b[1;21r") != null);
+    try expect(std.mem.indexOf(u8, written, "\x1b[1;20r") != null);
     // The transcript is written again so the newest line stays above the input.
     try expectEqual(1, std.mem.count(u8, written, "answer\r\n"));
     try expectEqual(1, std.mem.count(u8, written, "answer\n"));
-    try expect(std.mem.indexOf(u8, written, "\x1b[22;1H\x1b[0J") != null);
+    try expect(std.mem.indexOf(u8, written, "\x1b[21;1H\x1b[0J") != null);
 }
