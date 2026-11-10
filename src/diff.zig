@@ -231,6 +231,8 @@ fn planFile(
     var ending: Ending = .original;
     var added: usize = 0;
     var removed: usize = 0;
+    // The last matched hunk anchors stale line numbers in the same file.
+    var anchor: ?HunkAnchor = null;
 
     for (file.hunks) |hunk| {
         // A zero-length old range names the line *before* an insertion.
@@ -243,10 +245,11 @@ fn planFile(
         // `locate` has more than one way to find nothing, and each explains
         // itself; `describeMiss` is for the one that has nothing to say yet.
         const already_said = diag.written().len;
-        const at = locate(diag, path, source.lines.items, consumed, hunk, stated) orelse {
+        const at = locate(diag, path, source.lines.items, consumed, hunk, stated, anchor) orelse {
             if (diag.written().len == already_said) describeMiss(diag, path, source.lines.items, hunk, stated);
             return error.BadPatch;
         };
+        if (oldSideLen(hunk) > 0) anchor = .{ .stated = stated, .actual = at };
 
         try out.appendSlice(allocator, source.lines.items[consumed..at]);
         if (at > consumed) ending = .original;
@@ -380,20 +383,24 @@ fn matchesAt(lines: []const []const u8, at: usize, hunk: Hunk) bool {
     return true;
 }
 
-/// Where a hunk's old side sits in the file, at or after `consumed`.
-///
-/// The line the hunk states is tried first, and that is the only position that
-/// cannot be wrong: a patch written against this file goes exactly where it
-/// says. The text decides after that, because a model that counted the lines of
-/// a file it had not re-read is off by a little far more often than it is wrong
-/// about the text.
-///
-/// A hunk whose stated line does not match is placed only where its text fits
-/// in exactly one place. Two fits are two different places — nearly always two
-/// different functions — and taking the nearer one is a coin flip that produces
-/// a file that compiles and does the wrong thing, with nothing in the output to
-/// say so. Being told to add a line of context costs one round trip.
-fn locate(diag: *Diagnostic, path: []const u8, lines: []const []const u8, consumed: usize, hunk: Hunk, stated: usize) ?usize {
+/// A confirmed match supplies an offset without signed arithmetic on untrusted
+/// header numbers. Overflow/underflow means there is no usable prediction.
+const HunkAnchor = struct {
+    stated: usize,
+    actual: usize,
+
+    fn predict(self: HunkAnchor, stated: usize) ?usize {
+        if (self.actual >= self.stated)
+            return std.math.add(usize, stated, self.actual - self.stated) catch null;
+        return std.math.sub(usize, stated, self.stated - self.actual) catch null;
+    }
+};
+
+/// Try the stated position, then the offset established by the previous hunk,
+/// always requiring an exact old-side match outside already consumed text.
+/// Otherwise only a unique text match is accepted: proximity alone is not
+/// evidence that one of two identical blocks is the intended target.
+fn locate(diag: *Diagnostic, path: []const u8, lines: []const []const u8, consumed: usize, hunk: Hunk, stated: usize, anchor: ?HunkAnchor) ?usize {
     const need = oldSideLen(hunk);
     // A hunk that only adds lines has nothing to match against; it goes where
     // it says it goes, which is how the first lines of a new file are placed.
@@ -405,8 +412,12 @@ fn locate(diag: *Diagnostic, path: []const u8, lines: []const []const u8, consum
         return stated;
     }
 
-    const from = @max(stated, consumed);
-    if (matchesAt(lines, from, hunk)) return from;
+    if (stated >= consumed and matchesAt(lines, stated, hunk)) return stated;
+    if (anchor) |previous| {
+        if (previous.predict(stated)) |predicted| {
+            if (predicted >= consumed and matchesAt(lines, predicted, hunk)) return predicted;
+        }
+    }
 
     var first: ?usize = null;
     var second: ?usize = null;
@@ -1503,6 +1514,62 @@ test "a hunk that fits in two places is refused rather than guessed at" {
     defer allocator.free(message);
     try testing.expect(std.mem.indexOf(u8, message, "two places") != null);
     try expectFileContent(allocator, &tmp, "note.txt", "a\nsame\nb\nsame\n");
+}
+
+test "a relocated hunk anchors later repeated text in original coordinates" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Exercise offsets in both directions. An insertion in the first hunk
+    // must not contribute to the offset: all hunks read the original file.
+    for ([_]usize{ 1, 5 }) |start| {
+        try tmp.dir.writeFile(testing.io, .{
+            .sub_path = "note.txt",
+            .data = "prefix\nanchor\ngap\nsame\nseparator\nsame\n",
+        });
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const dir = try fixturePath(&tmp, &buf);
+        const patch = try std.fmt.allocPrint(
+            allocator,
+            "--- {s}/note.txt\n+++ {s}/note.txt\n@@ -{d},1 +{d},2 @@\n-anchor\n+ANCHOR\n+inserted\n@@ -{d},1 +{d},1 @@\n-same\n+CHANGED\n",
+            .{ dir, dir, start, start, start + 2, start + 3 },
+        );
+        defer allocator.free(patch);
+        const outcome = try applyOk(allocator, patch);
+        defer outcome.deinit(allocator);
+        try expectFileContent(allocator, &tmp, "note.txt", "prefix\nANCHOR\ninserted\ngap\nCHANGED\nseparator\nsame\n");
+    }
+}
+
+test "stated positions are not clamped to the consumed boundary" {
+    var diag: Diagnostic = .init(testing.allocator);
+    defer diag.deinit();
+    var body = [_]Line{.{ .kind = .remove, .text = "same" }};
+    const hunk: Hunk = .{
+        .header = .{ .old_start = 1, .old_count = 1, .new_count = 1 },
+        .lines = &body,
+        .patch_line = 3,
+    };
+    const lines = [_][]const u8{ "same", "same", "gap", "same" };
+    try testing.expectEqual(@as(?usize, null), locate(&diag, "note.txt", &lines, 1, hunk, 0, null));
+    try testing.expect(std.mem.indexOf(u8, diag.written(), "two places") != null);
+}
+
+test "anchor predictions cannot wrap or override an exact stated match" {
+    try testing.expectEqual(@as(?usize, null), (HunkAnchor{ .stated = 5, .actual = 0 }).predict(2));
+    try testing.expectEqual(@as(?usize, null), (HunkAnchor{ .stated = 0, .actual = 5 }).predict(std.math.maxInt(usize)));
+    var diag: Diagnostic = .init(testing.allocator);
+    defer diag.deinit();
+    var body = [_]Line{.{ .kind = .remove, .text = "same" }};
+    const hunk: Hunk = .{
+        .header = .{ .old_start = 1, .old_count = 1, .new_count = 1 },
+        .lines = &body,
+        .patch_line = 3,
+    };
+    const lines = [_][]const u8{ "same", "gap", "same" };
+    try testing.expectEqual(@as(?usize, 0), locate(&diag, "note.txt", &lines, 0, hunk, 0, .{ .stated = 0, .actual = 2 }));
+    // A prediction that does not match must not select the nearest duplicate.
+    try testing.expectEqual(@as(?usize, null), locate(&diag, "note.txt", &lines, 0, hunk, 9, .{ .stated = 8, .actual = 0 }));
 }
 
 test "a patch for a file that is not there says what to do" {
