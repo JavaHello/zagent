@@ -109,33 +109,16 @@ pub const SUMMARY_SYSTEM_PROMPT =
     \\and keep it under about 400 words.
 ;
 
-/// Roughly how many tokens a conversation will cost. This uses the same
-/// byte-based estimate as the live token counter, so the compaction threshold
-/// and the number on the status line agree.
+/// Estimate exactly the history projection sent by Responses, not the local
+/// duplicate text/call fields beside response_items. JSON framing and escaping
+/// are counted too. This is still a byte heuristic, not a model tokenizer.
 pub fn estimateTokens(messages: []const Message) u64 {
-    var tokens: u64 = 0;
-    for (messages) |message| {
-        if (message.content) |content| {
-            if (content.len > 0) tokens += openai.estimateTokens(content);
-        }
-        if (message.reasoning_content) |content| {
-            if (content.len > 0) tokens += openai.estimateTokens(content);
-        }
-        if (message.tool_call_id) |id| {
-            if (id.len > 0) tokens += openai.estimateTokens(id);
-        }
-        if (message.response_items) |items| {
-            if (items.len > 0) tokens += openai.estimateTokens(items);
-        }
-        if (message.tool_calls) |calls| {
-            for (calls) |call| {
-                if (call.name.len > 0) tokens += openai.estimateTokens(call.name);
-                if (call.arguments.len > 0) tokens += openai.estimateTokens(call.arguments);
-                if (call.id.len > 0) tokens += openai.estimateTokens(call.id);
-            }
-        }
-    }
-    return tokens;
+    if (messages.len == 0) return 0;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var aw: std.Io.Writer.Allocating = .init(arena.allocator());
+    openai.writeInput(arena.allocator(), &aw.writer, messages) catch return std.math.maxInt(u64);
+    return openai.estimateTokens(aw.written());
 }
 
 /// Whether the conversation has grown past the configured budget. A zero
@@ -229,6 +212,11 @@ pub fn renderTranscript(
             continue;
         }
         if (std.mem.eql(u8, message.role, "tool")) {
+            if (message.tool_status) |status| {
+                try w.writeAll("Tool status: ");
+                try std.json.Stringify.value(status, .{}, w);
+                try w.writeByte('\n');
+            }
             if (message.content) |content| {
                 try w.writeAll("Tool result: ");
                 try writeTruncated(w, content, max_tool_result_bytes);
@@ -381,6 +369,30 @@ test "read deduplication compares effective arguments and contents only in live 
     const empty = try deduplicateReadResult(a, &.{}, calls[0], "file contents", false);
     defer a.free(empty);
     try std.testing.expectEqualStrings("file contents", empty);
+}
+
+test "estimation uses authoritative response items and counts escaped wire input" {
+    const a = std.testing.allocator;
+    var calls = [_]openai.ToolCallData{.{ .id = "call", .name = "bash", .arguments = "{}" }};
+    var messages = [_]Message{
+        .{ .role = "assistant", .content = "local duplicate", .reasoning_content = "local reasoning", .tool_calls = &calls, .tool_call_id = null, .response_items = "[{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"},{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"bash\",\"arguments\":\"{}\"}]" },
+        .{ .role = "tool", .content = "中文\n\"escaped\"", .reasoning_content = null, .tool_calls = null, .tool_call_id = "call", .tool_status = .{ .is_error = true, .exit_code = 2, .truncated = true } },
+    };
+    var wire: std.Io.Writer.Allocating = .init(a);
+    defer wire.deinit();
+    try openai.writeInput(a, &wire.writer, &messages);
+    const estimate = estimateTokens(&messages);
+    try std.testing.expectEqual(openai.estimateTokens(wire.written()), estimate);
+    try std.testing.expect(std.mem.indexOf(u8, wire.written(), "tool_status") != null);
+    messages[0].content = "a completely different local duplicate which must not affect the estimate";
+    messages[0].reasoning_content = null;
+    messages[0].tool_calls = null;
+    try std.testing.expectEqual(estimate, estimateTokens(&messages));
+    messages[0].response_items = "[]";
+    try std.testing.expect(estimateTokens(&messages) < estimate);
+    messages[0].response_items = "invalid";
+    try std.testing.expectEqual(std.math.maxInt(u64), estimateTokens(&messages));
+    try std.testing.expectEqual(@as(u64, 0), estimateTokens(&.{}));
 }
 
 test "a conversation under budget needs no compaction" {

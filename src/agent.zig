@@ -365,7 +365,7 @@ pub const Agent = struct {
     /// Compact when the estimated conversation has crossed the budget.
     fn compactIfNeeded(self: *Agent, turn_start: ?*usize) !bool {
         if (self.compact_threshold == 0) return false;
-        if (!compact.needsCompaction(self.history.items, self.compact_threshold)) return false;
+        if (try self.client.estimateRequestTokens(self.history.items, self.mcp_registry.functionJson()) < self.compact_threshold) return false;
         return self.compactHistory(turn_start);
     }
 
@@ -962,6 +962,7 @@ pub const Agent = struct {
                         break :blk tools.ToolResult{
                             .content = error_content,
                             .is_error = true,
+                            .timed_out = err == error.Timeout,
                         };
                     };
                     defer result.deinit(self.allocator);
@@ -977,6 +978,7 @@ pub const Agent = struct {
                         .reasoning_content = null,
                         .tool_calls = null,
                         .tool_call_id = call_id,
+                        .tool_status = result.status(),
                     });
                 }
                 try self.checkpoint();

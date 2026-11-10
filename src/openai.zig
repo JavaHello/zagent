@@ -82,6 +82,8 @@ pub const Message = struct {
     tool_call_id: ?[]const u8,
     /// Exact Responses output items, including encrypted reasoning.
     response_items: ?[]const u8 = null,
+    /// Local execution metadata; null in older snapshots or for non-tool messages.
+    tool_status: ?search_tools.ToolStatus = null,
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         if (self.content) |c| allocator.free(c);
@@ -300,6 +302,19 @@ pub const Client = struct {
     /// must not be able to answer with a tool call, MCP ones included.
     pub fn respondWithoutTools(self: *Client, messages: []const Message) !ApiResponse {
         return self.respondWith(messages, .omitted, &.{}, null);
+    }
+
+    /// Use the same request projection as the live counter, including tool
+    /// schemas and the Codex adapter, without sending or authenticating.
+    pub fn estimateRequestTokens(self: *Client, messages: []const Message, extra_tools: []const []const u8) !u64 {
+        const ordinary = try buildRequestWithSearch(self.allocator, self.model, messages, self.max_tokens, .included, extra_tools, true, self.search);
+        defer self.allocator.free(ordinary);
+        if (self.codex_auth_path != null) {
+            const adapted = try codexRequest(self.allocator, ordinary);
+            defer self.allocator.free(adapted);
+            return estimateTokens(adapted);
+        }
+        return estimateTokens(ordinary);
     }
 
     fn respondWith(
@@ -646,13 +661,9 @@ pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, me
     return buildRequestWithSearch(allocator, model, messages, max_tokens, tools, extra_tools, stream, .{});
 }
 
-pub fn buildRequestWithSearch(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8, stream: bool, search: search_tools.SearchBackends) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-    try w.writeAll("{\"model\":");
-    try std.json.Stringify.encodeJsonString(model, .{}, w);
-    try w.print(",\"max_output_tokens\":{d},\"store\":false,\"stream\":{},\"include\":[\"reasoning.encrypted_content\"],\"input\":[", .{ max_tokens, stream });
+/// The single source of truth for Responses history replay and size estimates.
+pub fn writeInput(allocator: std.mem.Allocator, w: *std.Io.Writer, messages: []const Message) !void {
+    try w.writeByte('[');
     var first = true;
     for (messages) |message| {
         if (message.response_items) |items| {
@@ -674,7 +685,13 @@ pub fn buildRequestWithSearch(allocator: std.mem.Allocator, model: []const u8, m
             try w.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
             try std.json.Stringify.encodeJsonString(call_id, .{}, w);
             try w.writeAll(",\"output\":");
-            try std.json.Stringify.encodeJsonString(message.content orelse "", .{}, w);
+            if (message.tool_status) |status| {
+                const output = try search_tools.formatToolOutput(allocator, status, message.content orelse "");
+                defer allocator.free(output);
+                try std.json.Stringify.encodeJsonString(output, .{}, w);
+            } else {
+                try std.json.Stringify.encodeJsonString(message.content orelse "", .{}, w);
+            }
             try w.writeByte('}');
             continue;
         }
@@ -710,9 +727,19 @@ pub fn buildRequestWithSearch(allocator: std.mem.Allocator, model: []const u8, m
         };
     }
     try w.writeByte(']');
+}
+
+pub fn buildRequestWithSearch(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8, stream: bool, search: search_tools.SearchBackends) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("{\"model\":");
+    try std.json.Stringify.encodeJsonString(model, .{}, w);
+    try w.print(",\"max_output_tokens\":{d},\"store\":false,\"stream\":{},\"include\":[\"reasoning.encrypted_content\"],\"input\":", .{ max_tokens, stream });
+    try writeInput(allocator, w, messages);
     if (tools == .included) {
         try w.writeAll(",\"tools\":[");
-        first = true;
+        var first = true;
         const builtin = try std.json.parseFromSlice(std.json.Value, allocator, TOOLS_JSON, .{});
         defer builtin.deinit();
         for (builtin.value.array.items) |tool| {
@@ -1009,6 +1036,22 @@ test "an http failure is kept until the caller asks for it" {
     const message = client.takeHttpError() orelse return error.TestUnexpectedResult;
     defer allocator.free(message);
     try std.testing.expectEqualStrings("API error (HTTP 429): rate limit reached", message);
+}
+
+test "preflight estimate uses full wire request including schemas and Codex projection" {
+    const a = std.testing.allocator;
+    var client: Client = .{ .allocator = a, .io = std.testing.io, .http_client = .{ .allocator = a, .io = std.testing.io }, .api_key = "unused", .base_url = "https://example.invalid", .model = "test", .max_tokens = 512, .http_error = null };
+    defer client.deinit();
+    const messages = [_]Message{.{ .role = "user", .content = "中文\n\"quoted\"", .reasoning_content = null, .tool_calls = null, .tool_call_id = null }};
+    const extra = [_][]const u8{"{\"type\":\"function\",\"name\":\"mcp__test\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}"};
+    const ordinary = try buildRequestWithSearch(a, client.model, &messages, client.max_tokens, .included, &extra, true, client.search);
+    defer a.free(ordinary);
+    try std.testing.expectEqual(estimateTokens(ordinary), try client.estimateRequestTokens(&messages, &extra));
+    try std.testing.expect(try client.estimateRequestTokens(&messages, &extra) > try client.estimateRequestTokens(&messages, &.{}));
+    client.codex_auth_path = "unused";
+    const adapted = try codexRequest(a, ordinary);
+    defer a.free(adapted);
+    try std.testing.expectEqual(estimateTokens(adapted), try client.estimateRequestTokens(&messages, &extra));
 }
 
 test "Responses request uses typed items and flat non-strict function schemas" {

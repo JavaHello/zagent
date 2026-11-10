@@ -2,9 +2,36 @@ const std = @import("std");
 const text = @import("text.zig");
 const diff = @import("diff.zig");
 
+pub const ToolStatus = struct {
+    is_error: bool,
+    exit_code: ?u8 = null,
+    timed_out: bool = false,
+    truncated: bool = false,
+};
+
+/// Status is separate from the body in snapshots, but visible to the model
+/// even when output is empty, deduplicated, or clipped.
+pub fn formatToolOutput(allocator: std.mem.Allocator, status: ToolStatus, content: []const u8) ![]u8 {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, status, .{});
+    defer allocator.free(encoded);
+    return std.fmt.allocPrint(allocator, "[tool_status {s}]\n{s}", .{ encoded, content });
+}
+
 pub const ToolResult = struct {
     content: []const u8,
     is_error: bool,
+    exit_code: ?u8 = null,
+    timed_out: bool = false,
+    truncated: bool = false,
+
+    pub fn status(self: ToolResult) ToolStatus {
+        return .{
+            .is_error = self.is_error,
+            .exit_code = self.exit_code,
+            .timed_out = self.timed_out,
+            .truncated = self.truncated,
+        };
+    }
 
     pub fn deinit(self: ToolResult, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
@@ -103,13 +130,11 @@ pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []
         try aw.writer.writeAll("(no output)");
     }
 
-    const content = try finalizeToolContent(allocator, aw.written());
-    aw.deinit();
-
-    return .{
-        .content = content,
+    defer aw.deinit();
+    return finalizeResultLimited(allocator, aw.written(), .{
         .is_error = exit_code == null or exit_code.? != 0,
-    };
+        .exit_code = exit_code,
+    }, 8192);
 }
 
 test "read ranges validate positive inclusive line numbers" {
@@ -270,9 +295,10 @@ pub fn readFileRange(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
         return .{
             .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated at line {d}; read again with start_line={d} and a smaller end_line. A single line may exceed the output limit.]", .{ normalized, line, line }),
             .is_error = false,
+            .truncated = true,
         };
     }
-    return .{ .content = normalized, .is_error = false };
+    return .{ .content = normalized, .is_error = false, .truncated = content.items.len > 8192 };
 }
 
 pub fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, content: []const u8) !ToolResult {
@@ -340,7 +366,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
             defer allocator.free(content);
             // Sanitised like any other result: the message quotes lines of the
             // patch, which the model wrote.
-            return .{ .content = try finalizeToolContent(allocator, content), .is_error = true };
+            return finalizeResultLimited(allocator, content, .{ .is_error = true }, 8192);
         },
         .applied => |stats| {
             var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -356,7 +382,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
                 }
                 try aw.writer.writeByte(')');
             }
-            return .{ .content = try finalizeToolContent(allocator, aw.written()), .is_error = false };
+            return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, 8192);
         },
     }
 }
@@ -709,10 +735,10 @@ fn runSearch(
         try aw.writer.writeAll(if (is_error) "(no output)" else "(no matches)");
     }
 
-    return .{
-        .content = try finalizeToolContent(allocator, aw.written()),
+    return finalizeResultLimited(allocator, aw.written(), .{
         .is_error = is_error,
-    };
+        .exit_code = exit_code,
+    }, 8192);
 }
 
 /// The grep tool: search file contents with a regular expression.
@@ -978,10 +1004,7 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
         defer aw.deinit();
         try aw.writer.print("Saved {d} bytes to '{s}'\n", .{ written, path });
         try aw.writer.writeAll(head_aw.written());
-        return .{
-            .content = try finalizeToolContentLimited(allocator, aw.written(), http_max_content),
-            .is_error = false,
-        };
+        return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, http_max_content);
     }
 
     const body_text = if (has_body)
@@ -1000,10 +1023,7 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
         try aw.writer.writeAll("(empty body)");
     }
 
-    return .{
-        .content = try finalizeToolContentLimited(allocator, aw.written(), http_max_content),
-        .is_error = false,
-    };
+    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, http_max_content);
 }
 
 /// Write the status line and every response header. Takes the head's parts
@@ -1424,8 +1444,39 @@ test "a search that outruns the limit is refused with advice" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Narrow it") != null);
 }
 
+test "tool status preserves failures and records actual truncation not printed suffixes" {
+    const a = std.testing.allocator;
+    const result = try finalizeResultLimited(a, "abcdefghijklmnopqrstuvwxyz0123456789", .{ .is_error = true, .exit_code = 7, .timed_out = true }, 32);
+    defer a.free(result.content);
+    try std.testing.expect(result.status().is_error);
+    try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
+    try std.testing.expect(result.timed_out and result.truncated);
+    const printed = try finalizeResultLimited(a, "... (truncated)", .{ .is_error = false }, 32);
+    defer a.free(printed.content);
+    try std.testing.expect(!printed.truncated);
+    const encoded = try formatToolOutput(a, result.status(), result.content);
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"exit_code\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"timed_out\":true") != null);
+}
+
 fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return finalizeToolContentLimited(allocator, raw, 8192);
+}
+
+/// Turn text that came from outside this program into what the model is shown:
+/// Preserve truncation at the point it happens, rather than guessing from a
+/// suffix which the external tool could itself have printed.
+pub fn finalizeResultLimited(allocator: std.mem.Allocator, raw: []const u8, status: ToolStatus, max_len: usize) !ToolResult {
+    const normalized = try normalizeToolText(allocator, raw);
+    defer allocator.free(normalized);
+    return .{
+        .content = try finalizeToolContentLimited(allocator, normalized, max_len),
+        .is_error = status.is_error,
+        .exit_code = status.exit_code,
+        .timed_out = status.timed_out,
+        .truncated = status.truncated or normalized.len > max_len,
+    };
 }
 
 /// Turn text that came from outside this program into what the model is shown:

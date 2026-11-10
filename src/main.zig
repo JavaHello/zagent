@@ -125,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
             break :tools_error @import("tools.zig").ToolResult{
                 .content = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}),
                 .is_error = true,
+                .timed_out = err == error.Timeout,
             };
         };
         defer result.deinit(allocator);

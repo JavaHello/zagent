@@ -13,6 +13,15 @@ import threading
 
 BINARY = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 
+
+def tool_output(output):
+    header, separator, content = output.partition('\n')
+    assert separator and header.startswith('[tool_status ') and header.endswith(']'), output
+    status = json.loads(header[len('[tool_status '):-1])
+    assert set(status) == {'is_error', 'exit_code', 'timed_out', 'truncated'}, status
+    return status, content
+
+
 # macOS defaults to /private/var/folders, which the system-path write policy
 # deliberately isolates. Use /tmp so ordinary fixture edits remain ordinary.
 with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as temporary:
@@ -126,6 +135,17 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert len([m for m in requests[-2]['input'] if m.get('role') == 'user']) == 2
     assert limited.returncode != 0 and 'IterationLimitReached' in limited.stderr
     snapshot = json.loads(session_path.read_text())
+    statuses, contents = zip(*(tool_output(output) for output in observed))
+    observed[:] = contents
+    saved_statuses = [m['tool_status'] for m in snapshot['messages'] if m['role'] == 'tool']
+    assert saved_statuses == list(statuses[:len(calls)]), (saved_statuses, statuses)
+    resumed_statuses = [tool_output(m['output'])[0] for m in requests[-2]['input']
+                       if m.get('type') == 'function_call_output']
+    assert resumed_statuses == saved_statuses, (resumed_statuses, saved_statuses)
+    assert statuses[10]['is_error'] and statuses[10]['timed_out'], statuses[10]
+    assert statuses[9] == {'is_error': False, 'exit_code': 0,
+                           'timed_out': False, 'truncated': False}, statuses[9]
+    assert statuses[12]['is_error'], statuses[12]
     # The preflight stores its public approach as a plain assistant message;
     # execution responses must still retain their exact replay items.
     assert all(m['response_items'] for m in snapshot['messages']
@@ -173,6 +193,10 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     finally:
         server.shutdown()
     assert off.returncode == 0, off.stderr
+    off_statuses, off_contents = zip(*(tool_output(output) for output in observed))
+    observed[:] = off_contents
+    assert all(s['exit_code'] == 0 and not s['is_error'] for s in off_statuses[:2]), off_statuses
+    assert off_statuses[2]['is_error'], off_statuses[2]
     assert observed[:2] == ['Exit code: 0\nworld', 'Exit code: 0\nBASH_ONLY\n'], observed
     assert 'requires isolation and was not executed' in observed[2], observed
     assert 'skipped local MCP server' in off.stderr, off.stderr

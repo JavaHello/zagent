@@ -71,6 +71,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.Arr
     for (parsed.value.messages) |source| {
         var message: Message = .{ .role = undefined, .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null };
         errdefer message.deinit(allocator);
+        message.tool_status = source.tool_status;
         message.role = if (std.mem.eql(u8, source.role, "user")) "user" else if (std.mem.eql(u8, source.role, "assistant")) "assistant" else if (std.mem.eql(u8, source.role, "tool")) "tool" else return error.InvalidSessionRole;
         if (pending) |calls| {
             if (!std.mem.eql(u8, message.role, "tool") or source.tool_call_id == null or !std.mem.eql(u8, calls[next_tool].id, source.tool_call_id.?)) return error.InvalidSessionToolSequence;
@@ -119,7 +120,7 @@ test "session roundtrip retains tool calls and reasoning" {
     var calls = [_]openai.ToolCallData{.{ .id = "1", .name = "shell", .arguments = "{}" }};
     var messages = [_]Message{
         .{ .role = "assistant", .content = null, .reasoning_content = "plan", .tool_calls = &calls, .tool_call_id = null, .response_items = "[{\"type\":\"reasoning\",\"id\":\"rs1\",\"summary\":[],\"encrypted_content\":\"opaque-token\"},{\"type\":\"function_call\",\"call_id\":\"1\",\"name\":\"shell\",\"arguments\":\"{}\"}]" },
-        .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1" },
+        .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true, .truncated = true } },
     };
     try save(io, allocator, path, &messages);
     var loaded = try load(io, allocator, path);
@@ -132,8 +133,15 @@ test "session roundtrip retains tool calls and reasoning" {
     try std.testing.expectEqualStrings(messages[0].response_items.?, loaded.items[0].response_items.?);
     try std.testing.expectEqualStrings("shell", loaded.items[0].tool_calls.?[0].name);
     try std.testing.expectEqualStrings("done", loaded.items[1].content.?);
+    try std.testing.expectEqualDeep(messages[1].tool_status, loaded.items[1].tool_status);
     try save(io, allocator, path, messages[0..1]);
     try std.testing.expectError(error.InvalidSessionToolSequence, load(io, allocator, path));
+}
+
+test "legacy messages without tool status remain readable" {
+    const parsed = try std.json.parseFromSlice(Message, std.testing.allocator, "{\"role\":\"tool\",\"content\":\"old\",\"reasoning_content\":null,\"tool_calls\":null,\"tool_call_id\":\"1\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?@import("tools.zig").ToolStatus, null), parsed.value.tool_status);
 }
 
 test "a missing session starts empty but malformed JSON is rejected" {

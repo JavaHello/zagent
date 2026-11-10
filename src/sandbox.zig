@@ -280,20 +280,11 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, network: bool, name: []
 }
 
 fn executeLinux(io: std.Io, allocator: std.mem.Allocator, network: bool, name: []const u8, arguments: []const u8, workspace: []const u8, worker_path: []const u8, timeout: u32) !tools.ToolResult {
-    var l = try launch(io, allocator, workspace, worker_path, network, &.{ "/zagent-worker", "--tool-worker", name, arguments }, &.{}, timeout);
+    // The parent owns the deadline, so timeout is an observed event rather
+    // than a guess from exit 137 (which can also mean an unrelated SIGKILL).
+    var l = try launch(io, allocator, workspace, worker_path, network, &.{ "/zagent-worker", "--tool-worker", name, arguments }, &.{}, null);
     defer l.deinit();
-    const result = std.process.run(allocator, io, .{
-        .argv = l.argv,
-        .environ_map = &l.env,
-        .stdout_limit = .limited(2 * 1024 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    }) catch |err| return .{
-        .content = try std.fmt.allocPrint(allocator, "Sandbox failed ({s}). Install bubblewrap and GNU timeout; no tool ran outside the sandbox.", .{@errorName(err)}),
-        .is_error = true,
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    return parseResult(allocator, result.stdout, result.stderr, result.term);
+    return executeLaunch(io, allocator, &l, workspace, timeout);
 }
 
 fn executeMacos(io: std.Io, allocator: std.mem.Allocator, network: bool, name: []const u8, arguments: []const u8, workspace: []const u8, worker: []const u8, timeout: u32) !tools.ToolResult {
@@ -344,7 +335,7 @@ fn executeLaunch(io: std.Io, allocator: std.mem.Allocator, l: *Launch, workspace
         // with the worker, matching bubblewrap's --die-with-parent behaviour.
         .pgid = 0,
     }) catch |err| return .{
-        .content = try std.fmt.allocPrint(allocator, "Sandbox failed ({s}). macOS sandbox-exec is required; no tool ran outside the sandbox.", .{@errorName(err)}),
+        .content = try std.fmt.allocPrint(allocator, "Tool worker launch failed ({s}); no fallback execution was attempted.", .{@errorName(err)}),
         .is_error = true,
     };
     defer _ = killGroup(&child, io);
@@ -357,25 +348,28 @@ fn executeLaunch(io: std.Io, allocator: std.mem.Allocator, l: *Launch, workspace
     const stdout_reader = multi.reader(0);
     const stderr_reader = multi.reader(1);
 
-    const run_timeout: std.Io.Timeout = .{ .duration = .{
+    const run_timeout = (std.Io.Timeout{ .duration = .{
         .raw = std.Io.Duration.fromSeconds(@intCast(timeout)),
         .clock = .awake,
-    } };
+    } }).toDeadline(io);
 
     while (multi.fill(64, run_timeout)) |_| {
         if (stdout_reader.buffered().len > 2 * 1024 * 1024) return .{
             .content = try allocator.dupe(u8, "Tool output exceeded the 2 MiB limit."),
             .is_error = true,
+            .truncated = true,
         };
         if (stderr_reader.buffered().len > 64 * 1024) return .{
             .content = try allocator.dupe(u8, "Tool error output exceeded the 64 KiB limit."),
             .is_error = true,
+            .truncated = true,
         };
     } else |err| switch (err) {
         error.EndOfStream => {},
         error.Timeout => return .{
             .content = try std.fmt.allocPrint(allocator, "Tool timed out after {d}s.", .{timeout}),
             .is_error = true,
+            .timed_out = true,
         },
         else => |e| return .{
             .content = try std.fmt.allocPrint(allocator, "Sandbox failed ({s}).", .{@errorName(e)}),
@@ -402,13 +396,19 @@ fn parseResult(allocator: std.mem.Allocator, stdout: []const u8, stderr: []const
     if (!term.success()) return .{
         .content = try std.fmt.allocPrint(allocator, "Sandbox failed or tool timed out: {s}", .{stderr}),
         .is_error = true,
+        .exit_code = switch (term) {
+            .exited => |code| code,
+            else => null,
+        },
     };
     const parsed = std.json.parseFromSlice(tools.ToolResult, allocator, stdout, .{ .allocate = .alloc_always }) catch return .{
         .content = try allocator.dupe(u8, "Sandbox worker returned an invalid result."),
         .is_error = true,
     };
     defer parsed.deinit();
-    return .{ .content = try allocator.dupe(u8, parsed.value.content), .is_error = parsed.value.is_error };
+    var result = parsed.value;
+    result.content = try allocator.dupe(u8, result.content);
+    return result;
 }
 
 /// Kill the child and every process in its process group, then reap it and
@@ -452,6 +452,23 @@ test "sandbox launch requires a bounded workspace" {
         defer ll.deinit();
         for (ll.argv) |arg| try std.testing.expect(!std.mem.eql(u8, arg, "--share-net"));
     }
+}
+
+test "worker JSON preserves status and old workers default to unknown exit code" {
+    const a = std.testing.allocator;
+    const result = try parseResult(a, "{\"content\":\"failed\",\"is_error\":true,\"exit_code\":7,\"timed_out\":true,\"truncated\":true}", "", .{ .exited = 0 });
+    defer a.free(result.content);
+    try std.testing.expect(result.is_error and result.timed_out and result.truncated);
+    try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
+    const legacy = try parseResult(a, "{\"content\":\"old\",\"is_error\":false}", "", .{ .exited = 0 });
+    defer a.free(legacy.content);
+    try std.testing.expect(!legacy.is_error and !legacy.timed_out and !legacy.truncated);
+    try std.testing.expectEqual(@as(?u8, null), legacy.exit_code);
+    const failed = try parseResult(a, "", "worker crashed", .{ .exited = 137 });
+    defer a.free(failed.content);
+    try std.testing.expect(failed.is_error);
+    try std.testing.expect(!failed.timed_out);
+    try std.testing.expectEqual(@as(?u8, 137), failed.exit_code);
 }
 
 test "shell timeout is bounded and applies only to commands" {

@@ -58,10 +58,23 @@ try:
         def session_id(output):
             return re.search(r'(?:Session\s+|Session: )([a-f0-9]{32})', output)[1]
 
+        def assert_failed_tool_status(body):
+            output = next(m['output'] for m in body['input']
+                          if m.get('type') == 'function_call_output')
+            header, content = output.split('\n', 1)
+            assert header.startswith('[tool_status ') and header.endswith(']'), output
+            assert json.loads(header[len('[tool_status '):-1]) == {
+                'is_error': True, 'exit_code': 42, 'timed_out': False, 'truncated': False}, output
+            assert content == 'Exit code: 42\n(no output)', content
+
         first = session_id(run('first-session-marker'))
         path = state / 'sessions' / f'{first}.json'
         old = path.read_bytes()
         saved = json.loads(old)
+        saved_tool = next(m for m in saved['messages'] if m['role'] == 'tool')
+        assert saved_tool['tool_status'] == {
+            'is_error': True, 'exit_code': 42, 'timed_out': False, 'truncated': False}, saved_tool
+        assert_failed_tool_status(requests[-1])
         assert any(message.get('role') == 'tool'
                    and message.get('content') == 'Exit code: 42\n(no output)'
                    for message in saved['messages']), saved
@@ -77,6 +90,7 @@ try:
         assert 'first-session-marker' in json.dumps(requests[-1]), requests[-1]
         assert 'Saved answer' in json.dumps(requests[-1]), requests[-1]
         assert 'Exit code: 42' in json.dumps(requests[-1]), requests[-1]
+        assert_failed_tool_status(requests[-1])
         assert len(list(path.parent.glob('*.json'))) == 3
         run('--resume', first, stdin='/clear\n/quit\n')
         assert json.loads(path.read_text())['messages'] == []

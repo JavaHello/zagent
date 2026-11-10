@@ -1184,10 +1184,7 @@ pub fn renderCallResult(allocator: std.mem.Allocator, result_json: []const u8) !
 
     if (!wrote) try w.writeAll("(the tool returned nothing)");
 
-    return .{
-        .content = try tools.finalizeToolContentLimited(allocator, aw.written(), tools.http_max_content),
-        .is_error = is_error,
-    };
+    return tools.finalizeResultLimited(allocator, aw.written(), .{ .is_error = is_error }, tools.http_max_content);
 }
 
 /// Write one content item, after `following` earlier ones. Returns whether
@@ -1277,10 +1274,7 @@ fn decodedSize(base64: []const u8) usize {
 fn errorResult(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !tools.ToolResult {
     const raw = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(raw);
-    return .{
-        .content = try tools.finalizeToolContentLimited(allocator, raw, tools.http_max_content),
-        .is_error = true,
-    };
+    return tools.finalizeResultLimited(allocator, raw, .{ .is_error = true }, tools.http_max_content);
 }
 
 /// How long a tool description is allowed to be. A server can send anything,
@@ -1583,11 +1577,13 @@ pub const Registry = struct {
         defer allocator.free(arguments);
 
         var response = connection.callTool(allocator, tool.remote_name, arguments) catch |err| {
-            return errorResult(
+            var result = try errorResult(
                 allocator,
                 "Calling '{s}' on \"{s}\" failed: {s}",
                 .{ tool.remote_name, server.config.name, describeError(err) },
             );
+            result.timed_out = err == error.McpTimeout;
+            return result;
         };
         defer response.deinit(allocator);
 
