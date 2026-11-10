@@ -965,7 +965,7 @@ pub const Agent = struct {
                     };
                     defer result.deinit(self.allocator);
 
-                    const result_content = try self.allocator.dupe(u8, result.content);
+                    const result_content = try compact.deduplicateReadResult(self.allocator, self.history.items, call, result.content, result.is_error);
                     errdefer self.allocator.free(result_content);
                     const call_id = try self.allocator.dupe(u8, call.id);
                     errdefer self.allocator.free(call_id);
