@@ -17,6 +17,8 @@ pub const Credentials = struct {
     }
 };
 pub fn path(a: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
+    const auth_path = env.get("AI_CODEX_AUTH_FILE") orelse null;
+    if (auth_path != null) return try a.dupe(u8, auth_path.?);
     const home = env.get("HOME") orelse return error.HomeNotSet;
     return std.fmt.allocPrint(a, "{s}/.config/zagent/codex-auth.json", .{home});
 }
