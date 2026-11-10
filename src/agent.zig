@@ -78,7 +78,7 @@ const SYSTEM_PROMPT =
     \\- When you learn something durable — a user preference, a project fact, a decision, or a constraint — call remember with a short, self-contained note. Do not save transient details, secrets, or anything the user asked you to forget.
     \\- When the conversation grows long, earlier messages may be replaced by a summary. Treat that summary as part of the conversation, and keep your own replies concise so it stays useful.
     \\- When the request is ambiguous, or when a decision only the user can make is blocking you, call ask_user with two to four concrete options and mark the one you recommend. Ask only when the answer changes what you do next; decide routine details yourself.
-    \\- After every turn that used tools, an automatic completion check reviews your work. If it reports unfinished work, act on it instead of restating your answer.
+    \\- When a tool-based task is truly finished, call task_complete after all work and validation, then give your final answer. Only this explicit declaration requests an independent completion check; ordinary replies do not. Do not call it for progress updates, questions, or blocked work. If you use other tools afterward, declare completion again. If the check reports unfinished work, fix it and call task_complete again when ready.
 ;
 
 /// The system prompt as the model is given it: the constant above, plus what
@@ -775,6 +775,7 @@ pub const Agent = struct {
             worked = worked or turn.tool_calls > 0;
             // A query that never touched a tool is a conversation, not a task.
             if (!worked) return .completed;
+            if (!turn.completion_requested) return .paused;
             if (self.max_verifications == 0) return .completed;
 
             // A check that fails to produce a verdict — the request errored,
@@ -899,6 +900,8 @@ pub const Agent = struct {
         tool_calls: usize,
         /// False when the iteration budget ran out before an answer.
         completed: bool,
+        /// Explicit model declaration, invalidated by subsequent tool work.
+        completion_requested: bool = false,
     };
 
     /// Run the tool-call loop until the model answers or the iteration budget
@@ -1030,6 +1033,7 @@ pub const Agent = struct {
                         };
                     };
                     defer result.deinit(self.allocator);
+                    turn.completion_requested = std.mem.eql(u8, call.name, "task_complete") and !result.is_error;
 
                     const result_content = try compact.deduplicateReadResult(self.allocator, self.history.items, call, result.content, result.is_error);
                     errdefer self.allocator.free(result_content);
@@ -1404,6 +1408,8 @@ pub const Agent = struct {
                 break :blk try self.rememberTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "task_complete")) {
+                break :blk .{ .content = try self.allocator.dupe(u8, "Completion declared. Give your final answer; an independent check will run if enabled. Further tool work requires a new declaration."), .is_error = false };
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
             } else if (std.mem.eql(u8, call.name, mcp.Registry.loader_name)) {

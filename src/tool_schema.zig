@@ -115,6 +115,14 @@ pub const ask_user = ToolDefinition{
     ,
 };
 
+pub const task_complete = ToolDefinition{
+    .name = "task_complete",
+    .description = "Declare that the requested task is finished and request an independent completion check after your final answer. Call only after doing and validating the work, not for progress updates, questions, or blocked work. If you do more tool work afterward, call again when finished.",
+    .parameters_json =
+    \\{"type":"object","properties":{},"required":[],"additionalProperties":false}
+    ,
+};
+
 pub const remember = ToolDefinition{
     .name = "remember",
     .description = "Save one durable note to memory so it survives this session. Use it when the user states a lasting preference, convention or constraint, when a project fact or build command is learned, or when a decision is made that future work must respect. Do not save transient status, one-off task details, secrets, or anything the user asked to forget.",
@@ -126,9 +134,9 @@ pub const remember = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash, read, write, apply_patch, ls,
-    rg,            fd,   grep, find,  http,        ask_user,
-    remember,
+    memory_search, bash,          read, write, apply_patch, ls,
+    rg,            fd,            grep, find,  http,        ask_user,
+    remember,      task_complete,
 };
 
 test "built-in definitions have valid schemas and unique names" {

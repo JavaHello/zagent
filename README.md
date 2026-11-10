@@ -218,7 +218,7 @@ All configuration is also supported through environment variables:
 | `AI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
 | `AI_MAX_TOKENS`| `8192`                           | Initial output token budget per response    |
 | `AI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
-| `AI_MAX_VERIFICATIONS` | `3`                     | Completion checks per query; `0` disables the check |
+| `AI_MAX_VERIFICATIONS` | `3`                     | Checks per query, requested by `task_complete`; `0` disables checking |
 | `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
 | `AI_COMPACT_THRESHOLD` | `48000`                      | Estimated tokens before older messages are summarized; `0` disables |
 | `AI_COMPACT_KEEP`  | `16`                             | Newest messages kept verbatim across a compaction |
@@ -337,11 +337,11 @@ export OPENAI_API_KEY=sk-...
 
 ### Completion check
 
-A turn ends when the model stops calling tools and prints an answer — which is
-only the model's own opinion that the work is done. zagent asks a second,
-independent question about it: after every turn that used at least one tool, it
-sends the user's request plus a summary of the work (tool calls, short tool
-results, the final answer) to the model with no tools advertised, and expects
+Completion checks are explicitly requested by the AI, not automatically triggered
+by tool use. Once the work and validation are finished, the AI calls
+`task_complete` and gives its final answer. Only then does zagent send the user's
+request plus a summary of the work (tool calls, short tool results, the final
+answer) to an independent model request with no tools advertised, and expect
 
 ```json
 {"complete": false, "reason": "The tests were never run.", "next_step": "Run zig build test."}
@@ -350,8 +350,10 @@ results, the final answer) to the model with no tools advertised, and expects
 An unfinished verdict is printed and fed back into the conversation, and the
 agent keeps working. Up to `AI_MAX_VERIFICATIONS` checks are made per query
 (3 by default); the budget is printed when it runs out, and `AI_MAX_VERIFICATIONS=0`
-turns the check off. A turn that used no tools is never checked. A reported
-blocker, partial implementation or a plan is not a completed task.
+turns the check off. Without `task_complete`, no judge request is made: tool-using
+turns end as `Task paused`, while plain conversation ends normally. Further tool
+work after a declaration invalidates it; the AI must declare completion again.
+A reported blocker, partial implementation or a plan is not a completed task.
 When the checker identifies an unavailable external prerequisite (such as
 private Maven dependencies or authentication), the turn ends normally with
 `Task blocked`, the reason and the next step. It does not retry, throw
@@ -367,7 +369,7 @@ repair rounds; a larger budget alone does not establish completion.
 
 Two things worth knowing:
 
-- The check costs one extra request per tool-using turn, and it re-sends a
+- Each explicit completion check costs an extra request, and it re-sends a
   summary of that turn rather than the whole history. A turn too long for that
   summary keeps its most recent work — the answer, or the failure that stopped
   it — and omits the beginning, so the judge always sees how the turn ended.

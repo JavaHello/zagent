@@ -115,7 +115,9 @@ try:
 
         replies.extend([
             {'status': 'completed', 'output': [{'type': 'function_call', 'call_id': 'read_evidence',
-                'name': 'read', 'arguments': json.dumps({'path': 'evidence.txt'})}]},
+                'name': 'read', 'arguments': json.dumps({'path': 'evidence.txt'})},
+                {'type': 'function_call', 'call_id': 'complete',
+                 'name': 'task_complete', 'arguments': '{}'}]},
             partial, partial, completed_text('Recovered answer'),
             partial, completed_text(json.dumps({'complete': True, 'reason': 'Verified evidence'})),
         ])

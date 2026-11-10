@@ -11,7 +11,7 @@ import threading
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 scenario = {'verdict': None, 'checks': 0, 'rounds': 0, 'judge_replies': [],
-            'require': None, 'command': None}
+            'require': None, 'command': None, 'declare': True, 'after_declare': False}
 judge_prompts = []
 
 class API(http.server.BaseHTTPRequestHandler):
@@ -50,7 +50,7 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply({'status': 'completed', 'output': [
                 {'type': 'message', 'role': 'assistant',
                  'content': [{'type': 'output_text', 'text': content}]}]})
-        answered = sum(m.get('type') == 'function_call_output' for m in body['input'])
+        answered = sum(m.get('type') == 'function_call_output' and m.get('call_id', '').startswith('probe-') for m in body['input'])
         if answered < scenario['rounds'] or answered == 0:
             if scenario['command'] is not None:
                 command = scenario['command']
@@ -61,6 +61,17 @@ class API(http.server.BaseHTTPRequestHandler):
             return self.reply({'status': 'completed', 'output': [
                 {'type': 'function_call', 'call_id': f'probe-{answered}', 'name': 'bash',
                  'arguments': json.dumps({'command': command})}]})
+        last = body['input'][-1]
+        declared = last.get('type') == 'function_call_output' and last.get('call_id', '').startswith('complete-')
+        if scenario['declare'] and not declared:
+            return self.reply({'status': 'completed', 'output': [
+                {'type': 'function_call', 'call_id': f'complete-{len(body["input"])}',
+                 'name': 'task_complete', 'arguments': '{}'}]})
+        if declared and scenario['after_declare']:
+            scenario['declare'] = False
+            return self.reply({'status': 'completed', 'output': [
+                {'type': 'function_call', 'call_id': 'late-work', 'name': 'bash',
+                 'arguments': json.dumps({'command': 'printf more-work'})}]})
         return self.reply({'status': 'completed', 'output': [
             {'type': 'message', 'role': 'assistant',
              'content': [{'type': 'output_text', 'text': 'Candidate answer'}]}]})
@@ -74,6 +85,21 @@ try:
                'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '5', 'AI_MAX_VERIFICATIONS': '1',
                'AI_MEMORY': '0', 'AI_COMPACT_THRESHOLD': '0'}
         trust_workspace(directory, env)
+        # Ordinary tool replies and progress reports must not spend judge tokens.
+        for declare, after_declare in [(False, False), (True, True)]:
+            scenario.update(declare=declare, after_declare=after_declare, checks=0)
+            result = subprocess.run([str(binary), 'Report progress'], cwd=directory, env=env,
+                                    capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+            assert scenario['checks'] == 0, result.stderr
+            assert 'Task paused' in result.stderr, result.stderr
+            assert 'Task completed' not in result.stderr, result.stderr
+        scenario.update(declare=True, after_declare=False, checks=0)
+        result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
+                                env=dict(env, AI_MAX_VERIFICATIONS='0'),
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0 and scenario['checks'] == 0, result.stderr
+        assert 'Task completed' in result.stderr, result.stderr
         for verdict, expected_ok in [
             (json.dumps({'complete': True, 'reason': 'Verified evidence'}), True),
             (json.dumps({'complete': False, 'reason': 'Missing behavior', 'next_step': 'Implement it'}), False),
