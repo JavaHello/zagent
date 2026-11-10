@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
     var previous: *std.Build.Step = b.getInstallStep();
     for ([_][]const u8{
         "tests/workspace_integration.py",
+        "tests/search_dispatch_integration.py",
         "tests/memory_integration.py",
         "tests/streaming_integration.py",
         "tests/execution_integration.py",

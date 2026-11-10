@@ -67,19 +67,35 @@ pub const ls = ToolDefinition{
     ,
 };
 
-pub const grep = ToolDefinition{
-    .name = "grep",
+pub const rg = ToolDefinition{
+    .name = "rg",
     .description = "Search file contents with a regular expression and return the matching lines with their file and line number. Use this search tool instead of shell commands. Binary files are skipped.",
     .parameters_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob to search (e.g. README* or src/*.zig); defaults to the current directory. Path globs expand before searching, unlike the recursive glob filter."},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"},"context_lines":{"type":"integer","minimum":0,"description":"Number of surrounding lines before and after each match; defaults to 0"},"max_matches":{"type":"integer","minimum":1,"description":"Stop after this many matching lines per file (not a global limit); defaults to unlimited."},"hidden":{"type":"boolean","description":"Include hidden files with rg; fallback grep includes them by default"},"no_ignore":{"type":"boolean","description":"Disable ignore files with rg; fallback grep does not read ignore files"},"offset":{"type":"integer","minimum":0,"description":"Output-line offset, default 0; resume using the returned cursor on an unchanged tree. Searches exceeding 256 KiB must be narrowed."}},"required":["pattern"]}
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob to search (e.g. README* or src/*.zig); defaults to the current directory. Path globs expand before searching, unlike the recursive glob filter."},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"},"context_lines":{"type":"integer","minimum":0,"description":"Number of surrounding lines before and after each match; defaults to 0"},"max_matches":{"type":"integer","minimum":1,"description":"Stop after this many matching lines per file (not a global limit); defaults to unlimited."},"hidden":{"type":"boolean","description":"Include hidden files (default false)"},"no_ignore":{"type":"boolean","description":"Disable ignore files (default false)"},"offset":{"type":"integer","minimum":0,"description":"Output-line offset, default 0; resume using the returned cursor on an unchanged tree. Searches exceeding 256 KiB must be narrowed."}},"required":["pattern"]}
+    ,
+};
+
+pub const fd = ToolDefinition{
+    .name = "fd",
+    .description = "Find files and directories whose name matches a glob and return their paths. Use this filename search tool instead of shell commands.",
+    .parameters_json =
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob the name must match, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search in, defaults to the current directory"},"hidden":{"type":"boolean","description":"Include hidden entries (default false)"},"no_ignore":{"type":"boolean","description":"Disable ignore files (default false)"},"offset":{"type":"integer","minimum":0,"description":"Output-line offset, default 0; resume using returned cursor on an unchanged tree. Searches exceeding 256 KiB must be narrowed."}},"required":["pattern"]}
+    ,
+};
+
+pub const grep = ToolDefinition{
+    .name = "grep",
+    .description = "Search file contents with grep extended regular expressions and return matching lines with file and line number. Skips binary files and .git directories; includes hidden files and does not read ignore files. Always runs grep, never rg.",
+    .parameters_json =
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Extended regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob (e.g. README*); defaults to ."},"glob":{"type":"string","description":"Only search files whose names match this glob"},"ignore_case":{"type":"boolean"},"context_lines":{"type":"integer","minimum":0},"max_matches":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0,"description":"Output-line offset; resume using returned cursor on an unchanged tree"}},"required":["pattern"]}
     ,
 };
 
 pub const find = ToolDefinition{
     .name = "find",
-    .description = "Find files and directories whose name matches a glob and return their paths. Use this filename search tool instead of shell commands.",
+    .description = "Find files and directories by name glob using find. Prunes .git directories; includes hidden entries and does not read ignore files. Always runs find, never fd.",
     .parameters_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob the name must match, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search in, defaults to the current directory"},"hidden":{"type":"boolean","description":"Include hidden entries with fd; fallback find includes them by default"},"no_ignore":{"type":"boolean","description":"Disable ignore files with fd; fallback find does not read ignore files"},"offset":{"type":"integer","minimum":0,"description":"Output-line offset, default 0; resume using returned cursor on an unchanged tree. Searches exceeding 256 KiB must be narrowed."}},"required":["pattern"]}
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Name glob, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search; defaults to ."},"offset":{"type":"integer","minimum":0,"description":"Output-line offset; resume using returned cursor on an unchanged tree"}},"required":["pattern"]}
     ,
 };
 
@@ -110,8 +126,9 @@ pub const remember = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash, read, write,    apply_patch, ls,
-    grep,          find, http, ask_user, remember,
+    memory_search, bash, read, write, apply_patch, ls,
+    rg,            fd,   grep, find,  http,        ask_user,
+    remember,
 };
 
 test "built-in definitions have valid schemas and unique names" {

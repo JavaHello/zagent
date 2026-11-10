@@ -236,10 +236,10 @@ test "search limits parse and reach both backends" {
     defer args.deinit(a);
     try std.testing.expectEqual(@as(?usize, 2), args.context_lines);
     try std.testing.expectEqual(@as(?usize, 1), args.max_matches);
-    for ([_]bool{ false, true }) |rg| {
-        const argv = try grepArgv(a, args, .{ .rg = rg });
+    for ([_]bool{ false, true }) |use_rg| {
+        const argv = try (if (use_rg) &rgArgv else &grepArgv)(a, args);
         defer freeGrepArgv(a, argv);
-        const start: usize = if (rg) 4 else 6;
+        const start: usize = if (use_rg) 4 else 6;
         try std.testing.expectEqualStrings("--context=2", argv[start]);
         try std.testing.expectEqualStrings("--max-count=1", argv[start + 1]);
     }
@@ -260,7 +260,7 @@ test "grep includes context and stops matching per file" {
     try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "before\nneedle\nafter\ngap\nneedle later\n" });
     const path = try tmp.dir.realPathFileAlloc(io, "note.txt", a);
     defer a.free(path);
-    const result = try grep(io, a, .{}, .{
+    const result = try grep(io, a, .{
         .pattern = "needle",
         .path = path,
         .glob = null,
@@ -590,8 +590,7 @@ fn isExecutableFile(io: std.Io, path: []const u8) bool {
 
 /// A grep tool call as the model described it. Owns its strings.
 pub const GrepArgs = struct {
-    /// A regular expression, in the extended flavour both backends are asked
-    /// for (see `grepArgv`).
+    /// A regular expression: ripgrep syntax for rg, extended syntax for grep.
     pattern: []const u8,
     /// The file or directory to search.
     path: []const u8,
@@ -722,45 +721,49 @@ fn freeGrepFlags(allocator: std.mem.Allocator, argv: []const []const u8) void {
     }
 }
 
-pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs, backends: SearchBackends) ![]const []const u8 {
+pub fn rgArgv(allocator: std.mem.Allocator, args: GrepArgs) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     errdefer {
         freeGrepFlags(allocator, argv.items);
         argv.deinit(allocator);
     }
 
-    if (backends.rg) {
-        // The flags are passed even though ripgrep prints this shape by itself
-        // when it is not writing to a terminal: a RIPGREP_CONFIG_PATH file can
-        // change the defaults, and the model should read the same output on
-        // every machine. `--color=never` is for that same file: the result is
-        // stripped of escapes before the model sees it, but that is no reason
-        // to pay for them.
-        try argv.appendSlice(allocator, &.{ "rg", "--line-number", "--no-heading", "--color=never" });
-        try appendGrepLimits(allocator, &argv, args);
-        try argv.appendSlice(allocator, &.{ "--no-config", "--sort=path" });
-        if (args.hidden) try argv.append(allocator, "--hidden");
-        if (args.no_ignore) try argv.append(allocator, "--no-ignore");
-        if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--glob", glob });
-        if (args.ignore_case) try argv.append(allocator, "--ignore-case");
-        // `--` keeps a pattern that starts with a dash from being read as a flag.
-        try argv.appendSlice(allocator, &.{ "--", args.pattern, args.path });
-    } else {
-        // `-E` is what makes the fallback mean the same thing as ripgrep: a plain
-        // grep reads a basic regular expression, where `+`, `?`, `|` and `()`
-        // are literals until they are escaped.
-        // Everything else is short options plus `--include` and `--exclude-dir`,
-        // which the grep macOS ships also accepts.
-        // `-I` drops binary files, as ripgrep does by default, and `.git` is
-        // skipped by hand because this grep does not read .gitignore and would
-        // otherwise work through every object the repository has ever stored.
-        try argv.appendSlice(allocator, &.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git" });
-        try appendGrepLimits(allocator, &argv, args);
-        if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--include", glob });
-        if (args.ignore_case) try argv.append(allocator, "-i");
-        // `-e` rather than a bare pattern, for the same reason as `--` above.
-        try argv.appendSlice(allocator, &.{ "-e", args.pattern, "--", args.path });
+    // The flags are passed even though ripgrep prints this shape by itself
+    // when it is not writing to a terminal: a RIPGREP_CONFIG_PATH file can
+    // change the defaults, and the model should read the same output on
+    // every machine. `--color=never` is for that same file: the result is
+    // stripped of escapes before the model sees it, but that is no reason
+    // to pay for them.
+    try argv.appendSlice(allocator, &.{ "rg", "--line-number", "--no-heading", "--color=never" });
+    try appendGrepLimits(allocator, &argv, args);
+    try argv.appendSlice(allocator, &.{ "--no-config", "--sort=path" });
+    if (args.hidden) try argv.append(allocator, "--hidden");
+    if (args.no_ignore) try argv.append(allocator, "--no-ignore");
+    if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--glob", glob });
+    if (args.ignore_case) try argv.append(allocator, "--ignore-case");
+    // `--` keeps a pattern that starts with a dash from being read as a flag.
+    try argv.appendSlice(allocator, &.{ "--", args.pattern, args.path });
+    return argv.toOwnedSlice(allocator);
+}
+
+pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        freeGrepFlags(allocator, argv.items);
+        argv.deinit(allocator);
     }
+    // `-E` selects extended regular expressions.
+    // Everything else is short options plus `--include` and `--exclude-dir`,
+    // which the grep macOS ships also accepts.
+    // `-I` drops binary files, as ripgrep does by default, and `.git` is
+    // skipped by hand because this grep does not read .gitignore and would
+    // otherwise work through every object the repository has ever stored.
+    try argv.appendSlice(allocator, &.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git" });
+    try appendGrepLimits(allocator, &argv, args);
+    if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--include", glob });
+    if (args.ignore_case) try argv.append(allocator, "-i");
+    // `-e` rather than a bare pattern, for the same reason as `--` above.
+    try argv.appendSlice(allocator, &.{ "-e", args.pattern, "--", args.path });
 
     return argv.toOwnedSlice(allocator);
 }
@@ -779,25 +782,28 @@ fn appendGrepLimits(allocator: std.mem.Allocator, argv: *std.ArrayList([]const u
 }
 
 /// Build argv for one find call. Borrows args and literals; free only the slice.
-pub fn findArgv(allocator: std.mem.Allocator, args: FindArgs, backends: SearchBackends) ![]const []const u8 {
+pub fn fdArgv(allocator: std.mem.Allocator, args: FindArgs) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     errdefer argv.deinit(allocator);
 
-    if (backends.fd) {
-        // fd's defaults are the ones this tool wants: hidden files and anything
-        // .gitignore leaves out are skipped, so the answer is the tree a
-        // developer would have searched by hand.
-        try argv.appendSlice(allocator, &.{ "fd", "--color=never", "--glob" });
-        if (args.hidden) try argv.append(allocator, "--hidden");
-        if (args.no_ignore) try argv.append(allocator, "--no-ignore");
-        try argv.appendSlice(allocator, &.{ "--", args.pattern, args.path });
-    } else {
-        // find reads no ignore file of its own, so `.git` is pruned by hand —
-        // without it, a search for a name would walk every object in the
-        // repository. The `-print` on the second branch cannot be left out:
-        // the `-o` alone would make find print nothing at all.
-        try argv.appendSlice(allocator, &.{ "find", args.path, "-name", ".git", "-prune", "-o", "-name", args.pattern, "-print" });
-    }
+    // fd's defaults are the ones this tool wants: hidden files and anything
+    // .gitignore leaves out are skipped, so the answer is the tree a
+    // developer would have searched by hand.
+    try argv.appendSlice(allocator, &.{ "fd", "--color=never", "--glob" });
+    if (args.hidden) try argv.append(allocator, "--hidden");
+    if (args.no_ignore) try argv.append(allocator, "--no-ignore");
+    try argv.appendSlice(allocator, &.{ "--", args.pattern, args.path });
+    return argv.toOwnedSlice(allocator);
+}
+
+pub fn findArgv(allocator: std.mem.Allocator, args: FindArgs) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(allocator);
+    // find reads no ignore file of its own, so `.git` is pruned by hand —
+    // without it, a search for a name would walk every object in the
+    // repository. The `-print` on the second branch cannot be left out:
+    // the `-o` alone would make find print nothing at all.
+    try argv.appendSlice(allocator, &.{ "find", args.path, "-name", ".git", "-prune", "-o", "-name", args.pattern, "-print" });
 
     return argv.toOwnedSlice(allocator);
 }
@@ -907,9 +913,20 @@ fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, s
 }
 
 /// The grep tool: search file contents with a regular expression.
-pub fn grep(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, args: GrepArgs) !ToolResult {
-    const argv = try grepArgv(allocator, args, backends);
+pub fn grep(io: std.Io, allocator: std.mem.Allocator, args: GrepArgs) !ToolResult {
+    const argv = try grepArgv(allocator, args);
     defer freeGrepArgv(allocator, argv);
+    return runContentSearch(io, allocator, argv, args);
+}
+
+/// The rg tool always runs ripgrep, independent of startup detection.
+pub fn rg(io: std.Io, allocator: std.mem.Allocator, args: GrepArgs) !ToolResult {
+    const argv = try rgArgv(allocator, args);
+    defer freeGrepArgv(allocator, argv);
+    return runContentSearch(io, allocator, argv, args);
+}
+
+fn runContentSearch(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, args: GrepArgs) !ToolResult {
     if (std.mem.indexOfAny(u8, args.path, "*?[") != null) {
         // Match the shell's pathname expansion, not rg's recursive --glob
         // filter: README* must only select entries in the current directory.
@@ -929,8 +946,15 @@ pub fn grep(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, 
 }
 
 /// The find tool: find files and directories by name.
-pub fn find(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, args: FindArgs) !ToolResult {
-    const argv = try findArgv(allocator, args, backends);
+pub fn find(io: std.Io, allocator: std.mem.Allocator, args: FindArgs) !ToolResult {
+    const argv = try findArgv(allocator, args);
+    defer allocator.free(argv);
+    return runSearch(io, allocator, argv, false, args.offset);
+}
+
+/// The fd tool always runs fd, independent of startup detection.
+pub fn fd(io: std.Io, allocator: std.mem.Allocator, args: FindArgs) !ToolResult {
+    const argv = try fdArgv(allocator, args);
     defer allocator.free(argv);
     return runSearch(io, allocator, argv, false, args.offset);
 }
@@ -1395,8 +1419,8 @@ test "a search program is only found where one can be run" {
 
     // An executable `rg`, a plain file `fd`, and a directory named `grep`:
     // only the first is something the tool could run.
-    var rg = try tmp.dir.createFile(io, "rg", .{ .permissions = std.Io.File.Permissions.fromMode(0o755) });
-    rg.close(io);
+    var rg_file = try tmp.dir.createFile(io, "rg", .{ .permissions = std.Io.File.Permissions.fromMode(0o755) });
+    rg_file.close(io);
     var fd_file = try tmp.dir.createFile(io, "fd", .{ .permissions = std.Io.File.Permissions.fromMode(0o644) });
     fd_file.close(io);
     try tmp.dir.createDir(io, "grep", std.Io.File.Permissions.default_dir);
@@ -1414,11 +1438,11 @@ test "a search program is only found where one can be run" {
     try std.testing.expect(!isOnPath(io, ":", "rg"));
 }
 
-test "grep argv picks ripgrep when it is installed" {
+test "rg argv always executes ripgrep" {
     const allocator = std.testing.allocator;
     const args = GrepArgs{ .pattern = "fn main", .path = "src", .glob = "*.zig", .ignore_case = true };
 
-    const argv = try grepArgv(allocator, args, .{ .rg = true });
+    const argv = try rgArgv(allocator, args);
     defer allocator.free(argv);
 
     try expectArgv(
@@ -1427,40 +1451,40 @@ test "grep argv picks ripgrep when it is installed" {
     );
 }
 
-test "grep argv falls back to grep" {
+test "grep argv always executes grep" {
     const allocator = std.testing.allocator;
     const args = GrepArgs{ .pattern = "fn main", .path = "src", .glob = "*.zig", .ignore_case = true };
 
-    const argv = try grepArgv(allocator, args, .{});
+    const argv = try grepArgv(allocator, args);
     defer allocator.free(argv);
 
-    // `-E` is what makes the fallback read the same regular expressions as
-    // ripgrep; without it `|`, `+` and `()` would be literals.
+    // `-E` enables extended regular expressions; without it `|`, `+` and
+    // `()` would be literals.
     try expectArgv(
         &.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git", "--include", "*.zig", "-i", "-e", "fn main", "--", "src" },
         argv,
     );
 
-    const plain = try grepArgv(allocator, .{ .pattern = "needle", .path = ".", .glob = null, .ignore_case = false }, .{});
+    const plain = try grepArgv(allocator, .{ .pattern = "needle", .path = ".", .glob = null, .ignore_case = false });
     defer allocator.free(plain);
     try expectArgv(&.{ "grep", "-r", "-n", "-I", "-E", "--exclude-dir=.git", "-e", "needle", "--", "." }, plain);
 }
 
-test "find argv picks fd when it is installed" {
+test "fd argv always executes fd" {
     const allocator = std.testing.allocator;
     const args = FindArgs{ .pattern = "*.zig", .path = "src" };
 
-    const argv = try findArgv(allocator, args, .{ .fd = true });
+    const argv = try fdArgv(allocator, args);
     defer allocator.free(argv);
 
     try expectArgv(&.{ "fd", "--color=never", "--glob", "--", "*.zig", "src" }, argv);
 }
 
-test "find argv falls back to find" {
+test "find argv always executes find" {
     const allocator = std.testing.allocator;
     const args = FindArgs{ .pattern = "*.zig", .path = "src" };
 
-    const argv = try findArgv(allocator, args, .{});
+    const argv = try findArgv(allocator, args);
     defer allocator.free(argv);
 
     // The `-print` is load-bearing: `-prune -o -name …` with nothing after it
@@ -1508,7 +1532,7 @@ test "grep finds a line and the file it is in" {
 
     // The fallback backend is asked for by name: whether the machine running
     // the tests has ripgrep installed must not change what they assert.
-    const result = try grep(io, allocator, .{}, .{ .pattern = "needle", .path = dir, .glob = null, .ignore_case = false });
+    const result = try grep(io, allocator, .{ .pattern = "needle", .path = dir, .glob = null, .ignore_case = false });
     defer result.deinit(allocator);
 
     try std.testing.expect(!result.is_error);
@@ -1544,7 +1568,7 @@ test "grep expands path globs without interpreting user input as shell source" {
         if (use_rg and !have_rg) continue;
         const path = try std.fmt.allocPrint(allocator, "{s}/docs */README*", .{dir});
         defer allocator.free(path);
-        const result = try grep(io, allocator, .{ .rg = use_rg }, .{
+        const result = try (if (use_rg) &rg else &grep)(io, allocator, .{
             .pattern = "needle",
             .path = path,
             .glob = null,
@@ -1560,7 +1584,7 @@ test "grep expands path globs without interpreting user input as shell source" {
 
         const missing_path = try std.fmt.allocPrint(allocator, "{s}/missing*", .{dir});
         defer allocator.free(missing_path);
-        const missing = try grep(io, allocator, .{ .rg = use_rg }, .{
+        const missing = try (if (use_rg) &rg else &grep)(io, allocator, .{
             .pattern = "needle",
             .path = missing_path,
             .glob = null,
@@ -1584,13 +1608,13 @@ test "a search that matched nothing is an answer" {
 
     // grep exits 1 when it matched nothing. Reading that as a failure would
     // send the model off to retry a search that has already answered.
-    const searched = try grep(io, allocator, .{}, .{ .pattern = "nowhere", .path = dir, .glob = null, .ignore_case = false });
+    const searched = try grep(io, allocator, .{ .pattern = "nowhere", .path = dir, .glob = null, .ignore_case = false });
     defer searched.deinit(allocator);
     try std.testing.expect(!searched.is_error);
     try std.testing.expectEqualStrings("(no matches)", searched.content);
 
     // find reports the same nothing with a zero exit and no output at all.
-    const looked = try find(io, allocator, .{}, .{ .pattern = "*.nope", .path = dir });
+    const looked = try find(io, allocator, .{ .pattern = "*.nope", .path = dir });
     defer looked.deinit(allocator);
     try std.testing.expect(!looked.is_error);
     try std.testing.expectEqualStrings("(no matches)", looked.content);
@@ -1608,7 +1632,7 @@ test "find returns the paths whose name matches" {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try fixturePath(&tmp, &buf);
 
-    const result = try find(io, allocator, .{}, .{ .pattern = "*.zig", .path = dir });
+    const result = try find(io, allocator, .{ .pattern = "*.zig", .path = dir });
     defer result.deinit(allocator);
 
     try std.testing.expect(!result.is_error);
@@ -1622,7 +1646,7 @@ test "a search that failed is an error, not an empty answer" {
 
     // A pattern the program cannot compile comes back on stderr with the code
     // that means failure — 2 for both greps, unlike the 1 for "no match".
-    const result = try grep(io, allocator, .{}, .{ .pattern = "[", .path = ".", .glob = null, .ignore_case = false });
+    const result = try grep(io, allocator, .{ .pattern = "[", .path = ".", .glob = null, .ignore_case = false });
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
@@ -1630,7 +1654,7 @@ test "a search that failed is an error, not an empty answer" {
 
     // A path that does not exist is a failure for find too, even though fd
     // reports it with the exit code the content searches use for "no match".
-    const missing = try find(io, allocator, .{}, .{ .pattern = "*.zig", .path = "/nonexistent-path-for-zagent-tests" });
+    const missing = try find(io, allocator, .{ .pattern = "*.zig", .path = "/nonexistent-path-for-zagent-tests" });
     defer missing.deinit(allocator);
     try std.testing.expect(missing.is_error);
 }

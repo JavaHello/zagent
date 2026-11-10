@@ -59,13 +59,36 @@ test "tool selection composes runtime subsets and MCP schemas without mutating d
     defer parsed.deinit();
     const tools = parsed.value.object.get("tools").?.array.items;
     try std.testing.expectEqual(@as(usize, 4), tools.len);
-    for (tools, [_][]const u8{ "read", "rg", "grep", "mcp__flat" }) |tool, name| {
+    for (tools, [_][]const u8{ "read", "grep", "grep", "mcp__flat" }) |tool, name| {
         try std.testing.expectEqualStrings(name, tool.object.get("name").?.string);
         try std.testing.expect(!tool.object.get("strict").?.bool);
         try std.testing.expect(tool.object.get("function") == null);
     }
     try std.testing.expectEqualStrings("grep", selected.items[1].name);
     try std.testing.expectEqualStrings("grep", tool_schema.grep.name);
+}
+
+test "explicit search definitions are independent of startup availability" {
+    const a = std.testing.allocator;
+    const definitions = [_]ToolDefinition{ tool_schema.rg, tool_schema.grep, tool_schema.fd, tool_schema.find };
+    for ([_]search_tools.SearchBackends{ .{}, .{ .rg = true, .fd = true } }) |search| {
+        const body = try buildRequestWithToolSelection(a, "test", &.{}, 100, .{ .builtin = &definitions }, false, search);
+        defer a.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        const registered = parsed.value.object.get("tools").?.array.items;
+        try std.testing.expectEqual(definitions.len, registered.len);
+        for (registered, definitions) |tool, definition| {
+            try std.testing.expectEqualStrings(definition.name, tool.object.get("name").?.string);
+            const parameters = try std.json.Stringify.valueAlloc(a, tool.object.get("parameters").?, .{});
+            defer a.free(parameters);
+            const expected = try std.json.parseFromSlice(std.json.Value, a, definition.parameters_json, .{});
+            defer expected.deinit();
+            const expected_parameters = try std.json.Stringify.valueAlloc(a, expected.value, .{});
+            defer a.free(expected_parameters);
+            try std.testing.expectEqualStrings(expected_parameters, parameters);
+        }
+    }
 }
 
 test "tool selection distinguishes omitted empty and MCP-only sets" {
@@ -206,7 +229,7 @@ pub const Client = struct {
     search: search_tools.SearchBackends = .{},
     /// Borrowed definitions; callers may replace this slice between requests.
     /// The slice and its strings must remain valid for each request's duration.
-    builtin_tools: []const ToolDefinition = &tool_schema.builtin,
+    builtin_tools: ?[]const ToolDefinition = null,
     /// Set only by tests; see `Transport`.
     transport: ?Transport = null,
     /// Live token accounting, read by the spinner while a request is in
@@ -786,12 +809,13 @@ pub fn buildRequestWithSearch(allocator: std.mem.Allocator, model: []const u8, m
 /// Built-in definitions can be any slice (including a runtime ArrayList's
 /// items). Extra entries retain the existing MCP JSON schema interface.
 pub const ToolSelection = struct {
-    builtin: []const ToolDefinition = &tool_schema.builtin,
+    /// null selects startup defaults; an explicit slice is used unchanged.
+    builtin: ?[]const ToolDefinition = null,
     extra: []const []const u8 = &.{},
 };
 
 /// null omits the tools member; an empty selection emits an empty array.
-/// Backend aliases apply only to selected built-ins, never to MCP entries.
+/// Startup preferences select independent search definitions, never MCP entries.
 pub fn buildRequestWithToolSelection(
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -811,12 +835,12 @@ pub fn buildRequestWithToolSelection(
     if (selection) |selected| {
         try w.writeAll(",\"tools\":[");
         var first = true;
-        for (selected.builtin) |definition| {
-            var tool = definition;
-            if (search.rg and std.mem.eql(u8, tool.name, "grep")) {
-                tool.name = "rg";
-            } else if (search.fd and std.mem.eql(u8, tool.name, "find")) {
-                tool.name = "fd";
+        for (selected.builtin orelse &tool_schema.builtin) |tool| {
+            if (selected.builtin == null) {
+                if (std.mem.eql(u8, tool.name, "rg") and !search.rg) continue;
+                if (std.mem.eql(u8, tool.name, "grep") and search.rg) continue;
+                if (std.mem.eql(u8, tool.name, "fd") and !search.fd) continue;
+                if (std.mem.eql(u8, tool.name, "find") and search.fd) continue;
             }
             try separator(w, &first);
             try tool.writeJson(w);

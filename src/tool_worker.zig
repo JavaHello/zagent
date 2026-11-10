@@ -3,7 +3,6 @@ const tools = @import("tools.zig");
 const openai = @import("openai.zig");
 
 pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8, arguments: []const u8) !tools.ToolResult {
-    const search = tools.detectSearchBackends(io, env);
     return blk: {
         if (std.mem.eql(u8, name, "bash")) {
             const command = openai.extractStringArg(allocator, arguments, "command") catch {
@@ -93,27 +92,33 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
                 break :blk .{
                     .content = try std.fmt.allocPrint(
                         allocator,
-                        "Error: grep arguments are unusable ({s}); expected a non-empty pattern, optional path/glob strings, ignore_case boolean, context_lines integer >= 0, and max_matches integer >= 1",
-                        .{@errorName(err)},
+                        "Error: {s} arguments are unusable ({s}); expected a non-empty pattern, optional path/glob strings, ignore_case boolean, context_lines integer >= 0, and max_matches integer >= 1",
+                        .{ name, @errorName(err) },
                     ),
                     .is_error = true,
                 };
             };
             defer args.deinit(allocator);
-            break :blk try tools.grep(io, allocator, search, args);
+            break :blk if (std.mem.eql(u8, name, "rg"))
+                try tools.rg(io, allocator, args)
+            else
+                try tools.grep(io, allocator, args);
         } else if (std.mem.eql(u8, name, "fd") or std.mem.eql(u8, name, "find")) {
             const args = tools.parseFindArgs(allocator, arguments) catch |err| {
                 break :blk .{
                     .content = try std.fmt.allocPrint(
                         allocator,
-                        "Error: find arguments are unusable ({s}); it needs a non-empty 'pattern' holding a glob, and a 'path' it can use",
-                        .{@errorName(err)},
+                        "Error: {s} arguments are unusable ({s}); it needs a non-empty 'pattern' holding a glob, and a 'path' it can use",
+                        .{ name, @errorName(err) },
                     ),
                     .is_error = true,
                 };
             };
             defer args.deinit(allocator);
-            break :blk try tools.find(io, allocator, search, args);
+            break :blk if (std.mem.eql(u8, name, "fd"))
+                try tools.fd(io, allocator, args)
+            else
+                try tools.find(io, allocator, args);
         } else if (std.mem.eql(u8, name, "http")) {
             const request = tools.parseHttpRequest(allocator, arguments) catch |err| {
                 break :blk .{

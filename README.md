@@ -462,11 +462,12 @@ body. Four behaviours are worth knowing:
 | `context_lines` | no     | `rg` / `grep`: number of surrounding lines before and after matches (integer >= 0; default 0) |
 | `max_matches` | no       | `rg` / `grep`: maximum matching lines **per file**, not globally (integer >= 1; default unlimited); the output byte limit still applies |
 
-Which program runs is decided once, at startup, from `PATH`, and never by the
-agent: `grep` uses `rg` where it is installed and the system `grep` otherwise,
-`find` uses `fd` where it is installed and the system `find` otherwise. The
-arguments mean the same thing on either side, and neither tool accepts free-form
-flags — a command line of your own belongs in `shell`.
+Default tool registration is decided once at startup from `PATH`: prefer `rg`
+over `grep`, and `fd` over `find`. These are four independent tools: calling
+`grep` always runs `grep`, and calling `rg` always runs `rg` (likewise for
+`find` and `fd`). Missing programs and execution failures are errors, never
+triggers for fallback. None accepts free-form flags — use `bash` for a custom
+command line. Search `path` globs expand safely without executing shell code.
 
 Four behaviours are worth knowing:
 
@@ -474,15 +475,15 @@ Four behaviours are worth knowing:
   reports `(no matches)`. A search that *failed* — a pattern the program cannot
   parse, a path that does not exist — comes back as an error carrying the
   program's own message.
-- **The backends see different trees.** `rg` and `fd` skip what `.gitignore`
-  excludes and what is hidden, which the fallbacks do not. All four skip `.git`
-  itself, and none of them leaves the `path` it was given.
+- **The programs see different trees.** `rg` and `fd` skip ignored and hidden
+  paths by default; `hidden` and `no_ignore` can override those defaults.
+  `grep` and `find` include hidden and ignored paths, but prune `.git`.
 - **Limits.** A search that returns more than 256 KB is refused rather than cut
   short, and the message says how to narrow it. What does come back is shown up
   to 8 KB, marked `... (truncated)` beyond that.
 - **Regex flavour.** `grep`'s pattern is an extended regular expression —
-  `+`, `?`, `|` and `()` stand for themselves, as they do in `rg` — so the same
-  pattern selects the same lines whichever backend runs it.
+  `+`, `?`, `|` and `()` are operators, as they are in `rg`. More advanced
+  regex syntax can differ between the two programs.
 
 ### Patching code
 
