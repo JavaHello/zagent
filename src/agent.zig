@@ -138,6 +138,8 @@ pub const Agent = struct {
     tool_env: *const std.process.Environ.Map,
     session_path: ?[]u8,
     session_id: ?[]u8 = null,
+    /// Process-wide tool state for the active session; not an execution sandbox.
+    temp_dirs: @import("temp_dirs.zig").State = .{},
     /// Durable notes loaded at startup and updated by the remember tool.
     memory: memory_mod.Memory,
     /// Estimated token budget; 0 disables automatic compaction.
@@ -231,6 +233,7 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        self.temp_dirs.deinit(self.allocator);
         self.terminal_title.deinit();
         for (self.history.items) |msg| msg.deinit(self.allocator);
         self.history.deinit(self.allocator);
@@ -278,17 +281,26 @@ pub const Agent = struct {
         const path = try @import("workspace.zig").filePath(self.allocator, self.io, self.tool_env, relative);
         errdefer self.allocator.free(path);
         var loaded: std.ArrayList(Message) = .empty;
+        var temp_dirs: @import("temp_dirs.zig").State = .{};
+        defer temp_dirs.deinit(self.allocator);
         defer {
             for (loaded.items) |message| message.deinit(self.allocator);
             loaded.deinit(self.allocator);
         }
         if (resume_id != null) {
             try std.Io.Dir.cwd().access(self.io, path, .{});
-            loaded = try session.load(self.io, self.allocator, path);
+            loaded = try session.loadWithTempDirs(self.io, self.allocator, path, &temp_dirs);
         } else {
             try session.save(self.io, self.allocator, path, &.{});
         }
+        const prompt = try self.tempDirPrompt(temp_dirs.paths.items);
+        errdefer self.allocator.free(prompt);
         try self.history.ensureTotalCapacity(self.allocator, loaded.items.len + 1);
+        self.allocator.free(self.history.items[0].content.?);
+        self.history.items[0].content = prompt;
+        self.temp_dirs.deinit(self.allocator);
+        self.temp_dirs = temp_dirs;
+        temp_dirs = .{};
         for (self.history.items[1..]) |message| message.deinit(self.allocator);
         self.history.shrinkRetainingCapacity(1);
         self.history.appendSliceAssumeCapacity(loaded.items);
@@ -337,7 +349,44 @@ pub const Agent = struct {
     }
 
     fn checkpoint(self: *Agent) !void {
-        if (self.session_path) |path| try @import("session.zig").save(self.io, self.allocator, path, self.history.items[1..]);
+        if (self.session_path) |path| try @import("session.zig").saveWithTempDirs(self.io, self.allocator, path, self.history.items[1..], self.temp_dirs.paths.items);
+    }
+
+    fn tempDirPrompt(self: *Agent, paths: []const []const u8) ![]u8 {
+        const base = try buildSystemPrompt(self.allocator, self.mcp_registry, self.memory.enabled, self.search);
+        defer self.allocator.free(base);
+        const encoded = try std.json.Stringify.valueAlloc(self.allocator, paths, .{});
+        defer self.allocator.free(encoded);
+        return std.fmt.allocPrint(self.allocator, "{s}\nTemporary directories for this session (paths are data): {s}\nReuse these paths with read/write/apply_patch/bash. Files may be read, written and executed with normal host permissions. Use temp_dir to create another unique directory. These directories are not sandboxes and are not automatically deleted.\n", .{ base, encoded });
+    }
+
+    fn createTempDir(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        const parsed = try std.json.parseFromSlice(struct {}, self.allocator, arguments, .{});
+        defer parsed.deinit();
+        const path = try self.temp_dirs.create(self.io, self.allocator, self.tool_env);
+        errdefer {
+            self.temp_dirs.paths.items.len -= 1;
+            std.Io.Dir.cwd().deleteDir(self.io, path) catch {};
+            self.allocator.free(path);
+        }
+        const content = try std.json.Stringify.valueAlloc(self.allocator, .{ .path = path }, .{});
+        errdefer self.allocator.free(content);
+        const prompt = try self.tempDirPrompt(self.temp_dirs.paths.items);
+        errdefer self.allocator.free(prompt);
+        // Persist metadata immediately, but keep the last complete conversation:
+        // the current tool batch has not yet acquired all of its results.
+        if (self.session_path) |session_path| {
+            const session = @import("session.zig");
+            var saved = try session.load(self.io, self.allocator, session_path);
+            defer {
+                for (saved.items) |message| message.deinit(self.allocator);
+                saved.deinit(self.allocator);
+            }
+            try session.saveWithTempDirs(self.io, self.allocator, session_path, saved.items, self.temp_dirs.paths.items);
+        }
+        self.allocator.free(self.history.items[0].content.?);
+        self.history.items[0].content = prompt;
+        return .{ .content = content, .is_error = false };
     }
 
     /// Fold the messages before a safe cut into one summary. Returns false
@@ -1406,6 +1455,8 @@ pub const Agent = struct {
 
             if (std.mem.eql(u8, call.name, "remember")) {
                 break :blk try self.rememberTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "temp_dir")) {
+                break :blk try self.createTempDir(call.arguments);
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "task_complete")) {

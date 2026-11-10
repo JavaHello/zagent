@@ -67,6 +67,16 @@ Tool calls retain a 180-second default limit
 (`bash.timeout_seconds` accepts 1–3600), output bounds and process-group cleanup.
 Commands use `bash --noprofile --norc -c`, not `/bin/sh`.
 
+The `temp_dir` tool takes `{}` and returns `{"path":"/absolute/path"}` for a
+new, unique private directory (mode `0700`) under `$TMPDIR`, or `/tmp` if unset.
+Use existing tools such as `write`, `read`, `apply_patch` and `bash` to store,
+inspect and execute files there; no separate workspace or file API is needed.
+Paths are tracked in runtime state and saved with the session. Resuming restores
+still-existing directories without recreating deleted ones; clearing history
+keeps the paths, while a new session starts with an empty list. Directories and
+files are **not deleted on exit**. Remove them explicitly when no longer needed.
+These are ordinary host directories, not sandboxes or an extra authorization boundary.
+
 ```sh
 cd /path/to/project
 AI_PROVIDER=deepseek zagent "Analyze this project and update its documentation"
