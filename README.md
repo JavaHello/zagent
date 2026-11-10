@@ -159,10 +159,17 @@ a project fact, a decision that future work must respect), when the user runs
 something durable emerged. Duplicates are ignored, and the list is capped at
 200 notes of 500 bytes each.
 
-At startup the newest notes are added to the system prompt within a fixed
-budget, so a long memory cannot crowd out the instructions. `/memory` lists the
-notes, and `/forget <n>` or `/forget all` removes them. A read or write failure
-never breaks a session.
+Saved notes are not injected into the system prompt. The model uses
+`memory_search` on demand before relying on past preferences, project conventions,
+decisions or workarounds. Local keyword retrieval supports case-insensitive English
+and unspaced Chinese (character bigrams), ranks by relevance then recency, and
+returns up to 5 notes by default (maximum 10), within 4,000 bytes. This is lexical,
+not semantic search; retry with shorter keywords or synonyms when needed. The
+end-of-turn extractor receives only notes relevant to the current request rather
+than a bulk memory dump. Exact duplicate notes are still ignored on save.
+`remember` can add, replace or delete an exact note; `/memory` lists all notes,
+and `/forget <n>` or `/forget all` removes them. A read or write failure never
+breaks a session.
 
 ```sh
 AI_MEMORY=0 zagent                 # disable memory entirely

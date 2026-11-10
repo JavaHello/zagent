@@ -87,7 +87,7 @@ const SYSTEM_PROMPT =
 fn buildSystemPrompt(
     allocator: std.mem.Allocator,
     registry: *const mcp.Registry,
-    memory_section: ?[]const u8,
+    memory_enabled: bool,
     search: tools.SearchBackends,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -110,11 +110,8 @@ fn buildSystemPrompt(
             try aw.writer.writeByte('\n');
         }
     }
-    if (memory_section) |section| {
-        try aw.writer.writeByte('\n');
-        try aw.writer.writeAll(section);
-        try aw.writer.writeByte('\n');
-    }
+    try aw.writer.writeByte('\n');
+    try aw.writer.writeAll(if (memory_enabled) memory_mod.lookup_instructions else "Durable memory is disabled. Do not call memory_search or remember.\n");
 
     return aw.toOwnedSlice();
 }
@@ -185,13 +182,11 @@ pub const Agent = struct {
         else
             try memory_mod.Memory.initWithPath(allocator, io, null);
         errdefer memory.deinit();
-        const memory_section = try memory.promptSection(allocator, memory_mod.prompt_budget);
-        defer if (memory_section) |section| allocator.free(section);
 
         const search = tools.detectSearchBackends(io, env);
         var client = openai.Client.init(allocator, io, config);
         client.search = search;
-        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory_section, search);
+        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search);
         errdefer allocator.free(system_content);
         try history.append(allocator, .{
             .role = "system",
@@ -343,19 +338,6 @@ pub const Agent = struct {
         if (self.session_path) |path| try @import("session.zig").save(self.io, self.allocator, path, self.history.items[1..]);
     }
 
-    /// Rebuild the system prompt so notes saved during this session are part
-    /// of every later request.
-    fn refreshSystemPrompt(self: *Agent) !void {
-        const section = try self.memory.promptSection(self.allocator, memory_mod.prompt_budget);
-        defer if (section) |value| self.allocator.free(value);
-        const content = try buildSystemPrompt(self.allocator, self.mcp_registry, section, self.search);
-        errdefer self.allocator.free(content);
-
-        const previous = self.history.items[0].content;
-        self.history.items[0].content = content;
-        if (previous) |value| self.allocator.free(value);
-    }
-
     /// Fold the messages before a safe cut into one summary. Returns false
     /// when there is nothing safe to compact or the model could not produce a
     /// summary; in both cases the history is left as it was, because losing
@@ -478,7 +460,6 @@ pub const Agent = struct {
             try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
             return;
         };
-        self.refreshSystemPrompt() catch {};
         try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ remembered: {s}\n" ++ RESET, .{note});
     }
 
@@ -499,7 +480,6 @@ pub const Agent = struct {
                 try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
                 return;
             };
-            self.refreshSystemPrompt() catch {};
             try self.emit(std.Io.File.stderr(), DIM ++ "  all memories forgotten\n" ++ RESET, .{});
             return;
         }
@@ -515,8 +495,27 @@ pub const Agent = struct {
             try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
             return;
         };
-        self.refreshSystemPrompt() catch {};
         try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ forgot memory {d}\n" ++ RESET, .{number});
+    }
+
+    fn memorySearchTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        const parsed = std.json.parseFromSlice(struct {
+            query: []const u8,
+            limit: usize = 5,
+        }, self.allocator, arguments, .{}) catch {
+            return .{ .content = try self.allocator.dupe(u8, "Error: memory_search requires a query string and an optional integer limit (1-10)."), .is_error = true };
+        };
+        defer parsed.deinit();
+        const args = parsed.value;
+        if (std.mem.trim(u8, args.query, " \t\r\n").len == 0 or args.query.len > 512 or
+            !std.unicode.utf8ValidateSlice(args.query) or args.limit < 1 or args.limit > 10)
+        {
+            return .{ .content = try self.allocator.dupe(u8, "Error: query must be non-empty UTF-8 (at most 512 bytes); limit must be 1-10."), .is_error = true };
+        }
+        return .{
+            .content = try self.memory.search(self.allocator, args.query, args.limit, memory_mod.search_budget),
+            .is_error = !self.memory.enabled,
+        };
     }
 
     /// The remember tool: save one durable note and tell the model whether it
@@ -570,7 +569,6 @@ pub const Agent = struct {
             return .{ .content = try std.fmt.allocPrint(self.allocator, "Memory save failed: {s}", .{@errorName(err)}), .is_error = true };
         };
         std.mem.swap(memory_mod.Memory, &self.memory, &staged);
-        self.refreshSystemPrompt() catch {};
         return .{
             .content = try std.fmt.allocPrint(self.allocator, "Memory {s}: {s}", .{ parsed.value.action, note }),
             .is_error = false,
@@ -587,8 +585,8 @@ pub const Agent = struct {
         const from = if (self.history.items.len > window) self.history.items.len - window else 1;
         const transcript = try compact.renderTranscript(self.allocator, self.history.items, from, self.history.items.len);
         defer self.allocator.free(transcript);
-        const known = try self.memory.promptSection(self.allocator, memory_mod.prompt_budget);
-        defer if (known) |value| self.allocator.free(value);
+        const known = try self.memory.search(self.allocator, query, 5, memory_mod.search_budget);
+        defer self.allocator.free(known);
 
         const messages = try memory_mod.buildExtractMessages(self.allocator, query, transcript, known);
         defer memory_mod.freeExtractMessages(self.allocator, messages);
@@ -621,7 +619,6 @@ pub const Agent = struct {
             try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
             return;
         };
-        self.refreshSystemPrompt() catch {};
         try self.emit(std.Io.File.stderr(), DIM ++ "  ✧ remembered {d} note{s}\n" ++ RESET, .{ added, if (added == 1) "" else "s" });
     }
 
@@ -1403,6 +1400,8 @@ pub const Agent = struct {
 
             if (std.mem.eql(u8, call.name, "remember")) {
                 break :blk try self.rememberTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "memory_search")) {
+                break :blk try self.memorySearchTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
             } else if (std.mem.startsWith(u8, call.name, mcp.tool_prefix)) {
