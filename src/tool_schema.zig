@@ -123,9 +123,9 @@ pub const ask_user = ToolDefinition{
 
 pub const compact_context = ToolDefinition{
     .name = "compact_context",
-    .description = "Summarize older conversation messages to free context while preserving recent messages. You decide when this is useful; no automatic token threshold runs. Compaction happens after all calls in this batch finish. If there is no safe range or summarization fails, history stays unchanged.",
+    .description = "Summarize older conversation messages to free context while preserving recent messages. You decide when this is useful and how many recent messages to retain with keep_messages (default 16, minimum 2). No automatic token threshold runs. Compaction happens after all calls in this batch finish; the first valid request sets retention for the batch. If there is no safe range or summarization fails, history stays unchanged.",
     .parameters_json =
-    \\{"type":"object","properties":{},"required":[],"additionalProperties":false}
+    \\{"type":"object","properties":{"keep_messages":{"type":"integer","minimum":2,"maximum":4294967295,"description":"Recent messages to preserve verbatim; choose based on current work. Defaults to 16. Safe tool boundaries may retain fewer messages."}},"required":[],"additionalProperties":false}
     ,
 };
 

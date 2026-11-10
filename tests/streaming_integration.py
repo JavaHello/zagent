@@ -34,7 +34,7 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-stream-') as directory:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_KEY': 'test',
-               'AI_MODEL': 'mock', 'AI_MEMORY': '0'}
+               'AI_MODEL': 'mock'}
         trust_workspace(directory, env)
         for answer in ('Plain answer', '中文与 emoji 😀', '# Heading\n\n**bold**\n',
                        'first\nsecond', '```zig\nconst n = 1;\n```'):

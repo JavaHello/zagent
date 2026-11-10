@@ -31,8 +31,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
     original = termios.tcgetattr(slave)
     env = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory,
                XDG_STATE_HOME=str(root / 'state'),
-               TERM='xterm-256color', AI_KEY='test', AI_MODEL='popup-mock',
-               AI_MEMORY='0')
+               TERM='xterm-256color', AI_KEY='test', AI_MODEL='popup-mock')
     trust_workspace(directory, env)
     process = subprocess.Popen([str(binary)], cwd=directory, env=env,
                                stdin=slave, stdout=slave, stderr=slave)

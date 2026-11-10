@@ -82,8 +82,7 @@ try:
         ])
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': base + '/v1', 'AI_MODEL': 'mock', 'AI_KEY': 'local-test',
-               'AI_MAX_ITERATIONS': '12',
-               'AI_MEMORY': '1', 'AI_MEMORY_AUTO': '0'}
+               'AI_MAX_ITERATIONS': '12'}
         trust_workspace(directory, env)
         result = subprocess.run([str(binary), 'Exercise tool contracts'], cwd=directory,
                                 env=env, capture_output=True, text=True, timeout=60)

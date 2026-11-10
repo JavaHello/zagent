@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""On-demand memory retrieval, bounded tool contracts and extraction context."""
+"""On-demand memory retrieval with no extra end-of-turn extraction request."""
 import http.server
 import json
 from pathlib import Path
@@ -58,7 +58,7 @@ try:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1',
                'AI_MODEL': 'mock', 'AI_KEY': 'test',
-               'AI_MAX_ITERATIONS': '12', 'AI_MEMORY_AUTO': '1', 'AI_MEMORY': '1'}
+               'AI_MAX_ITERATIONS': '12'}
         state = trust_workspace(directory, env)
         relevant = '中文 tmux clipboard workaround'
         unrelated = 'UNRELATED_SECRET_SENTINEL build command'
@@ -82,11 +82,12 @@ try:
             status = json.loads(output.split('\n', 1)[0][len('[tool_status '):-1])
             assert status['is_error'] == (index in (2, 3, 4, 7)), (index, output)
         assert 'tmux new durable note' in results[6] and relevant not in results[6]
-        assert len(extractions) == 1, (extractions, result.stderr)
-        extraction = json.dumps(extractions[0], ensure_ascii=False)
-        assert relevant in extraction and unrelated not in extraction
+        assert not extractions, (extractions, result.stderr)
+        saved = (state / 'memory.md').read_text()
+        assert 'tmux new durable note' in saved
+        assert relevant in saved and unrelated in saved
 finally:
     server.shutdown()
     server.server_close()
 
-print('PASS: on-demand memory, validation, fresh lookups and relevant-only extraction')
+print('PASS: model-driven memory, validation, fresh lookups and no automatic extraction')

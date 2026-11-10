@@ -141,7 +141,8 @@ A long conversation eventually costs more context than the model has. The main
 model decides when to call `compact_context`; there is no automatic token
 threshold or separate compaction-decision request. The operation runs after
 the current tool batch finishes. Older messages are replaced by one summary,
-with `AI_COMPACT_KEEP` (16 by default) as the recent-message retention target.
+with the model choosing the recent-message retention target through the tool's
+`keep_messages` argument (default 16, minimum 2).
 
 The summary is produced by the model in bounded chunks, each one carrying the
 summary so far, so compacting a very large history never needs a single
@@ -151,19 +152,14 @@ produce a usable summary, the history is left untouched and the turn continues;
 losing the conversation is worse than one turn over budget. `/compact` runs the
 same operation on demand.
 
-```sh
-# Keep a smaller recent-message tail when the model requests compaction
-AI_COMPACT_KEEP=4 zagent
-```
-
 ## Memory
 
 zagent keeps durable notes between sessions in the global `memory.md` scoped to the
 workspace — a plain markdown list the user can read and edit. A note is saved
 when the model calls the `remember` tool at a key point (a preferred convention,
 a project fact, a decision that future work must respect), when the user runs
-`/remember <text>`, or when the conservative end-of-turn extractor decides that
-something durable emerged. Duplicates are ignored, and the list is capped at
+`/remember <text>`. The main model decides what to save; there is no separate
+end-of-turn extraction request. Duplicates are ignored, and the list is capped at
 200 notes of 500 bytes each.
 
 Saved notes are not injected into the system prompt. The model uses
@@ -171,16 +167,13 @@ Saved notes are not injected into the system prompt. The model uses
 decisions or workarounds. Local keyword retrieval supports case-insensitive English
 and unspaced Chinese (character bigrams), ranks by relevance then recency, and
 returns up to 5 notes by default (maximum 10), within 4,000 bytes. This is lexical,
-not semantic search; retry with shorter keywords or synonyms when needed. The
-end-of-turn extractor receives only notes relevant to the current request rather
-than a bulk memory dump. Exact duplicate notes are still ignored on save.
+not semantic search; retry with shorter keywords or synonyms when needed.
+Exact duplicate notes are still ignored on save.
 `remember` can add, replace or delete an exact note; `/memory` lists all notes,
 and `/forget <n>` or `/forget all` removes them. A read or write failure never
 breaks a session.
 
 ```sh
-AI_MEMORY=0 zagent                 # disable memory entirely
-AI_MEMORY_AUTO=0 zagent            # keep the remember tool, skip the per-turn extractor
 AI_MEMORY_FILE=/path/to/notes.md zagent
 ```
 
@@ -209,7 +202,7 @@ Configuration can be loaded from a config file and/or environment variables. The
 - `$XDG_CONFIG_HOME/zagent` (if `XDG_CONFIG_HOME` is set)
 - `~/.config/zagent` (fallback)
 
-The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_MARKDOWN`, `AI_COMPACT_KEEP`, `AI_MEMORY`, `AI_MEMORY_AUTO`. Environment variables override config file values.
+The file supports `key=value` lines (comments start with `#`). Supported keys are `AI_PROVIDER`, `AI_URL`, `AI_KEY`, `AI_MODEL`, `AI_MAX_TOKENS`, `AI_MAX_ITERATIONS`, `AI_REASONING_EFFORT`, `AI_SERVICE_TIER`. Environment variables override config file values.
 
 See `zagent.example.conf` for a complete example config file, and
 `mcp.example.json` for the MCP servers zagent can be given.
@@ -225,10 +218,6 @@ All configuration is also supported through environment variables:
 | `AI_MODEL`     | `gpt-4o-mini`                    | Model to use                         |
 | `AI_MAX_TOKENS`| `8192`                           | Initial output token budget per response    |
 | `AI_MAX_ITERATIONS` | `200`                      | Maximum tool-call loop iterations    |
-| `AI_MARKDOWN`      | `true`                           | Render assistant markdown in a terminal |
-| `AI_COMPACT_KEEP`  | `16`                             | Newest messages kept verbatim across a compaction |
-| `AI_MEMORY`        | `true`                           | Keep durable notes in the workspace and expose the `remember` tool |
-| `AI_MEMORY_AUTO`   | `true`                           | Ask the model after each turn whether anything should be remembered |
 | `AI_MEMORY_FILE`   | Global workspace state: `memory.md` | Override where the notes are stored |
 
 Use `AI_` settings in both the config file and environment. An explicit value wins over the provider preset. Provider-specific API keys (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) are read from the environment; use `AI_KEY` in the config file.
@@ -239,7 +228,7 @@ When a response hits `max_output_tokens`, the main conversation retries the same
 
 Replies are markdown, and in a terminal they are rendered rather than printed as literal markers: headings, emphasis, inline code and fenced blocks get styling, lists and quotes get a prefix, and lines that carry a prefix wrap with a hanging indent so continuation lines never fall back to the left margin. Tables are laid out in columns, with `:---`, `:---:` and `---:` honoured and cells wrapped inside their column when the table is wider than the terminal. Plain paragraphs are left to the terminal's own soft-wrap.
 
-Output that is not a terminal — piped, redirected, or under `TERM=dumb` — gets the raw markdown instead, so `zagent "..." > notes.md` and `zagent "..." | grep` see exactly what the model wrote. Set `AI_MARKDOWN=0` to turn rendering off in a terminal as well.
+Output that is not a terminal — piped, redirected, or under `TERM=dumb` — gets the raw markdown instead, so `zagent "..." > notes.md` and `zagent "..." | grep` see exactly what the model wrote. Rendering is selected automatically from terminal capabilities; no configuration switch is needed.
 
 The startup wordmark uses the terminal theme's standard ANSI cyan, with no custom RGB colours, 256-colour palette or gradient. Other semantic UI colours also use the terminal's standard palette and follow its theme. Output is uncoloured when stdout is not a terminal, `TERM=dumb`, or `NO_COLOR` is non-empty. When the window is too narrow for the letterforms, a one-line `✦ zagent` takes their place.
 

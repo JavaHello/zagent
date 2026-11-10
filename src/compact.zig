@@ -183,8 +183,8 @@ pub fn messageWeight(message: Message) usize {
     return weight;
 }
 
-/// Render messages `[from, to)` as plain text for a summarizer or a memory
-/// extractor. Long values are truncated, not dropped: what was done matters
+/// Render messages `[from, to)` as plain text for a summarizer.
+/// Long values are truncated, not dropped: what was done matters
 /// more than every byte of its output.
 pub fn renderTranscript(
     allocator: std.mem.Allocator,

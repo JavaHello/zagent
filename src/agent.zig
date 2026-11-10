@@ -136,10 +136,6 @@ pub const Agent = struct {
     temp_dirs: @import("temp_dirs.zig").State = .{},
     /// Durable notes loaded at startup and updated by the remember tool.
     memory: memory_mod.Memory,
-    /// Newest messages kept verbatim across a compaction.
-    compact_keep: u32,
-    /// Ask the model after each turn whether anything should be remembered.
-    memory_auto: bool,
     /// Whether to render the model's markdown for a terminal. Decided once, in
     /// `init`, so the answer path never has to ask the operating system.
     render_markdown: bool,
@@ -173,10 +169,7 @@ pub const Agent = struct {
         var history: std.ArrayList(Message) = .empty;
         errdefer history.deinit(allocator);
 
-        var memory = if (config.memory)
-            try memory_mod.Memory.init(allocator, io, env)
-        else
-            try memory_mod.Memory.initWithPath(allocator, io, null);
+        var memory = try memory_mod.Memory.init(allocator, io, env);
         errdefer memory.deinit();
 
         const search = tools.detectSearchBackends(io, env);
@@ -203,13 +196,10 @@ pub const Agent = struct {
             .tool_env = env,
             .session_path = null,
             .memory = memory,
-            .compact_keep = config.compact_keep,
-            .memory_auto = config.memory and config.memory_auto,
             // The check is on stdout rather than on `linenoise.is_tty`, which
             // describes stdin: `zagent "q" < file` with a terminal on stdout
             // should still render, and `zagent "q" | less` must not.
-            .render_markdown = config.markdown and
-                linenoise.term_supported and
+            .render_markdown = linenoise.term_supported and
                 (std.Io.File.stdout().isTty(io) catch false),
             // stderr as well as stdout, unlike the renderer: the animation is
             // written to stderr, and a run whose stdout is a file or a pager is
@@ -383,8 +373,8 @@ pub const Agent = struct {
     /// when there is nothing safe to compact or the model could not produce a
     /// summary; in both cases the history is left as it was, because losing
     /// the conversation is worse than exceeding the budget by one turn.
-    fn compactHistory(self: *Agent, turn_start: ?*usize) !bool {
-        const cut = compact.findCut(self.history.items, self.compact_keep) orelse return false;
+    fn compactHistory(self: *Agent, turn_start: ?*usize, keep_messages: u32) !bool {
+        const cut = compact.findCut(self.history.items, keep_messages) orelse return false;
         const before = compact.estimateTokens(self.history.items);
 
         const summary = self.summarizeRange(1, cut) catch |err| {
@@ -405,8 +395,8 @@ pub const Agent = struct {
             if (index.* >= cut) {
                 index.* -= shift;
             } else {
-                // The turn began in the part that was summarized; the first
-                // kept message is the nearest point memory extraction can use.
+                // The turn began in the summarized range; move its index to
+                // the first retained message.
                 index.* = @min(index.*, 2);
             }
         }
@@ -454,11 +444,11 @@ pub const Agent = struct {
 
     /// `/compact`: explicitly summarize the older part of the conversation.
     pub fn compactCommand(self: *Agent) !void {
-        if (compact.findCut(self.history.items, self.compact_keep) == null) {
+        if (compact.findCut(self.history.items, 16) == null) {
             try self.emit(std.Io.File.stderr(), DIM ++ "  nothing to compact yet\n" ++ RESET, .{});
             return;
         }
-        _ = try self.compactHistory(null);
+        _ = try self.compactHistory(null, 16);
     }
 
     /// `/memory`: list what is saved, newest last.
@@ -556,7 +546,7 @@ pub const Agent = struct {
     fn rememberTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
         if (!self.memory.enabled) {
             return .{
-                .content = try self.allocator.dupe(u8, "Memory is disabled (AI_MEMORY=0)."),
+                .content = try self.allocator.dupe(u8, "Memory is unavailable: no storage path could be resolved."),
                 .is_error = true,
             };
         }
@@ -606,53 +596,6 @@ pub const Agent = struct {
             .content = try std.fmt.allocPrint(self.allocator, "Memory {s}: {s}", .{ parsed.value.action, note }),
             .is_error = false,
         };
-    }
-
-    /// After a turn, ask the model whether anything durable emerged. This is
-    /// deliberately conservative, and does nothing when memory is off.
-    fn extractMemories(self: *Agent, query: []const u8) !void {
-        if (!self.memory_auto or !self.memory.enabled) return;
-        if (self.history.items.len <= 1) return;
-
-        const window = 12;
-        const from = if (self.history.items.len > window) self.history.items.len - window else 1;
-        const transcript = try compact.renderTranscript(self.allocator, self.history.items, from, self.history.items.len);
-        defer self.allocator.free(transcript);
-        const known = try self.memory.search(self.allocator, query, 5, memory_mod.search_budget);
-        defer self.allocator.free(known);
-
-        const messages = try memory_mod.buildExtractMessages(self.allocator, query, transcript, known);
-        defer memory_mod.freeExtractMessages(self.allocator, messages);
-
-        self.terminal_title.update("checking memory…", self.current_task);
-        defer self.terminal_title.update("ready", self.current_task);
-        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "checking memory…", self.progressOptions());
-        defer spin.stop();
-        const response = self.client.respondWithoutTools(messages) catch {
-            // Optional work: drop the stored HTTP detail rather than letting a
-            // later, unrelated failure report it as its own.
-            if (self.client.takeHttpError()) |message| self.allocator.free(message);
-            return;
-        };
-        defer response.deinit(self.allocator);
-        if (!std.mem.eql(u8, response.finish_reason, "stop")) return;
-        const content = response.content orelse return;
-
-        var extracted = memory_mod.parseExtraction(self.allocator, content);
-        defer extracted.deinit();
-        if (extracted.notes.items.len == 0) return;
-
-        var added: usize = 0;
-        for (extracted.notes.items) |note| {
-            if (self.memory.add(note) catch false) added += 1;
-        }
-        if (added == 0) return;
-
-        self.memory.save() catch |err| {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
-            return;
-        };
-        try self.emit(std.Io.File.stderr(), DIM ++ "  ✧ remembered {d} note{s}\n" ++ RESET, .{ added, if (added == 1) "" else "s" });
     }
 
     /// Settle unanswered calls after an interrupted query.
@@ -716,10 +659,6 @@ pub const Agent = struct {
             counts.input,
             counts.output,
         });
-        // The extraction is a small extra request, so it runs after the
-        // user's own stats and never turns a finished answer into an error.
-        try self.checkInterrupted();
-        self.extractMemories(query) catch {};
         try self.checkInterrupted();
         switch (outcome) {
             .completed => try self.emit(std.Io.File.stderr(), BOLD ++ GREEN ++ "  ✓ Task completed" ++ RESET ++ "\n", .{}),
@@ -991,7 +930,8 @@ pub const Agent = struct {
                 var compacted: ?bool = null;
                 for (tool_calls) |call| {
                     if (!std.mem.eql(u8, call.name, "compact_context")) continue;
-                    if (compacted == null) compacted = try self.compactHistory(start);
+                    const keep = compactKeep(self.allocator, call.arguments) catch continue;
+                    if (compacted == null) compacted = try self.compactHistory(start, keep);
                     for (self.history.items) |*message| {
                         const id = message.tool_call_id orelse continue;
                         if (!std.mem.eql(u8, id, call.id)) continue;
@@ -1327,6 +1267,9 @@ pub const Agent = struct {
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "compact_context")) {
+                _ = compactKeep(self.allocator, call.arguments) catch {
+                    break :blk .{ .content = try self.allocator.dupe(u8, "Error: keep_messages must be an integer of at least 2."), .is_error = true };
+                };
                 break :blk .{ .content = try self.allocator.dupe(u8, "Context compaction requested; it runs after this tool batch finishes."), .is_error = false };
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
@@ -1616,9 +1559,34 @@ fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptim
     try file.writeStreamingAll(io, message);
 }
 
-/// A standalone agent for tests. The line editor and MCP registry live beside
-/// it because the agent only borrows them, and the whole harness is
-/// heap-allocated so their addresses stay valid while it runs.
+fn compactKeep(allocator: std.mem.Allocator, arguments: []const u8) !u32 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCompactKeep;
+    if (parsed.value.object.count() == 0) return 16;
+    if (parsed.value.object.count() != 1) return error.InvalidCompactKeep;
+    const value = parsed.value.object.get("keep_messages") orelse return error.InvalidCompactKeep;
+    if (value != .integer or value.integer < 2 or value.integer > std.math.maxInt(u32)) return error.InvalidCompactKeep;
+    return @intCast(value.integer);
+}
+
+test "model chooses compaction retention with safe bounds" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(u32, 16), try compactKeep(a, "{}"));
+    try std.testing.expectEqual(@as(u32, 4), try compactKeep(a, "{\"keep_messages\":4}"));
+    for ([_][]const u8{
+        "{\"keep_messages\":0}",  "{\"keep_messages\":1}",
+        "{\"keep_messages\":-1}", "{\"keep_messages\":\"4\"}",
+        "not json",
+    }) |invalid| {
+        if (compactKeep(a, invalid)) |_| {
+            return error.ExpectedInvalidRetention;
+        } else |_| {}
+    }
+}
+
+/// A standalone agent with a hermetic environment for tests. The line editor
+/// and MCP registry live beside it because the agent only borrows them.
 const TestHarness = struct {
     env: std.process.Environ.Map,
     config: Config,
@@ -1635,8 +1603,8 @@ const TestHarness = struct {
         try self.env.put("AI_URL", "http://127.0.0.1:1/v1");
         try self.env.put("AI_MODEL", "test-model");
         try self.env.put("AI_KEY", "test-key");
-        // Never read or write the developer's real memory file from a test.
-        try self.env.put("AI_MEMORY", "0");
+        // No home/state directory: tests never resolve the developer's memory.
+        // Tests that need memory install their own storage explicitly.
 
         self.config = try Config.load(allocator, io, &self.env);
         errdefer self.config.deinit();
@@ -1787,7 +1755,6 @@ test "compaction replaces old turns with a summary and keeps the recent ones" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);
     defer harness.deinit(allocator);
-    harness.agent.compact_keep = 2;
 
     try harness.agent.appendUserMessage("one");
     try harness.agent.appendAssistantText("answer one");
@@ -1805,7 +1772,7 @@ test "compaction replaces old turns with a summary and keeps the recent ones" {
     {
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
-        try harness.agent.compactCommand();
+        try std.testing.expect(try harness.agent.compactHistory(null, 2));
     }
 
     // system, summary, then the newest turn verbatim.
@@ -1825,14 +1792,13 @@ test "model compaction waits for the whole tool batch and coalesces requests" {
         defer harness.deinit(allocator);
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
-        harness.agent.compact_keep = 4;
         for (0..3) |_| {
             try harness.agent.appendUserMessage("old question");
             try harness.agent.appendAssistantText("old answer");
         }
         const batch =
             "{\"status\":\"completed\",\"output\":[" ++
-            "{\"type\":\"function_call\",\"call_id\":\"compact1\",\"name\":\"compact_context\",\"arguments\":\"{}\"}," ++
+            "{\"type\":\"function_call\",\"call_id\":\"compact1\",\"name\":\"compact_context\",\"arguments\":\"{\\\"keep_messages\\\":4}\"}," ++
             "{\"type\":\"function_call\",\"call_id\":\"list\",\"name\":\"ls\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}," ++
             "{\"type\":\"function_call\",\"call_id\":\"compact2\",\"name\":\"compact_context\",\"arguments\":\"{}\"}]}";
         var mock: MockTransport = .{ .replies = &.{ batch, if (usable_summary) completed_answer else truncated_call, completed_answer } };
@@ -1886,7 +1852,6 @@ test "large history does not trigger compaction without a model request" {
     defer harness.deinit(allocator);
     var quiet = try Silence.init(std.testing.io);
     defer quiet.deinit(std.testing.io);
-    harness.agent.compact_keep = 2;
     const large = try allocator.alloc(u8, 200_000);
     defer allocator.free(large);
     @memset(large, 'x');

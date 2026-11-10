@@ -31,7 +31,7 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 
 工具定义使用 Responses 的扁平结构，工具结果通过 `call_id` 关联。请求设置 `store: false`，保留并回放全部输出 items（包括加密推理数据）；会话恢复也保留这些数据。旧版会话的消息、函数调用和结果会转换为 Responses 输入，旧的自由文本 `reasoning_content` 不会作为推理 item 发送。
 
-配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_MARKDOWN`、`AI_COMPACT_KEEP`、`AI_MEMORY`、`AI_MEMORY_AUTO`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。
+配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_REASONING_EFFORT`、`AI_SERVICE_TIER`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。Markdown 根据终端能力自动渲染，管道和文件输出保留原始 Markdown，无需配置开关。
 
 ## 复制文本
 
@@ -77,9 +77,9 @@ zagent --resume <会话id> "继续任务"
 
 ## 上下文压缩与记忆
 
-主模型自行决定何时调用 `compact_context` 压缩上下文，不再按固定 token 阈值触发，也不额外请求模型判断是否需要压缩。压缩在当前整批工具调用完成后执行，把较早的消息替换为模型生成的摘要，以 `AI_COMPACT_KEEP`（默认 16 条）为近期原文保留目标。摘要按大小分块生成，每块都带上已有摘要，因此压缩很长的历史也不需要一次超大请求。切分点只会落在不会拆散“工具调用 + 工具结果”的位置；如果没有安全切分点或模型没能给出可用摘要，历史保持不变，工具结果会说明未压缩。`/compact` 仍可手动触发同样的操作。
+主模型自行决定何时调用 `compact_context` 压缩上下文，并通过工具参数 `keep_messages` 选择近期原文保留目标（省略时为 16 条，最少 2 条），不再按固定 token 阈值触发，也不额外请求模型判断是否需要压缩。压缩在当前整批工具调用完成后执行，把较早的消息替换为模型生成的摘要。摘要按大小分块生成，每块都带上已有摘要，因此压缩很长的历史也不需要一次超大请求。切分点只会落在不会拆散“工具调用 + 工具结果”的位置；如果没有安全切分点或模型没能给出可用摘要，历史保持不变，工具结果会说明未压缩。`/compact` 仍可手动触发同样的操作，默认保留目标为 16 条。
 
-全局工作区状态目录中的 `memory.md` 保存按目录关联的跨会话长期记忆，格式是可直接阅读和编辑的 Markdown 列表。模型在关键点调用 `remember` 工具、用户执行 `/remember <文本>`，或每轮结束后的保守提取器判断出现了值得长期保存的信息时，都会写入一条笔记。重复内容会被忽略，最多保留 200 条，每条 500 字节。记忆正文不再注入系统提示；模型在需要历史偏好、项目约定、决策或已知解决方案时，通过 `memory_search` 按需查询。本地关键词检索支持英文忽略大小写及中文无空格短语（相邻字符匹配），按相关性排序、同分优先较新记录；默认最多返回 5 条，可指定 1–10 条，总量不超过 4,000 字节。这不是语义搜索，无匹配时可换用短关键词或同义词。每轮自动提取也仅接收与当前请求相关的笔记，保存时仍忽略完全重复项。`remember` 支持新增及精确替换、删除笔记。`/memory` 列出笔记，`/forget <序号>` 或 `/forget all` 删除。记忆文件读写失败不会影响正常对话；`AI_MEMORY=0` 关闭该功能，`AI_MEMORY_AUTO=0` 只关闭每轮自动提取，`AI_MEMORY_FILE` 可指定其它文件。
+全局工作区状态目录中的 `memory.md` 保存按目录关联的跨会话长期记忆，格式是可直接阅读和编辑的 Markdown 列表。是否保存、何时保存完全由主模型按需调用 `remember` 决定，不再每轮额外请求模型自动提取；用户也可执行 `/remember <文本>`。重复内容会被忽略，最多保留 200 条，每条 500 字节。记忆正文不再注入系统提示；模型在需要历史偏好、项目约定、决策或已知解决方案时，通过 `memory_search` 按需查询。本地关键词检索支持英文忽略大小写及中文无空格短语（相邻字符匹配），按相关性排序、同分优先较新记录；默认最多返回 5 条，可指定 1–10 条，总量不超过 4,000 字节。这不是语义搜索，无匹配时可换用短关键词或同义词。`remember` 支持新增及精确替换、删除笔记。`/memory` 列出笔记，`/forget <序号>` 或 `/forget all` 删除。记忆文件读写失败不会影响正常对话；`AI_MEMORY_FILE` 可指定其它文件。
 
 交互模式支持 `/help`、`/model`、`/status`、`/mcp`、`/compact`、`/memory`、`/remember`、`/forget`、`/clear`、`/quit`。`/status` 显示当前模型、最近一轮的输入/输出 token 数（服务端统计或本地估算）；Codex 模式还会查询 ChatGPT 订阅额度，显示各时间窗口的已用/剩余比例和重置倒计时。其他服务商的账户额度请查看其计费控制台。该命令不调用模型、不消耗对话 token；额度查询失败不会影响对话。`/clear` 同时清空持久化会话。单次查询模式将回答直接写入标准输出，可用于重定向生成文档。
 

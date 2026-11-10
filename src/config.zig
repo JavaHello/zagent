@@ -12,12 +12,6 @@ pub const max_output_tokens_ceiling: u32 = 8192;
 /// ceiling needs a larger value, which `AI_MAX_TOKENS` still provides.
 const default_max_tokens: u32 = max_output_tokens_ceiling;
 const default_max_iterations: u32 = 200;
-const default_markdown = true;
-/// Newest messages kept verbatim when the rest of the conversation is
-/// summarized.
-const default_compact_keep: u32 = 16;
-const default_memory = true;
-const default_memory_auto = true;
 
 const ConfigFile = struct {
     provider: ?[]u8 = null,
@@ -28,10 +22,6 @@ const ConfigFile = struct {
     service_tier: ?[]u8 = null,
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
-    markdown: ?bool = null,
-    compact_keep: ?u32 = null,
-    memory: ?bool = null,
-    memory_auto: ?bool = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
         if (self.provider) |value| allocator.free(value);
@@ -161,14 +151,6 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
         config.max_iterations = std.fmt.parseInt(u32, value, 10) catch default_max_iterations;
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_MARKDOWN")) {
-        config.markdown = parseBool(value);
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_COMPACT_KEEP")) {
-        config.compact_keep = std.fmt.parseInt(u32, value, 10) catch default_compact_keep;
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_MEMORY")) {
-        config.memory = parseBool(value);
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_MEMORY_AUTO")) {
-        config.memory_auto = parseBool(value);
     }
 }
 
@@ -289,39 +271,6 @@ fn resolveU32(
     return file_value orelse fallback;
 }
 
-const truthy = [_][]const u8{ "1", "true", "yes", "on", "y", "t" };
-const falsy = [_][]const u8{ "0", "false", "no", "off", "n", "f" };
-
-/// Parse a boolean setting. Anything unrecognised reads as "unset", so a typo
-/// leaves the default in place rather than silently flipping a feature off.
-fn parseBool(raw: []const u8) ?bool {
-    const value = std.mem.trim(u8, raw, " \t");
-    for (truthy) |candidate| {
-        if (std.ascii.eqlIgnoreCase(value, candidate)) return true;
-    }
-    for (falsy) |candidate| {
-        if (std.ascii.eqlIgnoreCase(value, candidate)) return false;
-    }
-    return null;
-}
-
-fn resolveBool(
-    allocator: std.mem.Allocator,
-    env: *const std.process.Environ.Map,
-    env_names: []const []const u8,
-    file_value: ?bool,
-    fallback: bool,
-) !bool {
-    for (env_names) |name| {
-        const raw = try envVarOwned(allocator, env, name) orelse continue;
-        defer allocator.free(raw);
-        // An empty value means "not set", matching `firstEnv`.
-        if (raw.len == 0) continue;
-        return parseBool(raw) orelse fallback;
-    }
-    return file_value orelse fallback;
-}
-
 /// `openai.zig` appends "/responses" to the base URL, so a trailing
 /// slash here would produce a doubled separator. Takes ownership of `url`.
 fn trimTrailingSlashes(allocator: std.mem.Allocator, url: []u8) ![]u8 {
@@ -400,37 +349,6 @@ fn resolve(
         file_config.max_iterations,
         default_max_iterations,
     );
-    const markdown = try resolveBool(
-        allocator,
-        env,
-        &.{"AI_MARKDOWN"},
-        file_config.markdown,
-        default_markdown,
-    );
-    const compact_keep = @max(
-        try resolveU32(
-            allocator,
-            env,
-            &.{"AI_COMPACT_KEEP"},
-            file_config.compact_keep,
-            default_compact_keep,
-        ),
-        2,
-    );
-    const memory = try resolveBool(
-        allocator,
-        env,
-        &.{"AI_MEMORY"},
-        file_config.memory,
-        default_memory,
-    );
-    const memory_auto = try resolveBool(
-        allocator,
-        env,
-        &.{"AI_MEMORY_AUTO"},
-        file_config.memory_auto,
-        default_memory_auto,
-    );
 
     return .{
         .allocator = allocator,
@@ -441,10 +359,6 @@ fn resolve(
         .service_tier = service_tier,
         .max_tokens = max_tokens,
         .max_iterations = max_iterations,
-        .markdown = markdown,
-        .compact_keep = compact_keep,
-        .memory = memory,
-        .memory_auto = memory_auto,
         .provider = selected_provider,
     };
 }
@@ -458,15 +372,6 @@ pub const Config = struct {
     service_tier: ?[]const u8 = null,
     max_tokens: u32,
     max_iterations: u32,
-    /// Render assistant markdown for a terminal instead of printing it raw.
-    /// A stdout that is not a terminal always prints raw, whatever this says.
-    markdown: bool,
-    /// Newest messages kept verbatim across a compaction.
-    compact_keep: u32,
-    /// Keep durable notes between sessions, and expose the remember tool.
-    memory: bool,
-    /// Ask the model after each turn whether anything should be remembered.
-    memory_auto: bool,
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
     codex_auth_path: ?[]const u8 = null,
@@ -551,105 +456,28 @@ test "config defaults" {
     try std.testing.expectEqualStrings("", config.api_key);
     try std.testing.expectEqual(@as(u32, 8192), config.max_tokens);
     try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
-    try std.testing.expect(config.markdown);
-    try std.testing.expectEqual(default_compact_keep, config.compact_keep);
-    try std.testing.expect(config.memory);
-    try std.testing.expect(config.memory_auto);
 }
 
-fn markdownSetting(
-    allocator: std.mem.Allocator,
-    env_pairs: []const [2][]const u8,
-    file_value: ?bool,
-) !bool {
-    var env = try testEnv(allocator, env_pairs);
+test "removed presentation, compaction and memory settings are ignored" {
+    const allocator = std.testing.allocator;
+    const pairs = &[_][2][]const u8{
+        .{ "AI_MARKDOWN", "false" },
+        .{ "AI_COMPACT_KEEP", "1" },
+        .{ "AI_MEMORY", "false" },
+        .{ "AI_MEMORY_AUTO", "false" },
+    };
+    var env = try testEnv(allocator, pairs);
     defer env.deinit();
-
-    var file_config = ConfigFile{ .markdown = file_value };
+    var file_config = try testFile(allocator, pairs);
     defer file_config.deinit(allocator);
-
     const config = try resolve(allocator, &file_config, &env);
     defer config.deinit();
-    return config.markdown;
-}
-
-test "AI_MARKDOWN reads booleans from either source" {
-    const allocator = std.testing.allocator;
-
-    // The environment wins over the file.
-    try std.testing.expect(!try markdownSetting(allocator, &.{.{ "AI_MARKDOWN", "false" }}, true));
-    try std.testing.expect(try markdownSetting(allocator, &.{.{ "AI_MARKDOWN", "true" }}, false));
-
-    // The file alone is honoured, in any of the accepted spellings.
-    try std.testing.expect(!try markdownSetting(allocator, &.{}, false));
-    try std.testing.expect(try markdownSetting(allocator, &.{}, true));
-}
-
-test "an unusable AI_MARKDOWN value leaves the default in place" {
-    const allocator = std.testing.allocator;
-
-    // A typo must not silently turn the feature off.
-    try std.testing.expect(try markdownSetting(allocator, &.{.{ "AI_MARKDOWN", "maybe" }}, null));
-    // An empty value means "not set", as it does for every other setting.
-    try std.testing.expect(try markdownSetting(allocator, &.{.{ "AI_MARKDOWN", "" }}, null));
-}
-
-test "parseBool accepts the documented spellings" {
-    try std.testing.expectEqual(@as(?bool, true), parseBool("true"));
-    try std.testing.expectEqual(@as(?bool, true), parseBool("ON"));
-    try std.testing.expectEqual(@as(?bool, true), parseBool(" 1 "));
-    try std.testing.expectEqual(@as(?bool, false), parseBool("No"));
-    try std.testing.expectEqual(@as(?bool, false), parseBool("off"));
-    try std.testing.expectEqual(@as(?bool, null), parseBool("yep"));
-    try std.testing.expectEqual(@as(?bool, null), parseBool("2"));
-}
-
-test "compaction and memory settings prefer the environment and keep zero" {
-    const allocator = std.testing.allocator;
-
-    {
-        var env = try testEnv(allocator, &.{
-            .{ "AI_COMPACT_KEEP", "4" },
-            .{ "AI_MEMORY", "false" },
-            .{ "AI_MEMORY_AUTO", "off" },
-        });
-        defer env.deinit();
-
-        var file_config = try testFile(allocator, &.{
-            .{ "AI_COMPACT_KEEP", "8" },
-            .{ "AI_MEMORY", "true" },
-            .{ "AI_MEMORY_AUTO", "true" },
-        });
-        defer file_config.deinit(allocator);
-
-        const config = try resolve(allocator, &file_config, &env);
-        defer config.deinit();
-
-        try std.testing.expectEqual(@as(u32, 4), config.compact_keep);
-        try std.testing.expect(!config.memory);
-        try std.testing.expect(!config.memory_auto);
-    }
-
-    {
-        var env = try testEnv(allocator, &.{});
-        defer env.deinit();
-
-        var file_config = try testFile(allocator, &.{
-            .{ "AI_COMPACT_KEEP", "1" },
-            .{ "AI_MEMORY", "0" },
-        });
-        defer file_config.deinit(allocator);
-
-        const config = try resolve(allocator, &file_config, &env);
-        defer config.deinit();
-
-        // Fewer than two kept messages would make every cut unsafe.
-        try std.testing.expectEqual(@as(u32, 2), config.compact_keep);
-        try std.testing.expect(!config.memory);
-        // The extractor default stays on; the memory flag is what switches
-        // the feature off, and Agent pairs the two.
-        try std.testing.expect(config.memory_auto);
-    }
+    try std.testing.expectEqual(@as(u32, 8192), config.max_tokens);
+    try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
+    try std.testing.expect(!@hasField(Config, "markdown"));
+    try std.testing.expect(!@hasField(Config, "compact_keep"));
+    try std.testing.expect(!@hasField(Config, "memory"));
+    try std.testing.expect(!@hasField(Config, "memory_auto"));
 }
 
 test "provider preset supplies defaults" {

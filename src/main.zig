@@ -129,9 +129,6 @@ pub fn main(init: std.process.Init) !void {
             "  models              List models for the selected provider\n\n" ++
             "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
-            "AI_COMPACT_KEEP       Newest messages kept verbatim across a compaction\n" ++
-            "AI_MEMORY=0           Disable durable memory for this workspace\n" ++
-            "AI_MEMORY_AUTO=0      Keep the remember tool, skip the per-turn extractor\n" ++
             "AI_MEMORY_FILE        Store memory in another file\n" ++
             "Tools and local MCP servers run on the host with inherited environment and network access.\n" ++
             "Build with Zig 0.17.0.\n");

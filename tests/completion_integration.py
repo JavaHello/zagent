@@ -42,8 +42,7 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-completion-') as directory:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_MODEL': 'mock',
-               'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '8',
-               'AI_MEMORY': '0'}
+               'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '8'}
         trust_workspace(directory, env)
         cases = [
             ('completed', 'Task completed'), ('blocked', 'Task blocked'),

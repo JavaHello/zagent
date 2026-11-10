@@ -24,7 +24,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='zagent-clipboard-') as directory:
         env = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory,
                    TERM='xterm-256color', AI_PROVIDER='openai', AI_KEY='test',
-                   AI_MODEL='clipboard-test', AI_MEMORY='0')
+                   AI_MODEL='clipboard-test')
         env.pop('TMUX', None)
         env.pop('TMUX_PANE', None)
         trust_workspace(directory, env)

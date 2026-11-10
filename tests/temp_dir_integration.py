@@ -75,7 +75,7 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-scratch-test-') as directory:
         env = dict(os.environ, HOME=directory, XDG_STATE_HOME=directory,
                    XDG_CONFIG_HOME=directory, TMPDIR=directory, TERM='dumb',
-                   AI_KEY='test', AI_MODEL='mock', AI_MEMORY='0',
+                   AI_KEY='test', AI_MODEL='mock',
                    AI_URL=f'http://127.0.0.1:{server.server_port}/v1')
         env.pop('AI_PROVIDER', None)
         state = trust_workspace(directory, env)
