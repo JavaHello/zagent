@@ -82,6 +82,14 @@ try:
                 if select.select([master], [], [], .1)[0]:
                     transcript.extend(os.read(master, 65536))
 
+        def wait_for(predicate):
+            deadline = time.monotonic() + 8
+            while not predicate():
+                assert time.monotonic() < deadline, transcript.decode(errors='replace')
+                assert process.poll() is None, transcript.decode(errors='replace')
+                if select.select([master], [], [], .05)[0]:
+                    transcript.extend(os.read(master, 65536))
+
         def send(keys):
             time.sleep(.2)
             while select.select([master], [], [], 0)[0]:
@@ -107,7 +115,7 @@ try:
         try:
             until('❯ '.encode())
             send(b'network wait\r')
-            assert blocked.wait(8)
+            wait_for(blocked.is_set)
             send(b'queued question\r')
             until(b'Input queued')
             send(b'/')
@@ -120,10 +128,7 @@ try:
             release.set()
             recover()
             send(b'slow tool\r')
-            deadline = time.monotonic() + 8
-            while not Path(directory, 'started').exists():
-                assert time.monotonic() < deadline
-                time.sleep(.05)
+            wait_for(Path(directory, 'started').exists)
             # Arrow keys must not interrupt. Input is preserved across ESC.
             send(b'draft\x1b[D\x1b[C')
             stop()

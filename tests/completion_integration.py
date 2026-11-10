@@ -154,7 +154,7 @@ try:
                         # The proof is produced by the command, not spelled in
                         # it, so an echoed command cannot stand in for a result.
                         command="N=42; R=0; printf 'running the suite...\\n'; "
-                                "head -c 600 /dev/zero | tr '\\0' x; "
+                                "printf '%600s' '' | tr ' ' x; "
                                 "printf '\\n%s tests, %s failures\\n' \"$N\" \"$R\"")
         result = subprocess.run([str(binary), 'Run the tests'], cwd=directory, env=env,
                                 capture_output=True, text=True, timeout=60)

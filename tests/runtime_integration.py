@@ -88,7 +88,14 @@ try:
         try:
             until('❯ '.encode())
             os.write(master, b'first question\r')
-            assert started.wait(8)
+            # Drain terminal output while waiting for the worker, otherwise
+            # PTY backpressure can prevent submission from finishing.
+            deadline = time.monotonic() + 8
+            while not started.is_set():
+                assert time.monotonic() < deadline, transcript.decode(errors='replace')
+                assert process.poll() is None, transcript.decode(errors='replace')
+                if select.select([master], [], [], .05)[0]:
+                    transcript.extend(os.read(master, 65536))
             until(b's \xc2\xb7 in ')
             assert b'thinking' in ansi.sub(b'', transcript), transcript
             send(b'/model\r\r', b'Model: runtime-mock')

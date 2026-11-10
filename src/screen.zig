@@ -24,6 +24,8 @@ const HIDE_CURSOR = "\x1b[?25l";
 const SHOW_CURSOR = "\x1b[?25h";
 const SAVE_CURSOR = "\x1b7";
 const RESTORE_CURSOR = "\x1b8";
+const SYNC_BEGIN = "\x1b[?2026h";
+const SYNC_END = "\x1b[?2026l";
 const ALT_ON = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const ALT_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1049l";
 const selection = @import("selection.zig");
@@ -44,6 +46,10 @@ pub const Screen = struct {
     input_rows: usize = 1,
     /// The log has to be drawn again before the next write.
     dirty: bool = true,
+    /// Transcript bytes already painted; queued output can extend the log
+    /// without clearing it when following the newest output.
+    rendered_len: usize = 0,
+    status_dirty: bool = false,
     scroll_rows: usize = 0,
     buffered: bool = false,
     queued: std.ArrayList(u8) = .empty,
@@ -132,12 +138,13 @@ pub const Screen = struct {
         if (self.dragging) return false;
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
+        const old_bottom = self.logBottom();
         var changed = self.progress_changed;
         if (self.notice_started) |started| {
             if (started.untilNow(self.io, .awake).toMilliseconds() >= 3000) {
                 self.notice_len = 0;
                 self.notice_started = null;
-                self.dirty = true;
+                self.status_dirty = true;
                 changed = true;
             }
         }
@@ -145,8 +152,9 @@ pub const Screen = struct {
             self.progress_len = self.pending_progress_len;
             @memcpy(self.progress[0..self.progress_len], self.pending_progress[0..self.progress_len]);
             self.progress_changed = false;
-            self.dirty = true;
+            self.status_dirty = true;
         }
+        if (old_bottom != self.logBottom()) self.dirty = true;
         if (self.queued.items.len == 0) return changed;
         const old_rows = if (self.scroll_rows > 0) blk: {
             const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
@@ -160,7 +168,10 @@ pub const Screen = struct {
             self.scroll_rows += rows.len -| old_rows;
         }
         self.queued.clearRetainingCapacity();
-        self.dirty = true;
+        // A scrolled/selected viewport must be reconstructed, not appended to.
+        if (self.scroll_rows > 0 or self.selection_end > self.selection_start) {
+            self.dirty = true;
+        }
         return true;
     }
 
@@ -214,7 +225,7 @@ pub const Screen = struct {
     pub fn leave(self: *Screen) void {
         if (!self.active) return;
         uninstallSignals();
-        self.out.writeStreamingAll(self.io, RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF) catch {};
+        self.out.writeStreamingAll(self.io, SYNC_END ++ RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF) catch {};
         self.active = false;
     }
 
@@ -243,6 +254,9 @@ pub const Screen = struct {
         if (resized or clamped != self.input_rows or self.dirty or repaintPending()) {
             self.input_rows = clamped;
             try self.replay();
+        } else {
+            try self.appendLog();
+            if (self.status_dirty) try self.repaintStatus();
         }
         self.syncSignals();
     }
@@ -292,6 +306,45 @@ pub const Screen = struct {
         if (self.dirty or repaintPending()) try self.replay();
         try self.transcript.appendSlice(self.allocator, bytes);
         try self.out.writeStreamingAll(self.io, bytes);
+        self.rendered_len = self.transcript.items.len;
+    }
+
+    /// Only called by the foreground layout, before the editor redraws its
+    /// input. Do not save the editor cursor over the saved log position.
+    fn repaintStatus(self: *Screen) !void {
+        var buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try w.writeAll(SYNC_BEGIN ++ HIDE_CURSOR);
+        try w.print("\x1b[{d};1H\x1b[2K", .{self.logBottom() + 1});
+        try w.writeAll(RESET);
+        try w.writeAll(if (self.notice_len > 0) self.notice[0..self.notice_len] else self.progress[0..self.progress_len]);
+        try w.writeAll(RESTORE_CURSOR ++ SHOW_CURSOR ++ SYNC_END);
+        try self.out.writeStreamingAll(self.io, w.buffered());
+        self.status_dirty = false;
+    }
+
+    /// Stream new bytes into the existing scrolling region. Full replay is
+    /// still used for resize, layout changes, history browsing and selection.
+    fn appendLog(self: *Screen) !void {
+        if (self.rendered_len == self.transcript.items.len) return;
+        try self.out.writeStreamingAll(self.io, SYNC_BEGIN);
+        defer self.out.writeStreamingAll(self.io, SYNC_END) catch {};
+        var buf: [8192]u8 = undefined;
+        var fw = self.out.writerStreaming(self.io, &buf);
+        const w = &fw.interface;
+        try w.writeAll(HIDE_CURSOR ++ RESTORE_CURSOR);
+        const bytes = self.transcript.items[self.rendered_len..];
+        var start: usize = 0;
+        for (bytes, 0..) |byte, i| {
+            if (byte != '\n') continue;
+            try w.writeAll(bytes[start..i]);
+            try w.writeAll("\r\n");
+            start = i + 1;
+        }
+        try w.writeAll(bytes[start..]);
+        try w.writeAll(SAVE_CURSOR ++ SHOW_CURSOR);
+        try w.flush();
+        self.rendered_len = self.transcript.items.len;
     }
 
     /// A writer that appends to the conversation, for callers that format into
@@ -316,6 +369,11 @@ pub const Screen = struct {
         _ = self.refreshSize();
         const bottom = self.logBottom();
         const top = bottom + 1;
+
+        // A replay may exceed the writer buffer. Keep the clear and all its
+        // writes in one terminal frame, and release sync mode even on error.
+        try self.out.writeStreamingAll(self.io, SYNC_BEGIN);
+        defer self.out.writeStreamingAll(self.io, SYNC_END) catch {};
 
         var buf: [8192]u8 = undefined;
         var file_writer = self.out.writerStreaming(self.io, &buf);
@@ -372,6 +430,8 @@ pub const Screen = struct {
         try w.flush();
 
         self.dirty = false;
+        self.status_dirty = false;
+        self.rendered_len = self.transcript.items.len;
         self.syncSignals();
     }
 
@@ -559,7 +619,7 @@ fn setDisposition(sig: std.posix.SIG, handler: ?std.posix.Sigaction.handler_fn) 
 }
 
 fn onExitSignal(sig: std.posix.SIG) callconv(.c) void {
-    writeRaw(RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF);
+    writeRaw(SYNC_END ++ RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF);
     if (handler_termios) |attributes| {
         std.posix.tcsetattr(handler_fd, .NOW, attributes) catch {};
     }
@@ -582,7 +642,7 @@ fn onTstp(_: std.posix.SIG) callconv(.c) void {
     if (handler_termios) |original| {
         std.posix.tcsetattr(handler_fd, .NOW, original) catch {};
     }
-    writeRaw(RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF);
+    writeRaw(SYNC_END ++ RESET ++ "\x1b[r" ++ SHOW_CURSOR ++ ALT_OFF);
 
     // Stop with the default action: the handler must not run again, or the
     // process would never stop. NODEFER makes the re-raise effective.
@@ -684,6 +744,82 @@ test "worker progress reserves a transient row above input without entering hist
     try std.testing.expectEqual(@as(usize, 0), s.progress_len);
     try std.testing.expectEqual(@as(usize, 13), s.logBottom());
     try std.testing.expectEqual(@as(usize, 14), s.inputTop());
+}
+
+test "animation frames repaint only status and keep the saved log cursor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.out = file;
+    s.buffered = true;
+    try s.writeLog("conversation\n");
+    s.setProgress("first frame");
+    try s.reserveInput(1, false);
+    const before = try readOutput(tmp.dir, a);
+    defer a.free(before);
+
+    s.setProgress("next frame");
+    try std.testing.expect(try s.drain());
+    try std.testing.expect(!s.dirty);
+    try s.reserveInput(1, false);
+    const after = try readOutput(tmp.dir, a);
+    defer a.free(after);
+    const frame = after[before.len..];
+    try std.testing.expect(std.mem.indexOf(u8, frame, "next frame") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[2K") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[0J") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "conversation") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, SAVE_CURSOR) == null);
+    try std.testing.expect(std.mem.endsWith(u8, frame, RESTORE_CURSOR ++ SHOW_CURSOR ++ SYNC_END));
+
+    // Removing the row really changes the layout and must still replay.
+    s.setProgress("");
+    try std.testing.expect(try s.drain());
+    try std.testing.expect(s.dirty);
+    try s.reserveInput(1, false);
+    try std.testing.expect(!s.dirty);
+}
+
+test "streamed output appends without clearing and history still replays" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.out = file;
+    s.buffered = true;
+    try s.writeLog("initial\n");
+    try s.reserveInput(1, false);
+    const before = try readOutput(tmp.dir, a);
+    defer a.free(before);
+    try s.writeLog("new\ntext");
+    try s.reserveInput(1, false);
+    const after = try readOutput(tmp.dir, a);
+    defer a.free(after);
+    const appended = after[before.len..];
+    try std.testing.expect(std.mem.indexOf(u8, appended, "new\r\ntext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, appended, "initial") == null);
+    try std.testing.expect(std.mem.indexOf(u8, appended, "\x1b[0J") == null);
+    try std.testing.expect(std.mem.startsWith(u8, appended, SYNC_BEGIN));
+    try std.testing.expect(std.mem.endsWith(u8, appended, SYNC_END));
+    try std.testing.expectEqual(s.transcript.items.len, s.rendered_len);
+
+    // Explicit redraws still reconstruct the complete visible transcript.
+    try s.reserveInput(1, true);
+    const replayed = try readOutput(tmp.dir, a);
+    defer a.free(replayed);
+    const redraw = replayed[after.len..];
+    try std.testing.expect(std.mem.startsWith(u8, redraw, SYNC_BEGIN));
+    try std.testing.expect(std.mem.endsWith(u8, redraw, SYNC_END));
+    try std.testing.expect(std.mem.indexOf(u8, redraw, "initial\r\nnew\r\ntext") != null);
 }
 
 test "wheel scrolls three visual rows while keyboard scrolls a page" {

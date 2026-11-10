@@ -33,7 +33,11 @@ def interact(directory, env, answer):
             # Wait until raw-mode selection has ended before queuing lines.
             while not (workspace_state(directory, env) / 'trusted').exists():
                 assert time.monotonic() < deadline, output
-                time.sleep(.01)
+                assert process.poll() is None, output
+                # Keep draining the PTY while the menu redraws. On macOS a
+                # pending terminal write can otherwise stall the transition.
+                if select.select([master], [], [], .01)[0]:
+                    output.extend(os.read(master, 65536))
             os.write(master, b'/memory\n/remember globally saved note\n/quit\n')
         while process.poll() is None:
             assert time.monotonic() < deadline, output

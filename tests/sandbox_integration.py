@@ -13,7 +13,9 @@ import threading
 
 BINARY = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 
-with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
+# macOS defaults to /private/var/folders, which the system-path write policy
+# deliberately isolates. Use /tmp so ordinary fixture edits remain ordinary.
+with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as temporary:
     root = Path(temporary)
     live_binary = root / 'zagent-live'
     replacement = root / 'zagent-replacement'
@@ -139,9 +141,11 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-') as temporary:
     assert 'SECRET_OUTSIDE_WORKSPACE_9c18' in observed[5]
     assert not Path('/etc/zagent-policy-test-must-not-exist').exists()
     # Linux exposes a private /etc directory: a write there may succeed, but
-    # must never reach the host. Other sandbox backends may deny it outright.
+    # must never reach the host. Other backends may deny it outright, and
+    # hosts without a sandbox must refuse it rather than fall back to execution.
     assert ('SANDBOX_PRIVATE_WRITE' in observed[14] or
-            'stderr:' in observed[14] or 'failed' in observed[14].lower()), observed[14]
+            'stderr:' in observed[14] or 'failed' in observed[14].lower() or
+            'requires isolation and was not executed' in observed[14]), observed[14]
     assert 'Replaced one exact text block' in observed[11], observed[11]
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
