@@ -689,7 +689,9 @@ pub const Connection = struct {
     /// an empty body, an old server's plain `400` — means the request was not
     /// understood, which is what a legacy server does to a modern one.
     fn judgeRefusal(self: *Connection, status: u16, body: []const u8) !Settlement {
-        if (status == 400 or status == 404 or status == 405) {
+        // rmcp may reject discovery with 422 because it expects initialize.
+        // This fallback is only for discovery, never ordinary tool calls.
+        if (status == 400 or status == 404 or status == 405 or status == 422) {
             if (try readError(self.allocator, body)) |err| {
                 defer err.deinit(self.allocator);
                 if (isModernErrorCode(err.code)) {
@@ -2360,6 +2362,7 @@ test "over http the era is read from a refusal" {
 
         try std.testing.expectEqual(Connection.Settlement.ask_for_handshake, try connection.judgeRefusal(400, "Bad Request"));
         try std.testing.expectEqual(Connection.Settlement.ask_for_handshake, try connection.judgeRefusal(404, ""));
+        try std.testing.expectEqual(Connection.Settlement.ask_for_handshake, try connection.judgeRefusal(422, "Unexpected message, expect initialize request"));
     }
 
     // Any other status is not a question about the era at all.
@@ -2367,6 +2370,7 @@ test "over http the era is read from a refusal" {
         var connection = scriptedConnection(allocator, &.{});
         defer connection.deinit();
 
+        try std.testing.expectError(error.McpRefused, connection.judgeRefusal(401, "{}"));
         try std.testing.expectError(error.McpRefused, connection.judgeRefusal(403, "{}"));
         try std.testing.expectError(error.McpRefused, connection.judgeRefusal(500, "{}"));
     }
