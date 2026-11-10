@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Session IDs survive CLI restarts and /new never overwrites an old session."""
+import fcntl
 import http.server
 import json
 import os
 from pathlib import Path
 import re
+import pty
+import select
+import struct
 import subprocess
 import tempfile
+import termios
 import threading
+import time
 from mock_api import handle_planning, send_response, trust_workspace
 
 requests = []
@@ -27,7 +33,8 @@ class API(http.server.BaseHTTPRequestHandler):
                             for item in body.get('input', []))):
             send_response(self, body, {'status': 'completed', 'output': [
                 {'type': 'function_call', 'id': 'fc_exit', 'call_id': 'exit_call',
-                 'name': 'bash', 'arguments': json.dumps({'command': 'exit 42'})}]})
+                 'name': 'bash', 'arguments': json.dumps({
+                     'command': 'echo executed >> execution-count; exit 42'})}]})
             return
         send_response(self, body, {'status': 'completed', 'output': [
             {'type': 'message', 'role': 'assistant', 'content': [
@@ -85,7 +92,65 @@ try:
         files = list(path.parent.glob('*.json'))
         assert len(files) == 3, files  # initial startup, /new, and the first run
         assert all(json.loads(p.read_text())['messages'] == [] for p in files if p != path)
+        # Resume without asking a new question: restore visible execution
+        # records, but neither contact the API nor execute the saved command.
+        before_requests = len(requests)
+        restored = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '',
+                          run('--resume', first, stdin='/quit\n'))
+        assert 'Restored session history' in restored, restored
+        assert '❯ first-session-marker' in restored, restored
+        assert '⚙ bash' in restored and 'execution-count' in restored, restored
+        assert '✗ Exit code: 42' in restored, restored
+        assert 'Saved answer' in restored, restored
+        assert len(requests) == before_requests
+        assert path.read_bytes() == old
+
+        # Fullscreen startup must seed the Screen log too, not print history
+        # before entering the alternate screen where it would disappear.
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 50, 120, 0, 0))
+        process = subprocess.Popen([str(binary), '--resume', first], cwd=directory,
+                                   env=dict(env, TERM='xterm-256color'),
+                                   stdin=slave, stdout=slave, stderr=slave)
+        transcript = bytearray()
+        ansi = re.compile(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|[78])')
+        try:
+            deadline = time.monotonic() + 10
+            while b'End of restored history' not in ansi.sub(b'', transcript):
+                assert time.monotonic() < deadline, transcript
+                assert process.poll() is None, transcript
+                if select.select([master], [], [], .1)[0]:
+                    transcript.extend(os.read(master, 65536))
+            visible = ansi.sub(b'', transcript)
+            assert b'first-session-marker' in visible, visible
+            assert b'execution-count' in visible, visible
+            assert '✗ Exit code: 42'.encode() in visible, visible
+            assert b'Saved answer' in visible, visible
+            # History is painted before the editor enters raw mode; wait for
+            # its final prompt cursor before sending EOF.
+            while b'\x1b[50;3H\x1b[?25h' not in transcript:
+                assert time.monotonic() < deadline, transcript
+                if select.select([master], [], [], .1)[0]:
+                    transcript.extend(os.read(master, 65536))
+            os.write(master, b'\x04')
+            deadline = time.monotonic() + 5
+            while process.poll() is None:
+                assert time.monotonic() < deadline, transcript
+                if select.select([master], [], [], .1)[0]:
+                    transcript.extend(os.read(master, 65536))
+            assert process.returncode == 0, transcript
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+        assert len(requests) == before_requests
+        assert path.read_bytes() == old
+        assert (Path(directory) / 'execution-count').read_text() == 'executed\n'
+
         resumed = run('--resume', first, 'continue-session-marker')
+        assert 'Restored session history' not in resumed  # keep batch stdout clean
         assert session_id(resumed) == first
         assert 'first-session-marker' in json.dumps(requests[-1]), requests[-1]
         assert 'Saved answer' in json.dumps(requests[-1]), requests[-1]

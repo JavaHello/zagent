@@ -392,6 +392,10 @@ fn runRepl(
         try writeOut(&screen, stderr, io, msg);
     }
 
+    // The API history was loaded before the terminal existed. Seed the screen's
+    // conversation log now so scrolling and redraws retain the restored turns.
+    try agent.replayHistory();
+
     while (true) {
         // linenoise handles raw-mode input, Unicode width, and multi-byte
         // character deletion correctly (including Chinese/CJK characters).

@@ -303,6 +303,42 @@ pub const Agent = struct {
         self.client.resetTokenCounters();
     }
 
+    /// Restore the visible conversation from the saved messages, without
+    /// dispatching tools or changing the model history/checkpoint.
+    pub fn replayHistory(self: *Agent) !void {
+        if (self.history.items.len <= 1) return;
+        try self.emit(std.Io.File.stdout(), DIM ++ "  ── Restored session history ──\n" ++ RESET, .{});
+        for (self.history.items[1..]) |message| {
+            if (std.mem.eql(u8, message.role, "user")) {
+                if (message.content) |content| {
+                    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+                    defer aw.deinit();
+                    try aw.writer.writeAll("\n" ++ BOLD ++ GREEN ++ "❯" ++ RESET ++ " ");
+                    try text.writeSanitized(&aw.writer, content);
+                    try aw.writer.writeByte('\n');
+                    try self.writeLogOrStdout(aw.written());
+                }
+            } else if (std.mem.eql(u8, message.role, "assistant")) {
+                if (message.content) |content| {
+                    if (content.len > 0) {
+                        try self.answerHeader();
+                        try self.writeAnswer(content);
+                        try self.answerTrailer();
+                    }
+                }
+                if (message.tool_calls) |calls| {
+                    for (calls) |call| try self.announceToolCall(call);
+                }
+            } else if (std.mem.eql(u8, message.role, "tool")) {
+                if (message.content) |content| {
+                    const is_error = if (message.tool_status) |status| status.is_error else false;
+                    try self.previewToolResult(content, is_error);
+                }
+            }
+        }
+        try self.emit(std.Io.File.stdout(), DIM ++ "  ── End of restored history ──\n\n" ++ RESET, .{});
+    }
+
     fn checkpoint(self: *Agent) !void {
         if (self.session_path) |path| try @import("session.zig").save(self.io, self.allocator, path, self.history.items[1..]);
     }
@@ -1378,18 +1414,20 @@ pub const Agent = struct {
             }
         };
 
-        // Print a brief preview of the result
-        const preview_len = @min(result.content.len, 200);
-        const truncated = result.content.len > preview_len;
-        if (result.is_error) {
-            try self.emit(std.Io.File.stderr(), RED ++ "  ✗ {s}\n" ++ RESET, .{result.content});
-        } else if (truncated) {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ {s}...\n" ++ RESET, .{result.content[0..preview_len]});
-        } else {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ {s}\n" ++ RESET, .{result.content});
-        }
-
+        try self.previewToolResult(result.content, result.is_error);
         return result;
+    }
+
+    /// Use the same result preview for live execution and restored messages.
+    fn previewToolResult(self: *Agent, content: []const u8, is_error: bool) !void {
+        const preview_len = if (is_error) content.len else @min(content.len, 200);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll(if (is_error) RED ++ "  ✗ " else DIM ++ "  ✓ ");
+        try text.writeSanitized(&aw.writer, content[0..preview_len]);
+        if (content.len > preview_len) try aw.writer.writeAll("...");
+        try aw.writer.writeAll("\n" ++ RESET);
+        try self.emit(std.Io.File.stderr(), "{s}", .{aw.written()});
     }
 
     /// Print the model's answer: rendered for a terminal, raw otherwise.
