@@ -603,6 +603,10 @@ pub const LinenoiseState = struct {
         const cursor_row = cursor.row - self.viewport_start;
 
         const reserved = visible + popup_visible;
+        // Hide before the layout callback can move into the log/status area,
+        // and only show again once the input cursor is in its final position.
+        try self.stdout.writeStreamingAll(self.ln.io, "\x1b[?25l");
+        errdefer self.stdout.writeStreamingAll(self.ln.io, "\x1b[?25h") catch {};
         if (self.ln.layout_callback) |callback| {
             try callback(self.ln.layout_context, reserved, self.force_repaint);
         }
@@ -650,6 +654,7 @@ pub const LinenoiseState = struct {
             input_top + popup_visible + cursor_row,
             @min(cursor.col + 1, self.cols),
         });
+        try writer.writeAll("\x1b[?25h");
         try self.stdout.writeStreamingAll(self.ln.io, aw.written());
 
         self.max_rows = visible;
@@ -1049,6 +1054,10 @@ test "a bottom anchored input is drawn on the last rows and asks for its height"
     try std.testing.expect(std.mem.indexOf(u8, written, "> abc\x1b[0K") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[24;1Hdef\x1b[0K") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[24;4H") != null);
+    const hidden = std.mem.indexOf(u8, written, "\x1b[?25l") orelse return error.TestUnexpectedResult;
+    const draw = std.mem.indexOf(u8, written, "\x1b[23;1H") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(hidden < draw);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\x1b[24;4H\x1b[?25h"));
 }
 
 test "a bottom anchored popup sits above the input and keeps its items while moving" {

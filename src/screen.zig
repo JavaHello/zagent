@@ -318,7 +318,9 @@ pub const Screen = struct {
         try w.print("\x1b[{d};1H\x1b[2K", .{self.logBottom() + 1});
         try w.writeAll(RESET);
         try w.writeAll(if (self.notice_len > 0) self.notice[0..self.notice_len] else self.progress[0..self.progress_len]);
-        try w.writeAll(RESTORE_CURSOR ++ SHOW_CURSOR ++ SYNC_END);
+        // The editor owns the visible cursor. Keep it hidden at the log
+        // position until refreshBottom has redrawn and positioned the input.
+        try w.writeAll(RESTORE_CURSOR ++ SYNC_END);
         try self.out.writeStreamingAll(self.io, w.buffered());
         self.status_dirty = false;
     }
@@ -342,7 +344,7 @@ pub const Screen = struct {
             start = i + 1;
         }
         try w.writeAll(bytes[start..]);
-        try w.writeAll(SAVE_CURSOR ++ SHOW_CURSOR);
+        try w.writeAll(SAVE_CURSOR);
         try w.flush();
         self.rendered_len = self.transcript.items.len;
     }
@@ -427,7 +429,6 @@ pub const Screen = struct {
             try w.writeAll("\r\n");
         }
         try w.writeAll(RESTORE_CURSOR);
-        try w.writeAll(SHOW_CURSOR);
         try w.flush();
 
         self.dirty = false;
@@ -795,7 +796,8 @@ test "animation frames repaint only status and keep the saved log cursor" {
     try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[0J") == null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "conversation") == null);
     try std.testing.expect(std.mem.indexOf(u8, frame, SAVE_CURSOR) == null);
-    try std.testing.expect(std.mem.endsWith(u8, frame, RESTORE_CURSOR ++ SHOW_CURSOR ++ SYNC_END));
+    try std.testing.expect(std.mem.indexOf(u8, after, SHOW_CURSOR) == null);
+    try std.testing.expect(std.mem.endsWith(u8, frame, RESTORE_CURSOR ++ SYNC_END));
 
     // Removing the row really changes the layout and must still replay.
     s.setProgress("");
@@ -836,6 +838,7 @@ test "streamed output appends without clearing and history still replays" {
     try s.reserveInput(1, true);
     const replayed = try readOutput(tmp.dir, a);
     defer a.free(replayed);
+    try std.testing.expect(std.mem.indexOf(u8, replayed, SHOW_CURSOR) == null);
     const redraw = replayed[after.len..];
     try std.testing.expect(std.mem.startsWith(u8, redraw, SYNC_BEGIN));
     try std.testing.expect(std.mem.endsWith(u8, redraw, SYNC_END));
