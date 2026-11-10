@@ -165,7 +165,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
     assert observed[9] == 'Exit code: 0\n(no output)', observed[9]
-    # Legacy sandbox settings must not block host tools or local MCP startup.
+    # Host tools and local MCP startup need no isolation configuration.
     calls[:] = [
         ('bash', {'command': 'items=(hello world); [[ ${#items[@]} == 2 ]] && printf "%s" "${items[1]}"'}),
         ('bash', {'command': 'echo BASH_ONLY'}),
@@ -181,21 +181,20 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     }}))
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    off_env = dict(env, AI_TOOL_SANDBOX='off', AI_URL=f'http://127.0.0.1:{server.server_port}/v1')
+    host_env = dict(env, AI_URL=f'http://127.0.0.1:{server.server_port}/v1')
     try:
-        off = subprocess.run([str(live_binary), 'Exercise disabled sandbox'], cwd=workspace,
-                             env=off_env, text=True, capture_output=True, timeout=60)
+        host = subprocess.run([str(live_binary), 'Exercise host execution'], cwd=workspace,
+                              env=host_env, text=True, capture_output=True, timeout=60)
     finally:
         server.shutdown()
-    assert off.returncode == 0, off.stderr
-    off_statuses, off_contents = zip(*(tool_output(output) for output in observed))
-    observed[:] = off_contents
-    assert all(s['exit_code'] == 0 and not s['is_error'] for s in off_statuses[:2]), off_statuses
-    assert not off_statuses[2]['is_error'] and off_statuses[2]['exit_code'] == 0, off_statuses[2]
+    assert host.returncode == 0, host.stderr
+    host_statuses, host_contents = zip(*(tool_output(output) for output in observed))
+    observed[:] = host_contents
+    assert all(s['exit_code'] == 0 and not s['is_error'] for s in host_statuses[:2]), host_statuses
+    assert not host_statuses[2]['is_error'] and host_statuses[2]['exit_code'] == 0, host_statuses[2]
     assert observed[:2] == ['Exit code: 0\nworld', 'Exit code: 0\nBASH_ONLY\n'], observed
     assert 'HOST_EXECUTION' in observed[2], observed
-    assert 'skipped local MCP server' not in off.stderr, off.stderr
     assert (workspace / 'MCP_STARTED').read_text() == env['PRIVATE_SENTINEL']
     tool_names = [t['name'] for t in requests[0]['tools']]
     assert 'bash' in tool_names and 'shell' not in tool_names, tool_names
-    print('PASS: direct editing/search, host environment/network, timeout, API retry, durable resume, Bash, ignored legacy sandbox settings and local MCP startup')
+    print('PASS: direct editing/search, host environment/network, timeout, API retry, durable resume, Bash and local MCP startup')

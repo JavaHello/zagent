@@ -31,7 +31,6 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 ## Requirements
 
 - Zig 0.17.x
-- For dangerous operations and local MCP servers: Linux with bubblewrap (`bwrap`) and GNU coreutils (`timeout`), **or** macOS with `sandbox-exec`; ordinary tools do not require a sandbox
 - An API key and base URL for a Responses-compatible endpoint
 
 ## Build
@@ -44,44 +43,23 @@ The binary is written to `zig-out/bin/zagent`.
 
 ## Tool execution policy
 
-Ordinary built-in filesystem, search, HTTP and shell tools run directly in the
+All built-in filesystem, search, HTTP and shell tools run directly in the
 current working directory. They inherit the host environment (including credentials),
 filesystem permissions and network access. Start zagent in the intended project
 and only run trusted tasks. Zig compilation caches use `.zig-cache/global`.
 
-A conservative heuristic routes dangerous operations to a sandbox: privilege
-escalation, system service or network administration, disk/power/account management,
-system package managers, shell references to protected system paths, and built-in
-writes to system paths. File-write checks resolve relative paths and existing
-symlinked parents. Detection is **not a security boundary**: scripts, dynamic shell
-commands and indirect side effects can evade it; some read-only commands may also
-be classified conservatively. No arbitrary-script isolation is promised.
+There is no sandbox or command safety filter. Tools can modify the host system
+with the current user's permissions. Local MCP servers also run directly and
+inherit the host environment; configured `env` entries add or override variables.
 
-Dangerous operations use bubblewrap on Linux or `sandbox-exec` on macOS. Only the
-workspace is writable; the host home and credentials are hidden and the environment
-is clean. If sandbox startup fails, an error is returned, with no host fallback.
-Operations requiring real host configuration changes are therefore not performed.
-Sandbox support is detected once at startup by actually launching the backend.
-`AI_TOOL_SANDBOX=auto` (default) skips unavailable sandbox support with a warning;
-`required` fails startup if unavailable; `off` disables sandbox support without probing.
-This setting can also be set in the config file and is independent of networking.
-When sandbox support is disabled or unavailable, operations requiring isolation are
-refused (never run on the host), and local stdio MCP servers are skipped. Remote
-MCP endpoints and ordinary tools remain available. Local MCP servers always use
-the sandbox and receive only explicitly configured environment entries.
-
-Both direct and sandboxed tool calls retain a 180-second default limit
+Tool calls retain a 180-second default limit
 (`bash.timeout_seconds` accepts 1–3600), output bounds and process-group cleanup.
 Commands use `bash --noprofile --norc -c`, not `/bin/sh`.
-Sandbox networking is disabled by default; `AI_TOOL_NETWORK=1` enables host network
-access (including localhost) for sandboxed tools and local MCP servers. This setting
-does **not** restrict ordinary direct tools. Model API calls and explicitly configured
-remote MCP endpoints use the main process network independently.
 
 ```sh
 cd /path/to/project
 AI_PROVIDER=deepseek zagent "Analyze this project and update its documentation"
-AI_TOOL_NETWORK=1 zagent "Download the public API documentation and summarize it"
+zagent "Download the public API documentation and summarize it"
 ```
 
 ## Directory trust and global state
@@ -190,7 +168,7 @@ memory files from accidental commits.
 ```sh
 zig build
 zig build test
-python3 tests/sandbox_integration.py
+python3 tests/execution_integration.py
 python3 tests/completion_integration.py
 python3 tests/responses_failure_integration.py
 ```
@@ -560,7 +538,7 @@ file, and `mcp.example.json` shows every member it takes:
 
 An entry with `command` is started as a subprocess and spoken to over its
 standard streams; an entry with `url` is a Streamable HTTP endpoint. `env` adds
-variables to the subprocess's clean sandbox environment, `headers` are sent with
+or overrides variables in the subprocess's inherited host environment, `headers` are sent with
 every HTTP request, `timeoutMs` says how long a request waits for an answer
 (default 60000), and `disabled` keeps an entry without starting it.
 
@@ -691,7 +669,7 @@ zig build test
 zig build test-integration
 ```
 
-The integration target builds the binary and runs all six Python 3 suites, covering streamed output, sandbox boundaries, completion checks, response failures, menus and prompt popups. On Linux, run it where bubblewrap can create user namespaces.
+The integration target builds the binary and runs the Python 3 suites, covering streamed output, host tool execution, completion checks, response failures, menus and prompt popups. No isolation backend is required.
 
 ## Project structure
 

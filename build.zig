@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{
         "tests/workspace_integration.py",
         "tests/streaming_integration.py",
-        "tests/sandbox_integration.py",
+        "tests/execution_integration.py",
         "tests/completion_integration.py",
         "tests/responses_failure_integration.py",
         "tests/menu_integration.py",

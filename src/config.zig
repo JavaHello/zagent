@@ -509,20 +509,6 @@ fn testFile(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !ConfigF
     return file_config;
 }
 
-test "legacy sandbox settings are ignored" {
-    const a = std.testing.allocator;
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    try env.put("AI_KEY", "test-key");
-    var file = ConfigFile{};
-    defer file.deinit(a);
-    try applyConfigValue(a, &file, "AI_TOOL_SANDBOX", "required");
-    try env.put("AI_TOOL_SANDBOX", "invalid");
-    const config = try resolve(a, &file, &env);
-    defer config.deinit();
-    try std.testing.expectEqualStrings("test-key", config.api_key);
-}
-
 test "config defaults" {
     const allocator = std.testing.allocator;
     var env = try testEnv(allocator, &.{});
