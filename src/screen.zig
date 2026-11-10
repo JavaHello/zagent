@@ -35,6 +35,9 @@ pub const Screen = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     out: std.Io.File,
+    /// Use tmux's native clipboard command rather than application OSC 52,
+    /// which the default `set-clipboard external` deliberately ignores.
+    tmux_env: ?*const std.process.Environ.Map = null,
     /// False for a run whose output is not a terminal. Every method then does
     /// nothing, so callers do not have to ask before writing.
     active: bool,
@@ -113,18 +116,51 @@ pub const Screen = struct {
         const plain = try selection.plain(self.allocator, self.transcript.items[self.selection_start..self.selection_end]);
         defer self.allocator.free(plain);
         if (plain.len == 0) return;
+        if (self.tmux_env) |env| {
+            self.copyViaTmux(env, plain) catch {
+                const message = "复制失败：tmux 剪贴板写入失败";
+                @memcpy(self.notice[0..message.len], message);
+                self.notice_len = message.len;
+                self.notice_started = std.Io.Timestamp.now(self.io, .awake);
+                return;
+            };
+        } else {
+            try self.copyViaOsc52(plain);
+        }
+        const count = try std.unicode.utf8CountCodepoints(plain);
+        const message = try std.fmt.bufPrint(&self.notice, "已请求复制 {d} 个字符", .{count});
+        self.notice_len = message.len;
+        self.notice_started = std.Io.Timestamp.now(self.io, .awake);
+    }
+
+    fn copyViaOsc52(self: *Screen, plain: []const u8) !void {
         const encoder = std.base64.standard.Encoder;
         const encoded = try self.allocator.alloc(u8, encoder.calcSize(plain.len));
         defer self.allocator.free(encoded);
         _ = encoder.encode(encoded, plain);
-        // OSC 52 works locally and over SSH; the terminal controls permission.
+        // OSC 52 has no success acknowledgement; terminal permissions still apply.
         try self.out.writeStreamingAll(self.io, ansi.CLIPBOARD_PREFIX);
         try self.out.writeStreamingAll(self.io, encoded);
-        try self.out.writeStreamingAll(self.io, "\x07");
-        const count = try std.unicode.utf8CountCodepoints(plain);
-        const message = try std.fmt.bufPrint(&self.notice, "已复制 {d} 个字符", .{count});
-        self.notice_len = message.len;
-        self.notice_started = std.Io.Timestamp.now(self.io, .awake);
+        try self.out.writeStreamingAll(self.io, ansi.OSC_END);
+    }
+
+    fn copyViaTmux(self: *Screen, env: *const std.process.Environ.Map, plain: []const u8) !void {
+        // stdin preserves arbitrary UTF-8/newlines without shell quoting, argv
+        // size limits, or temporary files. -w asks tmux itself to send OSC 52
+        // to its client, even with set-clipboard=external and passthrough off.
+        var child = try std.process.spawn(self.io, .{
+            .argv = &.{ "tmux", "load-buffer", "-w", "-" },
+            .environ_map = env,
+            .stdin = .pipe,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
+        defer child.kill(self.io);
+        try child.stdin.?.writeStreamingAll(self.io, plain);
+        child.stdin.?.close(self.io);
+        child.stdin = null;
+        const result = try child.wait(self.io);
+        if (!result.success()) return error.TmuxClipboardFailed;
     }
 
     /// Workers publish a transient line; only the foreground draws it.
@@ -752,7 +788,7 @@ test "drag selects Unicode output and release copies once with character notice"
     try s.replay();
     try s.mouse("0;3;1m");
     try std.testing.expect(!s.dragging);
-    try std.testing.expectEqualStrings("已复制 2 个字符", s.notice[0..s.notice_len]);
+    try std.testing.expectEqualStrings("已请求复制 2 个字符", s.notice[0..s.notice_len]);
     const output = try readOutput(tmp.dir, a);
     defer a.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "\x1b[7m") != null);
@@ -765,10 +801,26 @@ test "drag selects Unicode output and release copies once with character notice"
     try s.mouse("0;3;1M");
     try s.mouse("32;1;1M");
     try s.mouse("0;1;1m");
-    try std.testing.expectEqualStrings("已复制 2 个字符", s.notice[0..s.notice_len]);
+    try std.testing.expectEqualStrings("已请求复制 2 个字符", s.notice[0..s.notice_len]);
     try s.mouse("0;1;1M");
     try s.mouse("0;1;1m");
     try std.testing.expectEqual(s.selection_start, s.selection_end);
+}
+
+test "tmux command failure reports failure without emitting a false success" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("TMUX", "/nonexistent-zagent-clipboard-test/socket,0,0");
+    var s = Screen.init(a, std.testing.io, false);
+    defer s.deinit();
+    s.tmux_env = &env;
+    try s.transcript.appendSlice(a, "你好\nclipboard");
+    s.selection_end = s.transcript.items.len;
+    // The failure must be a notice, not an error that terminates the REPL.
+    try s.copySelection();
+    try std.testing.expectEqualStrings("复制失败：tmux 剪贴板写入失败", s.notice[0..s.notice_len]);
+    try std.testing.expect(s.notice_started != null);
 }
 
 test "visual history rows count wrapping, CJK and ANSI without splitting UTF-8" {
@@ -807,13 +859,13 @@ test "copy notice is right aligned beside status and yields in narrow windows" {
     const progress = "thinking…";
     @memcpy(s.progress[0..progress.len], progress);
     s.progress_len = progress.len;
-    const notice = "已复制 2 个字符";
+    const notice = "已请求复制 2 个字符";
     @memcpy(s.notice[0..notice.len], notice);
     s.notice_len = notice.len;
     var buf: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try s.writeStatus(&w);
-    try std.testing.expectEqualStrings(RESET ++ "thinking…" ++ RESET ++ "\x1b[23;66H已复制 2 个字符" ++ RESET, w.buffered());
+    try std.testing.expectEqualStrings(RESET ++ "thinking…" ++ RESET ++ "\x1b[23;62H已请求复制 2 个字符" ++ RESET, w.buffered());
 
     s.cols = 20;
     w = std.Io.Writer.fixed(&buf);
@@ -834,7 +886,7 @@ test "copy notice is right aligned beside status and yields in narrow windows" {
     s.progress_len = 0;
     w = std.Io.Writer.fixed(&buf);
     try s.writeStatus(&w);
-    try std.testing.expectEqualStrings(RESET ++ RESET ++ "\x1b[23;66H已复制 2 个字符" ++ RESET, w.buffered());
+    try std.testing.expectEqualStrings(RESET ++ RESET ++ "\x1b[23;62H已请求复制 2 个字符" ++ RESET, w.buffered());
 }
 
 test "animation frames repaint only status and keep the saved log cursor" {

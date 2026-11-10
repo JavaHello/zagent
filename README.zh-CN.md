@@ -33,6 +33,12 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 
 配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_MAX_VERIFICATIONS`、`AI_MARKDOWN`、`AI_COMPACT_THRESHOLD`、`AI_COMPACT_KEEP`、`AI_MEMORY`、`AI_MEMORY_AUTO`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。
 
+## 复制文本
+
+在对话区拖动选择文字，松开后请求复制。普通终端使用 OSC 52；tmux 内使用 `tmux load-buffer -w -`（需要 tmux 3.2+ 且 `tmux` 在 PATH 中），同时写入 tmux 缓冲区并请求同步系统剪贴板，无需开启 `allow-passthrough`，默认 `set-clipboard external` 即可。
+
+终端必须支持并允许 OSC 52 写入剪贴板，SSH 场景也一样。若 tmux 未识别终端支持，需要为对应终端配置 `clipboard` terminal feature。界面显示“已请求复制”，不代表系统剪贴板已确认写入；tmux 命令失败会显示错误提示。
+
 ## 工具执行策略
 
 所有文件读写、补丁、目录搜索、HTTP 和 shell 工具直接在当前工作目录执行，继承宿主机环境变量（包括凭据）、文件权限和网络权限。请在目标项目目录启动，并仅执行可信任务。

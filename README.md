@@ -41,6 +41,17 @@ zig build
 
 The binary is written to `zig-out/bin/zagent`.
 
+## Copying text
+
+Drag over conversation text to request a clipboard copy. Outside tmux this
+uses OSC 52; inside tmux it uses `tmux load-buffer -w -` (tmux 3.2+), which
+also updates the tmux buffer and works with `set-clipboard external` and
+`allow-passthrough off`. The `tmux` executable must be on PATH.
+The terminal must support and permit OSC 52 clipboard writes, including over
+SSH. If tmux does not detect that support, configure its `clipboard` terminal
+feature for your terminal. The copy notice confirms a request, not an
+acknowledgement from the system clipboard; command failures show an error notice.
+
 ## Tool execution policy
 
 All built-in filesystem, search, HTTP and shell tools run directly in the

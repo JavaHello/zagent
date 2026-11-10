@@ -313,6 +313,9 @@ fn runRepl(
     // the old inline layout, where the output is what the consumer reads.
     var screen = Screen.init(allocator, io, ln.is_tty and ln.term_supported and
         (stdout.isTty(io) catch false));
+    if (env.get("TMUX")) |value| {
+        if (value.len > 0) screen.tmux_env = env;
+    }
     agent.attachScreen(if (screen.isActive()) &screen else null);
     defer agent.attachScreen(null);
     try screen.enter();
