@@ -148,7 +148,9 @@ fn animate(
         ) catch return;
         // Either of these can observe the cancelation; both end the loop.
         if (options.screen) |screen| {
-            screen.setProgress(line);
+            // Screen owns positioning and erasure. A leading carriage return
+            // would make its single-line clipping stop before the label.
+            screen.setProgress(line[erase.len..]);
             io.sleep(.fromMilliseconds(options.frame_interval_ms), .awake) catch return;
             continue;
         }
@@ -271,6 +273,30 @@ test "the animation draws frames and gives the line back" {
     try expect(std.mem.indexOf(u8, written, "⠙") != null);
     // ...and the last thing written is the erasure that gives the line back.
     try expect(std.mem.endsWith(u8, written, "\r\x1b[2K"));
+}
+
+test "screen progress publishes text without inline cursor controls" {
+    const io = std.testing.io;
+    var screen = Screen.init(std.testing.allocator, io, false);
+    defer screen.deinit();
+    var spin = Spinner.start(io, std.Io.File.stderr(), "thinking…", .{
+        .enabled = true,
+        .screen = &screen,
+        .first_frame_delay_ms = 0,
+        .frame_interval_ms = 1,
+    });
+    defer spin.stop();
+    // Drain while waiting so the test observes the same publication path as
+    // the foreground, without racing the animation's next write.
+    var attempts: usize = 0;
+    while (screen.progress_len == 0 and attempts < 100) : (attempts += 1) {
+        try io.sleep(.fromMilliseconds(5), .awake);
+        _ = try screen.drain();
+    }
+    const progress = screen.progress[0..screen.progress_len];
+    try expect(std.mem.indexOf(u8, progress, "thinking…") != null);
+    try expect(std.mem.indexOfScalar(u8, progress, '\r') == null);
+    try expect(std.mem.indexOf(u8, progress, "\x1b[2K") == null);
 }
 
 test "work status stays above the input prompt and clears both rows on stop" {

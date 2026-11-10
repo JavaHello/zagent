@@ -98,6 +98,23 @@ try:
                     transcript.extend(os.read(master, 65536))
             until(b's \xc2\xb7 in ')
             assert b'thinking' in ansi.sub(b'', transcript), transcript
+            # Observe live spinner ticks without typing. Every published frame
+            # must include the final visible input cursor, not expose the
+            # hidden cursor between the status repaint and input redraw.
+            tick_start = len(transcript)
+            deadline = time.monotonic() + .6
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], .05)[0]:
+                    transcript.extend(os.read(master, 65536))
+            frames = re.findall(rb'\x1b\[\?2026h(.*?)\x1b\[\?2026l',
+                                bytes(transcript[tick_start:]), re.S)
+            live_frames = [frame for frame in frames if b'thinking' in frame]
+            assert len(live_frames) >= 2, transcript
+            for frame in live_frames:
+                assert b'\x1b[?2026h' not in frame, frame
+                assert frame.endswith(b'\x1b[?25h'), frame
+                # Show only after the final absolute input cursor position.
+                assert re.search(rb'\x1b\[16;\d+H\x1b\[\?25h$', frame), frame
             send(b'/model\r\r', b'Model: runtime-mock')
             assert not release.is_set()
             send(b'/status\r\r', b'Account quota:')

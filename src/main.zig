@@ -563,6 +563,8 @@ fn reportCommandError(
 /// what repaints the conversation when the prompt grows.
 fn layoutScreen(context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void {
     const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    runtime.screen.editor_frame = true;
+    defer runtime.screen.editor_frame = false;
     try runtime.screen.reserveInput(rows, repaint);
 }
 

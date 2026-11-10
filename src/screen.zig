@@ -50,6 +50,9 @@ pub const Screen = struct {
     /// without clearing it when following the newest output.
     rendered_len: usize = 0,
     status_dirty: bool = false,
+    /// The editor already owns a synchronized frame during its layout callback.
+    /// DEC synchronized updates are a boolean mode, not a nesting counter.
+    editor_frame: bool = false,
     scroll_rows: usize = 0,
     buffered: bool = false,
     queued: std.ArrayList(u8) = .empty,
@@ -314,12 +317,14 @@ pub const Screen = struct {
     fn repaintStatus(self: *Screen) !void {
         var buf: [512]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try w.writeAll(SYNC_BEGIN ++ HIDE_CURSOR);
+        if (!self.editor_frame) try w.writeAll(SYNC_BEGIN);
+        try w.writeAll(HIDE_CURSOR);
         try w.print("\x1b[{d};1H\x1b[2K", .{self.logBottom() + 1});
         try self.writeStatus(&w);
         // The editor owns the visible cursor. Keep it hidden at the log
         // position until refreshBottom has redrawn and positioned the input.
-        try w.writeAll(RESTORE_CURSOR ++ SYNC_END);
+        try w.writeAll(RESTORE_CURSOR);
+        if (!self.editor_frame) try w.writeAll(SYNC_END);
         try self.out.writeStreamingAll(self.io, w.buffered());
         self.status_dirty = false;
     }
@@ -346,8 +351,8 @@ pub const Screen = struct {
     /// still used for resize, layout changes, history browsing and selection.
     fn appendLog(self: *Screen) !void {
         if (self.rendered_len == self.transcript.items.len) return;
-        try self.out.writeStreamingAll(self.io, SYNC_BEGIN);
-        defer self.out.writeStreamingAll(self.io, SYNC_END) catch {};
+        if (!self.editor_frame) try self.out.writeStreamingAll(self.io, SYNC_BEGIN);
+        defer if (!self.editor_frame) self.out.writeStreamingAll(self.io, SYNC_END) catch {};
         var buf: [8192]u8 = undefined;
         var fw = self.out.writerStreaming(self.io, &buf);
         const w = &fw.interface;
@@ -391,8 +396,8 @@ pub const Screen = struct {
 
         // A replay may exceed the writer buffer. Keep the clear and all its
         // writes in one terminal frame, and release sync mode even on error.
-        try self.out.writeStreamingAll(self.io, SYNC_BEGIN);
-        defer self.out.writeStreamingAll(self.io, SYNC_END) catch {};
+        if (!self.editor_frame) try self.out.writeStreamingAll(self.io, SYNC_BEGIN);
+        defer if (!self.editor_frame) self.out.writeStreamingAll(self.io, SYNC_END) catch {};
 
         var buf: [8192]u8 = undefined;
         var file_writer = self.out.writerStreaming(self.io, &buf);
@@ -907,6 +912,44 @@ test "streamed output appends without clearing and history still replays" {
     try std.testing.expect(std.mem.startsWith(u8, redraw, SYNC_BEGIN));
     try std.testing.expect(std.mem.endsWith(u8, redraw, SYNC_END));
     try std.testing.expect(std.mem.indexOf(u8, redraw, "initial\r\nnew\r\ntext") != null);
+}
+
+test "layout paints never end the editor synchronized frame" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.out = file;
+    s.buffered = true;
+    s.editor_frame = true;
+
+    // Initial replay, status-only tick, streaming append, and forced replay.
+    try s.writeLog("initial\n");
+    try s.reserveInput(1, false);
+    s.setProgress("thinking");
+    try s.reserveInput(1, false);
+    try s.writeLog("streamed\n");
+    try s.reserveInput(1, false);
+    try s.reserveInput(1, true);
+    const written = try readOutput(tmp.dir, a);
+    defer a.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "thinking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "streamed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, SYNC_BEGIN) == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, SYNC_END) == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, SHOW_CURSOR) == null);
+
+    // Standalone repaints must still release their own synchronized frame.
+    s.editor_frame = false;
+    try s.reserveInput(1, true);
+    const standalone = try readOutput(tmp.dir, a);
+    defer a.free(standalone);
+    try std.testing.expect(std.mem.startsWith(u8, standalone[written.len..], SYNC_BEGIN));
+    try std.testing.expect(std.mem.endsWith(u8, standalone, SYNC_END));
 }
 
 test "viewport restores hidden SGR state without replaying terminal commands" {
