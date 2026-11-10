@@ -357,12 +357,10 @@ const LineBuffer = struct {
     }
 };
 
-/// How a server subprocess is launched. Its command is resolved inside the
-/// sandbox, using /usr/bin:/bin unless the server explicitly configures PATH.
+/// How a server subprocess is launched on the host.
 pub const StdioSpec = struct {
     argv: []const []const u8,
-    /// Explicit variables added to the server's clean sandbox environment.
-    /// The host environment is not inherited; declare required credentials here.
+    /// Variables overriding the inherited host environment.
     env: []const [2][]const u8 = &.{},
 };
 
@@ -382,9 +380,6 @@ pub const Stdio = struct {
     /// Lines that were not JSON-RPC messages, counted over the whole
     /// connection.
     garbage: usize = 0,
-    /// macOS: the private temp directory owned by the sandboxed server. It is
-    /// removed when the server is closed.
-    tmp_dir: ?[]u8 = null,
 
     pub fn start(
         allocator: std.mem.Allocator,
@@ -392,24 +387,21 @@ pub const Stdio = struct {
         spec: StdioSpec,
         parent_env: *const std.process.Environ.Map,
     ) !Stdio {
-        // MCP commands receive the same filesystem/process boundary as built-ins.
-        // Credentials must be explicitly assigned in the server's env settings.
         const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
         defer allocator.free(workspace);
-        const network = if (parent_env.get("AI_TOOL_NETWORK")) |v| std.mem.eql(u8, v, "1") else false;
+        var env = try parent_env.clone(allocator);
+        defer env.deinit();
         for (spec.env) |pair| {
             if (!std.process.Environ.Map.validateKeyForPut(pair[0])) return Error.McpInvalidEnvKey;
+            try env.put(pair[0], pair[1]);
         }
-        var l = try @import("sandbox.zig").launch(io, allocator, workspace, null, network, spec.argv, spec.env, null);
-        defer l.deinit();
-        const tmp_dir = l.tmp_dir;
         const child = try std.process.spawn(io, .{
-            .argv = l.argv,
+            .argv = spec.argv,
             .cwd = .{ .path = workspace },
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .inherit,
-            .environ_map = &l.env,
+            .environ_map = &env,
         });
 
         return .{
@@ -417,7 +409,6 @@ pub const Stdio = struct {
             .allocator = allocator,
             .child = child,
             .inbox = .{ .allocator = allocator },
-            .tmp_dir = tmp_dir,
         };
     }
 
@@ -438,11 +429,6 @@ pub const Stdio = struct {
             self.child.stdin = null;
         }
         if (self.child.id != null) self.child.kill(self.io);
-        if (self.tmp_dir) |d| {
-            std.Io.Dir.cwd().deleteTree(self.io, d) catch {};
-            self.allocator.free(d);
-            self.tmp_dir = null;
-        }
     }
 
     fn notify(self: *Stdio, json: []const u8) !void {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the real API -> agent -> sandbox boundary without paid API calls."""
+"""Exercise real API -> agent -> host tool execution without paid API calls."""
 from mock_api import send_response, handle_planning, PLAN_APPROACH, trust_workspace
 
 import http.server
@@ -22,8 +22,7 @@ def tool_output(output):
     return status, content
 
 
-# macOS defaults to /private/var/folders, which the system-path write policy
-# deliberately isolates. Use /tmp so ordinary fixture edits remain ordinary.
+# Keep fixture paths short and stable across POSIX hosts.
 with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as temporary:
     root = Path(temporary)
     live_binary = root / 'zagent-live'
@@ -35,12 +34,12 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     outside = root / 'private'
     outside.write_text('SECRET_OUTSIDE_WORKSPACE_9c18')
     (workspace / 'escape').symlink_to(outside)
-    forbidden = subprocess.run([str(live_binary), '--direct-tool-worker', 'write',
-                                json.dumps({'path': '/etc/zagent-policy-test-must-not-exist', 'content': 'must not run'})],
-                               cwd=workspace, env={'PATH': '/usr/bin:/bin'}, capture_output=True,
-                               text=True, timeout=10)
-    assert forbidden.returncode != 0 and 'WorkerRequiresSandbox' in forbidden.stderr, forbidden.stderr
-    assert not (workspace / 'HOST_WORKER_BYPASS').exists()
+    worker = subprocess.run([str(live_binary), '--tool-worker', 'bash',
+                             json.dumps({'command': '/bin/echo HOST_WORKER'})],
+                            cwd=workspace, env={'PATH': '/usr/bin:/bin'}, capture_output=True,
+                            text=True, timeout=10)
+    assert worker.returncode == 0, worker.stderr
+    assert 'HOST_WORKER' in json.loads(worker.stdout)['content'], worker.stdout
     calls = [
         ('bash', {'command': 'test -n "$DEEPSEEK_API_KEY" && test -n "$OPENAI_API_KEY" && test -n "$PRIVATE_SENTINEL" && echo ENV_INHERITED'}),
         ('write', {'path': 'notes.md', 'content': '# Report\nAnalysis complete.\n'}),
@@ -58,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
         ('write', {'path': 'notes.md', 'old_text': 'Analysis verified.', 'new_text': 'Analysis checked.'}),
         ('write', {'path': 'notes.md', 'old_text': 'not present', 'new_text': 'MUST_NOT_APPEAR'}),
         ('write', {'path': 'escape', 'old_text': 'SHOULD_NOT_ESCAPE', 'new_text': 'DIRECT_EDIT_WORKED'}),
-        ('bash', {'command': 'echo DANGEROUS_HOST_WRITE > /etc/zagent-policy-test-must-not-exist && echo SANDBOX_PRIVATE_WRITE'}),
+        ('bash', {'command': '/bin/echo HOST_WRITE > host-write.txt && cat host-write.txt'}),
     ])
     observed = []
     requests = []
@@ -159,22 +158,18 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert 'notes.md' in observed[4], observed[4]
     assert outside.read_text() == 'DIRECT_EDIT_WORKED\n', (outside.read_text(), observed[6:14])
     assert 'SECRET_OUTSIDE_WORKSPACE_9c18' in observed[5]
-    assert not Path('/etc/zagent-policy-test-must-not-exist').exists()
-    # Linux exposes a private /etc directory: a write there may succeed, but
-    # must never reach the host. Other backends may deny it outright, and
-    # hosts without a sandbox must refuse it rather than fall back to execution.
-    assert ('SANDBOX_PRIVATE_WRITE' in observed[14] or
-            'stderr:' in observed[14] or 'failed' in observed[14].lower() or
-            'requires isolation and was not executed' in observed[14]), observed[14]
+    assert statuses[14]['exit_code'] == 0 and not statuses[14]['is_error'], statuses[14]
+    assert (workspace / 'host-write.txt').read_text() == 'HOST_WRITE\n'
+    assert 'HOST_WRITE' in observed[14], observed[14]
     assert 'Replaced one exact text block' in observed[11], observed[11]
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
     assert observed[9] == 'Exit code: 0\n(no output)', observed[9]
-    # Exercise disabled sandbox policy through the real CLI/worker boundary.
+    # Legacy sandbox settings must not block host tools or local MCP startup.
     calls[:] = [
         ('bash', {'command': 'items=(hello world); [[ ${#items[@]} == 2 ]] && printf "%s" "${items[1]}"'}),
         ('bash', {'command': 'echo BASH_ONLY'}),
-        ('bash', {'command': 'echo MUST_NOT_RUN > /etc/zagent-policy-test-must-not-exist'}),
+        ('bash', {'command': '/bin/echo HOST_EXECUTION'}),
     ]
     observed.clear()
     requests.clear()
@@ -182,7 +177,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     config_dir = root / 'zagent'
     config_dir.mkdir()
     (config_dir / 'mcp.json').write_text(json.dumps({'mcpServers': {
-        'disabled-local': {'command': 'sh', 'args': ['-c', 'touch MCP_MUST_NOT_START']}
+        'host-local': {'command': 'sh', 'args': ['-c', 'printf "%s" "$PRIVATE_SENTINEL" > MCP_STARTED']}
     }}))
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -196,12 +191,11 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     off_statuses, off_contents = zip(*(tool_output(output) for output in observed))
     observed[:] = off_contents
     assert all(s['exit_code'] == 0 and not s['is_error'] for s in off_statuses[:2]), off_statuses
-    assert off_statuses[2]['is_error'], off_statuses[2]
+    assert not off_statuses[2]['is_error'] and off_statuses[2]['exit_code'] == 0, off_statuses[2]
     assert observed[:2] == ['Exit code: 0\nworld', 'Exit code: 0\nBASH_ONLY\n'], observed
-    assert 'requires isolation and was not executed' in observed[2], observed
-    assert 'skipped local MCP server' in off.stderr, off.stderr
-    assert not (workspace / 'MCP_MUST_NOT_START').exists()
-    assert not Path('/etc/zagent-policy-test-must-not-exist').exists()
+    assert 'HOST_EXECUTION' in observed[2], observed
+    assert 'skipped local MCP server' not in off.stderr, off.stderr
+    assert (workspace / 'MCP_STARTED').read_text() == env['PRIVATE_SENTINEL']
     tool_names = [t['name'] for t in requests[0]['tools']]
     assert 'bash' in tool_names and 'shell' not in tool_names, tool_names
-    print('PASS: direct editing/search, host environment/network, dangerous-command isolation, timeout, API retry, durable resume, Bash, sandbox off and local MCP skip')
+    print('PASS: direct editing/search, host environment/network, timeout, API retry, durable resume, Bash, ignored legacy sandbox settings and local MCP startup')

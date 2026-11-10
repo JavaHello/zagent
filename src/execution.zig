@@ -1,118 +1,136 @@
-//! Default-host execution policy. Detection is deliberately conservative, not
-//! a security boundary: scripts and dynamically constructed commands can hide effects.
+//! Host tool execution with bounded output, deadlines and process-group cleanup.
 const std = @import("std");
-const sandbox = @import("sandbox.zig");
 const tools = @import("tools.zig");
 
-pub fn requiresSandbox(io: std.Io, allocator: std.mem.Allocator, name: []const u8, arguments: []const u8) !bool {
+pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8, arguments: []const u8) !tools.ToolResult {
+    if (arguments.len > 120 * 1024) return .{ .content = try allocator.dupe(u8, "Tool arguments exceed 120 KiB; split the operation into smaller patches."), .is_error = true };
+    const timeout = shellTimeout(allocator, name, arguments) catch return .{
+        .content = try allocator.dupe(u8, "Invalid timeout_seconds: use an integer from 1 to 3600."),
+        .is_error = true,
+    };
+    const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(workspace);
+    const exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(exe);
+    const deleted = " (deleted)";
+    const worker = if (std.mem.endsWith(u8, exe, deleted)) exe[0 .. exe.len - deleted.len] else exe;
+    var child = std.process.spawn(io, .{
+        .argv = &.{ worker, "--tool-worker", name, arguments },
+        .cwd = .{ .path = workspace },
+        .environ_map = env,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    }) catch |err| return .{
+        .content = try std.fmt.allocPrint(allocator, "Tool worker launch failed ({s}).", .{@errorName(err)}),
+        .is_error = true,
+    };
+    defer _ = killGroup(&child, io);
+
+    var multi_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi: std.Io.File.MultiReader = undefined;
+    multi.init(allocator, io, multi_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi.deinit();
+    const stdout_reader = multi.reader(0);
+    const stderr_reader = multi.reader(1);
+    const run_timeout = (std.Io.Timeout{ .duration = .{
+        .raw = std.Io.Duration.fromSeconds(@intCast(timeout)),
+        .clock = .awake,
+    } }).toDeadline(io);
+    while (multi.fill(64, run_timeout)) |_| {
+        if (stdout_reader.buffered().len > 2 * 1024 * 1024) return .{
+            .content = try allocator.dupe(u8, "Tool output exceeded the 2 MiB limit."),
+            .is_error = true,
+            .truncated = true,
+        };
+        if (stderr_reader.buffered().len > 64 * 1024) return .{
+            .content = try allocator.dupe(u8, "Tool error output exceeded the 64 KiB limit."),
+            .is_error = true,
+            .truncated = true,
+        };
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        error.Timeout => return .{
+            .content = try std.fmt.allocPrint(allocator, "Tool timed out after {d}s.", .{timeout}),
+            .is_error = true,
+            .timed_out = true,
+        },
+        else => |e| return .{
+            .content = try std.fmt.allocPrint(allocator, "Tool worker failed ({s}).", .{@errorName(e)}),
+            .is_error = true,
+        },
+    }
+    multi.checkAnyError() catch |err| return .{
+        .content = try std.fmt.allocPrint(allocator, "Tool worker failed ({s}).", .{@errorName(err)}),
+        .is_error = true,
+    };
+    const term = killGroup(&child, io) orelse std.process.Child.Term{ .unknown = 1 };
+    const stdout = try multi.toOwnedSlice(0);
+    defer allocator.free(stdout);
+    const stderr = try multi.toOwnedSlice(1);
+    defer allocator.free(stderr);
+    return parseResult(allocator, stdout, stderr, term);
+}
+
+fn parseResult(allocator: std.mem.Allocator, stdout: []const u8, stderr: []const u8, term: std.process.Child.Term) !tools.ToolResult {
+    if (!term.success()) return .{
+        .content = try std.fmt.allocPrint(allocator, "Tool worker failed: {s}", .{stderr}),
+        .is_error = true,
+        .exit_code = switch (term) {
+            .exited => |code| code,
+            else => null,
+        },
+    };
+    const parsed = std.json.parseFromSlice(tools.ToolResult, allocator, stdout, .{ .allocate = .alloc_always }) catch return .{
+        .content = try allocator.dupe(u8, "Tool worker returned an invalid result."),
+        .is_error = true,
+    };
+    defer parsed.deinit();
+    var result = parsed.value;
+    result.content = try allocator.dupe(u8, result.content);
+    return result;
+}
+
+/// Kill and reap the worker and any background processes left in its group.
+fn killGroup(child: *std.process.Child, io: std.Io) ?std.process.Child.Term {
+    const pid = child.id orelse return null;
+    std.posix.kill(-pid, .KILL) catch {};
+    return child.wait(io) catch null;
+}
+
+fn shellTimeout(allocator: std.mem.Allocator, name: []const u8, arguments: []const u8) !u32 {
+    if (!std.mem.eql(u8, name, "bash")) return 180;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArguments;
-    const obj = parsed.value.object;
-    if (std.mem.eql(u8, name, "bash")) {
-        const value = obj.get("command") orelse return error.InvalidArguments;
-        if (value != .string) return error.InvalidArguments;
-        return dangerousCommand(value.string);
-    }
-    // Resolve symlinks and relative paths before checking file-writing tools.
-    const key: []const u8 = if (std.mem.eql(u8, name, "http")) "save_to" else "path";
-    if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "http")) {
-        if (obj.get(key)) |value| {
-            if (value != .string) return error.InvalidArguments;
-            const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-            defer allocator.free(cwd);
-            const absolute = try std.fs.path.resolve(allocator, &.{ cwd, value.string });
-            defer allocator.free(absolute);
-            if (systemPath(absolute)) return true;
-            // Resolve existing parents too, so new files through symlinked
-            // directories receive the same policy as existing files.
-            var parent: []const u8 = absolute;
-            while (true) {
-                const resolved = std.Io.Dir.cwd().realPathFileAlloc(io, parent, allocator) catch {
-                    parent = std.fs.path.dirname(parent) orelse break;
-                    continue;
-                };
-                defer allocator.free(resolved);
-                return systemPath(resolved);
-            }
-            return false;
-        }
-    }
-    if (std.mem.eql(u8, name, "apply_patch")) {
-        if (obj.get("patch")) |value| {
-            if (value != .string) return error.InvalidArguments;
-            return dangerousCommand(value.string);
-        }
-    }
-    return false;
+    const value = parsed.value.object.get("timeout_seconds") orelse return 180;
+    if (value != .integer or value.integer < 1 or value.integer > 3600) return error.InvalidTimeout;
+    return @intCast(value.integer);
 }
 
-fn systemPath(path: []const u8) bool {
-    for ([_][]const u8{ "/etc", "/private/etc", "/usr", "/boot", "/sys", "/proc", "/dev", "/System", "/Library", "/var", "/private/var", "/sbin", "/bin" }) |root| {
-        if (std.mem.eql(u8, path, root) or (std.mem.startsWith(u8, path, root) and path.len > root.len and path[root.len] == '/')) return true;
-    }
-    return false;
-}
-
-fn dangerousCommand(command: []const u8) bool {
-    var tokens = std.mem.tokenizeAny(u8, command, " \t\r\n;|&()<>\"'`=\\");
-    while (tokens.next()) |token| {
-        if (systemPath(token)) return true;
-        const base = std.fs.path.basename(token);
-        for ([_][]const u8{
-            "sudo",    "su",           "doas",      "systemctl", "service",  "launchctl",
-            "sysctl",  "iptables",     "ip6tables", "nft",       "ip",       "ifconfig",
-            "route",   "networksetup", "nmcli",     "netplan",   "ufw",      "firewall-cmd",
-            "reboot",  "shutdown",     "poweroff",  "halt",      "mount",    "umount",
-            "mkfs",    "fdisk",        "parted",    "dd",        "diskutil", "chroot",
-            "passwd",  "useradd",      "usermod",   "userdel",   "groupadd", "apt",
-            "apt-get", "dnf",          "yum",       "pacman",    "rpm",      "dpkg",
-        }) |dangerous| {
-            if (std.mem.eql(u8, base, dangerous) or std.mem.startsWith(u8, base, "mkfs.")) return true;
-        }
-    }
-    return false;
-}
-
-pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, network: bool, sandbox_available: bool, name: []const u8, arguments: []const u8) !tools.ToolResult {
-    const isolated = requiresSandbox(io, allocator, name, arguments) catch return .{
-        .content = try allocator.dupe(u8, "Invalid tool arguments; execution was not attempted."),
-        .is_error = true,
-    };
-    if (isolated) {
-        if (!sandbox_available) return .{
-            .content = try allocator.dupe(u8, "Sandbox is disabled or unavailable; this operation requires isolation and was not executed."),
-            .is_error = true,
-        };
-        return sandbox.execute(io, allocator, network, name, arguments);
-    }
-    return sandbox.executeDirect(io, allocator, env, name, arguments);
-}
-
-test "unavailable sandbox rejects dangerous bash calls" {
+test "worker JSON preserves status and legacy defaults" {
     const a = std.testing.allocator;
-    var env = std.process.Environ.Map.init(a);
-    defer env.deinit();
-    for ([_][]const u8{"bash"}) |name| {
-        const result = try execute(std.testing.io, a, &env, false, false, name, "{\"command\":\"sudo true\"}");
-        defer result.deinit(a);
-        try std.testing.expect(result.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "was not executed") != null);
-    }
+    const result = try parseResult(a, "{\"content\":\"failed\",\"is_error\":true,\"exit_code\":7,\"timed_out\":true,\"truncated\":true}", "", .{ .exited = 0 });
+    defer result.deinit(a);
+    try std.testing.expect(result.is_error and result.timed_out and result.truncated);
+    try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
+    const legacy = try parseResult(a, "{\"content\":\"old\",\"is_error\":false}", "", .{ .exited = 0 });
+    defer legacy.deinit(a);
+    try std.testing.expect(!legacy.is_error and !legacy.timed_out and !legacy.truncated);
+    try std.testing.expectEqual(@as(?u8, null), legacy.exit_code);
+    const failed = try parseResult(a, "", "worker crashed", .{ .exited = 137 });
+    defer failed.deinit(a);
+    try std.testing.expect(failed.is_error and !failed.timed_out);
+    try std.testing.expectEqual(@as(?u8, 137), failed.exit_code);
 }
 
-test "ordinary development commands run directly; system changes require sandbox" {
+test "shell timeout is bounded and applies only to commands" {
     const a = std.testing.allocator;
-    for ([_][]const u8{ "zig build test", "git status", "npm install", "python3 script.py", "echo hello > local.txt" }) |command| {
-        try std.testing.expect(!dangerousCommand(command));
-    }
-    for ([_][]const u8{ "sudo true", "echo x > /etc/hosts", "ip route add default", "sh -c 'systemctl restart ssh'", "true && /sbin/reboot", "mkfs.ext4 /dev/sda" }) |command| {
-        try std.testing.expect(dangerousCommand(command));
-    }
-    try std.testing.expect(try requiresSandbox(std.testing.io, a, "write", "{\"path\":\"/etc/hosts\"}"));
-    try std.testing.expect(!try requiresSandbox(std.testing.io, a, "write", "{\"path\":\"src/main.zig\"}"));
-    try std.testing.expect(!try requiresSandbox(std.testing.io, a, "http", "{\"url\":\"https://example.com\"}"));
-    try std.testing.expect(try requiresSandbox(std.testing.io, a, "http", "{\"url\":\"https://example.com\",\"save_to\":\"/etc/hosts\"}"));
-    try std.testing.expect(!try requiresSandbox(std.testing.io, a, "http", "{\"url\":\"https://example.com\",\"save_to\":\"download.txt\"}"));
-    try std.testing.expectError(error.InvalidArguments, requiresSandbox(std.testing.io, a, "bash", "{}"));
+    try std.testing.expectEqual(@as(u32, 180), try shellTimeout(a, "bash", "{}"));
+    try std.testing.expectEqual(@as(u32, 600), try shellTimeout(a, "bash", "{\"timeout_seconds\":600}"));
+    try std.testing.expectEqual(@as(u32, 180), try shellTimeout(a, "read", "{\"timeout_seconds\":600}"));
+    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "bash", "{\"timeout_seconds\":0}"));
+    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "bash", "{\"timeout_seconds\":3601}"));
+    try std.testing.expectError(error.InvalidTimeout, shellTimeout(a, "bash", "{\"timeout_seconds\":\"600\"}"));
 }

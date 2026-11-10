@@ -36,7 +36,6 @@ const ConfigFile = struct {
     compact_keep: ?u32 = null,
     memory: ?bool = null,
     memory_auto: ?bool = null,
-    tool_sandbox: ?@import("sandbox.zig").Mode = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
         if (self.provider) |value| allocator.free(value);
@@ -172,8 +171,6 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         config.memory = parseBool(value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MEMORY_AUTO")) {
         config.memory_auto = parseBool(value);
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_TOOL_SANDBOX")) {
-        config.tool_sandbox = std.meta.stringToEnum(@import("sandbox.zig").Mode, value) orelse return error.InvalidSandboxMode;
     }
 }
 
@@ -435,10 +432,6 @@ fn resolve(
     return .{
         .allocator = allocator,
         .api_key = api_key,
-        .tool_sandbox = if (env.get("AI_TOOL_SANDBOX")) |value|
-            std.meta.stringToEnum(@import("sandbox.zig").Mode, value) orelse return error.InvalidSandboxMode
-        else
-            file_config.tool_sandbox orelse .auto,
         .base_url = base_url,
         .model = model,
         .max_tokens = max_tokens,
@@ -478,7 +471,6 @@ pub const Config = struct {
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
     codex_auth_path: ?[]const u8 = null,
-    tool_sandbox: @import("sandbox.zig").Mode = .auto,
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Config {
         var file_config = try loadConfigFile(io, allocator, env);
@@ -517,33 +509,18 @@ fn testFile(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !ConfigF
     return file_config;
 }
 
-test "sandbox mode defaults, config, environment override and invalid values" {
+test "legacy sandbox settings are ignored" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     try env.put("AI_KEY", "test-key");
     var file = ConfigFile{};
     defer file.deinit(a);
-    {
-        const config = try resolve(a, &file, &env);
-        defer config.deinit();
-        try std.testing.expectEqual(@import("sandbox.zig").Mode.auto, config.tool_sandbox);
-    }
     try applyConfigValue(a, &file, "AI_TOOL_SANDBOX", "required");
-    {
-        const config = try resolve(a, &file, &env);
-        defer config.deinit();
-        try std.testing.expectEqual(@import("sandbox.zig").Mode.required, config.tool_sandbox);
-    }
-    try env.put("AI_TOOL_SANDBOX", "off");
-    {
-        const config = try resolve(a, &file, &env);
-        defer config.deinit();
-        try std.testing.expectEqual(@import("sandbox.zig").Mode.off, config.tool_sandbox);
-    }
     try env.put("AI_TOOL_SANDBOX", "invalid");
-    try std.testing.expectError(error.InvalidSandboxMode, resolve(a, &file, &env));
-    try std.testing.expectError(error.InvalidSandboxMode, applyConfigValue(a, &file, "AI_TOOL_SANDBOX", "invalid"));
+    const config = try resolve(a, &file, &env);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("test-key", config.api_key);
 }
 
 test "config defaults" {

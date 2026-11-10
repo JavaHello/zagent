@@ -108,6 +108,32 @@ pub const Memory = struct {
         return true;
     }
 
+    /// Add a note, or replace/delete an exact existing note.
+    pub fn edit(self: *Memory, action: []const u8, text: []const u8, old_text: ?[]const u8) !bool {
+        if (!self.enabled) return error.MemoryDisabled;
+        if (std.mem.eql(u8, action, "add")) {
+            if (old_text != null) return error.InvalidMemoryAction;
+            return self.add(text);
+        }
+        const replacing = std.mem.eql(u8, action, "replace");
+        if (!replacing and !std.mem.eql(u8, action, "delete")) return error.InvalidMemoryAction;
+        if (!replacing and old_text != null) return error.InvalidMemoryAction;
+        const target = if (replacing) old_text orelse return error.MissingOldText else text;
+        for (self.entries.items, 0..) |entry, index| {
+            if (!std.mem.eql(u8, entry, target)) continue;
+            if (!replacing) return self.remove(index);
+            const note = try normalize(self.allocator, text);
+            if (note.len == 0) {
+                self.allocator.free(note);
+                return error.EmptyMemory;
+            }
+            self.entries.items[index] = note;
+            self.allocator.free(entry);
+            return true;
+        }
+        return error.MemoryNotFound;
+    }
+
     /// Remove the note at a zero-based index. Returns whether it existed.
     pub fn remove(self: *Memory, index: usize) bool {
         if (index >= self.entries.items.len) return false;
@@ -381,6 +407,21 @@ fn extractJsonObject(text: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+test "memory edits replace and delete exact notes without losing failed edits" {
+    var memory = try Memory.initWithPath(std.testing.allocator, std.testing.io, null);
+    memory.enabled = true;
+    defer memory.deinit();
+    _ = try memory.edit("add", "old convention", null);
+    try std.testing.expectError(error.MemoryNotFound, memory.edit("replace", "new", "old"));
+    try std.testing.expectError(error.EmptyMemory, memory.edit("replace", "  ", "old convention"));
+    try std.testing.expectEqualStrings("old convention", memory.entries.items[0]);
+    try std.testing.expect(try memory.edit("replace", "new convention", "old convention"));
+    try std.testing.expectEqualStrings("new convention", memory.entries.items[0]);
+    try std.testing.expectError(error.InvalidMemoryAction, memory.edit("delete", "new convention", "unexpected"));
+    try std.testing.expect(try memory.edit("delete", "new convention", null));
+    try std.testing.expectEqual(@as(usize, 0), memory.count());
 }
 
 test "notes are normalised, deduplicated and bounded" {

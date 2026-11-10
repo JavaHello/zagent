@@ -104,23 +104,7 @@ pub fn main(init: std.process.Init) !void {
         args.deinit(allocator);
     }
 
-    const direct_worker = args.items.len == 4 and std.mem.eql(u8, args.items[1], "--direct-tool-worker");
-    if (args.items.len == 4 and (direct_worker or std.mem.eql(u8, args.items[1], "--tool-worker"))) {
-        // Calling the internal dispatch flag on the host must not bypass the
-        // sandbox. On Linux the worker is mounted at a private path that only
-        // exists inside bubblewrap; on macOS the worker proves it is sandboxed
-        // by failing to list /Users.
-        if (direct_worker) {
-            if (try @import("execution.zig").requiresSandbox(io, allocator, args.items[2], args.items[3])) return error.WorkerRequiresSandbox;
-        } else if (@import("builtin").os.tag == .macos) {
-            @import("sandbox.zig").verifyMacosSandbox(io) catch return error.WorkerRequiresSandbox;
-        } else {
-            const executable = try std.process.executablePathAlloc(io, allocator);
-            defer allocator.free(executable);
-            const deleted = " (deleted)";
-            const worker_path = if (std.mem.endsWith(u8, executable, deleted)) executable[0 .. executable.len - deleted.len] else executable;
-            if (!std.mem.eql(u8, worker_path, "/zagent-worker")) return error.WorkerRequiresSandbox;
-        }
+    if (args.items.len == 4 and std.mem.eql(u8, args.items[1], "--tool-worker")) {
         const result = @import("tool_worker.zig").execute(io, allocator, env, args.items[2], args.items[3]) catch |err| tools_error: {
             break :tools_error @import("tools.zig").ToolResult{
                 .content = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}),
@@ -150,11 +134,8 @@ pub fn main(init: std.process.Init) !void {
             "AI_MEMORY=0           Disable durable memory for this workspace\n" ++
             "AI_MEMORY_AUTO=0      Keep the remember tool, skip the per-turn extractor\n" ++
             "AI_MEMORY_FILE        Store memory in another file\n" ++
-            "AI_TOOL_NETWORK=1     Enable sandbox network access (default: off)\n" ++
-            "AI_TOOL_SANDBOX       auto (default), required, or off\n\n" ++
-            "Bash tools run on the host; operations requiring isolation never fall back.\n" ++
-            "Sandbox: Linux (bubblewrap + GNU timeout), macOS (sandbox-exec).\n" ++
-            "Unsupported sandboxes are skipped in auto mode. Build with Zig 0.17.0.\n");
+            "Tools and local MCP servers run on the host with inherited environment and network access.\n" ++
+            "Build with Zig 0.17.0.\n");
         return;
     }
     if (args.items.len == 2 and std.mem.eql(u8, args.items[1], "--version")) {
@@ -265,11 +246,10 @@ pub fn main(init: std.process.Init) !void {
     }
     const stderr = std.Io.File.stderr();
     var watcher = McpProgress{ .io = io, .allocator = allocator };
-    const sandbox_available = try @import("sandbox.zig").initialize(io, allocator, config.tool_sandbox);
-    var registry = mcp.Registry.connectWithSandbox(allocator, io, env, &problems, .{
+    var registry = mcp.Registry.connect(allocator, io, env, &problems, .{
         .context = &watcher,
         .started = McpProgress.started,
-    }, sandbox_available) catch |err| failed: {
+    }) catch |err| failed: {
         try printToStderr(allocator, io, YELLOW ++ "  ⚠ mcp: no servers were read: {s}\n" ++ RESET, .{@errorName(err)});
         break :failed mcp.Registry.empty(allocator, io);
     };
@@ -290,7 +270,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var agent = try Agent.init(allocator, io, config, &ln, env, &registry, sandbox_available);
+    var agent = try Agent.init(allocator, io, config, &ln, env, &registry);
     defer agent.deinit();
 
     agent.startSession(resume_id) catch |err| {
@@ -625,7 +605,7 @@ test {
     _ = @import("unicode_width/main.zig");
     _ = @import("agent.zig");
     _ = @import("status.zig");
-    _ = @import("sandbox.zig");
+    _ = @import("execution.zig");
     _ = @import("session.zig");
     _ = @import("tool_worker.zig");
     _ = @import("history.zig");

@@ -82,10 +82,11 @@ fn readKey(allocator: std.mem.Allocator, call: openai.ToolCallData, content: []c
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(path.string);
     // A length prefix prevents a path from being confused with range bytes.
-    var fields: [24]u8 = undefined;
+    var fields: [32]u8 = undefined;
     std.mem.writeInt(u64, fields[0..8], @intCast(path.string.len), .little);
     std.mem.writeInt(u64, fields[8..16], @intCast(range.start_line), .little);
     std.mem.writeInt(u64, fields[16..24], @intCast(range.end_line orelse 0), .little);
+    std.mem.writeInt(u64, fields[24..32], @intCast(range.start_column), .little);
     hash.update(&fields);
     hash.update(content);
     return hash.finalResult();
@@ -346,6 +347,7 @@ test "read deduplication compares effective arguments and contents only in live 
     for ([_]Case{
         .{ .args = "{\"path\":\"b.zig\"}" },
         .{ .args = "{\"path\":\"a.zig\",\"start_line\":2}" },
+        .{ .args = "{\"path\":\"a.zig\",\"start_column\":2}" },
         .{ .args = "{\"path\":\"a.zig\",\"end_line\":5}" },
         .{ .content = "changed contents" },
         .{ .is_error = true },

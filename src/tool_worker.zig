@@ -78,6 +78,8 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
         } else if (std.mem.eql(u8, name, "ls")) {
             const parsed = std.json.parseFromSlice(struct {
                 path: []const u8 = ".",
+                offset: usize = 0,
+                limit: usize = 100,
             }, allocator, arguments, .{ .ignore_unknown_fields = true }) catch {
                 break :blk .{
                     .content = try allocator.dupe(u8, "Error: ls expects an optional 'path' string (defaults to the current directory)"),
@@ -85,7 +87,7 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
                 };
             };
             defer parsed.deinit();
-            break :blk try tools.listDir(io, allocator, parsed.value.path);
+            break :blk try tools.listDirPage(io, allocator, parsed.value.path, .{ .offset = parsed.value.offset, .limit = parsed.value.limit });
         } else if (std.mem.eql(u8, name, "rg") or std.mem.eql(u8, name, "grep")) {
             const args = tools.parseGrepArgs(allocator, arguments) catch |err| {
                 break :blk .{

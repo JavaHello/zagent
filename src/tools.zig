@@ -182,6 +182,53 @@ test "read streams ranges beyond the old file and output limits" {
     try std.testing.expect(std.mem.indexOf(u8, full.content, "start_line=1") != null);
 }
 
+test "read continuation preserves long utf8 lines without skipping bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(a);
+    for (0..3000) |_| try buffer.appendSlice(a, "你");
+    const data = buffer.items;
+    try tmp.dir.writeFile(io, .{ .sub_path = "utf8", .data = data });
+    const path = try tmp.dir.realPathFileAlloc(io, "utf8", a);
+    defer a.free(path);
+    const first = try readFileRange(io, a, path, .{});
+    defer first.deinit(a);
+    try std.testing.expect(first.truncated);
+    try std.testing.expect(std.mem.startsWith(u8, first.content, data[0..8190]));
+    try std.testing.expect(std.mem.indexOf(u8, first.content, "start_column=8191") != null);
+    const second = try readFileRange(io, a, path, .{ .start_column = 8191 });
+    defer second.deinit(a);
+    try std.testing.expect(!second.truncated);
+    try std.testing.expectEqualStrings(data[8190..], second.content);
+}
+
+test "search pages sort names, preserve status, and expose continuation" {
+    const a = std.testing.allocator;
+    const sorted = try searchPage(a, "z\na\nm\n", 1, true, .{ .is_error = false, .exit_code = 0 });
+    defer sorted.deinit(a);
+    try std.testing.expectEqualStrings("m\nz\n", sorted.content);
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(a);
+    for (0..600) |_| try buffer.appendSlice(a, "one matching line\n");
+    const data = buffer.items;
+    const first = try searchPage(a, data, 0, false, .{ .is_error = true, .exit_code = 2 });
+    defer first.deinit(a);
+    try std.testing.expect(first.is_error);
+    try std.testing.expectEqual(@as(?u8, 2), first.exit_code);
+    try std.testing.expect(first.truncated);
+    const cursor = 7800 / "one matching line\n".len;
+    const marker = try std.fmt.allocPrint(a, "offset={d}", .{cursor});
+    defer a.free(marker);
+    try std.testing.expect(std.mem.indexOf(u8, first.content, marker) != null);
+    const second = try searchPage(a, data, cursor, false, .{ .is_error = false });
+    defer second.deinit(a);
+    try std.testing.expect(!second.truncated);
+    try std.testing.expectEqualStrings(data[cursor * "one matching line\n".len ..], second.content);
+}
+
 test "search limits parse and reach both backends" {
     const a = std.testing.allocator;
     const args = try parseGrepArgs(a, "{\"pattern\":\"needle\",\"context_lines\":2,\"max_matches\":1}");
@@ -230,6 +277,8 @@ test "grep includes context and stops matching per file" {
 pub const ReadRange = struct {
     start_line: usize = 1,
     end_line: ?usize = null,
+    /// 1-based byte position within start_line.
+    start_column: usize = 1,
 };
 
 pub fn optionalUnsigned(value: ?std.json.Value, minimum: usize) !?usize {
@@ -247,6 +296,7 @@ pub fn parseReadRange(allocator: std.mem.Allocator, arguments: []const u8) !Read
     const range = ReadRange{
         .start_line = (try optionalUnsigned(parsed.value.object.get("start_line"), 1)) orelse 1,
         .end_line = try optionalUnsigned(parsed.value.object.get("end_line"), 1),
+        .start_column = (try optionalUnsigned(parsed.value.object.get("start_column"), 1)) orelse 1,
     };
     if (range.end_line) |end| {
         if (end < range.start_line) return error.InvalidArguments;
@@ -259,7 +309,7 @@ pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Too
 }
 
 pub fn readFileRange(io: std.Io, allocator: std.mem.Allocator, path: []const u8, range: ReadRange) !ToolResult {
-    if (range.start_line == 0 or (range.end_line != null and range.end_line.? < range.start_line))
+    if (range.start_line == 0 or range.start_column == 0 or (range.end_line != null and range.end_line.? < range.start_line))
         return toolError(allocator, "Error: line numbers must be positive and end_line must be >= start_line", .{});
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         return .{
@@ -274,26 +324,41 @@ pub fn readFileRange(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(allocator);
     var line: usize = 1;
+    var column: usize = 1;
     var truncated = false;
     while (range.end_line == null or line <= range.end_line.?) {
         const byte = file_reader.interface.takeByte() catch |err| switch (err) {
             error.EndOfStream => break,
             else => return toolError(allocator, "Error reading '{s}': {s}", .{ path, @errorName(err) }),
         };
-        if (line >= range.start_line) {
+        if (line > range.start_line or (line == range.start_line and column >= range.start_column)) {
             if (content.items.len == 8192) {
                 truncated = true;
                 break;
             }
             try content.append(allocator, byte);
         }
-        if (byte == '\n') line = std.math.add(usize, line, 1) catch break;
+        if (byte == '\n') {
+            line = std.math.add(usize, line, 1) catch break;
+            column = 1;
+        } else column += 1;
+    }
+    // Never split a valid UTF-8 character at the byte cap. Its bytes belong
+    // to the next page, whose cursor refers to the original file, not output.
+    if (truncated and content.items.len > 0) {
+        var lead = content.items.len - 1;
+        while (lead > 0 and content.items[lead] & 0xc0 == 0x80) : (lead -= 1) {}
+        const width = std.unicode.utf8ByteSequenceLength(content.items[lead]) catch 1;
+        if (width > content.items.len - lead) {
+            column -= content.items.len - lead;
+            content.shrinkRetainingCapacity(lead);
+        }
     }
     const normalized = try finalizeToolContent(allocator, content.items);
     if (truncated) {
         defer allocator.free(normalized);
         return .{
-            .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated at line {d}; read again with start_line={d} and a smaller end_line. A single line may exceed the output limit.]", .{ normalized, line, line }),
+            .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated; continue with start_line={d}, start_column={d} (1-based byte column).]", .{ normalized, line, column }),
             .is_error = false,
             .truncated = true,
         };
@@ -302,24 +367,18 @@ pub fn readFileRange(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
 }
 
 pub fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, content: []const u8) !ToolResult {
-    if (std.Io.Dir.path.dirname(path)) |dir_path| {
-        std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
-    }
-
-    const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
-        return .{
-            .content = try std.fmt.allocPrint(allocator, "Error creating '{s}': {s}", .{ path, @errorName(err) }),
-            .is_error = true,
-        };
-    };
-    defer file.close(io);
-
-    file.writeStreamingAll(io, content) catch |err| {
-        return .{
-            .content = try std.fmt.allocPrint(allocator, "Error writing '{s}': {s}", .{ path, @errorName(err) }),
-            .is_error = true,
-        };
-    };
+    const cwd = std.Io.Dir.cwd();
+    const target = cwd.realPathFileAlloc(io, path, allocator) catch try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(target);
+    if (std.Io.Dir.path.dirname(target)) |parent| try cwd.createDirPath(io, parent);
+    const stat = cwd.statFile(io, target, .{}) catch null;
+    const permissions: std.Io.File.Permissions = if (stat) |s| s.permissions else .default_file;
+    var atomic = cwd.createFileAtomic(io, target, .{ .replace = true, .permissions = permissions }) catch |err|
+        return toolError(allocator, "Error creating '{s}': {s}", .{ path, @errorName(err) });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, content);
+    if (stat != null) try atomic.file.setPermissions(io, permissions);
+    try atomic.replace(io);
 
     return .{
         .content = try std.fmt.allocPrint(allocator, "Successfully wrote {d} bytes to '{s}'", .{ content.len, path }),
@@ -404,7 +463,41 @@ test "patch envelopes do not change hunk content" {
     try std.testing.expectEqualStrings("+*** End Patch", normalizePatchEnvelope("+*** End Patch"));
 }
 
+test "ls pages are sorted and expose a resumable entry offset" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "z", "a", "m" }) |name|
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    const first = try listDirPage(io, a, path, .{ .limit = 2 });
+    defer first.deinit(a);
+    try std.testing.expect(first.truncated);
+    try std.testing.expect(std.mem.startsWith(u8, first.content, "a\tf\nm\tf\n"));
+    try std.testing.expect(std.mem.indexOf(u8, first.content, "offset=2") != null);
+    const second = try listDirPage(io, a, path, .{ .offset = 2, .limit = 2 });
+    defer second.deinit(a);
+    try std.testing.expect(!second.truncated);
+    try std.testing.expectEqualStrings("z\tf\n", second.content);
+}
+
 pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
+    return listDirPage(io, allocator, path, .{});
+}
+
+pub const Page = struct {
+    offset: usize = 0,
+    limit: usize = 100,
+};
+
+fn lessString(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, page: Page) !ToolResult {
+    if (page.limit == 0 or page.limit > 1000) return error.InvalidArguments;
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) }),
@@ -413,9 +506,11 @@ pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Tool
     };
     defer dir.close(io);
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-
+    var entries: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (entries.items) |entry| allocator.free(entry);
+        entries.deinit(allocator);
+    }
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         const kind_char: u8 = switch (entry.kind) {
@@ -424,14 +519,23 @@ pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Tool
             .sym_link => 'l',
             else => '?',
         };
-        try aw.writer.print("{c} {s}\n", .{ kind_char, entry.name });
+        const line = try std.fmt.allocPrint(allocator, "{s}\t{c}\n", .{ entry.name, kind_char });
+        errdefer allocator.free(line);
+        try entries.append(allocator, line);
     }
-
-    if (aw.written().len == 0) {
-        try aw.writer.writeAll("(empty directory)");
+    std.mem.sort([]const u8, entries.items, {}, lessString);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var index = @min(page.offset, entries.items.len);
+    while (index < entries.items.len and index - page.offset < page.limit) : (index += 1) {
+        const entry = entries.items[index];
+        if (aw.written().len + entry.len > 7800) break;
+        try aw.writer.writeAll(entry);
     }
-
-    return .{ .content = try aw.toOwnedSlice(), .is_error = false };
+    const truncated = index < entries.items.len;
+    if (truncated) try aw.writer.print("[More entries; continue with offset={d}, limit={d}.]\n", .{ index, page.limit });
+    if (aw.written().len == 0) try aw.writer.writeAll("(no entries)");
+    return .{ .content = try aw.toOwnedSlice(), .is_error = false, .truncated = truncated };
 }
 
 /// Which search programs are installed. Decided once, in `Agent.init`, so a
@@ -495,6 +599,9 @@ pub const GrepArgs = struct {
     ignore_case: bool,
     context_lines: ?usize = null,
     max_matches: ?usize = null,
+    hidden: bool = false,
+    no_ignore: bool = false,
+    offset: usize = 0,
 
     pub fn deinit(self: GrepArgs, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
@@ -518,7 +625,7 @@ pub fn parseGrepArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !
     const pattern = try allocator.dupe(u8, pattern_value.string);
     errdefer allocator.free(pattern);
 
-    const path = (try optionalString(allocator, arguments.get("path"))) orelse try allocator.dupe(u8, ".");
+    const path = try searchPath(allocator, arguments.get("path"));
     errdefer allocator.free(path);
     const glob = try optionalString(allocator, arguments.get("glob"));
     errdefer if (glob) |value| allocator.free(value);
@@ -530,6 +637,9 @@ pub fn parseGrepArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !
         .ignore_case = try optionalBool(arguments.get("ignore_case")),
         .context_lines = try optionalUnsigned(arguments.get("context_lines"), 0),
         .max_matches = try optionalUnsigned(arguments.get("max_matches"), 1),
+        .hidden = try optionalBool(arguments.get("hidden")),
+        .no_ignore = try optionalBool(arguments.get("no_ignore")),
+        .offset = (try optionalUnsigned(arguments.get("offset"), 0)) orelse 0,
     };
 }
 
@@ -538,6 +648,9 @@ pub const FindArgs = struct {
     /// A glob the name has to match, e.g. `*.zig`. Not a regular expression.
     pattern: []const u8,
     path: []const u8,
+    hidden: bool = false,
+    no_ignore: bool = false,
+    offset: usize = 0,
 
     pub fn deinit(self: FindArgs, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
@@ -557,10 +670,25 @@ pub fn parseFindArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !
     const pattern = try allocator.dupe(u8, pattern_value.string);
     errdefer allocator.free(pattern);
 
-    const path = (try optionalString(allocator, arguments.get("path"))) orelse try allocator.dupe(u8, ".");
+    const path = try searchPath(allocator, arguments.get("path"));
     errdefer allocator.free(path);
 
-    return .{ .pattern = pattern, .path = path };
+    return .{
+        .pattern = pattern,
+        .path = path,
+        .hidden = try optionalBool(arguments.get("hidden")),
+        .no_ignore = try optionalBool(arguments.get("no_ignore")),
+        .offset = (try optionalUnsigned(arguments.get("offset"), 0)) orelse 0,
+    };
+}
+
+fn searchPath(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const u8 {
+    const path = (try optionalString(allocator, value)) orelse return allocator.dupe(u8, ".");
+    if (std.mem.startsWith(u8, path, "-")) {
+        defer allocator.free(path);
+        return std.fmt.allocPrint(allocator, "./{s}", .{path});
+    }
+    return path;
 }
 
 /// A boolean argument that may be absent, in which case it is false. Anything
@@ -609,6 +737,9 @@ pub fn grepArgv(allocator: std.mem.Allocator, args: GrepArgs, backends: SearchBa
         // to pay for them.
         try argv.appendSlice(allocator, &.{ "rg", "--line-number", "--no-heading", "--color=never" });
         try appendGrepLimits(allocator, &argv, args);
+        try argv.appendSlice(allocator, &.{ "--no-config", "--sort=path" });
+        if (args.hidden) try argv.append(allocator, "--hidden");
+        if (args.no_ignore) try argv.append(allocator, "--no-ignore");
         if (args.glob) |glob| try argv.appendSlice(allocator, &.{ "--glob", glob });
         if (args.ignore_case) try argv.append(allocator, "--ignore-case");
         // `--` keeps a pattern that starts with a dash from being read as a flag.
@@ -655,7 +786,10 @@ pub fn findArgv(allocator: std.mem.Allocator, args: FindArgs, backends: SearchBa
         // fd's defaults are the ones this tool wants: hidden files and anything
         // .gitignore leaves out are skipped, so the answer is the tree a
         // developer would have searched by hand.
-        try argv.appendSlice(allocator, &.{ "fd", "--color=never", "--glob", "--", args.pattern, args.path });
+        try argv.appendSlice(allocator, &.{ "fd", "--color=never", "--glob" });
+        if (args.hidden) try argv.append(allocator, "--hidden");
+        if (args.no_ignore) try argv.append(allocator, "--no-ignore");
+        try argv.appendSlice(allocator, &.{ "--", args.pattern, args.path });
     } else {
         // find reads no ignore file of its own, so `.git` is pruned by hand —
         // without it, a search for a name would walk every object in the
@@ -685,6 +819,7 @@ fn runSearch(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     exit_one_is_no_match: bool,
+    offset: usize,
 ) !ToolResult {
     const result = std.process.run(allocator, io, .{
         .argv = argv,
@@ -735,24 +870,53 @@ fn runSearch(
         try aw.writer.writeAll(if (is_error) "(no output)" else "(no matches)");
     }
 
-    return finalizeResultLimited(allocator, aw.written(), .{
+    return searchPage(allocator, aw.written(), offset, !exit_one_is_no_match, .{
         .is_error = is_error,
         .exit_code = exit_code,
-    }, 8192);
+    });
+}
+
+fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, sort: bool, status: ToolStatus) !ToolResult {
+    if (offset == 0 and std.mem.eql(u8, output, "(no matches)"))
+        return finalizeResultLimited(allocator, output, status, 8192);
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var it = std.mem.tokenizeScalar(u8, output, '\n');
+    while (it.next()) |line| try lines.append(allocator, line);
+    if (sort) std.mem.sort([]const u8, lines.items, {}, lessString);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var index = @min(offset, lines.items.len);
+    var oversized = false;
+    while (index < lines.items.len) : (index += 1) {
+        const line = lines.items[index];
+        if (aw.written().len + line.len + 1 > 7800) {
+            if (aw.written().len == 0) {
+                try aw.writer.writeAll("[One result exceeds the page size; use read with start_column or narrow the search.]\n");
+                oversized = true;
+                index += 1;
+            }
+            break;
+        }
+        try aw.writer.print("{s}\n", .{line});
+    }
+    const truncated = index < lines.items.len;
+    if (truncated) try aw.writer.print("[More results; continue with offset={d}.]\n", .{index});
+    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = status.is_error, .exit_code = status.exit_code, .truncated = truncated or oversized }, 8192);
 }
 
 /// The grep tool: search file contents with a regular expression.
 pub fn grep(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, args: GrepArgs) !ToolResult {
     const argv = try grepArgv(allocator, args, backends);
     defer freeGrepArgv(allocator, argv);
-    return runSearch(io, allocator, argv, true);
+    return runSearch(io, allocator, argv, true, args.offset);
 }
 
 /// The find tool: find files and directories by name.
 pub fn find(io: std.Io, allocator: std.mem.Allocator, backends: SearchBackends, args: FindArgs) !ToolResult {
     const argv = try findArgv(allocator, args, backends);
     defer allocator.free(argv);
-    return runSearch(io, allocator, argv, false);
+    return runSearch(io, allocator, argv, false, args.offset);
 }
 
 /// Longest response text the model is shown. Larger than the cap the other
@@ -891,8 +1055,8 @@ fn optionalString(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]cons
 /// and the body. With `save_to` the body is streamed to that file and only a
 /// summary comes back.
 ///
-/// A delivery failure is an error result, but an HTTP status never is, however
-/// unhelpful: the request did reach the server, and the status line says so.
+/// Delivery failures and HTTP 4xx/5xx statuses are error results. Failed
+/// downloads leave the destination unchanged.
 pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpRequest) !ToolResult {
     const method = parseHttpMethod(request.method) orelse return toolError(
         allocator,
@@ -983,6 +1147,7 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
     var head_aw: std.Io.Writer.Allocating = .init(allocator);
     defer head_aw.deinit();
     const head = response.head;
+    const http_error = @backingInt(head.status) >= 400;
     try writeResponseHead(&head_aw.writer, head.version, head.status, head.reason, head.iterateHeaders());
 
     const has_body = responseHasBody(&response);
@@ -994,6 +1159,10 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
     }
 
     if (request.save_to) |path| {
+        if (http_error) return .{
+            .content = try std.fmt.allocPrint(allocator, "{s}\nHTTP error: destination '{s}' was not changed.", .{ head_aw.written(), path }),
+            .is_error = true,
+        };
         const written = saveResponseBody(io, allocator, &response, path) catch |err| return toolError(
             allocator,
             "Error: could not save the response from '{s}' to '{s}': {s}",
@@ -1023,7 +1192,7 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
         try aw.writer.writeAll("(empty body)");
     }
 
-    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, http_max_content);
+    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = http_error, .truncated = body_text.len == http_max_content }, http_max_content);
 }
 
 /// Write the status line and every response header. Takes the head's parts
@@ -1084,7 +1253,31 @@ fn readResponseBody(allocator: std.mem.Allocator, response: *std.http.Client.Res
             else => return err,
         };
     }
+    if (aw.written().len < http_max_content) try checkResponseBodyComplete(response);
     return aw.toOwnedSlice();
+}
+
+// A decompressor can finish before the transfer reader consumes the final
+// chunk framing. Advance that reader to EOF without accepting extra payload.
+// Zig's content-length reader can also forward a premature socket EOF while
+// framed bytes remain, so verify the state after observing EOF.
+fn checkResponseBodyComplete(response: *std.http.Client.Response) !void {
+    const transfer = &response.request.reader;
+    switch (transfer.state) {
+        .body_remaining_content_length, .body_remaining_chunk_len => {
+            if (transfer.interface.takeByte()) |_| {
+                return error.UnexpectedTrailingData;
+            } else |err| switch (err) {
+                error.EndOfStream => {},
+                else => return err,
+            }
+            switch (transfer.state) {
+                .body_remaining_content_length, .body_remaining_chunk_len => return error.UnexpectedEndOfStream,
+                else => {},
+            }
+        },
+        else => {},
+    }
 }
 
 /// Stream the response body into `path`, creating parent directories as needed,
@@ -1094,12 +1287,15 @@ fn saveResponseBody(io: std.Io, allocator: std.mem.Allocator, response: *std.htt
         std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
     }
 
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
+    defer atomic.deinit(io);
 
     // A bodyless response still gets its file, empty, so that a download's
     // result does not depend on the server having sent one.
-    if (!responseHasBody(response)) return 0;
+    if (!responseHasBody(response)) {
+        try atomic.replace(io);
+        return 0;
+    }
 
     const decompress_buffer = try allocDecompressBuffer(allocator, response.head.content_encoding);
     defer allocator.free(decompress_buffer);
@@ -1109,14 +1305,16 @@ fn saveResponseBody(io: std.Io, allocator: std.mem.Allocator, response: *std.htt
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
     var file_buffer: [16 * 1024]u8 = undefined;
-    var file_writer = file.writer(io, &file_buffer);
+    var file_writer = atomic.file.writer(io, &file_buffer);
     const written = reader.streamRemaining(&file_writer.interface) catch |err| {
         // A write failure is reported as WriteFailed, with the real error kept
         // on the writer.
         if (file_writer.err) |write_err| return write_err;
         return err;
     };
+    try checkResponseBodyComplete(response);
     try file_writer.end();
+    try atomic.replace(io);
     return written;
 }
 
@@ -1208,7 +1406,7 @@ test "grep argv picks ripgrep when it is installed" {
     defer allocator.free(argv);
 
     try expectArgv(
-        &.{ "rg", "--line-number", "--no-heading", "--color=never", "--glob", "*.zig", "--ignore-case", "--", "fn main", "src" },
+        &.{ "rg", "--line-number", "--no-heading", "--color=never", "--no-config", "--sort=path", "--glob", "*.zig", "--ignore-case", "--", "fn main", "src" },
         argv,
     );
 }
@@ -1437,7 +1635,7 @@ test "a search that outruns the limit is refused with advice" {
     // `yes` writes without end, which is the shape of output this tool cannot
     // read at all: std refuses the whole result once the cap is passed rather
     // than handing back the beginning of it.
-    const result = try runSearch(io, allocator, &.{"yes"}, true);
+    const result = try runSearch(io, allocator, &.{"yes"}, true, 0);
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
