@@ -529,7 +529,10 @@ pub fn resolve(allocator: std.mem.Allocator, slots: []Slot, reader: Reader) !Rep
             .answered => return repliesFrom(allocator, slots),
             .custom => |index| switch (try reader.read(reader.context)) {
                 .answer => |text| {
-                    try typed.append(allocator, text);
+                    typed.append(allocator, text) catch |err| {
+                        allocator.free(text);
+                        return err;
+                    };
                     const slot = &slots[index];
                     slot.custom = text;
                     slot.selected = slot.options.len;
@@ -940,6 +943,7 @@ test "the description names the recommendation" {
 const FakeReader = struct {
     /// One entry per free-text read: the line to type, or null for Esc.
     lines: []const ?[]const u8 = &.{},
+    allocator: std.mem.Allocator = std.testing.allocator,
     reads: usize = 0,
     calls: usize = 0,
     /// The question the form was last asked to start on.
@@ -970,9 +974,26 @@ const FakeReader = struct {
         const line = if (self.reads < self.lines.len) self.lines[self.reads] else null;
         self.reads += 1;
         const typed = line orelse return .back;
-        return .{ .answer = try std.testing.allocator.dupe(u8, typed) };
+        return .{ .answer = try self.allocator.dupe(u8, typed) };
     }
 };
+
+test "typed answers are freed when resolve allocation fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+            slots[0].selected = 2;
+            var reader = FakeReader{ .lines = &.{"custom"}, .allocator = allocator };
+            const replies = try resolve(allocator, &slots, .{
+                .context = &reader,
+                .present = FakeReader.present,
+                .read = FakeReader.read,
+            });
+            defer replies.deinit(allocator);
+            try std.testing.expectEqualStrings("custom", replies.items[0].custom);
+        }
+    }.run, .{});
+}
 
 test "a typed answer is the reply, and Esc in that line goes back to the options" {
     const allocator = std.testing.allocator;

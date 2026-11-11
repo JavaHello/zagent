@@ -263,6 +263,7 @@ pub const LinenoiseState = struct {
             self.popup_rows = 0;
             self.buf.deinit(self.allocator);
             self.buf = replacement;
+            replacement = .empty;
             self.pos = new_pos;
             return self.refreshBottom(false);
         }
@@ -270,6 +271,7 @@ pub const LinenoiseState = struct {
         self.freePopup();
         self.buf.deinit(self.allocator);
         self.buf = replacement;
+        replacement = .empty;
         self.pos = new_pos;
         try self.refreshSingleLine();
     }
@@ -802,8 +804,9 @@ pub const LinenoiseState = struct {
             // Update the current history with the current line
             const old_index = self.ln.history.current;
             const current_entry = self.ln.history.hist.items[old_index];
+            const replacement = try self.ln.history.allocator.dupe(u8, self.buf.items);
             self.ln.history.allocator.free(current_entry);
-            self.ln.history.hist.items[old_index] = try self.ln.history.allocator.dupe(u8, self.buf.items);
+            self.ln.history.hist.items[old_index] = replacement;
 
             // Update history index
             const new_index = switch (dir) {
@@ -928,6 +931,83 @@ pub const LinenoiseState = struct {
         try self.refreshLine();
     }
 };
+
+test "accept popup keeps transferred buffer alive on redraw allocation failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try tmp.dir.createFile(std.testing.io, "popup-output", .{});
+    defer out.close(std.testing.io);
+    for ([_]bool{ false, true }) |bottom| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+            fn run(allocator: Allocator, output: File, bottom_anchor: bool) !void {
+                var ln: Linenoise = .{
+                    .allocator = allocator,
+                    .io = std.testing.io,
+                    .env = undefined,
+                    .history = History.empty(allocator),
+                    .bottom_anchor = bottom_anchor,
+                };
+                defer ln.deinit();
+                var state: LinenoiseState = .{
+                    .allocator = allocator,
+                    .ln = &ln,
+                    .stdin = output,
+                    .stdout = output,
+                    .prompt = "> ",
+                    .cols = 80,
+                };
+                defer state.buf.deinit(allocator);
+                defer state.freePopup();
+                try state.buf.appendSlice(allocator, "before suffix");
+                state.pos = 6;
+                const Item = @import("main.zig").PopupItem;
+                {
+                    const value = try allocator.dupe(u8, "replacement");
+                    errdefer allocator.free(value);
+                    const label = try allocator.dupe(u8, "label");
+                    errdefer allocator.free(label);
+                    const description = try allocator.dupe(u8, "description");
+                    errdefer allocator.free(description);
+                    state.popup_items = try allocator.alloc(Item, 1);
+                    state.popup_items[0] = .{ .value = value, .label = label, .description = description };
+                }
+                state.acceptPopup() catch |err| switch (err) {
+                    // Allocating writers expose allocation failure as WriteFailed.
+                    error.WriteFailed => return error.OutOfMemory,
+                    else => return err,
+                };
+                try std.testing.expectEqualStrings("replacement suffix", state.buf.items);
+            }
+        }.run, .{ out, bottom });
+    }
+}
+
+test "history navigation preserves the entry when duplication fails" {
+    const allocator = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var ln: Linenoise = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .env = undefined,
+        .history = History.empty(allocator),
+    };
+    defer ln.deinit();
+    try ln.history.add("original");
+    ln.history.allocator = failing.allocator();
+    var state: LinenoiseState = .{
+        .allocator = allocator,
+        .ln = &ln,
+        .stdin = undefined,
+        .stdout = undefined,
+        .prompt = "> ",
+        .cols = 80,
+    };
+    defer state.buf.deinit(allocator);
+    try state.buf.appendSlice(allocator, "edited");
+    try std.testing.expectError(error.OutOfMemory, state.editHistoryNext(.prev));
+    try std.testing.expectEqualStrings("original", ln.history.hist.items[0]);
+    try std.testing.expectEqualStrings("edited", state.buf.items);
+}
 
 test "multiline layout tracks CJK wrapping, blank lines and cursor splits" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);

@@ -1026,6 +1026,8 @@ pub const Agent = struct {
         }
 
         const owned_prompt = try prompt.toOwnedSlice(self.allocator);
+        // Taken out of the list above, so it owns itself until the task does.
+        errdefer self.allocator.free(owned_prompt);
         // A check-in of zero means the child's first boundary: asking before
         // the task starts is what makes that the first request rather than
         // whichever one the child happens to reach next.
@@ -1035,7 +1037,6 @@ pub const Agent = struct {
         // leave a live task pointing at freed memory.
         try self.runs.append(self.allocator, run);
         run.future = self.io.concurrent(childTurn, .{ child, &run.supervisor, owned_prompt }) catch |err| {
-            self.allocator.free(owned_prompt);
             _ = self.runs.pop();
             return err;
         };
@@ -1348,7 +1349,7 @@ pub const Agent = struct {
                 _ = try self.injectSteering();
                 try self.applySupervision();
             }
-            const response = self.chatAnimated(self.history.items, stream) catch |err| {
+            var response = self.chatAnimated(self.history.items, stream) catch |err| {
                 // Do not leave a continuation prompt as the last message for
                 // the next request to answer.
                 self.settleContinuations(&continuation_start, carried.items, null) catch {};
@@ -1403,24 +1404,17 @@ pub const Agent = struct {
                 // Clone tool calls so the assistant message can own them
                 {
                     const owned_calls = try cloneToolCalls(self.allocator, tool_calls);
-                    errdefer {
-                        for (owned_calls) |c| c.deinit(self.allocator);
-                        self.allocator.free(owned_calls);
-                    }
                     // Keep exact Responses output items alongside the UI summary.
                     // This retains reasoning and function call IDs for stateless replay.
-                    const owned_content = if (response.content) |value| try self.allocator.dupe(u8, value) else null;
-                    errdefer if (owned_content) |value| self.allocator.free(value);
-                    const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
-                    errdefer if (owned_reasoning) |value| self.allocator.free(value);
-
-                    const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
-                    errdefer if (owned_items) |value| self.allocator.free(value);
-                    try self.history.append(self.allocator, .{
-                        .response_items = owned_items,
+                    // The response's own fields are handed over rather than
+                    // copied; only the tool calls are cloned, because the loop
+                    // below keeps using them. Everything given to the history,
+                    // the clone included, is released again if the append fails.
+                    try self.appendOwnedMessage(.{
+                        .response_items = takeOwnedSlice(&response.response_items),
                         .role = "assistant",
-                        .content = owned_content,
-                        .reasoning_content = owned_reasoning,
+                        .content = takeOwnedSlice(&response.content),
+                        .reasoning_content = takeOwnedSlice(&response.reasoning_content),
                         .tool_calls = owned_calls,
                         .tool_call_id = null,
                     });
@@ -1497,18 +1491,19 @@ pub const Agent = struct {
                         // make up; incomplete items are never replayed.
                         try self.settleContinuations(&continuation_start, printed, response.reasoning_content);
                     } else {
-                        const owned_content = try self.allocator.dupe(u8, content);
-                        errdefer self.allocator.free(owned_content);
-                        const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
-                        errdefer if (owned_reasoning) |value| self.allocator.free(value);
-
-                        const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
-                        errdefer if (owned_items) |value| self.allocator.free(value);
-                        try self.history.append(self.allocator, .{
-                            .response_items = owned_items,
+                        // What was just printed becomes the history's message
+                        // without a second copy: the folded text when the reply
+                        // was assembled from fragments, and otherwise the
+                        // response's own buffer. Taking a field out leaves the
+                        // response unable to free it, so exactly one owner
+                        // remains; a failed append hands them back.
+                        const owned_content = combined orelse takeOwnedSlice(&response.content).?;
+                        combined = null;
+                        try self.appendOwnedMessage(.{
+                            .response_items = takeOwnedSlice(&response.response_items),
                             .role = "assistant",
                             .content = owned_content,
-                            .reasoning_content = owned_reasoning,
+                            .reasoning_content = takeOwnedSlice(&response.reasoning_content),
                             .tool_calls = null,
                             .tool_call_id = null,
                         });
@@ -1771,7 +1766,11 @@ pub const Agent = struct {
         for (calls, 0..) |call, i| {
             if (!std.mem.eql(u8, call.name, "ask_user")) continue;
             const question = menu.parseAskUser(self.allocator, call.arguments) catch continue;
-            try questions.append(self.allocator, question);
+            // The array does not own it until the append succeeds.
+            questions.append(self.allocator, question) catch |err| {
+                question.deinit(self.allocator);
+                return err;
+            };
             try slots.append(self.allocator, menu.Slot.init(question.text, question.options.items));
             try indexes.append(self.allocator, i);
         }
@@ -1787,6 +1786,24 @@ pub const Agent = struct {
             answers.items[index] = .{ .content = .{ .text = result.content, .is_error = result.is_error } };
         }
         return answers;
+    }
+
+    /// Give the history a message whose fields are already owned. The history
+    /// is the only owner afterwards, so a failed append — the only operation
+    /// that can fail here — releases the fields again.
+    fn appendOwnedMessage(self: *Agent, message: Message) !void {
+        self.history.append(self.allocator, message) catch |err| {
+            message.deinit(self.allocator);
+            return err;
+        };
+    }
+
+    /// Take a response field out of the response so the history can own it
+    /// instead of copying it. The response no longer frees what is taken.
+    fn takeOwnedSlice(field: *?[]const u8) ?[]const u8 {
+        const value = field.* orelse return null;
+        field.* = null;
+        return value;
     }
 
     /// Append a user-role message, taking a copy of `message`.
@@ -2003,6 +2020,7 @@ pub const Agent = struct {
         // tools page and clip what they can, and this holds the line for the
         // rest, an MCP server's answer included.
         const clipped = try tools.clipOversized(self.allocator, result);
+        errdefer clipped.deinit(self.allocator);
         try self.previewToolResult(clipped.content, clipped.is_error);
         return clipped;
     }
@@ -2366,14 +2384,35 @@ fn cloneToolCalls(allocator: std.mem.Allocator, calls: []const ToolCallData) ![]
         allocator.free(result);
     }
     for (calls, 0..) |call, j| {
-        result[j] = .{
-            .id = try allocator.dupe(u8, call.id),
-            .name = try allocator.dupe(u8, call.name),
-            .arguments = try allocator.dupe(u8, call.arguments),
-        };
+        // Each field is owned as soon as it exists: a failure half way through
+        // one call must not strand the fields already copied for it.
+        const id = try allocator.dupe(u8, call.id);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, call.name);
+        errdefer allocator.free(name);
+        const arguments = try allocator.dupe(u8, call.arguments);
+        result[j] = .{ .id = id, .name = name, .arguments = arguments };
         i = j + 1;
     }
     return result;
+}
+
+fn checkCloneToolCallsFailures(allocator: std.mem.Allocator) !void {
+    const calls = [_]ToolCallData{
+        .{ .id = "call_1", .name = "read", .arguments = "{\"path\":\"a.zig\"}" },
+        .{ .id = "call_2", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
+    };
+    const clone = try cloneToolCalls(allocator, &calls);
+    defer {
+        for (clone) |call| call.deinit(allocator);
+        allocator.free(clone);
+    }
+    try std.testing.expectEqual(@as(usize, 2), clone.len);
+    try std.testing.expectEqualStrings("shell", clone[1].name);
+}
+
+test "cloning tool calls releases a half copied call when an allocation fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCloneToolCallsFailures, .{});
 }
 
 fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {

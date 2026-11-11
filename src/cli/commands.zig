@@ -55,7 +55,9 @@ pub fn complete(allocator: Allocator, buffer: []const u8) Allocator.Error![]cons
     if (isCommandPrefix(buffer)) {
         for (all) |command| {
             if (std.mem.startsWith(u8, command.name, buffer)) {
-                try matches.append(allocator, try allocator.dupe(u8, command.name));
+                const owned = try allocator.dupe(u8, command.name);
+                errdefer allocator.free(owned);
+                try matches.append(allocator, owned);
             }
         }
     }
@@ -92,6 +94,16 @@ pub fn hint(allocator: Allocator, buffer: []const u8) Allocator.Error!?[]const u
 fn freeCompletions(allocator: Allocator, matches: []const []const u8) void {
     for (matches) |match| allocator.free(match);
     allocator.free(matches);
+}
+
+test "command completions clean up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: Allocator) !void {
+            const matches = try complete(allocator, "/");
+            defer freeCompletions(allocator, matches);
+            try std.testing.expectEqual(all.len, matches.len);
+        }
+    }.run, .{});
 }
 
 test "complete offers every command matching the prefix" {

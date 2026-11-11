@@ -18,7 +18,6 @@ pub const Scratch = struct {
         var bytes: [16]u8 = undefined;
         std.Io.random(io, &bytes);
         const path = try std.fmt.allocPrint(a, "{s}/zagent-{s}", .{ canonical, std.fmt.bytesToHex(bytes, .lower) });
-        errdefer std.Io.Dir.cwd().deleteDir(io, path) catch {};
         errdefer a.free(path);
         try std.Io.Dir.createDirAbsolute(io, path, .fromMode(0o700));
         return .{ .io = io, .path = path };
@@ -82,7 +81,7 @@ test "each run gets its own private scratch directory" {
 
     try first.reset();
     try std.testing.expectEqualStrings(first_path, first.path);
-    var emptied = try std.Io.Dir.openDirAbsolute(io, first_path, .{});
+    var emptied = try std.Io.Dir.openDirAbsolute(io, first_path, .{ .iterate = true });
     var it = emptied.iterate();
     try std.testing.expect((try it.next(io)) == null);
     emptied.close(io);

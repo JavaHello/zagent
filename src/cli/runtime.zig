@@ -5,6 +5,20 @@ const Agent = @import("../agent/mod.zig").Agent;
 const Screen = @import("../ui/screen.zig").Screen;
 const menu = @import("../ui/menu.zig");
 
+test "submit relinquishes ownership before tick fails to launch" {
+    var vtable = std.testing.io.vtable.*;
+    vtable.concurrent = std.Io.failingConcurrent;
+    var agent: Agent = undefined;
+    agent.allocator = std.testing.allocator;
+    agent.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    agent.interrupted = .init(false);
+    var runtime: Runtime = .{ .agent = &agent, .screen = undefined };
+    defer runtime.queue.deinit(agent.allocator);
+    try std.testing.expectError(error.ConcurrencyUnavailable, runtime.submit("queued"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.queue.items.len);
+    try std.testing.expect(runtime.future == null);
+}
+
 pub const Runtime = struct {
     agent: *Agent,
     screen: *Screen,
@@ -86,8 +100,10 @@ pub const Runtime = struct {
             return;
         }
         const owned = try self.agent.allocator.dupe(u8, line);
-        errdefer self.agent.allocator.free(owned);
-        try self.queue.append(self.agent.allocator, owned);
+        self.queue.append(self.agent.allocator, owned) catch |err| {
+            self.agent.allocator.free(owned);
+            return err;
+        };
         _ = try self.tick();
     }
 

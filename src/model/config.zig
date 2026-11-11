@@ -132,8 +132,11 @@ fn isDirectory(io: std.Io, path: []const u8) !bool {
 }
 
 fn setString(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
+    // Allocate before releasing: a failed allocation must leave the old value
+    // in place rather than a pointer to freed memory.
+    const owned = try allocator.dupe(u8, value);
     if (slot.*) |old| allocator.free(old);
-    slot.* = try allocator.dupe(u8, value);
+    slot.* = owned;
 }
 
 fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []const u8, value: []const u8) !void {
@@ -165,6 +168,7 @@ fn readFileAlloc(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, ma
 
 fn loadConfigFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !ConfigFile {
     var config = ConfigFile{};
+    errdefer config.deinit(allocator);
     var file = (try openConfigFile(io, allocator, env)) orelse return config;
     defer file.close(io);
 
@@ -423,6 +427,33 @@ fn testFile(allocator: std.mem.Allocator, pairs: []const [2][]const u8) !ConfigF
     errdefer file_config.deinit(allocator);
     for (pairs) |pair| try applyConfigValue(allocator, &file_config, pair[0], pair[1]);
     return file_config;
+}
+
+fn checkApplyAllocationFailures(allocator: std.mem.Allocator) !void {
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+    for ([_][2][]const u8{
+        .{ "AI_PROVIDER", "codex" },
+        .{ "AI_KEY", "key" },
+        .{ "AI_URL", "https://example.test/v1" },
+        .{ "AI_MODEL", "model" },
+        // Replacing a value already set is a separate path: the old string is
+        // released once the new one exists.
+        .{ "AI_PROVIDER", "openai" },
+    }) |pair| try applyConfigValue(allocator, &file_config, pair[0], pair[1]);
+    try std.testing.expectEqualStrings("openai", file_config.provider.?);
+    try std.testing.expectEqualStrings("https://example.test/v1", file_config.base_url.?);
+}
+
+test "config values are cleaned up and replaced atomically under allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkApplyAllocationFailures, .{});
+
+    const a = std.testing.allocator;
+    var slot: ?[]u8 = try a.dupe(u8, "old");
+    defer if (slot) |value| a.free(value);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, setString(failing.allocator(), &slot, "new"));
+    try std.testing.expectEqualStrings("old", slot.?);
 }
 
 test "Codex options resolve from environment and file, or remain absent" {

@@ -52,7 +52,9 @@ pub const History = struct {
     /// instead copies it
     pub fn add(self: *Self, line: []const u8) !void {
         if (self.hist.items.len < 1 or !std.mem.eql(u8, line, self.hist.items[self.hist.items.len - 1])) {
-            try self.hist.append(self.allocator, try self.allocator.dupe(u8, line));
+            const owned = try self.allocator.dupe(u8, line);
+            errdefer self.allocator.free(owned);
+            try self.hist.append(self.allocator, owned);
             self.truncate();
         }
     }
@@ -142,6 +144,19 @@ fn skipLine(io: std.Io, file: File) !void {
         if ((try term.read(io, file, &byte_buf)) < 1) return;
         if (byte_buf[0] == '\n') return;
     }
+}
+
+test "history add cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: Allocator) !void {
+            var history = History.empty(allocator);
+            defer history.deinit();
+            try history.add("first");
+            try history.add("second");
+            try std.testing.expectEqualStrings("first", history.hist.items[0]);
+            try std.testing.expectEqualStrings("second", history.hist.items[1]);
+        }
+    }.run, .{});
 }
 
 test "history" {
