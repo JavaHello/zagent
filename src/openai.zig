@@ -432,45 +432,26 @@ pub const Client = struct {
         const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
         defer self.allocator.free(auth_header);
 
-        var max_tokens = self.max_tokens;
-        var attempt: u32 = 0;
-        while (true) : (attempt += 1) {
-            const ordinary_json = try buildRequestWithToolSelection(
-                self.allocator,
-                self.model,
-                messages,
-                max_tokens,
-                .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools },
-                true,
-                self.search,
-            );
-            defer self.allocator.free(ordinary_json);
-            const req_json = if (self.codex_auth_path != null) try codexRequest(self.allocator, ordinary_json, self.codex_options) else try self.allocator.dupe(u8, ordinary_json);
-            defer self.allocator.free(req_json);
-
-            const response = try self.performStreamWithRetry(response_url, auth_header, req_json, sink);
-            if (!std.mem.eql(u8, response.finish_reason, "length")) return response;
-            // Discard this attempt's partial output and retry the same input,
-            // so completed tools are not repeated and incomplete calls are
-            // never dispatched. Only the last attempt's partial text reaches
-            // the caller, which continues it. Bound both the extra requests
-            // and their token budget.
-            if (attempt >= 3 or max_tokens >= growth_cap) return response;
-            response.deinit(self.allocator);
-            max_tokens = @min(growth_cap, @max(@as(u32, 1), max_tokens *| 2));
+        const ordinary_json = try buildRequestWithToolSelection(
+            self.allocator,
+            self.model,
+            messages,
+            self.max_tokens,
+            .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools },
+            true,
+            self.search,
+        );
+        defer self.allocator.free(ordinary_json);
+        const use_codex = self.codex_auth_path != null;
+        const req_json = if (use_codex)
+            try codexRequest(self.allocator, ordinary_json, self.codex_options)
+        else
+            ordinary_json;
+        defer {
+            if (use_codex) self.allocator.free(req_json);
         }
-    }
 
-    fn performStreamWithRetry(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink) !ApiResponse {
-        var attempt: u32 = 0;
-        while (true) : (attempt += 1) {
-            return self.performResponseStream(response_url, auth_header, req_json, sink) catch |err| {
-                if (attempt >= 2 or (!isRecoverableFetchError(err) and !self.retryable_http_error)) return err;
-                self.resetHttpClient();
-                try self.io.sleep(.fromMilliseconds(1000 * (@as(i64, 1) << @intCast(attempt))), .awake);
-                continue;
-            };
-        }
+        return try self.performResponseStream(response_url, auth_header, req_json, sink);
     }
 
     /// A streaming Responses request. The body is an SSE stream: every event

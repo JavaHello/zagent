@@ -74,6 +74,9 @@ pub const Screen = struct {
     notice: [128]u8 = undefined,
     notice_len: usize = 0,
     notice_started: ?std.Io.Timestamp = null,
+    /// A rewrite of the last line waiting for the foreground: see
+    /// `rewriteLastLine`.
+    pending_rewrite: ?Rewrite = null,
 
     pub fn mouse(self: *Screen, report: []const u8) !void {
         if (!self.active) return;
@@ -195,24 +198,89 @@ pub const Screen = struct {
             self.status_dirty = true;
         }
         if (old_bottom != self.logBottom()) self.dirty = true;
-        if (self.queued.items.len == 0) return changed;
-        const old_rows = if (self.scroll_rows > 0) blk: {
-            const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
-            defer self.allocator.free(rows);
-            break :blk rows.len;
-        } else 0;
-        try self.transcript.appendSlice(self.allocator, self.queued.items);
-        if (old_rows > 0) {
-            const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
-            defer self.allocator.free(rows);
-            self.scroll_rows += rows.len -| old_rows;
+        if (self.queued.items.len > 0) {
+            const old_rows = if (self.scroll_rows > 0) blk: {
+                const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
+                defer self.allocator.free(rows);
+                break :blk rows.len;
+            } else 0;
+            try self.transcript.appendSlice(self.allocator, self.queued.items);
+            if (old_rows > 0) {
+                const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
+                defer self.allocator.free(rows);
+                self.scroll_rows += rows.len -| old_rows;
+            }
+            self.queued.clearRetainingCapacity();
+            // A scrolled/selected viewport must be reconstructed, not appended to.
+            if (self.scroll_rows > 0 or self.selection_end > self.selection_start) {
+                self.dirty = true;
+            }
+            changed = true;
         }
-        self.queued.clearRetainingCapacity();
-        // A scrolled/selected viewport must be reconstructed, not appended to.
-        if (self.scroll_rows > 0 or self.selection_end > self.selection_start) {
-            self.dirty = true;
+        // After the queued bytes, because the line a rewrite replaces may still
+        // be one of them.
+        if (self.pending_rewrite) |waiting| {
+            self.pending_rewrite = null;
+            defer self.allocator.free(waiting.expect);
+            defer self.allocator.free(waiting.bytes);
+            self.applyRewrite(waiting.expect, waiting.bytes);
+            changed = true;
         }
-        return true;
+        return changed;
+    }
+
+    /// Rewrite the last line of the conversation: `expect` is that line as it
+    /// was written, and `bytes` — a whole line, with its newline — takes its
+    /// place. When the last line is no longer `expect`, the text is appended
+    /// instead, so a step taken after the line was written is never lost.
+    ///
+    /// A sub-agent's block is why this exists: its header is drawn the moment
+    /// the call starts, before the child knows what to call its work, and the
+    /// child then names it. Only the foreground touches `transcript` and a
+    /// worker is what asks, so the request waits in the same queue the
+    /// appended bytes use and the foreground applies it in `drain`.
+    pub fn rewriteLastLine(self: *Screen, written: []const u8, bytes: []const u8) void {
+        if (!self.active or bytes.len == 0) return;
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        if (!self.buffered) {
+            // Nobody else is writing: the caller is the foreground's own
+            // thread, as it is in the tests that drive a screen directly.
+            self.applyRewrite(written, bytes);
+            return;
+        }
+        // A request still waiting is superseded: the child has renamed its
+        // block again, and only the newest name is worth drawing.
+        if (self.pending_rewrite) |stale| {
+            self.allocator.free(stale.expect);
+            self.allocator.free(stale.bytes);
+            self.pending_rewrite = null;
+        }
+        const owned_expect = self.allocator.dupe(u8, written) catch return;
+        const owned_bytes = self.allocator.dupe(u8, bytes) catch {
+            self.allocator.free(owned_expect);
+            return;
+        };
+        self.pending_rewrite = .{ .expect = owned_expect, .bytes = owned_bytes };
+    }
+
+    /// The rewrite itself, under the queue's lock or on the thread that owns
+    /// the screen.
+    fn applyRewrite(self: *Screen, written: []const u8, bytes: []const u8) void {
+        // The last line is what sits between the second-to-last newline and the
+        // end: the newline that closed it is part of the line, not a line of
+        // its own.
+        const complete = std.mem.endsWith(u8, self.transcript.items, "\n");
+        const content = self.transcript.items[0 .. self.transcript.items.len - @intFromBool(complete)];
+        const tail_start = if (std.mem.lastIndexOfScalar(u8, content, '\n')) |i| i + 1 else 0;
+        if (std.mem.eql(u8, content[tail_start..], written)) {
+            self.transcript.shrinkRetainingCapacity(tail_start);
+        }
+        self.transcript.appendSlice(self.allocator, bytes) catch return;
+        // One line fewer or more moves every row below it, so the log is drawn
+        // again rather than extended.
+        self.rendered_len = @min(self.rendered_len, self.transcript.items.len);
+        self.dirty = true;
     }
 
     /// Wheel events advance a few visual rows; keyboard paging keeps its
@@ -242,6 +310,10 @@ pub const Screen = struct {
         if (self.active) self.leave();
         self.transcript.deinit(self.allocator);
         self.queued.deinit(self.allocator);
+        if (self.pending_rewrite) |waiting| {
+            self.allocator.free(waiting.expect);
+            self.allocator.free(waiting.bytes);
+        }
     }
 
     pub fn isActive(self: *const Screen) bool {
@@ -533,6 +605,15 @@ pub const Screen = struct {
         handler_rows = self.rows;
         handler_input_rows = self.input_rows;
     }
+};
+
+/// A rewrite of the last line, waiting for the foreground to apply it.
+const Rewrite = struct {
+    /// The line as it was written, which is what makes the rewrite safe to
+    /// apply: a line that reads otherwise is not the one meant.
+    expect: []u8,
+    /// The complete line that replaces it, newline included.
+    bytes: []u8,
 };
 
 fn statusWidth(bytes: []const u8) usize {
@@ -1103,6 +1184,52 @@ test "the log region keeps at least one row above the input" {
 /// Read what a screen wrote to its temporary output file.
 fn readOutput(dir: std.Io.Dir, allocator: std.mem.Allocator) ![]u8 {
     return dir.readFileAlloc(std.testing.io, "out", allocator, .limited(1 << 20));
+}
+
+test "a sub-agent's header line is rewritten when the child names its work" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.cols = 40;
+
+    // Not buffered: the caller is the thread that owns the screen.
+    try s.writeLog("  ⇢ subagent count the tests\n");
+    s.rewriteLastLine("  ⇢ subagent count the tests", "  \x1b[36m⇢ subagent · 数测试\x1b[0m\n");
+    try std.testing.expectEqualStrings("  \x1b[36m⇢ subagent · 数测试\x1b[0m\n", s.transcript.items);
+    // The line changed, so the log has to be drawn again rather than extended.
+    try std.testing.expect(s.dirty);
+
+    // A line the work has already moved past is not overwritten: the rename
+    // becomes a line of its own instead of eating the step below it.
+    try s.writeLog("  ┃ ⚙ bash\n");
+    s.rewriteLastLine("  ⇢ subagent count the tests", "  ⇢ subagent · later\n");
+    try std.testing.expectEqualStrings(
+        "  \x1b[36m⇢ subagent · 数测试\x1b[0m\n  ┃ ⚙ bash\n  ⇢ subagent · later\n",
+        s.transcript.items,
+    );
+}
+
+test "a rewrite from a worker waits for the foreground and lands in order" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.cols = 40;
+    s.buffered = true;
+
+    // The worker writes the header and, a moment later, asks for it to be
+    // renamed; both wait in the same queue, in that order.
+    try s.writeLog("  ⇢ subagent count the tests\n");
+    s.rewriteLastLine("  ⇢ subagent count the tests", "  ⇢ subagent · 数测试\n");
+    try std.testing.expectEqual(@as(usize, 0), s.transcript.items.len);
+
+    // A second request supersedes the first: only the newest name is drawn.
+    s.rewriteLastLine("  ⇢ subagent count the tests", "  ⇢ subagent · 数测试与渲染\n");
+
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqualStrings("  ⇢ subagent · 数测试与渲染\n", s.transcript.items);
+    try std.testing.expect(s.pending_rewrite == null);
 }
 
 test "the conversation is drawn in a region above the reserved input row" {

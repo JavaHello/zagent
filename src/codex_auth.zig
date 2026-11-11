@@ -62,19 +62,21 @@ fn post(a: std.mem.Allocator, http: *std.http.Client, url: []const u8, payload: 
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     const result = try http.fetch(.{
-        .location = .{ .url = url }, .method = .POST,
+        .location = .{ .url = url },
+        .method = .POST,
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .redirect_behavior = .unhandled,
-        .payload = data, .response_writer = &out.writer,
+        .payload = data,
+        .response_writer = &out.writer,
     });
     return .{ .status = result.status, .body = try a.dupe(u8, out.written()) };
 }
 // The authorization-code exchange uses OAuth's form encoding.
 fn exchangeCode(a: std.mem.Allocator, http: *std.http.Client, code: []const u8, verifier: []const u8) !Reply {
     const pairs = [_][2][]const u8{
-        .{ "grant_type", "authorization_code" }, .{ "client_id", client_id },
-        .{ "redirect_uri", issuer ++ "/deviceauth/callback" },
-        .{ "code", code }, .{ "code_verifier", verifier },
+        .{ "grant_type", "authorization_code" },               .{ "client_id", client_id },
+        .{ "redirect_uri", issuer ++ "/deviceauth/callback" }, .{ "code", code },
+        .{ "code_verifier", verifier },
     };
     var form: std.Io.Writer.Allocating = .init(a);
     defer form.deinit();
@@ -94,10 +96,12 @@ fn exchangeCode(a: std.mem.Allocator, http: *std.http.Client, code: []const u8, 
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     const result = try http.fetch(.{
-        .location = .{ .url = issuer ++ "/oauth/token" }, .method = .POST,
+        .location = .{ .url = issuer ++ "/oauth/token" },
+        .method = .POST,
         .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
         .redirect_behavior = .unhandled,
-        .payload = form.written(), .response_writer = &out.writer,
+        .payload = form.written(),
+        .response_writer = &out.writer,
     });
     return .{ .status = result.status, .body = try a.dupe(u8, out.written()) };
 }
@@ -131,9 +135,7 @@ pub fn login(a: std.mem.Allocator, io: std.Io, auth_path: []const u8) !void {
         if (poll.status != .ok) return error.DeviceLoginFailed;
         const grant = try std.json.parseFromSlice(std.json.Value, a, poll.body, .{});
         defer grant.deinit();
-        const exchange = try exchangeCode(a, &http,
-            try field(grant.value, "authorization_code"),
-            try field(grant.value, "code_verifier"));
+        const exchange = try exchangeCode(a, &http, try field(grant.value, "authorization_code"), try field(grant.value, "code_verifier"));
         defer a.free(exchange.body);
         if (exchange.status != .ok) return error.TokenExchangeFailed;
         const tokens = try std.json.parseFromSlice(Tokens, a, exchange.body, .{ .ignore_unknown_fields = true });
@@ -160,7 +162,9 @@ pub fn load(a: std.mem.Allocator, io: std.Io, auth_path: []const u8) !Credential
         var http: std.http.Client = .{ .allocator = a, .io = io };
         defer http.deinit();
         const refreshed = try post(a, &http, issuer ++ "/oauth/token", .{
-            .grant_type = "refresh_token", .client_id = client_id, .refresh_token = tokens.value.refresh_token,
+            .grant_type = "refresh_token",
+            .client_id = client_id,
+            .refresh_token = tokens.value.refresh_token,
         });
         defer a.free(refreshed.body);
         if (refreshed.status != .ok) return error.CodexLoginRequired;
