@@ -73,14 +73,16 @@ working directory, in the system prompt. The agent is told to use it for complex
 or multi-step work and for anything that would change the user's system,
 settings or configuration, so the workspace and the host stay untouched; only
 the finished deliverable is copied back. Existing tools such as `write`, `read`,
-`apply_patch` and `bash` work there, so no separate file API is needed. Because
-the directory belongs to the process, agents started at the same time never
-share a path, and a resumed session gets a fresh one instead of adopting an old
-one. The directory is not saved with the session, and nothing is removed at
-exit while it still holds files: an empty one is deleted, a used one is left as
-it is, so remove it explicitly when no longer needed (`/status` shows the
-current path). These are ordinary host directories, not sandboxes or an extra
-authorization boundary.
+`apply_patch` and `bash` work there, so no separate file API is needed. The
+directory is temporary, not durable: it belongs to the process, so agents
+started at the same time never share a path and a resumed session gets a fresh
+one instead of adopting an old one; `/new` empties it while keeping the path the
+system prompt names; and the whole tree, files included, is deleted at exit. The
+model may also delete the directory, or whatever it left in it, itself.
+Anything worth keeping has to be copied into the workspace or saved with
+`remember` before the run ends. The directory is not saved with the session
+(`/status` shows the current path). These are ordinary host directories, not
+sandboxes or an extra authorization boundary.
 
 ```sh
 cd /path/to/project
@@ -602,7 +604,7 @@ and what each brought. Seven behaviours are worth knowing:
 |---------------|----------------------------------|
 | `/help`       | Show help                        |
 | `/clear`      | Clear conversation history       |
-| `/new`        | Create a new session, preserving the previous one |
+| `/new`        | Create a new session and empty the scratch directory |
 | `/session`    | Show the current session ID and resume command |
 | `/memory`     | List saved memories              |
 | `/remember <text>` | Save a note to memory        |

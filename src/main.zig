@@ -23,7 +23,7 @@ const HELP =
     \\Commands:
     \\  /help        Show this help message
     \\  /clear       Clear conversation history
-    \\  /new         Create a new session (preserve the previous one)
+    \\  /new         Create a new session and empty the scratch directory
     \\  /session     Show the current session ID and resume command
     \\  /memory      List saved memories
     \\  /remember <text>  Save a note to memory
@@ -476,6 +476,14 @@ fn runRepl(
                 defer allocator.free(message);
                 try writeOut(&screen, stderr, io, message);
                 continue;
+            };
+            // The scratch directory belongs to the conversation being left
+            // behind, not to the new one, so a new session starts from an empty
+            // directory. The path itself stays: the system prompt names it.
+            agent.scratch.reset() catch |err| {
+                const message = try std.fmt.allocPrint(allocator, "Cannot clear scratch directory: {s}\n", .{@errorName(err)});
+                defer allocator.free(message);
+                try writeOut(&screen, stderr, io, message);
             };
             const message = try std.fmt.allocPrint(allocator, "New session: {s}\nResume: zagent --resume {s}\n", .{ agent.session_id.?, agent.session_id.? });
             defer allocator.free(message);

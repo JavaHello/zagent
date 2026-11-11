@@ -1,6 +1,6 @@
-//! The one scratch directory a run owns. Files deliberately outlive the
-//! process; an empty directory does not, so a run that discarded nothing leaves
-//! `$TMPDIR` as it found it.
+//! The one scratch directory a run owns. Nothing in it is meant to outlive the
+//! process: the whole tree — files included — is removed at exit, and a new
+//! session empties it so the next conversation starts from a clean path.
 const std = @import("std");
 
 pub const Scratch = struct {
@@ -24,11 +24,23 @@ pub const Scratch = struct {
         return .{ .io = io, .path = path };
     }
 
-    /// Remove the directory when it is still empty, keeping whatever the run
-    /// wrote: `deleteDir` refuses a directory that holds anything, which is
-    /// exactly the line to draw between leftover state and a tidy `$TMPDIR`.
+    /// Empty the directory without moving it, for `/new`: the files of the
+    /// conversation being abandoned belong to that conversation, but the system
+    /// prompt names one path for the life of the process, so the path stays.
+    /// A run that already removed the directory itself gets an empty one back.
+    pub fn reset(self: *Scratch) !void {
+        try std.Io.Dir.cwd().deleteTree(self.io, self.path);
+        std.Io.Dir.createDirAbsolute(self.io, self.path, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+
+    /// Remove the whole tree, whatever the run left in it: the directory is
+    /// temporary, and anything worth keeping was supposed to be copied out.
+    /// Already gone — the model may have deleted it itself — is not an error.
     pub fn deinit(self: *Scratch, a: std.mem.Allocator) void {
-        std.Io.Dir.cwd().deleteDir(self.io, self.path) catch {};
+        std.Io.Dir.cwd().deleteTree(self.io, self.path) catch {};
         a.free(self.path);
         self.* = undefined;
     }
@@ -46,33 +58,51 @@ test "each run gets its own private scratch directory" {
     try env.put("TMPDIR", base);
 
     var first = try Scratch.init(io, a, &env);
+    var second = try Scratch.init(io, a, &env);
     const first_path = try a.dupe(u8, first.path);
     defer a.free(first_path);
-    var second = try Scratch.init(io, a, &env);
-    defer second.deinit(a);
-    try std.testing.expect(!std.mem.eql(u8, first_path, second.path));
+    const second_path = try a.dupe(u8, second.path);
+    defer a.free(second_path);
+    try std.testing.expect(!std.mem.eql(u8, first_path, second_path));
 
-    for ([_][]const u8{ first_path, second.path }) |path| {
+    for ([_][]const u8{ first_path, second_path }) |path| {
         try std.testing.expect(std.mem.startsWith(u8, path, base));
         const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
         try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
     }
 
-    // An empty directory goes away with the run; files stay where they were
-    // written, and a directory holding them is kept.
+    // `reset` keeps the path and drops the contents, so a new session starts
+    // from an empty directory the system prompt already names.
     var dir = try std.Io.Dir.openDirAbsolute(io, first_path, .{});
-    defer dir.close(io);
     try dir.writeFile(io, .{ .sub_path = "script.sh", .data = "printf scratch" });
-    const data = try dir.readFileAlloc(io, "script.sh", a, .limited(100));
-    defer a.free(data);
-    first.deinit(a);
-    try std.testing.expectEqualStrings("printf scratch", data);
-    try std.testing.expect((try std.Io.Dir.cwd().statFile(io, first_path, .{})).kind == .directory);
+    try dir.createDir(io, "build", .fromMode(0o755));
+    try dir.writeFile(io, .{ .sub_path = "build/out.log", .data = "log" });
+    dir.close(io);
 
-    var empty = try Scratch.init(io, a, &env);
-    const empty_path = try a.dupe(u8, empty.path);
-    defer a.free(empty_path);
-    empty.deinit(a);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, empty_path, .{}));
+    try first.reset();
+    try std.testing.expectEqualStrings(first_path, first.path);
+    var emptied = try std.Io.Dir.openDirAbsolute(io, first_path, .{});
+    var it = emptied.iterate();
+    try std.testing.expect((try it.next(io)) == null);
+    emptied.close(io);
+
+    // Nothing outlives the run: files are removed with the directory, and the
+    // one this run owns is gone once the agent lets go of it.
+    var kept = try std.Io.Dir.openDirAbsolute(io, second_path, .{});
+    try kept.writeFile(io, .{ .sub_path = "kept.txt", .data = "kept" });
+    kept.close(io);
+    first.deinit(a);
+    second.deinit(a);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, first_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, second_path, .{}));
+
+    // The model may delete the directory itself; neither `reset` nor the exit
+    // cleanup treats that as a failure.
+    var third = try Scratch.init(io, a, &env);
+    try std.Io.Dir.cwd().deleteTree(io, third.path);
+    try third.reset();
+    try std.testing.expect((try std.Io.Dir.cwd().statFile(io, third.path, .{})).kind == .directory);
+    try std.Io.Dir.cwd().deleteTree(io, third.path);
+    third.deinit(a);
 }

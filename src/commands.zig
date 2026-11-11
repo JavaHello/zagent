@@ -20,7 +20,7 @@ pub const Command = struct {
 pub const all = [_]Command{
     .{ .name = "/help", .description = "Show this help message" },
     .{ .name = "/clear", .description = "Clear conversation history" },
-    .{ .name = "/new", .description = "Create a new session (preserve the previous one)" },
+    .{ .name = "/new", .description = "Create a new session and empty the scratch directory" },
     .{ .name = "/session", .description = "Show the current session ID and resume command" },
     .{ .name = "/memory", .description = "List saved memories" },
     .{ .name = "/remember", .description = "Save a note to memory: /remember <text>" },

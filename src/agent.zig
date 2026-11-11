@@ -87,12 +87,16 @@ fn buildSystemPrompt(
     });
     // Both paths stay fixed for the life of the process, so the model is told
     // them once, at startup, instead of having to ask for a scratch directory.
+    // The scratch path outlives `/new` but not the process, so the model is
+    // told not to treat anything in it as saved.
     try aw.writer.print(
         "\n- Working directory: {s} — the project to read, edit and run commands in." ++
             "\n- Scratch directory for this run: {s} (0700, unique per process). Put prototypes, throwaway scripts," ++
             " downloads and build experiments there rather than in the workspace, and copy back only the finished" ++
-            " deliverable. It is an ordinary host directory, not a sandbox: files outlive the run, and an empty" ++
-            " directory is removed at exit.\n",
+            " deliverable. It is an ordinary host directory, not a sandbox, and it is temporary: the whole directory" ++
+            " is deleted when zagent exits or starts a new session (**/new**), so copy out anything worth keeping and" ++
+            " never treat what is there as saved. You may also delete it, or whatever you left in it, yourself with" ++
+            " **bash** once a task's throwaway files are done; `mkdir -p` brings the path back if you need it again.\n",
         .{ workspace, scratch },
     );
     if (registry.functionJson().len > 0) {
@@ -140,7 +144,8 @@ pub const Agent = struct {
     workspace: [:0]u8,
     /// The private scratch directory this run owns, named in the system prompt.
     /// Created once, at startup, so concurrent agents never share one path and
-    /// the model never has to ask for a place to work. Not a sandbox.
+    /// the model never has to ask for a place to work. Not a sandbox, and not
+    /// durable: a new session empties it and the process removes it on exit.
     scratch: scratch_mod.Scratch,
     /// Durable notes loaded at startup and updated by the remember tool.
     memory: memory_mod.Memory,

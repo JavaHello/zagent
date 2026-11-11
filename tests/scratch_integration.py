@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The scratch directory is created at startup and named in the system prompt."""
+"""The scratch directory is created at startup, emptied by /new, and removed at exit."""
 import http.server
 import json
 from pathlib import Path
@@ -14,10 +14,9 @@ from mock_api import send_response, trust_workspace
 
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 requests = []
-runs = []  # the scratch path each run's system prompt announced
+runs = []  # the scratch path each process's system prompt announced
 workspace = None
 phase = 'create'
-issued = 0
 
 
 def announced(body):
@@ -30,7 +29,22 @@ def announced(body):
     found = set(re.findall(r'[^\s"\\]*/zagent-[0-9a-f]{32}', prompt))
     assert len(found) == 1, prompt
     assert workspace in prompt, prompt
-    return found.pop()
+    path = found.pop()
+    if path not in runs:
+        runs.append(path)
+    return path
+
+
+def turn(body):
+    """Everything the mock knows about the conversation that has run so far."""
+    inputs = body['input']
+    last_user = max(index for index, item in enumerate(inputs) if item.get('role') == 'user')
+    calls = [item for item in inputs[last_user:] if item.get('type') == 'function_call']
+    outputs = [item['output'] for item in inputs if item.get('type') == 'function_call_output']
+    for result in outputs:
+        status = json.loads(result.split('\n', 1)[0][len('[tool_status '):-1])
+        assert not status['is_error'], result
+    return inputs[last_user]['content'], calls, outputs
 
 
 class API(http.server.BaseHTTPRequestHandler):
@@ -38,30 +52,34 @@ class API(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        global issued
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         requests.append(body)
         path = announced(body)
-        if not runs or runs[-1] != path:
-            runs.append(path)
-        results = [i['output'] for i in body['input']
-                   if i.get('type') == 'function_call_output']
-        for result in results:
-            status = json.loads(result.split('\n', 1)[0][len('[tool_status '):-1])
-            assert not status['is_error'], result
+        # The run is alive inside this handler, so its directory should be too.
+        stat_result = Path(path).stat()
+        assert stat.S_ISDIR(stat_result.st_mode), path
+        assert stat.S_IMODE(stat_result.st_mode) == 0o700, path
+        text, calls, outputs = turn(body)
         call = None
-        if phase == 'create' and issued == 0:
-            call = ('write', {'path': str(Path(path) / 'task.sh'),
-                              'content': 'printf scratch-reused; pwd'})
-        elif phase == 'create' and issued == 1:
-            call = ('bash', {'command': 'bash ' + shlex.quote(str(Path(path) / 'task.sh'))})
-        elif phase == 'create':
-            # The announced directory is writable and commands started there run
-            # in the working directory.
-            assert 'scratch-reused' in results[-1], results[-1]
-            assert workspace in results[-1], results[-1]
-        if call:
-            issued += 1
+        if text in ('create scratch files', 'reuse scratch files'):
+            if not calls:
+                call = ('write', {'path': str(Path(path) / 'task.sh'),
+                                  'content': 'printf scratch-reused; pwd'})
+            elif len(calls) == 1:
+                call = ('bash', {'command': 'bash ' + shlex.quote(str(Path(path) / 'task.sh'))})
+            else:
+                # The announced directory is writable and commands started there
+                # run in the working directory.
+                assert 'scratch-reused' in outputs[-1], outputs[-1]
+                assert workspace in outputs[-1], outputs[-1]
+        elif text == 'list scratch':
+            if not calls:
+                call = ('bash', {'command': 'ls -A ' + shlex.quote(path)})
+            else:
+                # /new emptied this process's directory; the path itself stays,
+                # because the system prompt names one path for the whole run.
+                assert 'task.sh' not in outputs[-1], outputs[-1]
+                assert '(no output)' in outputs[-1], outputs[-1]
         index = len(requests)
         output = ([{'type': 'function_call', 'call_id': f'scratch-{index}',
                     'name': call[0], 'arguments': json.dumps(call[1])}]
@@ -89,43 +107,37 @@ try:
             assert result.returncode == 0, result.stderr
             return result.stdout + result.stderr
 
-        output = run('create scratch files')
-        sid = re.search(r'Session: ([a-f0-9]{32})', output)[1]
-        snapshot = state / 'sessions' / f'{sid}.json'
-        saved = json.loads(snapshot.read_text())
-        # The directory belongs to the process, so the session does not carry it.
-        assert 'temp_dirs' not in saved, saved
-
-        # One private directory per run, under TMPDIR and announced in the prompt.
+        # One private directory per process, announced in the prompt and used
+        # for the run's files. /new empties it without moving the path, and the
+        # process takes the whole tree with it when it exits.
+        output = run(stdin='create scratch files\n/new\nlist scratch\n/quit\n')
         assert len(runs) == 1, runs
         first = runs[0]
         assert first.startswith(str(scratch_root.resolve()) + '/'), first
-        assert stat.S_IMODE(Path(first).stat().st_mode) == 0o700, first
-        assert (Path(first) / 'task.sh').is_file(), first
+        assert not Path(first).exists(), f'{first} outlived the run'
+        sid = re.search(r'New session: ([a-f0-9]{32})', output)[1]
+        saved = json.loads((state / 'sessions' / f'{sid}.json').read_text())
+        # The directory belongs to the process, so the session does not carry it.
+        assert 'temp_dirs' not in saved, saved
 
         # A new process resumes the conversation but works in a directory of its
-        # own: nothing is adopted, so two agents never share one path, and the
-        # earlier directory keeps its files. A run that discarded nothing takes
-        # its empty directory with it.
-        phase = 'check'
-        run('--resume', sid, 'reuse scratch files')
+        # own: nothing is adopted, so two agents never share one path.
+        run('--resume', sid, stdin='reuse scratch files\n/quit\n')
         assert len(runs) == 2 and runs[1] != first, runs
         assert not Path(runs[1]).exists(), runs[1]
-        assert (Path(first) / 'task.sh').is_file(), 'scratch files outlive the run'
 
         # Snapshots written by the old build kept a temp_dirs list; they still
         # load, and their paths are not advertised again.
+        snapshot = state / 'sessions' / f'{sid}.json'
         legacy = json.loads(snapshot.read_text())
-        legacy['temp_dirs'] = [first, runs[1]]
+        legacy['temp_dirs'] = runs[:2]
         snapshot.write_text(json.dumps(legacy))
-        run('--resume', sid, 'resume a legacy snapshot')
-        assert len(runs) == 3 and runs[2] not in (first, runs[1]), runs
+        run('--resume', sid, stdin='resume a legacy snapshot\n/quit\n')
+        assert len(runs) == 3 and runs[2] not in runs[:2], runs
         assert not Path(runs[2]).exists(), runs[2]
 
-        # Clearing history keeps the process's paths; a new session gets its own.
+        # Clearing history keeps the process's directory and its files.
         run('--resume', sid, stdin='/clear\n/quit\n')
-        other = run(stdin='/quit\n')
-        assert re.search(r'--resume ([a-f0-9]{32})', other)[1] != sid
 finally:
     server.shutdown()
     server.server_close()
