@@ -1200,6 +1200,11 @@ pub const Agent = struct {
 
     /// The `report` tool: a sub-agent answering its caller's check-in.
     ///
+    /// The sub-agent's model writes the summary and issues this tool call;
+    /// the parent does not construct either. The runtime only injects the
+    /// check-in request and relays the report to the parent, which decides
+    /// whether the sub-agent should continue or stop.
+    ///
     /// The report is handed over here and the verdict is taken back here, in
     /// the same call, which is what makes the check-in a pause rather than a
     /// race: the child does nothing more until the caller has read it.
