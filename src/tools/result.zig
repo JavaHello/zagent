@@ -57,9 +57,10 @@ pub const page_room_bytes: usize = max_output_bytes - 256;
 
 /// Cut a result down to `max_output_bytes` when a tool let more through, and
 /// report the cut as an error so the model narrows the call. Takes ownership of
-/// `result.content`, which is freed here.
+/// `result.content`: consumed on success and failure (returned unchanged if it fits).
 pub fn clipOversized(allocator: std.mem.Allocator, result: ToolResult) !ToolResult {
     if (result.content.len <= max_output_bytes) return result;
+    defer allocator.free(result.content);
     const total = result.content.len;
     const notice = try std.fmt.allocPrint(
         allocator,
@@ -70,7 +71,6 @@ pub fn clipOversized(allocator: std.mem.Allocator, result: ToolResult) !ToolResu
     // The notice counts against the limit, and the text keeps whole characters.
     const kept = util.truncateUtf8(result.content, max_output_bytes - notice.len);
     const content = try std.fmt.allocPrint(allocator, "{s}{s}", .{ kept, notice });
-    allocator.free(result.content);
     return .{
         .content = content,
         .is_error = true,
@@ -111,13 +111,17 @@ pub fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 
 /// suffix which the external tool could itself have printed.
 pub fn finalizeResultLimited(allocator: std.mem.Allocator, raw: []const u8, status: ToolStatus, max_len: usize) !ToolResult {
     const normalized = try normalizeToolText(allocator, raw);
-    defer allocator.free(normalized);
+    return finalizeNormalizedResultOwnedLimited(allocator, normalized, status, max_len);
+}
+
+/// Takes already sanitized, owned text. Consumes it on success and failure.
+pub fn finalizeNormalizedResultOwnedLimited(allocator: std.mem.Allocator, normalized: []u8, status: ToolStatus, max_len: usize) !ToolResult {
     // A result held at the limit is an error even when the tool itself
     // succeeded: what the model has in hand is part of an answer, and it has to
     // narrow the call rather than read the rest as if it were all of it.
     const clipped = normalized.len > max_len;
     return .{
-        .content = try finalizeToolContentLimited(allocator, normalized, max_len),
+        .content = try clipNormalizedOwned(allocator, normalized, max_len),
         .is_error = status.is_error or clipped,
         .exit_code = status.exit_code,
         .timed_out = status.timed_out,
@@ -130,16 +134,18 @@ pub fn finalizeResultLimited(allocator: std.mem.Allocator, raw: []const u8, stat
 /// whose results are as untrusted as a tool's output and are read the same way.
 pub fn finalizeToolContentLimited(allocator: std.mem.Allocator, raw: []const u8, max_len: usize) ![]u8 {
     const normalized = try normalizeToolText(allocator, raw);
-    defer allocator.free(normalized);
+    return clipNormalizedOwned(allocator, normalized, max_len);
+}
 
+/// Consumes normalized on every path; fitting buffers transfer without a copy.
+fn clipNormalizedOwned(allocator: std.mem.Allocator, normalized: []u8, max_len: usize) ![]u8 {
     const suffix = "\n... (truncated)";
-    if (normalized.len <= max_len) return allocator.dupe(u8, normalized);
+    if (normalized.len <= max_len) return normalized;
+    defer allocator.free(normalized);
+    if (max_len < suffix.len) return allocator.dupe(u8, suffix[0..max_len]);
 
-    var cut = max_len - suffix.len;
-    while (cut > 0 and !std.unicode.utf8ValidateSlice(normalized[0..cut])) : (cut -= 1) {}
-    if (cut == 0) cut = max_len - suffix.len;
-
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ normalized[0..cut], suffix });
+    const kept = util.truncateUtf8(normalized, max_len - suffix.len);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ kept, suffix });
 }
 
 /// Strip what a terminal would act on out of tool output, and escape the rest

@@ -25,6 +25,10 @@ pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, p
         for (entries.items) |entry| allocator.free(entry);
         entries.deinit(allocator);
     }
+    // Keep only the lexicographically first limit formatted rows. Comparing
+    // the rows (not just names) preserves ordering even for unusual filenames.
+    try entries.ensureTotalCapacity(allocator, page.limit);
+    var has_more = false;
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         const kind_char: u8 = switch (entry.kind) {
@@ -34,10 +38,24 @@ pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, p
             else => '?',
         };
         const line = try std.fmt.allocPrint(allocator, "{s}\t{c}\n", .{ entry.name, kind_char });
-        errdefer allocator.free(line);
-        try entries.append(allocator, line);
+        var low: usize = 0;
+        var high = entries.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (lessString({}, line, entries.items[mid])) high = mid else low = mid + 1;
+        }
+        if (entries.items.len == page.limit) {
+            has_more = true;
+            if (low == entries.items.len) {
+                allocator.free(line);
+                continue;
+            }
+            allocator.free(entries.pop().?);
+        }
+        // Capacity was reserved before iteration; no fallible operation can
+        // strand the newly allocated row while shifting the bounded array.
+        entries.insertAssumeCapacity(low, line);
     }
-    std.mem.sort([]const u8, entries.items, {}, lessString);
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var index: usize = 0;
@@ -46,7 +64,7 @@ pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, p
         if (aw.written().len + entry.len > page_room_bytes) break;
         try aw.writer.writeAll(entry);
     }
-    const truncated = index < entries.items.len;
+    const truncated = has_more or index < entries.items.len;
     if (truncated) try aw.writer.writeAll("[More entries than listed; narrow 'path' or raise 'limit' to see the rest.]\n");
     if (aw.written().len == 0) try aw.writer.writeAll("(no entries)");
     return .{ .content = try aw.toOwnedSlice(), .is_error = false, .truncated = truncated };

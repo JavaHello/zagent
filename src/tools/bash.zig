@@ -4,7 +4,7 @@ const result_mod = @import("result.zig");
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
 const normalizeToolText = result_mod.normalizeToolText;
-const finalizeResultLimited = result_mod.finalizeResultLimited;
+const finalizeNormalizedResultOwnedLimited = result_mod.finalizeNormalizedResultOwnedLimited;
 const max_output_bytes = result_mod.max_output_bytes;
 
 pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
@@ -41,7 +41,7 @@ pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []
     };
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
+    defer aw.deinit();
 
     // Content is sent to the model and persisted in session history. Keep
     // status first so truncating long command output cannot hide it.
@@ -67,8 +67,9 @@ pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []
         try aw.writer.writeAll("(no output)");
     }
 
-    defer aw.deinit();
-    return finalizeResultLimited(allocator, aw.written(), .{
+    // Sanitize each stream independently: an unfinished escape in stdout must
+    // never consume the stderr label or stderr bytes. The joined text is safe.
+    return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
         .is_error = exit_code == null or exit_code.? != 0,
         .exit_code = exit_code,
     }, max_output_bytes);
