@@ -1,0 +1,119 @@
+# Development
+
+## Build
+
+```bash
+zig build
+```
+
+The binary is written to `zig-out/bin/zagent`. Zig 0.17.x is required.
+
+## Tests
+
+```bash
+zig build test
+zig build test-integration
+```
+
+`zig build test` runs the unit tests, which cover the application, the built-in
+line editor and the Unicode width tables. `zig build test-integration` builds
+the binary and runs the Python 3 suites in `tests/`: streamed output, host tool
+execution, main-model completion status, response failures, menus and prompt
+popups, steering, sessions, memory, plans and sub-agents. They drive the real
+binary against a local mock model endpoint, and cover file editing, patching,
+searching, working-directory isolation, symlink escapes, environment isolation,
+network isolation, API retries, session recovery, input typed into a running
+task, binary replacement during a run, and the exit status at the execution
+limit. No isolation backend is required.
+
+A single suite can also be run directly:
+
+```bash
+python3 tests/execution_integration.py
+python3 tests/completion_integration.py
+python3 tests/responses_failure_integration.py
+```
+
+## Project structure
+
+```
+src/
+  main.zig       — CLI entry point, REPL loop
+  agent/         — The agent loop
+    mod.zig      — Call API → execute tools → repeat → check completion
+    prompt.zig   — The system prompt, the sub-agent prompt, and their limits
+    subagent.zig — The check-in handshake between a caller and a sub-agent
+  cli/           — The terminal session around the loop
+    commands.zig — Slash commands
+    completion.zig — Command and @-path completion
+    history.zig  — Prompt history: where it is stored, and when it is saved
+    runtime.zig  — The one thread that owns the terminal; workers only enqueue
+  model/         — The model client and its configuration
+    openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
+    provider.zig — Built-in provider presets
+    config.zig   — Configuration loading from the config file and environment
+    codex_auth.zig — ChatGPT/Codex device login and token refresh
+    status.zig   — Status and quota formatting
+  tools/         — The built-in tools, one file per tool
+    mod.zig      — Re-exports the tool API the rest of the program uses
+    bash.zig     — bash
+    read.zig     — read: one numbered page of a file
+    write.zig    — write: whole-file writes and exact-block edits
+    apply_patch.zig — apply_patch: a Git unified diff
+    ls.zig       — ls
+    rg.zig       — rg
+    grep.zig     — grep
+    fd.zig       — fd
+    find.zig     — find
+    http.zig     — http
+    search.zig   — What the four search tools share: backends, arguments, paging
+    result.zig   — ToolResult, the output limit, sanitising and truncation
+    args.zig     — Reading a call's JSON arguments
+    progress.zig — The label shown while a tool runs
+    util.zig     — Helpers several tools share
+    schema.zig   — The JSON schema of every built-in tool
+  host/          — Running a tool on the host
+    execution.zig — Worker process, deadline, bounded output, process-group cleanup
+    tool_worker.zig — The worker: parse one call, run the tool, print the result
+    sysinfo.zig  — What machine this is: OS, kernel, architecture, CPUs, memory
+  mcp/           — Model Context Protocol
+    mod.zig      — Registry, tool aliases, loading a service's tools on demand
+    transport.zig — stdio JSON-RPC transport and framing
+  ui/            — Terminal presentation
+    screen.zig   — Screen buffer, scrolling, selection and copying
+    render.zig   — Markdown rendering
+    menu.zig     — Option parsing, choice menus, and reading the user's answer
+    spinner.zig  — The animation shown while a request or tool runs
+    banner.zig   — The startup wordmark: letterforms, palette, plain-text fallback
+    term.zig     — Raw mode, size, cursor and escape sequences
+    style.zig    — The SGR codes and styles everything else draws with
+    selection.zig — Turning a drag into the text to copy
+  diff/          — Unified diffs: reading one, applying one, drawing one (mod.zig)
+  state/         — What outlives a turn
+    memory.zig   — Durable notes: file format, local retrieval, edits
+    plan.zig     — The session plan: steps, snapshot form, prompt bullet
+    session.zig  — Session snapshots
+    workspace.zig — Trusted directories and the state directory inside them
+    scratch.zig  — The per-run scratch directory
+  util/          — Small shared modules
+    text.zig     — Sanitising, ANSI stripping and UTF-8 helpers
+    compact.zig  — Dropping tool results, deduplicating repeated reads
+  editor/        — Line editing, history, popup and raw terminal handling
+    linenoise.zig — The editor: read loop, key handling, popups and paste
+    state.zig    — One edit in progress: buffer, cursor, rows and popup
+    history.zig  — Prompt history: storage format and saving
+    term.zig     — Raw mode, key reads and terminal size
+    unicode.zig  — Moving by character and word across UTF-8
+  unicode_width/ — Terminal character widths and Unicode tables
+    wcwidth.zig  — wcwidth, wcswidth and sliceWidth
+    manual.zig, table_wide.zig, table_zero.zig — The width tables
+build.zig     — Zig build script
+```
+
+The line editor lives in `src/editor` and the character-width implementation in
+`src/unicode_width`; neither needs a local package dependency.
+
+## Documentation
+
+The documentation is this folder, `docs/`, with the entry point in
+[`docs/index.md`](index.md); `README.md` is the overview and the quick start.

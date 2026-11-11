@@ -45,6 +45,7 @@
         "build.zig.zon",
         "src",
         "tests",
+        "docs",
         "README.md",
         "README.zh-CN.md",
         "zagent.example.conf",
