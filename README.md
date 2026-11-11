@@ -153,6 +153,24 @@ history untouched. The first valid call in a batch sets summary and retention.
 `/compact` asks the main model to call the same tool on demand, retaining a
 target of 16 recent messages.
 
+### Dropping tool output
+
+Summarizing is not the only way context is wasted: a turn that read half a
+repository keeps paying for that output long after it served its purpose. When
+the model no longer needs one of its own earlier results, it names the call id
+and calls `drop_context` with `call_ids` (at most 64 ids of 512 bytes each).
+Each named result is replaced by a one-line marker naming the tool and the call
+id, and the drop runs after the current tool batch finishes.
+
+Only the result text changes. The assistant call and the result stay paired,
+because a Responses request must answer every `function_call` with its
+`function_call_output`, and the assistant message replays the exact output
+items it was given; deleting either side would break the next request. Ids that
+no live result answers — a compacted call, a typo — are reported back, a second
+drop of the same call is a no-op, and a result a deduplicated read still points
+at is kept rather than replaced by an empty reference. Re-run the tool if the
+output turns out to be needed again.
+
 ## Memory
 
 zagent keeps durable notes between sessions in the global `memory.md` scoped to the
@@ -686,7 +704,7 @@ src/
                 apply_patch, ls, rg/grep, fd/find, http)
   diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
-  compact.zig — Context budget, safe cut points, and summary installation
+  compact.zig — Context budget, safe cut points, summary installation, dropping tool results
   memory.zig  — Durable notes: file format, prompt section, extraction
   banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer

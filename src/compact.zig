@@ -1,10 +1,11 @@
 //! Context compaction: token estimation, the safe place to cut a
-//! conversation, and the material a model is asked to summarize.
+//! conversation, the material a model is asked to summarize, and the tool
+//! results it asks to drop.
 //!
 //! The conversation is a sequence a Responses request replays; cutting it in
 //! the middle of a tool call would leave a result without its call. The
-//! functions here only choose boundaries that keep every kept tool result
-//! attached to the assistant message that produced it.
+//! functions here only choose boundaries — and replacements — that keep every
+//! kept tool result attached to the assistant message that produced it.
 const std = @import("std");
 const openai = @import("openai.zig");
 const Message = openai.Message;
@@ -19,6 +20,19 @@ pub const max_summary_bytes: usize = 6_000;
 /// A range must contain at least this many messages before it is worth
 /// replacing with a summary.
 pub const min_messages_to_compact: usize = 2;
+
+/// The marker standing in for a read whose output is already in the history.
+/// The reference it carries is why `dropToolResults` refuses to replace the
+/// original result it points at.
+const duplicate_marker = "[Duplicate read omitted: same path, line range and content SHA-256={s}. See earlier tool result {s} in this context.]";
+const reference_prefix = "See earlier tool result ";
+const reference_suffix = " in this context.]";
+
+/// The marker standing in place of a dropped tool result. It keeps the call id
+/// so the model can run the tool again, and it stays short: the point of a drop
+/// is that what it replaced cost more than this.
+const dropped_marker = "[Tool result dropped by the model: {s} (call {s}) is no longer in context. Call the tool again if you need this output.]";
+const dropped_prefix = "[Tool result dropped by the model: ";
 
 /// Keep one full copy of identical read output in the live context. Do not
 /// cache across compaction: once the original result is gone, the model must
@@ -49,7 +63,7 @@ pub fn deduplicateReadResult(
                     if (std.mem.eql(u8, &digest, &previous_key)) {
                         var content_digest: [32]u8 = undefined;
                         std.crypto.hash.sha2.Sha256.hash(content, &content_digest, .{});
-                        return std.fmt.allocPrint(allocator, "[Duplicate read omitted: same path, line range and content SHA-256={s}. See earlier tool result {s} in this context.]", .{ std.fmt.bytesToHex(content_digest, .lower), id });
+                        return std.fmt.allocPrint(allocator, duplicate_marker, .{ std.fmt.bytesToHex(content_digest, .lower), id });
                     }
                     break;
                 }
@@ -261,6 +275,134 @@ pub fn install(allocator: std.mem.Allocator, history: *std.ArrayList(Message), c
     return cut - 2;
 }
 
+/// How a `drop_context` request resolved. The model asked for ids, so the
+/// result has to say what each of them became rather than repeat the request.
+pub const DropReport = struct {
+    /// Results replaced by the dropped marker.
+    dropped: usize = 0,
+    /// Results already carrying it: a second drop of one call is a no-op.
+    repeated: usize = 0,
+    /// Ids no live tool result answers, including calls a summary swallowed.
+    unknown: usize = 0,
+    /// Results kept because a deduplicated read later in the history points
+    /// at them; replacing one would leave that pointer empty.
+    referenced: usize = 0,
+    /// Bytes the dropped results contributed, after subtracting the markers
+    /// that took their place.
+    freed_bytes: usize = 0,
+};
+
+/// Replace the output of the tool results `ids` name with a short marker, so
+/// later requests stop paying for output the model no longer needs.
+///
+/// Both halves of the pairing stay. A Responses request must answer every
+/// function_call with its function_call_output, and an assistant message
+/// replays the exact output items it was given, so deleting either side would
+/// break the next request. Only the result text changes, which is also what
+/// keeps a restored session replayable.
+///
+/// Markers are built before any message is touched, so a failed allocation
+/// leaves the history whole rather than half dropped.
+pub fn dropToolResults(
+    allocator: std.mem.Allocator,
+    messages: []Message,
+    ids: []const []const u8,
+) !DropReport {
+    const Replacement = struct { index: usize, content: []u8 };
+
+    var report: DropReport = .{};
+    var replacements: std.ArrayList(Replacement) = .empty;
+    var applied: usize = 0;
+    defer {
+        for (replacements.items[applied..]) |replacement| allocator.free(replacement.content);
+        replacements.deinit(allocator);
+    }
+    try replacements.ensureTotalCapacity(allocator, ids.len);
+
+    for (ids) |id| {
+        const index = findToolResult(messages, id) orelse {
+            report.unknown += 1;
+            continue;
+        };
+        // A result with no body has nothing to free, which is the same no-op
+        // as dropping one that was already dropped.
+        const content = messages[index].content orelse {
+            report.repeated += 1;
+            continue;
+        };
+        if (std.mem.startsWith(u8, content, dropped_prefix) or queued(replacements.items, index)) {
+            report.repeated += 1;
+            continue;
+        }
+        if (referencedLater(messages, index, id)) {
+            report.referenced += 1;
+            continue;
+        }
+        const name = droppedCallName(messages, index, id) orelse "tool";
+        const marker = try std.fmt.allocPrint(allocator, dropped_marker, .{
+            truncateUtf8(name, 64),
+            truncateUtf8(id, 128),
+        });
+        replacements.appendAssumeCapacity(.{ .index = index, .content = marker });
+        report.dropped += 1;
+        report.freed_bytes += content.len -| marker.len;
+    }
+
+    for (replacements.items) |replacement| {
+        const message = &messages[replacement.index];
+        if (message.content) |old| allocator.free(old);
+        message.content = replacement.content;
+        applied += 1;
+    }
+    return report;
+}
+
+fn findToolResult(messages: []const Message, id: []const u8) ?usize {
+    for (messages, 0..) |message, index| {
+        if (!std.mem.eql(u8, message.role, "tool")) continue;
+        const call_id = message.tool_call_id orelse continue;
+        if (std.mem.eql(u8, call_id, id)) return index;
+    }
+    return null;
+}
+
+fn queued(replacements: anytype, index: usize) bool {
+    for (replacements) |replacement| {
+        if (replacement.index == index) return true;
+    }
+    return false;
+}
+
+/// A result message carries only the call id; the tool that produced it is
+/// named on the nearest preceding assistant call, which is the only place the
+/// dropped marker can learn what it is telling the model to run again.
+fn droppedCallName(messages: []const Message, index: usize, id: []const u8) ?[]const u8 {
+    var position = index;
+    while (position > 0) {
+        position -= 1;
+        const calls = messages[position].tool_calls orelse continue;
+        for (calls) |call| {
+            if (std.mem.eql(u8, call.id, id)) return call.name;
+        }
+    }
+    return null;
+}
+
+/// A deduplicated read points at the original output instead of repeating it.
+/// Dropping that original would leave the model following an empty pointer, so
+/// a referenced result is kept and reported as such.
+fn referencedLater(messages: []const Message, index: usize, id: []const u8) bool {
+    for (messages[index + 1 ..]) |message| {
+        if (!std.mem.eql(u8, message.role, "tool")) continue;
+        const content = message.content orelse continue;
+        const found = std.mem.indexOf(u8, content, reference_prefix) orelse continue;
+        const rest = content[found + reference_prefix.len ..];
+        if (!std.mem.startsWith(u8, rest, id)) continue;
+        if (std.mem.eql(u8, rest[id.len..], reference_suffix)) return true;
+    }
+    return false;
+}
+
 test "read deduplication compares effective arguments and contents only in live history" {
     const a = std.testing.allocator;
     var calls = [_]openai.ToolCallData{.{ .id = "original", .name = "read", .arguments = "{\"path\":\"a.zig\"}" }};
@@ -447,4 +589,124 @@ test "transcript renders only the requested range and preserves tool arguments" 
     const empty = try renderTranscript(allocator, &messages, 2, 2);
     defer allocator.free(empty);
     try std.testing.expectEqualStrings("", empty);
+}
+
+/// A history entry that owns its strings, the way the agent builds one. The
+/// dropped-result tests need messages `Message.deinit` can free.
+fn testMessage(allocator: std.mem.Allocator, role: []const u8, content: ?[]const u8) !Message {
+    return .{
+        .role = role,
+        .content = if (content) |value| try allocator.dupe(u8, value) else null,
+        .reasoning_content = null,
+        .tool_calls = null,
+        .tool_call_id = null,
+    };
+}
+
+/// One assistant call whose strings the history owns, so dropping can be
+/// tested against the same ownership rules the agent uses.
+fn testCall(allocator: std.mem.Allocator, id: []const u8, name: []const u8, arguments: []const u8) ![]openai.ToolCallData {
+    const calls = try allocator.alloc(openai.ToolCallData, 1);
+    errdefer allocator.free(calls);
+    calls[0] = .{
+        .id = try allocator.dupe(u8, id),
+        .name = try allocator.dupe(u8, name),
+        .arguments = try allocator.dupe(u8, arguments),
+    };
+    return calls;
+}
+
+fn freeMessages(allocator: std.mem.Allocator, history: *std.ArrayList(Message)) void {
+    for (history.items) |message| message.deinit(allocator);
+    history.deinit(allocator);
+}
+
+test "dropping a tool result keeps the call and its pairing" {
+    const allocator = std.testing.allocator;
+    const output = try allocator.alloc(u8, 4_000);
+    defer allocator.free(output);
+    @memset(output, 'x');
+
+    var history: std.ArrayList(Message) = .empty;
+    defer freeMessages(allocator, &history);
+    try history.append(allocator, try testMessage(allocator, "system", "sys"));
+    try history.append(allocator, try testMessage(allocator, "user", "build it"));
+    var call = try testMessage(allocator, "assistant", null);
+    call.tool_calls = try testCall(allocator, "call-1", "bash", "{\"command\":\"zig build test\"}");
+    try history.append(allocator, call);
+    var result = try testMessage(allocator, "tool", output);
+    result.tool_call_id = try allocator.dupe(u8, "call-1");
+    try history.append(allocator, result);
+
+    const before = estimateTokens(history.items);
+    const report = try dropToolResults(allocator, history.items, &.{"call-1"});
+
+    try std.testing.expectEqual(@as(usize, 1), report.dropped);
+    try std.testing.expect(report.freed_bytes > 3_000);
+    try std.testing.expect(estimateTokens(history.items) < before);
+    // Nothing moved: the call still answers, and the result still belongs to it.
+    try std.testing.expectEqual(@as(usize, 4), history.items.len);
+    try std.testing.expectEqualStrings("call-1", history.items[2].tool_calls.?[0].id);
+    try std.testing.expectEqualStrings("call-1", history.items[3].tool_call_id.?);
+    const marker = history.items[3].content.?;
+    try std.testing.expect(std.mem.indexOf(u8, marker, "bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, marker, "call-1") != null);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try openai.writeInput(allocator, &aw.writer, history.items);
+    const wire = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, wire, "function_call_output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, marker) != null);
+    try std.testing.expect(std.mem.indexOf(u8, wire, output) == null);
+}
+
+test "dropping reports repeats and ids no live result answers" {
+    const allocator = std.testing.allocator;
+    var history: std.ArrayList(Message) = .empty;
+    defer freeMessages(allocator, &history);
+    try history.append(allocator, try testMessage(allocator, "system", "sys"));
+    var call = try testMessage(allocator, "assistant", null);
+    call.tool_calls = try testCall(allocator, "call-1", "read", "{\"path\":\"a.zig\"}");
+    try history.append(allocator, call);
+    var result = try testMessage(allocator, "tool", "file contents");
+    result.tool_call_id = try allocator.dupe(u8, "call-1");
+    try history.append(allocator, result);
+
+    const report = try dropToolResults(allocator, history.items, &.{ "call-1", "call-1", "gone" });
+    try std.testing.expectEqual(@as(usize, 1), report.dropped);
+    try std.testing.expectEqual(@as(usize, 1), report.repeated);
+    try std.testing.expectEqual(@as(usize, 1), report.unknown);
+
+    // Dropping again changes nothing more: the marker is already there.
+    const again = try dropToolResults(allocator, history.items, &.{"call-1"});
+    try std.testing.expectEqual(@as(usize, 0), again.dropped);
+    try std.testing.expectEqual(@as(usize, 1), again.repeated);
+    try std.testing.expectEqual(@as(usize, 0), again.freed_bytes);
+}
+
+test "a result a deduplicated read points at is kept" {
+    const allocator = std.testing.allocator;
+    var history: std.ArrayList(Message) = .empty;
+    defer freeMessages(allocator, &history);
+    try history.append(allocator, try testMessage(allocator, "system", "sys"));
+    var first = try testMessage(allocator, "assistant", null);
+    first.tool_calls = try testCall(allocator, "call-1", "read", "{\"path\":\"a.zig\"}");
+    try history.append(allocator, first);
+    var original = try testMessage(allocator, "tool", "file contents");
+    original.tool_call_id = try allocator.dupe(u8, "call-1");
+    try history.append(allocator, original);
+    var second = try testMessage(allocator, "assistant", null);
+    second.tool_calls = try testCall(allocator, "call-2", "read", "{\"path\":\"a.zig\"}");
+    try history.append(allocator, second);
+    const reference = try std.fmt.allocPrint(allocator, duplicate_marker, .{ "00", "call-1" });
+    var duplicate = try testMessage(allocator, "tool", reference);
+    allocator.free(reference);
+    duplicate.tool_call_id = try allocator.dupe(u8, "call-2");
+    try history.append(allocator, duplicate);
+
+    const report = try dropToolResults(allocator, history.items, &.{"call-1"});
+    try std.testing.expectEqual(@as(usize, 0), report.dropped);
+    try std.testing.expectEqual(@as(usize, 1), report.referenced);
+    try std.testing.expectEqualStrings("file contents", history.items[2].content.?);
 }
