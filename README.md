@@ -18,11 +18,14 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `fd` / `find` — find files by name; dynamically advertise `fd` if installed on PATH, otherwise `find`; prompt guidance follows the selected tools
   - `http` — fetch a URL or call an API, without shelling out to `curl`
   - `ask_user` — put a question to you as an interactive selection menu
-  - `subagent` — hand one self-contained task to a second agent and get back one report
+  - `subagent` — hand one self-contained task to a second agent, and watch it: a check-in comes back as a progress report, and you decide whether it carries on
+  - `subagent_stop` — stop a sub-agent paused at a progress report and take its final report
+  - `report` — a sub-agent's answer to a check-in: a short progress report, then the caller's decision
 - **MCP servers** — start servers described in `mcp.json` and give the tools they offer to the model beside the built-in ones
 - **Multi-turn tool chaining** — the agent loops until the task is complete
 - **Session plan** — the model keeps a checklist of the work in progress through the `plan` tool, held in memory and saved with the session, and the system prompt names it with its progress; it survives `/clear` and comes back with a resumed session, where the conversation does not. `/plan` shows it
-- **Sub-agents** — the `subagent` tool runs one self-contained task in a second agent in the same process. It shares the working directory, the MCP servers, the tool environment and the credentials, but not the conversation, the plan, the session or the terminal: its output is captured and comes back as one report, its tokens count in the calling turn's totals, Esc stops both, and a wall-clock limit bounds its run. It is offered no `ask_user`, `plan`, `announce_task`, `remember` or nesting of its own, so the caller keeps the plan and marks a step done only after verifying the work.
+- **Sub-agents** — the `subagent` tool runs one self-contained task in a second agent in the same process. It shares the working directory, the MCP servers, the tool environment and the credentials, but not the conversation, the plan, the session or the terminal: its output is captured and comes back as one report, its tokens count in the calling turn's totals, and Esc stops both.
+  It has no iteration budget and no deadline of its own: what bounds it is being watched. The model picks how long it works before a check-in (`checkin_seconds`, default 300). At that check-in the run pauses, the child is asked for a progress report through its `report` tool, and the report comes back as the tool result. The model then lets it carry on by calling `subagent` again with the run's `id`, or stops it with `subagent_stop` and reads its final report — the stopped child writes that report and does no new work. A check-in of 0 asks at the next request boundary. It is offered no `ask_user`, `plan`, `announce_task`, `remember`, `subagent_stop` or nesting of its own, so the caller keeps the plan and marks a step done only after verifying the work.
 - **Task announcement from the main model** — the built-in `announce_task` call provides a `title` and `description` of the goal and approach, without a separate planning request. The description is displayed to the user; terminal titles use the generated title, never raw input. Both the submitted title and the entire terminal title stay below 80 Unicode characters, and a follow-up turn that announces no task of its own keeps the task already in the title.
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
 - **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
@@ -848,6 +851,7 @@ src/
   agent/         — The agent loop
     mod.zig      — Call API → execute tools → repeat → check completion
     prompt.zig   — The system prompt, the sub-agent prompt, and their limits
+    subagent.zig — The check-in handshake between a caller and a sub-agent
   cli/           — The terminal session around the loop
     commands.zig — Slash commands
     completion.zig — Command and @-path completion

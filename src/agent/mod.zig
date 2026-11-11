@@ -33,6 +33,7 @@ const RED = sgr.RED;
 // The instructions a run starts with, and the limits around them, live in
 // prompt.zig; the loop below uses them by their own names.
 const agent_prompt = @import("prompt.zig");
+const subagent = @import("subagent.zig");
 const SYSTEM_PROMPT = agent_prompt.SYSTEM_PROMPT;
 const max_continuations = agent_prompt.max_continuations;
 const max_empty_continuations = agent_prompt.max_empty_continuations;
@@ -42,12 +43,16 @@ const steering_note = agent_prompt.steering_note;
 const CHOICE_PROMPT = agent_prompt.CHOICE_PROMPT;
 const dismissed_question_message = agent_prompt.dismissed_question_message;
 const error_preview_max = agent_prompt.error_preview_max;
-const subagent_max_iterations = agent_prompt.subagent_max_iterations;
 const max_subagent_task_bytes = agent_prompt.max_subagent_task_bytes;
 const max_subagent_context_bytes = agent_prompt.max_subagent_context_bytes;
-const min_subagent_timeout_seconds = agent_prompt.min_subagent_timeout_seconds;
-const max_subagent_timeout_seconds = agent_prompt.max_subagent_timeout_seconds;
-const default_subagent_timeout_seconds = agent_prompt.default_subagent_timeout_seconds;
+const default_subagent_checkin_seconds = agent_prompt.default_subagent_checkin_seconds;
+const max_subagent_checkin_seconds = agent_prompt.max_subagent_checkin_seconds;
+const max_subagent_report_bytes = agent_prompt.max_subagent_report_bytes;
+const report_request_prompt = agent_prompt.report_request_prompt;
+const stop_prompt = agent_prompt.stop_prompt;
+const continue_verdict = agent_prompt.continue_verdict;
+const stop_verdict = agent_prompt.stop_verdict;
+const main_omitted = agent_prompt.main_omitted;
 const buildSystemPrompt = agent_prompt.buildSystemPrompt;
 const buildSubagentPrompt = agent_prompt.buildSubagentPrompt;
 const subagent_omitted = agent_prompt.subagent_omitted;
@@ -58,7 +63,10 @@ pub const Agent = struct {
     io: std.Io,
     client: openai.Client,
     history: std.ArrayList(Message),
-    max_iterations: u32,
+    /// How many requests one turn may make. Null for a sub-agent, which has no
+    /// budget of its own: its caller watches it instead, and decides whether it
+    /// goes on.
+    max_iterations: ?u32,
     /// The terminal ask_user and the choice menus read from.
     linenoise: *Linenoise,
     form_context: ?*anyopaque = null,
@@ -113,9 +121,14 @@ pub const Agent = struct {
     /// precedes a round of tool calls is not part of it: only the reply that
     /// stands on the finished work is.
     capture_mark: usize = 0,
-    /// Wall-clock limit for a sub-agent's run. Null for the agent on the
-    /// terminal, whose limit is the user.
-    deadline: ?std.Io.Timestamp = null,
+    /// The caller's side of the report handshake, for a sub-agent. Null for the
+    /// agent on the terminal, which has nobody to report to.
+    supervisor: ?*subagent.Supervisor = null,
+    /// The sub-agents this agent started and has not closed. A run that has
+    /// reported back is paused, not finished: it stays here until the model
+    /// resumes or stops it, and `deinit` closes whatever is left over.
+    runs: std.ArrayList(*Run) = .empty,
+    run_counter: usize = 0,
     /// The task the model last announced, named in the terminal title. It is
     /// kept across turns on purpose: a follow-up that announces no task of its
     /// own still belongs to the work the title names, and dropping it at the
@@ -156,6 +169,9 @@ pub const Agent = struct {
         parent: ?*Agent = null,
         /// Where a sub-agent's answer goes.
         capture: ?*std.ArrayList(u8) = null,
+        /// The caller's side of the handshake this agent reports through. The
+        /// run that starts the child owns it and outlives the child.
+        supervisor: ?*subagent.Supervisor = null,
     };
 
     pub fn init(
@@ -195,7 +211,13 @@ pub const Agent = struct {
         const search = if (parent) |p| p.search else tools.detectSearchBackends(io, env);
         var client = openai.Client.init(allocator, io, config.*);
         client.search = search;
-        if (options.role == .subagent) client.builtin_omit = &subagent_omitted;
+        // Each role is described by the few tools it does not get: the caller
+        // has no report to hand in, and a sub-agent has neither the call that
+        // started it nor the one that stops it.
+        client.builtin_omit = switch (options.role) {
+            .main => &main_omitted,
+            .subagent => &subagent_omitted,
+        };
         // A test transport is the one thing a sub-agent inherits that is not
         // settings: the loop is driven without a socket, so the requests the
         // sub-agent makes are scripted by the same test.
@@ -229,7 +251,7 @@ pub const Agent = struct {
             .io = io,
             .client = client,
             .history = history,
-            .max_iterations = if (interactive) config.max_iterations else @min(config.max_iterations, subagent_max_iterations),
+            .max_iterations = if (interactive) config.max_iterations else null,
             .linenoise = linenoise,
             .search = search,
             .tool_env = env,
@@ -242,6 +264,7 @@ pub const Agent = struct {
             .role = options.role,
             .parent = options.parent,
             .capture = options.capture,
+            .supervisor = options.supervisor,
             // The check is on stdout rather than on `linenoise.is_tty`, which
             // describes stdin: `zagent "q" < file` with a terminal on stdout
             // should still render, and `zagent "q" | less` must not.
@@ -259,6 +282,11 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        // A sub-agent left paused at a report would keep its task alive for the
+        // life of the process: the model that was going to resume it is gone.
+        // Whatever is still open is closed here, before anything it borrows.
+        self.closeRuns();
+        self.runs.deinit(self.allocator);
         if (self.current_task.len > 0) self.allocator.free(self.current_task);
         for (self.inbox.items) |line| self.allocator.free(line);
         self.inbox.deinit(self.allocator);
@@ -305,6 +333,10 @@ pub const Agent = struct {
 
     /// Clear conversation history (keeps the system prompt).
     pub fn clearHistory(self: *Agent) void {
+        // The ids of the runs this conversation started do not survive it. A
+        // paused child would sit there until the process ended, unreachable
+        // from a conversation that no longer names it.
+        self.closeRuns();
         for (self.history.items[1..]) |msg| msg.deinit(self.allocator);
         self.history.shrinkRetainingCapacity(1);
         // A conversation that starts over starts from what outlived it: the
@@ -736,10 +768,6 @@ pub const Agent = struct {
         if (self.parent) |parent| {
             if (parent.interrupted.load(.acquire)) return error.Canceled;
         }
-        // A sub-agent's run is bounded in time as well as in tool calls.
-        if (self.deadline) |deadline| {
-            if (deadline.untilNow(self.io, .awake).nanoseconds >= 0) return error.SubagentTimedOut;
-        }
     }
 
     /// Hand a line the user typed during a running task to that task. The
@@ -868,15 +896,22 @@ pub const Agent = struct {
         return .{ .content = try self.allocator.dupe(u8, "Task announced; the description is shown to the user."), .is_error = false };
     }
 
-    /// The `subagent` tool: run one self-contained task in an agent of its own
-    /// and hand its report back as the tool result.
+    /// The `subagent` tool: hand one self-contained task to an agent of its own
+    /// and read back what it has done so far.
     ///
-    /// The sub-agent is a second Agent in this process. It shares the provider,
-    /// the working directory, the MCP servers and the tool environment, but not
-    /// this conversation, this plan, this session or this terminal: its answer
-    /// is captured, and the caller prints the one line for the call. The plan
-    /// stays the caller's, which is why the report is a report and not a claim
-    /// of completion — the caller verifies the work before marking a step done.
+    /// The sub-agent is a second Agent in this process, running in a task of its
+    /// own. It shares the provider, the working directory, the MCP servers and
+    /// the tool environment, but not this conversation, this plan, this session
+    /// or this terminal: its answer is captured, and the caller prints the one
+    /// line for the call. The plan stays the caller's, which is why the report
+    /// is a report and not a claim of completion — the caller verifies the work
+    /// before marking a step done.
+    ///
+    /// It has no iteration budget and no deadline. What bounds it is this call:
+    /// after `checkin_seconds` the sub-agent is asked for a progress report
+    /// through its `report` tool, the run pauses there, and the report comes
+    /// back as the tool result. The caller then lets it carry on with its `id`,
+    /// or stops it with `subagent_stop`.
     ///
     /// The error set is spelled out rather than inferred: this function starts
     /// an agent that runs the tool loop that calls this function, and an
@@ -889,29 +924,42 @@ pub const Agent = struct {
             };
         }
         const Arguments = struct {
-            task: []const u8,
+            task: ?[]const u8 = null,
             context: ?[]const u8 = null,
-            timeout_seconds: ?u32 = null,
+            id: ?[]const u8 = null,
+            checkin_seconds: ?u32 = null,
         };
         const parsed = std.json.parseFromSlice(Arguments, self.allocator, arguments, .{}) catch {
             return .{
-                .content = try self.allocator.dupe(u8, "Error: subagent needs a 'task' string, and may take 'context' and 'timeout_seconds' (30-1800)."),
+                .content = try self.allocator.dupe(u8, "Error: subagent takes a 'task' string to start a run, or the 'id' of a paused run to let it carry on; it may also take 'context' and 'checkin_seconds' (0-3600)."),
                 .is_error = true,
             };
         };
         defer parsed.deinit();
 
-        const task = std.mem.trim(u8, parsed.value.task, " \t\r\n");
-        if (task.len == 0 or task.len > max_subagent_task_bytes or !std.unicode.utf8ValidateSlice(task)) {
+        const checkin = parsed.value.checkin_seconds orelse default_subagent_checkin_seconds;
+        if (checkin > max_subagent_checkin_seconds) {
             return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's task must be non-empty UTF-8 of at most {d} bytes: say what to do, and leave documents in files it can read.", .{max_subagent_task_bytes}),
+                .content = try std.fmt.allocPrint(self.allocator, "Error: checkin_seconds must be between 0 and {d}. It is how long the sub-agent works before it is asked for a progress report, not a limit on the work.", .{max_subagent_checkin_seconds}),
                 .is_error = true,
             };
         }
-        const seconds = parsed.value.timeout_seconds orelse default_subagent_timeout_seconds;
-        if (seconds < min_subagent_timeout_seconds or seconds > max_subagent_timeout_seconds) {
+
+        // A run that reported back is paused at that report: this call is the
+        // caller's answer to it, and the next wait starts from here.
+        if (parsed.value.id) |id| {
+            const run = self.findRun(id) orelse return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Error: no sub-agent has the id \"{s}\". A run that reported back names its own id; one that has finished is gone.", .{id}),
+                .is_error = true,
+            };
+            run.supervisor.carryOn(checkin == 0);
+            return self.waitRun(run, checkin);
+        }
+
+        const task = std.mem.trim(u8, parsed.value.task orelse "", " \t\r\n");
+        if (task.len == 0 or task.len > max_subagent_task_bytes or !std.unicode.utf8ValidateSlice(task)) {
             return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: timeout_seconds must be between {d} and {d}.", .{ min_subagent_timeout_seconds, max_subagent_timeout_seconds }),
+                .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's task must be non-empty UTF-8 of at most {d} bytes: say what to do, and leave documents in files it can read. Pass the 'id' of a paused run instead to let it carry on.", .{max_subagent_task_bytes}),
                 .is_error = true,
             };
         }
@@ -923,53 +971,124 @@ pub const Agent = struct {
             };
         }
 
-        var report: std.ArrayList(u8) = .empty;
-        defer report.deinit(self.allocator);
-
         // Starting the sub-agent is the one failure that is about this call
         // rather than about the task: it is reported as an error result, so
         // the model sees why its delegation went nowhere.
-        var child = initWith(self.allocator, self.io, self.config, self.linenoise, self.tool_env, self.mcp_registry, .{
-            .role = .subagent,
-            .parent = self,
-            .capture = &report,
-        }) catch |err| {
+        const run = self.startRun(task, context, checkin) catch |err| {
             return .{
                 .content = try std.fmt.allocPrint(self.allocator, "The sub-agent could not start: {s}.", .{@errorName(err)}),
                 .is_error = true,
             };
         };
-        defer child.deinit();
-        // The sub-agent's requests were part of what this query cost, so their
-        // tokens are counted where the user reads the totals.
-        defer self.client.absorbUsage(&child.client);
-        // An interrupt from the caller is seen through `parent`; this is the
-        // other half of the bound, so a model that keeps exploring cannot hold
-        // the caller's turn open indefinitely.
-        child.deadline = std.Io.Timestamp.addDuration(
-            std.Io.Timestamp.now(self.io, .awake),
-            .fromSeconds(@intCast(seconds)),
-        );
+        return self.waitRun(run, checkin);
+    }
+
+    /// Start one sub-agent and the task that runs it. The run owns the child,
+    /// the handshake they share, and the buffer the child answers into; the
+    /// caller of `subagent` only ever holds it by its id.
+    fn startRun(self: *Agent, task: []const u8, context: []const u8, checkin_seconds: u32) !*Run {
+        const run = try self.allocator.create(Run);
+        errdefer self.allocator.destroy(run);
+
+        self.run_counter += 1;
+        const id = try std.fmt.allocPrint(self.allocator, "s{d}", .{self.run_counter});
+        errdefer self.allocator.free(id);
+        run.* = .{
+            .id = id,
+            .child = undefined,
+            .supervisor = subagent.Supervisor.init(self.io, self.allocator),
+            .started = std.Io.Timestamp.now(self.io, .awake),
+        };
+        errdefer run.supervisor.deinit();
+
+        const child = try self.allocator.create(Agent);
+        errdefer self.allocator.destroy(child);
+        child.* = try Agent.initWith(self.allocator, self.io, self.config, self.linenoise, self.tool_env, self.mcp_registry, .{
+            .role = .subagent,
+            .parent = self,
+            .capture = &run.capture,
+            .supervisor = &run.supervisor,
+        });
+        errdefer child.deinit();
+        run.child = child;
+        // The two ways a run stops for a reason other than its caller's
+        // decision: this process asking for the task to stop, and the child
+        // itself being told to.
+        run.supervisor.canceled = &child.interrupted;
+        run.supervisor.caller_canceled = &self.interrupted;
 
         var prompt: std.ArrayList(u8) = .empty;
-        defer prompt.deinit(self.allocator);
+        errdefer prompt.deinit(self.allocator);
         try prompt.appendSlice(self.allocator, task);
         if (context.len > 0) {
             try prompt.appendSlice(self.allocator, "\n\nWhat the agent that asked you already knows:\n");
             try prompt.appendSlice(self.allocator, context);
         }
 
-        child.processQuery(prompt.items) catch |err| {
-            return .{
-                .content = try std.fmt.allocPrint(self.allocator, "The sub-agent stopped: {s}. Whatever it changed is on disk; inspect it before retrying.", .{subagentFailure(err)}),
-                .is_error = true,
-            };
+        const owned_prompt = try prompt.toOwnedSlice(self.allocator);
+        // A check-in of zero means the child's first boundary: asking before
+        // the task starts is what makes that the first request rather than
+        // whichever one the child happens to reach next.
+        if (checkin_seconds == 0) run.supervisor.requestReport();
+        // In the list before the task starts: once the child is running, only
+        // `closeRun` may free what it is using, and a failure below must not
+        // leave a live task pointing at freed memory.
+        try self.runs.append(self.allocator, run);
+        run.future = self.io.concurrent(childTurn, .{ child, &run.supervisor, owned_prompt }) catch |err| {
+            self.allocator.free(owned_prompt);
+            _ = self.runs.pop();
+            return err;
         };
+        return run;
+    }
 
+    /// Wait for the run's next stopping point — a progress report, the end of
+    /// its work, or a failure — and make it the tool result.
+    ///
+    /// `checkin_seconds` is the caller's tolerance, not a deadline for the
+    /// child: once it passes, the child is asked for a report and this keeps
+    /// waiting for it. A command that is already running is never cut short,
+    /// because a report that claims a check it did not finish is worse than a
+    /// report that arrives late.
+    fn waitRun(self: *Agent, run: *Run, checkin_seconds: u32) anyerror!tools.ToolResult {
+        const checkin_at = std.Io.Timestamp.addDuration(
+            std.Io.Timestamp.now(self.io, .awake),
+            .fromSeconds(@intCast(checkin_seconds)),
+        );
+        const outcome = run.supervisor.wait(checkin_at) catch |err| {
+            // Esc while the caller was waiting: nobody owns the child any more,
+            // and a child that kept going would edit files after a task was
+            // called off.
+            self.abortRun(run);
+            return err;
+        };
+        switch (outcome) {
+            .report => |report| {
+                defer self.allocator.free(report);
+                const elapsed_ms = run.started.untilNow(self.io, .awake).toMilliseconds();
+                return .{
+                    .content = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Sub-agent {s} progress report, {d}s in:\n{s}\n\nIt is paused at that report, waiting for you. Call subagent with id \"{s}\" to let it carry on; call subagent_stop with id \"{s}\" to stop it and take its final report.",
+                        .{ run.id, @divTrunc(elapsed_ms, 1000), report, run.id, run.id },
+                    ),
+                    .is_error = false,
+                };
+            },
+            .done => return self.finishRun(run, "Sub-agent report — verify it before marking a plan step done:"),
+            .failed => |failure| return self.failRun(run, failure),
+        }
+    }
+
+    /// Read the answer a run ended on and close it. `heading` says how the run
+    /// got there, because a stopped run and one that finished read differently
+    /// to whoever has to verify the work.
+    fn finishRun(self: *Agent, run: *Run, heading: []const u8) anyerror!tools.ToolResult {
         // The report is the reply that stands on the finished work: the
-        // commentary of earlier rounds stays in `report` before the mark.
-        const start = @min(child.capture_mark, report.items.len);
-        const answer = std.mem.trim(u8, report.items[start..], " \t\r\n");
+        // commentary of earlier rounds stays in the capture before the mark.
+        const start = @min(run.child.capture_mark, run.capture.items.len);
+        const answer = std.mem.trim(u8, run.capture.items[start..], " \t\r\n");
+        defer self.closeRun(run);
         if (answer.len == 0) {
             return .{
                 .content = try self.allocator.dupe(u8, "The sub-agent finished without a report. Inspect the working directory for what it did."),
@@ -977,9 +1096,166 @@ pub const Agent = struct {
             };
         }
         return .{
-            .content = try std.fmt.allocPrint(self.allocator, "Sub-agent report — verify it before marking a plan step done:\n{s}", .{answer}),
+            .content = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ heading, answer }),
             .is_error = false,
         };
+    }
+
+    /// A run that ended in an error. Whatever it changed is still on disk, and
+    /// the caller is told to look rather than to assume nothing happened.
+    fn failRun(self: *Agent, run: *Run, failure: anyerror) anyerror!tools.ToolResult {
+        defer self.closeRun(run);
+        return .{
+            .content = try std.fmt.allocPrint(self.allocator, "The sub-agent stopped: {s}. Whatever it changed is on disk; inspect it before retrying.", .{subagentFailure(failure)}),
+            .is_error = true,
+        };
+    }
+
+    /// The `subagent_stop` tool: the caller's answer to a progress report it
+    /// does not want to continue. The child gets one last turn to write its
+    /// final report and does no new work; that reply is the tool result.
+    fn subagentStopTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
+        if (self.role == .subagent) {
+            return .{
+                .content = try self.allocator.dupe(u8, "A sub-agent cannot stop a run: its own task ends when its caller says so."),
+                .is_error = true,
+            };
+        }
+        const parsed = std.json.parseFromSlice(struct { id: []const u8 }, self.allocator, arguments, .{}) catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: subagent_stop takes the 'id' the run's progress report named."),
+                .is_error = true,
+            };
+        };
+        defer parsed.deinit();
+        const run = self.findRun(parsed.value.id) orelse return .{
+            .content = try std.fmt.allocPrint(self.allocator, "Error: no sub-agent has the id \"{s}\"; one that has finished is gone.", .{parsed.value.id}),
+            .is_error = true,
+        };
+
+        run.supervisor.stop();
+        // The stop is the verdict on the report the child is paused at. If it
+        // is not paused there, its next request boundary says the same thing.
+        // Either way the wait ends when the child writes its last reply.
+        while (true) {
+            const outcome = run.supervisor.wait(null) catch |err| {
+                self.abortRun(run);
+                return err;
+            };
+            switch (outcome) {
+                // A report sent before the stop arrived is not the final one:
+                // the child has already been told to finish.
+                .report => |report| self.allocator.free(report),
+                .done => return self.finishRun(run, "Sub-agent stopped. Its final report — verify it before marking a plan step done:"),
+                .failed => |failure| return self.failRun(run, failure),
+            }
+        }
+    }
+
+    /// Close every run this agent still holds. Not while a turn is running:
+    /// the task doing that work owns the list, and it closes what it started
+    /// when it is done with it.
+    fn closeRuns(self: *Agent) void {
+        if (self.query_started != null) return;
+        while (self.runs.items.len > 0) self.abortRun(self.runs.items[self.runs.items.len - 1]);
+    }
+
+    fn findRun(self: *Agent, id: []const u8) ?*Run {
+        for (self.runs.items) |run| {
+            if (std.mem.eql(u8, run.id, id)) return run;
+        }
+        return null;
+    }
+
+    /// Close a run whose child has finished: take its tokens into this
+    /// session's totals, free the child, and forget the run. The task is
+    /// awaited first, so nothing reads the child after it is freed.
+    fn closeRun(self: *Agent, run: *Run) void {
+        if (run.future) |*future| _ = future.await(self.io);
+        // The sub-agent's requests were part of what this query cost, so their
+        // tokens are counted where the user reads the totals.
+        self.client.absorbUsage(&run.child.client);
+        run.child.deinit();
+        self.allocator.destroy(run.child);
+        run.capture.deinit(self.allocator);
+        run.supervisor.deinit();
+        self.allocator.free(run.id);
+        for (self.runs.items, 0..) |candidate, index| {
+            if (candidate == run) {
+                _ = self.runs.swapRemove(index);
+                break;
+            }
+        }
+        self.allocator.destroy(run);
+    }
+
+    /// Close a run that is still going: tell the child to stop, which it sees
+    /// at its next request boundary, or straight away if it is waiting at a
+    /// report. `closeRun` waits for it to be gone.
+    fn abortRun(self: *Agent, run: *Run) void {
+        run.supervisor.stop();
+        run.child.interrupted.store(true, .release);
+        self.closeRun(run);
+    }
+
+    /// The `report` tool: a sub-agent answering its caller's check-in.
+    ///
+    /// The report is handed over here and the verdict is taken back here, in
+    /// the same call, which is what makes the check-in a pause rather than a
+    /// race: the child does nothing more until the caller has read it.
+    fn reportTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
+        const supervisor = self.supervisor orelse return .{
+            .content = try self.allocator.dupe(u8, "The report tool belongs to a sub-agent. On the terminal, answer the user instead."),
+            .is_error = true,
+        };
+        const parsed = std.json.parseFromSlice(struct { summary: []const u8 }, self.allocator, arguments, .{}) catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: report takes a 'summary' string: what is done, what you ran, what is left."),
+                .is_error = true,
+            };
+        };
+        defer parsed.deinit();
+        const summary = std.mem.trim(u8, parsed.value.summary, " \t\r\n");
+        if (summary.len == 0 or !std.unicode.utf8ValidateSlice(summary)) {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: the report's summary must be non-empty UTF-8: say what is done, what you ran, and what is left."),
+                .is_error = true,
+            };
+        }
+        const report = if (summary.len > max_subagent_report_bytes)
+            try std.fmt.allocPrint(self.allocator, "{s}…", .{cutUtf8(summary, max_subagent_report_bytes)})
+        else
+            try self.allocator.dupe(u8, summary);
+        const verdict = supervisor.handOver(report) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+        };
+        return .{
+            .content = try self.allocator.dupe(u8, switch (verdict) {
+                .continue_task => continue_verdict,
+                .stop => stop_verdict,
+            }),
+            .is_error = false,
+        };
+    }
+
+    /// Take what the caller asked for at a request boundary: the progress
+    /// report it is waiting on, or the stop that ends this task. Both arrive as
+    /// a message in the conversation, the way a line the user typed does, and
+    /// both are answered inside the work in progress rather than after it.
+    fn applySupervision(self: *Agent) !void {
+        const supervisor = self.supervisor orelse return;
+        const due = supervisor.takeDue();
+        if (!due.any()) return;
+        // The stop outranks a report asked for before it: one of them is a
+        // question, the other is the end of the task.
+        if (due.stop) {
+            try self.appendUserMessage(stop_prompt);
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ the caller stopped this task\n" ++ RESET, .{});
+        } else {
+            try self.appendUserMessage(report_request_prompt);
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ the caller asked for a progress report\n" ++ RESET, .{});
+        }
+        try self.checkpoint();
     }
 
     fn processQueryInner(self: *Agent, query: []const u8) !void {
@@ -1053,7 +1329,9 @@ pub const Agent = struct {
         // reply turned into a tool call, so no transport scaffolding is kept.
         var continuation_start: ?usize = null;
 
-        while (iteration < self.max_iterations) : (iteration += 1) {
+        // A sub-agent's turn ends when its caller stops it, not when a budget
+        // runs out, so the loop has no count of its own there.
+        while (self.max_iterations == null or iteration < self.max_iterations.?) : (iteration += 1) {
             try self.checkInterrupted();
             // A line typed while the last request was running goes out with
             // this one: it belongs to the task in progress. A continuation
@@ -1063,6 +1341,7 @@ pub const Agent = struct {
             if (continuation_start == null) {
                 stream.flushPending() catch {};
                 _ = try self.injectSteering();
+                try self.applySupervision();
             }
             const response = self.chatAnimated(self.history.items, stream) catch |err| {
                 // Do not leave a continuation prompt as the last message for
@@ -1244,12 +1523,14 @@ pub const Agent = struct {
             }
         }
 
-        if (iteration == self.max_iterations) {
-            // Keep whatever the cut-off replies had produced, but not the
-            // prompts that asked for it.
-            try self.settleContinuations(&continuation_start, carried.items, null);
-            stream.flushPending() catch {};
-            try self.emit(std.Io.File.stderr(), RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
+        if (self.max_iterations) |max| {
+            if (iteration == max) {
+                // Keep whatever the cut-off replies had produced, but not the
+                // prompts that asked for it.
+                try self.settleContinuations(&continuation_start, carried.items, null);
+                stream.flushPending() catch {};
+                try self.emit(std.Io.File.stderr(), RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{max});
+            }
         }
 
         return turn;
@@ -1680,7 +1961,8 @@ pub const Agent = struct {
             // A sub-agent works out of sight, so its line is coloured like
             // its call: the user can tell a second agent at work from the
             // main model thinking, without reading the words.
-            if (std.mem.eql(u8, call.name, "subagent")) options.style = CYAN;
+            if (std.mem.eql(u8, call.name, "subagent") or std.mem.eql(u8, call.name, "subagent_stop"))
+                options.style = CYAN;
             var spin = if (label) |caption|
                 spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options)
             else
@@ -1695,6 +1977,10 @@ pub const Agent = struct {
                 break :blk try self.planTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "subagent")) {
                 break :blk try self.subagentTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "subagent_stop")) {
+                break :blk try self.subagentStopTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "report")) {
+                break :blk try self.reportTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments, answers, index);
             } else if (std.mem.eql(u8, call.name, mcp.Registry.loader_name)) {
@@ -1724,6 +2010,13 @@ pub const Agent = struct {
     /// `buf` is where a built label lives. It must outlive the animation, so
     /// the caller owns it and frees it after the spinner has stopped.
     fn callProgressLabel(self: *Agent, call: ToolCallData, buf: *std.Io.Writer.Allocating) !?[]const u8 {
+        // Stopping a run waits for its last reply, the way a resume waits for
+        // its next report, so both get the same kind of line.
+        if (std.mem.eql(u8, call.name, "subagent_stop")) {
+            buf.clearRetainingCapacity();
+            try buf.writer.writeAll("subagent · stopping…");
+            return buf.written();
+        }
         if (!std.mem.eql(u8, call.name, "subagent"))
             return tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
 
@@ -1732,6 +2025,14 @@ pub const Agent = struct {
         defer if (task) |t| self.allocator.free(t);
         const trimmed = if (task) |t| std.mem.trim(u8, t, " \t\r\n") else "";
         if (trimmed.len == 0) {
+            // A resume names the run it is waiting on instead of a task.
+            const id = openai.extractStringArg(self.allocator, call.arguments, "id") catch null;
+            defer if (id) |value| self.allocator.free(value);
+            if (id) |value| {
+                try buf.writer.writeAll("subagent · ");
+                try writeCallBrief(&buf.writer, std.mem.trim(u8, value, " \t\r\n"));
+                return buf.written();
+            }
             try buf.writer.writeAll("subagent…");
             return buf.written();
         }
@@ -1824,6 +2125,48 @@ pub const Agent = struct {
         try self.writeLogOrStdout("\n");
     }
 };
+
+/// One sub-agent this agent started: the child, the handshake they share, and
+/// the task running it.
+///
+/// Heap-allocated and owned by the `runs` list of the caller, because the run
+/// outlives the call that started it: the child holds pointers into this struct
+/// (its capture sink and its supervisor), and a paused run has to still be
+/// there when the model answers its report.
+const Run = struct {
+    /// The id the model names to resume or stop this run.
+    id: []u8,
+    child: *Agent,
+    supervisor: subagent.Supervisor,
+    /// Where the child's answers are collected instead of printed. Owned here
+    /// rather than by the tool call, for the same reason as the rest.
+    capture: std.ArrayList(u8) = .empty,
+    /// The task the child runs in. Null only between `create` and `concurrent`.
+    future: ?std.Io.Future(void) = null,
+    /// When the task was handed over, for the report's "Ns in".
+    started: std.Io.Timestamp,
+};
+
+/// The task a sub-agent runs: its one turn, with its end recorded where the
+/// caller is waiting for it.
+fn childTurn(child: *Agent, supervisor: *subagent.Supervisor, prompt: []u8) void {
+    defer child.allocator.free(prompt);
+    child.processQuery(prompt) catch |err| {
+        supervisor.finish(err);
+        return;
+    };
+    supervisor.finish(null);
+}
+
+/// The longest prefix of `bytes` that is at most `max` bytes and does not end
+/// inside a character. A report is model text, and half a codepoint is not
+/// text: it would come back as an invalid string in the caller's history.
+fn cutUtf8(bytes: []const u8, max: usize) []const u8 {
+    if (bytes.len <= max) return bytes;
+    var end = max;
+    while (end > 0 and (bytes[end] & 0xc0) == 0x80) end -= 1;
+    return bytes[0..end];
+}
 
 /// Paints the answer as it streams from the model. The markdown renderer is
 /// fed one complete line at a time, so bold, fences, lists and tables render
@@ -2038,8 +2381,6 @@ fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptim
 /// use: the bounds it runs under have names of their own only here.
 fn subagentFailure(err: anyerror) []const u8 {
     if (err == error.Canceled) return "the task was interrupted";
-    if (err == error.SubagentTimedOut) return "it ran past its time limit";
-    if (err == error.IterationLimitReached) return "it used up its tool calls on this task";
     return @errorName(err);
 }
 
@@ -2290,6 +2631,105 @@ test "a subagent runs its own turn and reports back" {
     const parent = mock.requests.items[2];
     try std.testing.expect(std.mem.indexOf(u8, parent, "Sub-agent report") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent, "answer.") != null);
+}
+
+test "a check-in returns a progress report and the caller stops the run" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+
+    // A check-in of zero is the child's first boundary, so the order of these
+    // replies is the order of the handshake itself: start, report, stop, the
+    // final report, the answer.
+    const start =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"sub\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"split the files\\\",\\\"checkin_seconds\\\":0}\"}]}";
+    const progress =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"rep\",\"name\":\"report\",\"arguments\":\"{\\\"summary\\\":\\\"two of four files split\\\"}\"}]}";
+    const halt =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"halt\",\"name\":\"subagent_stop\",\"arguments\":\"{\\\"id\\\":\\\"s1\\\"}\"}]}";
+    var mock: MockTransport = .{ .replies = &.{ start, progress, halt, completed_answer, completed_answer } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("split the source tree");
+
+    const turn = try harness.agent.runToolLoop();
+    try std.testing.expect(turn.completed);
+    try std.testing.expectEqual(@as(usize, 5), mock.requests.items.len);
+
+    // The child's first request carries the check-in as a line of its
+    // conversation, the way a line the user typed would.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "needs a progress report now") != null);
+    // The caller reads that report with the id to answer it with, and the
+    // child is paused at it rather than finished.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "two of four files split") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "paused at that report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "subagent_stop") != null);
+    // The stop reaches the child twice: as the verdict on the report it was
+    // waiting at, and again at its next boundary, so a child cannot work on.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "Do no further work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "has stopped this task") != null);
+    // What the caller is left with is the final report, not the transcript.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[4], "Sub-agent stopped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[4], "answer.") != null);
+}
+
+test "a resume lets the sub-agent carry on, and it is checked again" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+
+    const start =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"sub\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"split the files\\\",\\\"checkin_seconds\\\":0}\"}]}";
+    const progress =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"rep\",\"name\":\"report\",\"arguments\":\"{\\\"summary\\\":\\\"two of four files split\\\"}\"}]}";
+    const carry_on =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"go\",\"name\":\"subagent\",\"arguments\":\"{\\\"id\\\":\\\"s1\\\",\\\"checkin_seconds\\\":0}\"}]}";
+    var mock: MockTransport = .{ .replies = &.{ start, progress, carry_on, completed_answer, completed_answer } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("split the source tree");
+
+    const turn = try harness.agent.runToolLoop();
+    try std.testing.expect(turn.completed);
+    try std.testing.expectEqual(@as(usize, 5), mock.requests.items.len);
+
+    // The resume names the run, and the child reads the verdict as permission
+    // to go on rather than as a new task.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "let it carry on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "asks you to carry on") != null);
+    // Resuming with a check-in of zero asks again at the next boundary, so the
+    // child is watched as closely as the caller asked for.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "needs a progress report now") != null);
+    // A run that ends on its own is read as the report it stands on.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[4], "Sub-agent report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[4], "answer.") != null);
+}
+
+test "the two sides of the handshake are each refused on the other" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    // A caller has nobody to report to, and cannot stop a run it does not have.
+    const reported = try harness.agent.reportTool("{\"summary\":\"halfway\"}");
+    defer reported.deinit(allocator);
+    try std.testing.expect(reported.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, reported.content, "belongs to a sub-agent") != null);
+
+    const stopped = try harness.agent.subagentStopTool("{\"id\":\"s9\"}");
+    defer stopped.deinit(allocator);
+    try std.testing.expect(stopped.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, stopped.content, "no sub-agent has the id") != null);
+
+    // A check-in that no caller could wait out is refused before a run starts.
+    const started = try harness.agent.subagentTool("{\"task\":\"anything\",\"checkin_seconds\":4000}");
+    defer started.deinit(allocator);
+    try std.testing.expect(started.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, started.content, "checkin_seconds") != null);
 }
 
 test "the sub-agent's progress line names its task and keeps to one line" {

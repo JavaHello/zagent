@@ -173,18 +173,34 @@ pub const plan = ToolDefinition{
 
 pub const subagent = ToolDefinition{
     .name = "subagent",
-    .description = "Hand one self-contained task to a sub-agent that works on its own and returns a short report. The sub-agent does not read this conversation, cannot ask the user and cannot change the plan, so the task must carry everything it needs. Use it for a step whose tool output would flood this conversation; verify its work yourself before marking a plan step done.",
+    .description = "Hand one self-contained task to a sub-agent that works on its own and returns a short report. The sub-agent does not read this conversation, cannot ask the user and cannot change the plan, so the task must carry everything it needs. Use it for a step whose tool output would flood this conversation; verify its work yourself before marking a plan step done. The sub-agent has no limits of its own: you watch it instead. 'checkin_seconds' is how long it works before it is asked for a progress report, and the call returns with that report, the final report, or the end of the run. A run that reported is paused: call subagent again with its 'id' to let it carry on, or subagent_stop with its 'id' to stop it and take its final report.",
     .parameters_json =
-    \\{"type":"object","properties":{"task":{"type":"string","description":"One self-contained task: what to do and how it is verified, in full, since the sub-agent does not read this conversation"},"context":{"type":"string","description":"Optional facts the sub-agent needs: file paths, decisions already made, the shape of the expected change. Keep it short."},"timeout_seconds":{"type":"integer","minimum":30,"maximum":1800,"description":"Wall-clock limit for the sub-agent's whole run, default 600. A tool already running is not interrupted."}},"required":["task"]}
+    \\{"type":"object","properties":{"task":{"type":"string","description":"One self-contained task: what to do and how it is verified, in full, since the sub-agent does not read this conversation. Omit it to resume or to start a second sub-agent by 'id'."},"context":{"type":"string","description":"Optional facts the sub-agent needs: file paths, decisions already made, the shape of the expected change. Keep it short."},"id":{"type":"string","description":"The id of a sub-agent that is paused at a progress report: the call lets it carry on and returns its next report or its final one. Omit it to start a new sub-agent with 'task'."},"checkin_seconds":{"type":"integer","minimum":0,"maximum":3600,"description":"How long the sub-agent works before it is asked for a progress report, default 300. It is not a limit on the work: at the check-in the run pauses with that report, and you decide whether to go on. 0 asks for the report at the next request boundary."}},"required":[]}
+    ,
+};
+
+pub const report = ToolDefinition{
+    .name = "report",
+    .description = "Send the agent that called you a short progress report and wait for its decision. It is how a check-in is answered: the caller reads the report, then either tells you to continue or stops the task and asks for your final report. Keep it to a status line — what is done, what you ran, what is left — not the final answer.",
+    .parameters_json =
+    \\{"type":"object","properties":{"summary":{"type":"string","description":"Short progress report: what you have done and changed, what you ran and what it printed, what is verified, and what is left"}},"required":["summary"]}
+    ,
+};
+
+pub const subagent_stop = ToolDefinition{
+    .name = "subagent_stop",
+    .description = "Stop a sub-agent that is paused at a progress report and take its final report as the tool result. It gets one last turn to write that report and does no new work, so anything unfinished is named as unfinished.",
+    .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string","description":"The id of the paused sub-agent, as its progress report named it"}},"required":["id"]}
     ,
 };
 
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,          read, write,    apply_patch, ls,
-    rg,            fd,            grep, find,     http,        ask_user,
-    remember,      announce_task, plan, subagent,
+    memory_search, bash,          read, write,    apply_patch,   ls,
+    rg,            fd,            grep, find,     http,          ask_user,
+    remember,      announce_task, plan, subagent, subagent_stop, report,
 };
 
 test "built-in definitions have valid schemas and unique names" {

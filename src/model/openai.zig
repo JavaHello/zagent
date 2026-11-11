@@ -44,8 +44,10 @@ test "search registration follows installed backends and advertises renamed file
 
 test "omitted names drop from the startup defaults and search selection still applies" {
     const allocator = std.testing.allocator;
-    // The five tools a sub-agent must not hold, as src/agent/mod.zig names them.
-    const omit = [_][]const u8{ "ask_user", "announce_task", "plan", "remember", "subagent" };
+    // The six tools a sub-agent must not hold, as agent/prompt.zig names them:
+    // it cannot ask the user, announce on a terminal it does not own, move the
+    // plan, write the shared memory, start a run of its own, or stop one.
+    const omit = [_][]const u8{ "ask_user", "announce_task", "plan", "remember", "subagent", "subagent_stop" };
     for ([_]search_tools.SearchBackends{ .{}, .{ .rg = true }, .{ .fd = true }, .{ .rg = true, .fd = true } }) |search| {
         const body = try buildRequestWithToolSelection(allocator, "test", &.{}, 100, .{ .omit = &omit }, false, search);
         defer allocator.free(body);
@@ -56,8 +58,8 @@ test "omitted names drop from the startup defaults and search selection still ap
         for (parsed.value.object.get("tools").?.array.items) |tool| {
             try names.put(tool.object.get("name").?.string, {});
         }
-        try std.testing.expectEqual(@as(usize, 9), names.count());
-        for ([_][]const u8{ "memory_search", "bash", "read", "write", "apply_patch", "ls", "http" }) |name| {
+        try std.testing.expectEqual(@as(usize, 10), names.count());
+        for ([_][]const u8{ "memory_search", "bash", "read", "write", "apply_patch", "ls", "http", "report" }) |name| {
             try std.testing.expect(names.contains(name));
         }
         for (omit) |name| try std.testing.expect(!names.contains(name));
