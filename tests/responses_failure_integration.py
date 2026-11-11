@@ -62,9 +62,9 @@ try:
                                     capture_output=True, text=True, timeout=15)
             assert result.returncode != 0 and expected_error in result.stderr, result.stderr
             assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
-            # The default budget already sits on the growth cap, so a truncated
-            # response is not retried with a larger budget. It is asked for a
-            # smaller step twice before the turn is given up.
+            # The budget comes from the configuration alone: a truncated reply
+            # is asked for again at the same size, for a smaller step, twice,
+            # before the turn is given up.
             expected_budgets = [8192, 8192, 8192] if expected_error == 'ResponseTruncated' else [8192]
             assert [r['max_output_tokens'] for r in requests] == expected_budgets, requests
 
@@ -116,25 +116,30 @@ try:
             partial, partial, completed_text('Recovered answer'),
         ])
         requests.clear()
-        # Growth is only possible from below the cap, so this case lowers the
-        # budget to exercise the doubling up to the DeepSeek ceiling.
+        # The configured budget is what every request carries, whatever its
+        # size: a reply cut short is not re-asked with a larger one.
         result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
                                 env=dict(env, AI_MAX_TOKENS='2048'),
                                 capture_output=True, text=True, timeout=15)
         assert result.returncode == 0 and 'Recovered answer' in result.stdout, result.stderr
         assert not replies, replies
-        assert [r['max_output_tokens'] for r in requests] == [2048, 2048, 4096, 8192]
-        assert requests[1]['input'] == requests[2]['input'] == requests[3]['input']
-        assert any(item.get('type') == 'function_call_output' and 'retained-tool-evidence' in item['output']
-                   for item in requests[1]['input']), requests[1]
+        assert [r['max_output_tokens'] for r in requests] == [2048] * 4, requests
+        # A truncation is answered with a smaller-step prompt that joins the
+        # conversation, so each attempt carries more messages than the one
+        # before; the same request is never re-sent unchanged.
+        lengths = [len(r['input']) for r in requests]
+        assert lengths[1] < lengths[2] < lengths[3], lengths
+        for request in requests[1:]:
+            assert any(item.get('type') == 'function_call_output' and 'retained-tool-evidence' in item['output']
+                       for item in request['input']), request
+        assert any(item.get('role') == 'user' and 'Try again in smaller steps' in str(item.get('content'))
+                   for item in requests[3]['input']), requests[3]
         assert all('tools' in request for request in requests), requests
         assert not (Path(directory) / 'MUST_NOT_EXIST').exists(), 'Incomplete function call executed'
 
-        # The growth cap must not loop or lower a larger configured budget.
-        # With no text to continue, each of the three attempts is given the
-        # configured budget (doubled only while below the 8192 ceiling).
-        for budget, expected in [(4096, [4096, 8192] * 3), (8192, [8192] * 3),
-                                 (65536, [65536] * 3), (200000, [200000] * 3)]:
+        # With no text to continue, each of the three attempts carries the
+        # configured budget, however large or small it is.
+        for budget in (4096, 8192, 65536, 200000):
             reply.clear()
             reply.update(partial)
             requests.clear()
@@ -142,7 +147,7 @@ try:
                                     env=dict(env, AI_MAX_TOKENS=str(budget)),
                                     capture_output=True, text=True, timeout=15)
             assert result.returncode != 0 and 'ResponseTruncated' in result.stderr, result.stderr
-            assert [r['max_output_tokens'] for r in requests] == expected, requests
+            assert [r['max_output_tokens'] for r in requests] == [budget] * 3, requests
         assert all(path == '/v1/responses' for path in paths), paths
         print('PASS: bounded truncation recovery preserves tool results; partial calls never execute')
 finally:

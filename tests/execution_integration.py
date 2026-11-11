@@ -70,11 +70,10 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             requests.append(body)
             if len(requests) == 1:
+                # The binary on disk changes while this run is in flight. The
+                # run keeps using what it started from, and the session that is
+                # resumed afterwards is read by the replacement.
                 os.replace(replacement, live_binary)
-                self.send_response(503)
-                self.send_header('Content-Length', '0')
-                self.end_headers()
-                return
             results = [m for m in body['input'] if m.get('type') == 'function_call_output']
             if results:
                 observed.append(results[-1]['output'])
@@ -193,4 +192,4 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert (workspace / 'MCP_STARTED').read_text() == env['PRIVATE_SENTINEL']
     tool_names = [t['name'] for t in requests[0]['tools']]
     assert 'bash' in tool_names and 'shell' not in tool_names, tool_names
-    print('PASS: direct editing/search, host environment/network, timeout, API retry, durable resume, Bash and local MCP startup')
+    print('PASS: direct editing/search, host environment/network, timeout, binary replacement, durable resume, Bash and local MCP startup')
