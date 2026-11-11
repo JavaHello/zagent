@@ -667,6 +667,7 @@ test {
     _ = @import("agent/mod.zig");
     _ = @import("model/status.zig");
     _ = @import("host/execution.zig");
+    _ = @import("host/sysinfo.zig");
     _ = @import("state/session.zig");
     _ = @import("host/tool_worker.zig");
     _ = @import("cli/history.zig");

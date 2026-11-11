@@ -9,6 +9,7 @@ const memory_mod = @import("../state/memory.zig");
 const plan_mod = @import("../state/plan.zig");
 const mcp = @import("../mcp/mod.zig");
 const scratch_mod = @import("../state/scratch.zig");
+const sysinfo = @import("../host/sysinfo.zig");
 const render = @import("../ui/render.zig");
 const term = @import("../ui/term.zig");
 const spinner = @import("../ui/spinner.zig");
@@ -82,6 +83,11 @@ pub const Agent = struct {
     session_id: ?[]u8 = null,
     /// The working directory commands run in, named in the system prompt.
     workspace: [:0]u8,
+    /// What machine this run is on: the OS and its version, the kernel, the
+    /// architecture, the CPUs and the memory, read once in `init` and named in
+    /// the system prompt. A sub-agent inherits it from the agent that called
+    /// it, which works on the same machine.
+    host: sysinfo.Info,
     /// The private scratch directory this run owns, named in the system prompt.
     /// Created once, at startup, so concurrent agents never share one path and
     /// the model never has to ask for a place to work. Not a sandbox, and not
@@ -227,11 +233,16 @@ pub const Agent = struct {
         else
             try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
         errdefer allocator.free(workspace);
+        // The machine, read once: like the search programs above, its answer
+        // cannot change while the process runs, and a sub-agent works on the
+        // same one, so it inherits the parent's facts instead of asking again.
+        var host = if (parent) |p| try p.host.clone(allocator) else try sysinfo.Info.read(allocator, io);
+        errdefer host.deinit(allocator);
         var scratch = try scratch_mod.Scratch.init(io, allocator, env);
         errdefer scratch.deinit(allocator);
         const system_content = switch (options.role) {
-            .main => try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, workspace, scratch.path, &plan),
-            .subagent => try buildSubagentPrompt(allocator, mcp_registry, memory.enabled, search, workspace, scratch.path),
+            .main => try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, &host, workspace, scratch.path, &plan),
+            .subagent => try buildSubagentPrompt(allocator, mcp_registry, memory.enabled, search, &host, workspace, scratch.path),
         };
         errdefer allocator.free(system_content);
         try history.append(allocator, .{
@@ -255,6 +266,7 @@ pub const Agent = struct {
             .linenoise = linenoise,
             .search = search,
             .tool_env = env,
+            .host = host,
             .session_path = null,
             .workspace = workspace,
             .scratch = scratch,
@@ -290,6 +302,7 @@ pub const Agent = struct {
         if (self.current_task.len > 0) self.allocator.free(self.current_task);
         for (self.inbox.items) |line| self.allocator.free(line);
         self.inbox.deinit(self.allocator);
+        self.host.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
         self.allocator.free(self.workspace);
         self.terminal_title.deinit();
@@ -358,6 +371,7 @@ pub const Agent = struct {
                 self.mcp_registry,
                 self.memory.enabled,
                 self.search,
+                &self.host,
                 self.workspace,
                 self.scratch.path,
                 &self.plan,
@@ -369,6 +383,7 @@ pub const Agent = struct {
                 self.mcp_registry,
                 self.memory.enabled,
                 self.search,
+                &self.host,
                 self.workspace,
                 self.scratch.path,
             ),

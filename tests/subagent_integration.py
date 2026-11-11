@@ -120,6 +120,11 @@ try:
         assert scratch_of(child[0]) != scratch_of(parent[0]), (scratch_of(child[0]), scratch_of(parent[0]))
         assert child_scratch_live and all(child_scratch_live), child_scratch_live
 
+        # Both prompts name the machine they run on, read once at startup and
+        # inherited by the agent started from it.
+        for body in (parent[0], child[0]):
+            assert re.search(r'Host system: .+ \(.+\), ', instructions(body)), instructions(body)
+
         # It is not offered the tools that belong to the agent on the terminal.
         assert tool_names(child[0]).isdisjoint(
             {'ask_user', 'announce_task', 'subagent', 'subagent_stop', 'plan', 'remember'}), tool_names(child[0])

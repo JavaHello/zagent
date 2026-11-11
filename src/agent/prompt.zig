@@ -2,12 +2,14 @@
 //! sub-agent starts from, and the limits the continuation prompts are tied to.
 //!
 //! Kept apart from the agent loop because none of it depends on the loop: it is
-//! text assembled from the registry, the search programs, the workspace and the
-//! plan, and the loop only asks for it when a run begins or the plan changes.
+//! text assembled from the registry, the search programs, the host, the
+//! workspace and the plan, and the loop only asks for it when a run begins or
+//! the plan changes.
 const std = @import("std");
 const mcp = @import("../mcp/mod.zig");
 const tools = @import("../tools/mod.zig");
 const plan_mod = @import("../state/plan.zig");
+const sysinfo = @import("../host/sysinfo.zig");
 const sgr = @import("../ui/style.zig");
 
 /// How many times one reply may be continued after the output limit cut it
@@ -109,6 +111,7 @@ pub fn buildSystemPrompt(
     registry: *const mcp.Registry,
     memory_enabled: bool,
     search: tools.SearchBackends,
+    host: *const sysinfo.Info,
     workspace: []const u8,
     scratch: []const u8,
     plan: *const plan_mod.Plan,
@@ -121,6 +124,10 @@ pub fn buildSystemPrompt(
         if (search.rg) "rg" else "grep",
         if (search.fd) "fd" else "find",
     });
+    // The machine itself: which package manager and toolchain it has, and
+    // where its paths point, are facts about the host, told once at startup
+    // rather than learned with a tool call the model has to know to make.
+    try host.writePromptNote(&aw.writer);
     // Both paths stay fixed for the life of the process, so the model is told
     // them once, at startup, instead of having to ask for a scratch directory.
     // The scratch path outlives `/new` but not the process, so the model is
@@ -172,6 +179,7 @@ pub fn buildSubagentPrompt(
     registry: *const mcp.Registry,
     memory_enabled: bool,
     search: tools.SearchBackends,
+    host: *const sysinfo.Info,
     workspace: []const u8,
     scratch: []const u8,
 ) ![]u8 {
@@ -191,6 +199,9 @@ pub fn buildSubagentPrompt(
         if (search.rg) "rg" else "grep",
         if (search.fd) "fd" else "find",
     });
+    // The same machine as the parent, so the same facts: a sub-agent inherits
+    // them rather than reading the host again.
+    try host.writePromptNote(&aw.writer);
     try aw.writer.print(
         "\n- Working directory: {s} — the same project the parent works in." ++
             "\n- Scratch directory for this sub-agent: {s} (0700). It is removed when you finish, so put anything" ++

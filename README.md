@@ -82,6 +82,16 @@ an MCP server's answer included, comes back cut at the limit and reported as an
 error naming it. No tool description quotes the number: the limit lives in the
 code, not in the prompt.
 
+Startup also reads what machine the run is on and names it in the system
+prompt: the operating system and its version (the distribution's `PRETTY_NAME`
+on Linux, `ProductVersion` on macOS), the kernel release, the architecture, the
+CPU count and the total memory. It is read once, like the search programs: a
+sub-agent works on the same machine and inherits it. The agent is told that
+shell commands run with `bash` there, so it uses that system's package manager,
+paths and toolchain and checks which programs it has instead of assuming another
+machine's setup. Nothing in the note is an instruction to act on the host — it
+is what the host is.
+
 Every run creates one private scratch directory at startup (mode `0700`, a
 random name under `$TMPDIR`, or `/tmp` if unset) and names it, together with the
 working directory, in the system prompt. The agent is told to use it for complex
@@ -884,6 +894,7 @@ src/
   host/          — Running a tool on the host
     execution.zig — Worker process, deadline, bounded output, process-group cleanup
     tool_worker.zig — The worker: parse one call, run the tool, print the result
+    sysinfo.zig  — What machine this is: OS, kernel, architecture, CPUs, memory
   mcp/           — Model Context Protocol
     mod.zig      — Registry, tool aliases, loading a service's tools on demand
     transport.zig — stdio JSON-RPC transport and framing
