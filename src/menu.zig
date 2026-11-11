@@ -210,21 +210,46 @@ fn writeRow(w: *std.Io.Writer, allocator: std.mem.Allocator, raw: []const u8, co
     try w.writeAll(RESET ++ sgr.ERASE_LINE_END ++ "\r\n");
 }
 
-/// Returns options.len for the custom-answer row, or null on cancellation.
-/// Draw on stderr so redirected stdout receives no cursor control sequences.
-pub fn select(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !?usize {
+/// What the user did at a menu. The free-text row, when offered, is the last
+/// one and comes back as `custom`.
+pub const Choice = union(enum) {
+    /// Index into the offered options.
+    option: usize,
+    /// The user chose to type their own answer.
+    custom,
+    /// Ctrl+C, Ctrl+D or Esc on its own: this question is dismissed.
+    cancel,
+};
+
+/// A lone Esc is told apart from an arrow key by waiting this long for the rest
+/// of the sequence. It matches the wait the line editor uses for the same
+/// question, so one key is never read as a sequence here and as Esc there.
+const escape_timeout_ms = 100;
+
+/// Put the question to the user and let the menu own the keyboard until it is
+/// answered or dismissed. Draw on stderr so redirected stdout receives no
+/// cursor control sequences.
+pub fn select(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !Choice {
     return selectMenu(allocator, io, question, options, true);
 }
 
-/// A closed menu with no custom-answer row; defaults to the first option.
-pub fn selectOnly(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !?usize {
+/// A closed menu with no free-text row; defaults to the first option.
+pub fn selectOnly(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !Choice {
     return selectMenu(allocator, io, question, options, false);
 }
 
-fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option, allow_custom: bool) !?usize {
-    if (options.len == 0) return null;
+/// How many rows `select` draws for this many options: the blank line it starts
+/// with, the question, the option rows and the hint line.
+pub fn rowsFor(options_len: usize, allow_custom: bool) usize {
+    const rows: usize = options_len + @as(usize, @intFromBool(allow_custom));
+    const visible: usize = if (rows > 5) 5 else rows;
+    return visible + 3;
+}
+
+fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option, allow_custom: bool) !Choice {
+    if (options.len == 0) return .cancel;
     const out = std.Io.File.stderr();
-    var raw = try RawTerminal.init(io, std.Io.File.stdin(), out);
+    var raw = try RawTerminal.initKeepingInput(io, std.Io.File.stdin(), out);
     defer raw.deinit();
     try out.writeStreamingAll(io, sgr.HIDE_CURSOR);
     defer out.writeStreamingAll(io, RESET ++ sgr.SHOW_CURSOR) catch {};
@@ -255,15 +280,20 @@ fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, op
             if (i == state.selected) try aw.writer.writeAll(sgr.BOLD_CYAN);
             try writeRow(&aw.writer, allocator, row.written(), term.columns(out));
         }
-        try writeRow(&aw.writer, allocator, "  ↑/↓ select · Enter confirm · Ctrl+C cancel", term.columns(out));
+        try writeRow(&aw.writer, allocator, "  ↑/↓ select · Enter confirm · Ctrl+C or Esc cancel", term.columns(out));
         try out.writeStreamingAll(io, aw.written());
         drawn = true;
 
         while (true) {
-            const byte = try raw.readByte() orelse return null;
+            const byte = try raw.readByte() orelse return .cancel;
+            // Esc opens a sequence only when more bytes follow; on its own it
+            // dismisses the question, like the other ways out of a menu. Esc
+            // stops the task at the prompt instead: a question is a detour in
+            // the run, and backing out of it should not throw the run away.
+            if (byte == 0x1b and !try raw.waitReadable(io, escape_timeout_ms)) return .cancel;
             switch (state.key(byte)) {
-                .accept => return state.selected,
-                .cancel => return null,
+                .accept => return if (state.selected < options.len) .{ .option = state.selected } else .custom,
+                .cancel => return .cancel,
                 .redraw => break,
                 .ignore => {},
             }
@@ -461,4 +491,12 @@ test "the description names the recommendation" {
     const custom = try describeAnswer(allocator, .{ .custom = "neither" }, &test_options);
     defer allocator.free(custom);
     try std.testing.expectEqualStrings("The user did not pick one of the options and answered: neither", custom);
+}
+
+test "the menu asks for the rows it draws, however many options there are" {
+    // A blank line, the question, the option rows and the hint.
+    try std.testing.expectEqual(@as(usize, 5), rowsFor(1, true));
+    try std.testing.expectEqual(@as(usize, 6), rowsFor(3, false));
+    // The visible window stops at five rows; more options scroll inside it.
+    try std.testing.expectEqual(@as(usize, 8), rowsFor(9, true));
 }

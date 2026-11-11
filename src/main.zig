@@ -36,6 +36,7 @@ const HELP =
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
     \\  Wheel/PageUp/Down  Scroll output history
     \\  While running: commands remain available; typed text adjusts the task
+    \\  Questions   The menu owns the keyboard; Esc or Ctrl+C dismisses it
     \\  Esc          Stop current task and discard input typed while it ran
     \\  Ctrl+Z       Suspend; resume with fg
     \\  Ctrl+D       Exit zagent
@@ -169,7 +170,11 @@ pub fn main(init: std.process.Init) !void {
                 .{ .label = "Trust and continue", .description = "", .recommended = false },
             };
             const answer = try menu.selectOnly(allocator, io, "Choose an action", &options);
-            if (answer == null or answer.? != 1) {
+            const trusted = switch (answer) {
+                .option => |index| index == 1,
+                .custom, .cancel => false,
+            };
+            if (!trusted) {
                 try std.Io.File.stderr().writeStreamingAll(io, "Not trusted. Exiting.\n");
                 std.process.exit(1);
             }
@@ -328,6 +333,7 @@ fn runRepl(
         ln.scroll_callback = scrollRuntime;
         ln.mouse_callback = mouseRuntime;
         ln.interrupt_callback = interruptRuntime;
+        ln.handoff_callback = questionRuntime;
     }
 
     ln.multiline_mode = true;
@@ -344,6 +350,7 @@ fn runRepl(
         ln.scroll_callback = null;
         ln.mouse_callback = null;
         ln.interrupt_callback = null;
+        ln.handoff_callback = null;
         agent.choice_callback = null;
         agent.choice_context = null;
     }
@@ -410,6 +417,14 @@ fn runRepl(
         try screen.prepareInput();
         const maybe_line = ln.linenoise(PROMPT) catch |err| switch (err) {
             error.CtrlC => null,
+            error.Handoff => {
+                // A question is waiting. The editor has parked the line it was
+                // editing, so the menu can have the keyboard and the prompt
+                // rows: the question is asked where the input box was.
+                try screen.endInput();
+                try runtime.serveQuestions();
+                continue;
+            },
             error.Suspend => {
                 // Hand the terminal back, stop, and come back to the same
                 // line: the editor hands the typed text over in
@@ -428,10 +443,7 @@ fn runRepl(
 
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
 
-        if (line.len == 0) {
-            if (runtime.waiting.load(.acquire)) try runtime.submit(line);
-            continue;
-        }
+        if (line.len == 0) continue;
 
         // The editor's rows are cleared once the line is read; the question
         // still belongs in the record, with the prompt it was typed after. An
@@ -572,6 +584,10 @@ fn tickRuntime(context: ?*anyopaque) anyerror!bool {
 fn interruptRuntime(context: ?*anyopaque) anyerror!void {
     const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
     try runtime.interrupt();
+}
+
+fn questionRuntime(context: ?*anyopaque) anyerror!bool {
+    return @import("runtime.zig").Runtime.questionPending(context);
 }
 
 fn mouseRuntime(context: ?*anyopaque, report: []const u8) anyerror!void {

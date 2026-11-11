@@ -357,17 +357,21 @@ decision only you can make — the agent calls `ask_user` and you get a menu:
   > 1) Rewrite in place (recommended)  Keeps the history intact.
     2) New file  Leaves the original alone.
     3) Other / 自定义回答
-  ↑/↓ select · Enter confirm · Ctrl+C cancel
+  ↑/↓ select · Enter confirm · Ctrl+C or Esc cancel
 ```
 
 Use ↑/↓ (or j/k and Tab) to move, then Enter to confirm. The recommended option
 is selected initially, or the first option if none is recommended. Number keys
-1–9 also move the selection. Choose Other to type your own answer; Ctrl+C or
-Ctrl+D dismisses the menu. The judge can ask the same way:
-when it decides the work is blocked on a decision, it returns the options
-itself and you get the same menu. With no terminal to type at (piped input,
-or an unsupported terminal) the recommended option is taken and the agent says
-so. Interactive menus also work in single-query mode and render on stderr.
+1–9 also move the selection. Choose Other to type your own answer; Ctrl+C,
+Ctrl+D or Esc dismisses the question and the agent carries on from there on its
+own. Esc stops the task at the prompt, not at a menu: backing out of a question
+should not throw the run away. In the fullscreen session the menu takes the rows
+the prompt had, so nothing typed at a menu reaches the input box or steers the
+task: the keyboard belongs to the question until it is answered. Two or more
+questions arrive one after another, each taking the keyboard in turn. With no
+terminal to type at (piped input, or an unsupported terminal) the recommended
+option is taken and the agent says so. Interactive menus also work in
+single-query mode and render on stderr.
 
 ### HTTP requests
 
@@ -639,7 +643,9 @@ ones that change session state wait for the task to end.
 
 Press **Esc** to interrupt the current task, terminate its running tools, and
 discard input typed while it ran, keeping your own draft. If a completion popup
-is open, Esc only closes the popup. Completed actions are not undone.
+is open, Esc only closes the popup, and if a question menu is open, Esc only
+dismisses that question and the task carries on. Completed actions are not
+undone.
 File search skips `.git`, build caches and `node_modules`, and bounds traversal
 to keep large workspaces responsive. File selection inserts an `@path` reference
 (paths with spaces are quoted); it does not attach file contents automatically.

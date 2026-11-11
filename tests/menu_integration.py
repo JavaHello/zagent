@@ -62,6 +62,7 @@ try:
             (b'1\r', None, 'User selected: Alpha'),
             (b'\x1b[B\r', '自己的方案'.encode() + b'\r', '自己的方案'),
             (b'\x03', None, 'dismissed without an answer'),
+            (b'\x1b', None, 'dismissed without an answer'),
             (b'\x04', None, 'dismissed without an answer'),
         ]
         for keys, custom, expected in cases:
@@ -113,6 +114,6 @@ try:
         assert 'Enter confirm' not in piped.stdout + piped.stderr
         assert piped.stdout.count(task_description) == 1, piped.stdout
         assert '\x1b]2;' not in piped.stderr, piped.stderr
-        print('PASS: recommendation, arrows, number keys, custom text, cancellation, terminal restoration and piped fallback')
+        print('PASS: recommendation, arrows, number keys, custom text, Ctrl+C/Esc cancellation, terminal restoration and piped fallback')
 finally:
     server.shutdown()

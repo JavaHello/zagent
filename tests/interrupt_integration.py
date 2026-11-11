@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ESC cancels API waits, process groups and choices; the next turn still works."""
+"""ESC cancels API waits and process groups, and only dismisses a question."""
 import fcntl
 import http.server
 import json
@@ -19,6 +19,7 @@ from mock_api import send_response, trust_workspace
 blocked = threading.Event()
 release = threading.Event()
 requests = []
+asked = False
 
 
 class API(http.server.BaseHTTPRequestHandler):
@@ -26,6 +27,7 @@ class API(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
+        global asked
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         requests.append(body)
         text = 'Recovery complete'
@@ -41,7 +43,10 @@ class API(http.server.BaseHTTPRequestHandler):
             elif 'slow tool' in query:
                 output = [{'type': 'function_call', 'call_id': 'slow', 'name': 'bash',
                            'arguments': json.dumps({'command': 'echo STARTED > started; sleep 3; echo BAD > survived'})}]
-            elif 'choose now' in query:
+            elif 'choose now' in query and not asked:
+                # Once only: the model here is a stub, and asking again after a
+                # dismissal would test a looping question, not what Esc does.
+                asked = True
                 output = [{'type': 'function_call', 'call_id': 'choice', 'name': 'ask_user',
                            'arguments': json.dumps({'question': 'Cancel this choice?', 'options': [
                                {'label': 'Alpha'}, {'label': 'Beta'}]})}]
@@ -137,14 +142,27 @@ try:
             time.sleep(3.2)
             assert not Path(directory, 'survived').exists(), 'tool descendant survived ESC'
             send(b'choose now\r')
-            until(b'Cancel this choice?')
-            stop()
-            recover()
+            until(b'Enter confirm')
+            # A question is a detour in the run: Esc backs out of it, the agent
+            # decides for itself and the task carries on instead of dying.
+            send(b'\x1b')
+
+            # The dismissal comes back as a tool output, and a replayed screen
+            # can repeat old lines but cannot fake a request: wait for the one
+            # that carries it. That the run is still alive is the point — an
+            # interruption would leave the question unanswered in the record.
+            def dismissed():
+                bodies = [r for r in requests if r.get('tools')]
+                if not bodies:
+                    return False
+                return any(m.get('call_id') == 'choice' and 'dismissed' in m['output']
+                           for m in bodies[-1]['input'] if m.get('type') == 'function_call_output')
+            wait_for(dismissed)
             send(b'/quit\r\r')
             until(b'Goodbye!')
             assert process.wait(timeout=5) == 0
             assert termios.tcgetattr(slave) == original
-            print('PASS: ESC cancels API, process group and choice; replay and recovery work')
+            print('PASS: ESC cancels API and process group, only dismisses a question; replay and recovery work')
         finally:
             release.set()
             if process.poll() is None:

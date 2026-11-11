@@ -963,11 +963,28 @@ pub const Agent = struct {
             return null;
         }
 
-        const selected = try menu.select(self.allocator, self.io, question, options) orelse return null;
-        if (selected < options.len) {
-            return try menu.describeAnswer(self.allocator, .{ .option = selected }, options);
+        const selected = try menu.select(self.allocator, self.io, question, options);
+        switch (selected) {
+            .option => |index| return try menu.describeAnswer(self.allocator, .{ .option = index }, options),
+            .custom => {
+                const answer = try self.readChoiceLine() orelse {
+                    // End of input: fall back to the recommendation, if any.
+                    if (recommended) |index| return try menu.describeAnswer(self.allocator, .{ .option = index }, options);
+                    return null;
+                };
+                defer self.allocator.free(answer);
+                return try menu.describeAnswer(self.allocator, .{ .custom = answer }, options);
+            },
+            // A dismissed question is not a reason to stop the run: the model
+            // is told to carry on by itself. Esc at the menu dismisses it here
+            // too; stopping the task is the prompt's job.
+            .cancel => return null,
         }
+    }
 
+    /// Read the free text the "type your own answer" row asks for. Owned by the
+    /// caller, trimmed, and never empty: an empty line is no answer at all.
+    pub fn readChoiceLine(self: *Agent) !?[]u8 {
         // A menu answer is free text, not a slash command, so completion and
         // hints are switched off for this read and restored afterwards.
         const saved_completions = self.linenoise.completions_callback;
@@ -1005,15 +1022,11 @@ pub const Agent = struct {
             if (self.screen) |screen| try screen.endInput();
             break;
         }
-        const line = raw_line orelse {
-            // End of input: fall back to the recommendation, if any.
-            if (recommended) |index| return try menu.describeAnswer(self.allocator, .{ .option = index }, options);
-            return null;
-        };
+        const line = raw_line orelse return null;
         defer self.allocator.free(line);
 
-        // The question is part of the record even though the editor's rows are
-        // cleared once the answer is read.
+        // The answer is part of the record even though the editor's rows are
+        // cleared once it is read.
         if (self.screen) |screen| {
             const echo = try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ CHOICE_PROMPT, line });
             defer self.allocator.free(echo);
@@ -1022,7 +1035,7 @@ pub const Agent = struct {
 
         const answer = std.mem.trim(u8, line, " \t\r\n");
         if (answer.len == 0) return null;
-        return try menu.describeAnswer(self.allocator, .{ .custom = answer }, options);
+        return try self.allocator.dupe(u8, answer);
     }
 
     /// The ask_user tool: put the model's question to the user and hand the

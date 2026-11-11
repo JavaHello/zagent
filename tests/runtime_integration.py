@@ -123,8 +123,9 @@ try:
             # Page keys must leave the editor usable, even during a blocked request.
             send(b'\x1b[5~\x1b[6~/model\r\r', b'Model: runtime-mock')
             release.set()
-            until(b'Enter an option number or your own answer below')
-            # Clear any command-menu input left by the preceding redraw.
+            # The question is put to the user in the rows the prompt had: the
+            # menu owns the keyboard and the input box is not usable.
+            until(b'Enter confirm')
             send(b'\x15' + b'1\r', b'Background answer complete')
             until('✓ Turn finished'.encode())
             assert b'\x1b[1m\x1b[32m' + '  ✓ Turn finished'.encode() + b'\x1b[0m' in transcript, transcript

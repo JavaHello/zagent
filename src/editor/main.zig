@@ -10,6 +10,7 @@ pub const History = @import("history.zig").History;
 const term = @import("term.zig");
 const isUnsupportedTerm = term.isUnsupportedTerm;
 const enableRawMode = term.enableRawMode;
+const enableRawModeKeepingInput = term.enableRawModeKeepingInput;
 const disableRawMode = term.disableRawMode;
 const getColumns = term.getColumns;
 
@@ -48,6 +49,13 @@ pub const RawTerminal = struct {
         return .{ .io = io, .input = input, .output = output, .original = try enableRawMode(input, output) };
     }
 
+    /// Same, but bytes already typed stay readable: this terminal takes over
+    /// from the line editor, so the key the user pressed just as the takeover
+    /// happened is theirs to read, not type-ahead to throw away.
+    pub fn initKeepingInput(io: Io, input: File, output: File) !RawTerminal {
+        return .{ .io = io, .input = input, .output = output, .original = try enableRawModeKeepingInput(input, output) };
+    }
+
     pub fn deinit(self: RawTerminal) void {
         disableRawMode(self.input, self.output, self.original);
     }
@@ -55,6 +63,17 @@ pub const RawTerminal = struct {
     pub fn readByte(self: RawTerminal) !?u8 {
         var byte: [1]u8 = undefined;
         return if (try term.read(self.io, self.input, &byte) == 0) null else byte[0];
+    }
+
+    /// Whether another byte arrives within `timeout_ms`. Nothing is consumed:
+    /// this is how a lone Esc is told from the start of an escape sequence.
+    pub fn waitReadable(self: RawTerminal, io: Io, timeout_ms: i32) !bool {
+        _ = io;
+        if (@import("builtin").os.tag == .windows) return true;
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = self.input.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        return try std.posix.poll(&fds, timeout_ms) > 0;
     }
 };
 
@@ -79,6 +98,19 @@ const key_ctrl_z = 26;
 const key_esc = 27;
 const key_backspace = 127;
 
+/// Whether the terminal has been handed to something that needs it right now,
+/// such as a question to answer. The line being edited is parked so the next
+/// read puts it back, untouched.
+fn handOff(state: *LinenoiseState) !bool {
+    const ln = state.ln;
+    const handoff = ln.handoff_callback orelse return false;
+    if (!try handoff(ln.layout_context)) return false;
+    ln.history.pop();
+    if (ln.pending_input) |old| ln.allocator.free(old);
+    ln.pending_input = try ln.allocator.dupe(u8, state.buf.items);
+    return true;
+}
+
 fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]const u8 {
     var state = LinenoiseState.init(ln, in, out, prompt);
     defer state.buf.deinit(state.allocator);
@@ -99,6 +131,9 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
     try state.refreshLine();
 
     while (true) {
+        // A question is put to the user in front of this line: hand the
+        // terminal over before waiting for a key, keeping what was typed.
+        if (try handOff(&state)) return error.Handoff;
         if (ln.tick_callback) |tick| {
             if (try tick(ln.layout_context)) {
                 // Background repaint is not an edit: do not reopen a popup
@@ -114,6 +149,12 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                 if (try std.posix.poll(&fds, 100) == 0) continue;
             }
         }
+        // The wait above may have been woken by a question rather than by an
+        // edit: the menu takes the keyboard first and the key that woke us
+        // stays in the terminal for it, instead of being acted on here. Esc is
+        // the case that matters — at the prompt it stops the task, and a
+        // question must not swallow that answer to its own dismissal.
+        if (try handOff(&state)) return error.Handoff;
         var input_buf: [1]u8 = undefined;
         if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
         var c = input_buf[0];
@@ -194,6 +235,10 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             },
             key_esc => {
                 if ((try term.readEscape(ln.io, in, &input_buf)) < 1) {
+                    // A question can take the keyboard in the moment this Esc is
+                    // pressed. The menu comes first, and the run it belongs to
+                    // must not be killed by the answer to its own dismissal.
+                    if (try handOff(&state)) return error.Handoff;
                     try ln.escape(state.popup_items.len > 0);
                     try state.dismissPopup();
                     try state.refreshLine();
@@ -424,6 +469,10 @@ pub const Linenoise = struct {
     layout_callback: ?LayoutCallback = null,
     layout_context: ?*anyopaque = null,
     tick_callback: ?*const fn (?*anyopaque) anyerror!bool = null,
+    /// Asked before every key: true means something else needs the terminal
+    /// right now (a question to answer), so this read parks the typed text and
+    /// lets the caller draw. It comes back with the next `linenoise` call.
+    handoff_callback: ?*const fn (?*anyopaque) anyerror!bool = null,
     interrupt_callback: ?*const fn (?*anyopaque) anyerror!void = null,
 
     /// Direction (up) and whether to scroll a page rather than wheel lines.

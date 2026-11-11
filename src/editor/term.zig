@@ -47,6 +47,18 @@ const k32 = struct {
 };
 
 pub fn enableRawMode(in: File, out: File) !termios {
+    return enterRawMode(in, out, .FLUSH);
+}
+
+/// Raw mode that keeps bytes already typed but not yet read. A menu that takes
+/// the keyboard over from the line editor needs this: the key the user pressed
+/// just as the question arrived belongs to the menu, and flushing would swallow
+/// it so that nothing happened until the key was pressed again.
+pub fn enableRawModeKeepingInput(in: File, out: File) !termios {
+    return enterRawMode(in, out, .NOW);
+}
+
+fn enterRawMode(in: File, out: File, action: std.posix.TCSA) !termios {
     if (is_windows) {
         var result: termios = .{
             .inMode = 0,
@@ -87,7 +99,7 @@ pub fn enableRawMode(in: File, out: File) !termios {
         raw.cc[@backingInt(std.posix.V.MIN)] = 1;
         raw.cc[@backingInt(std.posix.V.TIME)] = 0;
 
-        try std.posix.tcsetattr(in.handle, std.posix.TCSA.FLUSH, raw);
+        try std.posix.tcsetattr(in.handle, action, raw);
 
         return orig;
     }
