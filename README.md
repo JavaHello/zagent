@@ -20,7 +20,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `ask_user` — put a question to you as an interactive selection menu
 - **MCP servers** — start servers described in `mcp.json` and give the tools they offer to the model beside the built-in ones
 - **Multi-turn tool chaining** — the agent loops until the task is complete
-- **Task metadata from the main model** — the built-in `set_task` call provides a `title` and `description` of the goal and approach, without a separate planning request. The description is displayed to the user; terminal titles use the generated title, never raw input. Both the submitted title and the entire terminal title stay below 80 Unicode characters.
+- **Task announcement from the main model** — the built-in `announce_task` call provides a `title` and `description` of the goal and approach, without a separate planning request. The description is displayed to the user; terminal titles use the generated title, never raw input. Both the submitted title and the entire terminal title stay below 80 Unicode characters.
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
 - **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
 - **Live progress** — waiting for the model, and running a tool, each get one animated line (`⠋ shell… 8s`) with the time so far, so a long wait never looks like a hang. Off unless both stdout and stderr are a terminal, where the line can be taken and given back

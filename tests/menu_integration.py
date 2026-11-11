@@ -35,7 +35,7 @@ class API(http.server.BaseHTTPRequestHandler):
         assert body.get('tools'), 'unexpected separate planning or summarization request'
         results = [m for m in body['input'] if m.get('type') == 'function_call_output']
         if not results:
-            output = [{'type': 'function_call', 'call_id': 'task', 'name': 'set_task',
+            output = [{'type': 'function_call', 'call_id': 'task', 'name': 'announce_task',
                        'arguments': json.dumps({'title': task_title,
                                                 'description': task_description})},
                       {'type': 'function_call', 'call_id': 'choice', 'name': 'ask_user',
