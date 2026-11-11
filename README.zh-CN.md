@@ -33,6 +33,28 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 
 配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_REASONING_EFFORT`、`AI_SERVICE_TIER`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。Markdown 根据终端能力自动渲染，管道和文件输出保留原始 Markdown，无需配置开关。
 
+## 服务商配置
+
+`AI_PROVIDER` 选择内置预设，预设只提供未被显式设置的默认值：
+
+| 预设 | 基础地址 | 默认模型 | Key 环境变量 |
+|------|----------|----------|--------------|
+| `openai` | `https://api.openai.com/v1` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| `deepseek` | `https://api.deepseek.com` | `deepseek-flash` | `DEEPSEEK_API_KEY` |
+| `openai-compatible` | 由 `AI_URL` 指定 | 由 `AI_MODEL` 指定 | `AI_KEY` |
+| `codex` | ChatGPT 后端（见下文） | `gpt-5.4` | 无需（`zagent login`） |
+
+`openai-compatible` 面向其他所有兼容 OpenAI Responses 的厂商，例如阿里云百炼、Moonshot、智谱，以及自建的 vLLM、LiteLLM 网关。它不预设地址和模型：必须提供 `AI_URL` 和 `AI_MODEL`，key 从 `AI_KEY` 读取，缺少哪一项会在启动时直接指出。名称大小写不敏感，也接受 `openai_compatible` 和 `compatible` 两种写法。
+
+```sh
+export AI_PROVIDER=openai-compatible
+export AI_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export AI_MODEL=qwen-plus
+export AI_KEY='你的百炼 API key'
+```
+
+`AI_URL` 填基础地址，不含 `/responses`；`AI_MODEL` 原样发送。服务端必须实现 Responses API，zagent 不会回退到 Chat Completions。只设置 `AI_KEY` 不会自动选中任何服务商，因为它不指向具体地址；未设置 `AI_PROVIDER` 时仍按导出的 `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` 自动选择，两者都存在时 `openai` 优先。
+
 ## 复制文本
 
 在对话区拖动选择文字，松开后请求复制。普通终端使用 OSC 52；tmux 内使用 `tmux load-buffer -w -`（需要 tmux 3.2+ 且 `tmux` 在 PATH 中），同时写入 tmux 缓冲区并请求同步系统剪贴板，无需开启 `allow-passthrough`，默认 `set-clipboard external` 即可。

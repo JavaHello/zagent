@@ -24,7 +24,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
 - **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
 - **Live progress** — waiting for the model, and running a tool, each get one animated line (`⠋ shell… 8s`) with the time so far, so a long wait never looks like a hang. Off unless both stdout and stderr are a terminal, where the line can be taken and given back
-- **Built-in provider presets** — one setting selects `deepseek` or `openai`, autodetected from `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` when unset
+- **Built-in provider presets** — one setting selects `deepseek` or `openai`, autodetected from `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` when unset; `openai-compatible` points the same client at any vendor whose URL you supply
 - **Responses API** — uses `POST /responses` with typed input/output items, function calling and stateless reasoning replay; works with OpenAI, DeepSeek or another endpoint implementing this protocol
 - **ANSI colour output**
 
@@ -253,12 +253,26 @@ The startup wordmark uses the terminal theme's standard ANSI cyan, with no custo
 
 `AI_PROVIDER` selects a built-in preset that supplies the base URL, the default model, and the name of the environment variable holding the API key:
 
-| Provider   | Base URL                     | Default model    | API key variable   |
-|------------|------------------------------|------------------|--------------------|
-| `openai`   | `https://api.openai.com/v1`  | `gpt-4o-mini`    | `OPENAI_API_KEY`   |
-| `deepseek` | `https://api.deepseek.com`   | `deepseek-flash` | `DEEPSEEK_API_KEY` |
+| Provider            | Base URL                    | Default model           | API key variable   |
+|---------------------|-----------------------------|-------------------------|--------------------|
+| `openai`            | `https://api.openai.com/v1` | `gpt-4o-mini`           | `OPENAI_API_KEY`   |
+| `deepseek`          | `https://api.deepseek.com`  | `deepseek-flash`        | `DEEPSEEK_API_KEY` |
+| `openai-compatible` | *(set with `AI_URL`)*       | *(set with `AI_MODEL`)* | `AI_KEY`           |
+| `codex`             | ChatGPT backend (see below) | `gpt-5.4`               | — (`zagent login`) |
 
-To use some other Responses-compatible endpoint, leave `AI_PROVIDER` unset and set `AI_URL` / `AI_MODEL` yourself.
+`openai-compatible` is the preset for every other vendor — Alibaba Cloud Model
+Studio (百炼), Moonshot, Zhipu, a self-hosted vLLM or LiteLLM gateway, and so on.
+It assumes no host of its own: `AI_URL` and `AI_MODEL` are required, the key
+comes from `AI_KEY`, and startup names the setting that is still missing. The
+spelling is matched case-insensitively, and `openai_compatible` and `compatible`
+are accepted too.
+
+```bash
+export AI_PROVIDER=openai-compatible
+export AI_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export AI_MODEL=qwen-plus
+export AI_KEY=sk-your-dashscope-key
+```
 
 Precedence, highest first: an explicit environment variable, then the config file, then the provider preset.
 
@@ -274,6 +288,8 @@ With no `AI_PROVIDER` in the environment or in the config file, zagent picks a p
 | neither                | no provider — the OpenAI defaults apply and startup warns about the missing key |
 
 So `export DEEPSEEK_API_KEY=...` on its own is enough to talk to DeepSeek, and a shell that has exported `OPENAI_API_KEY` resolves exactly as it did before autodetection existed.
+
+`openai-compatible` is never autodetected, even though `AI_KEY` is its key variable: a generic key names no host, so the endpoint has to be chosen explicitly.
 
 A key set in the *config file* turns autodetection off: that key is paired with the configured (or default OpenAI) endpoint, and an unrelated exported variable must not move the endpoint out from under it.
 
@@ -722,11 +738,20 @@ These popups apply only to the REPL prompt.
 ### Using a custom Responses-compatible endpoint
 
 ```bash
-export AI_URL=https://your-endpoint/v1
-export OPENAI_API_KEY=your-key
-export AI_MODEL=your-model
+export AI_PROVIDER=openai-compatible
+export AI_URL=https://your-endpoint/v1     # no /responses suffix
+export AI_MODEL=your-model                 # sent unchanged
+export AI_KEY=your-key
 ./zig-out/bin/zagent
 ```
+
+The `openai-compatible` preset carries no defaults, so a missing `AI_URL` or
+`AI_MODEL` is reported at startup instead of being sent to an empty host. The
+endpoint must implement the Responses API: the client posts to
+`<AI_URL>/responses` and lists `/models`, with no fallback to Chat Completions.
+That covers OpenAI-compatible vendors such as Alibaba Cloud Model Studio
+(`https://dashscope.aliyuncs.com/compatible-mode/v1`), Moonshot, Zhipu and
+self-hosted servers that speak the same protocol.
 
 ### Using DeepSeek
 

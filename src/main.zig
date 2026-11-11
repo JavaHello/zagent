@@ -129,6 +129,7 @@ pub fn main(init: std.process.Init) !void {
             "  login / logout      Sign in with ChatGPT / remove local credentials\n" ++
             "  models              List models for the selected provider\n\n" ++
             "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
+            "AI_PROVIDER=openai-compatible  Any Responses-compatible vendor; set AI_URL and AI_MODEL.\n" ++
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
             "AI_MEMORY_FILE        Store memory in another file\n" ++
             "Tools and local MCP servers run on the host with inherited environment and network access.\n" ++
@@ -191,13 +192,33 @@ pub fn main(init: std.process.Init) !void {
                 allocator,
                 RED ++ "Error: unknown AI_PROVIDER." ++ RESET ++
                     "\n  Valid values: {s}\n" ++
-                    "  To use another endpoint, unset AI_PROVIDER and set AI_URL and AI_MODEL instead.\n",
+                    "  To use another Responses-compatible vendor, set AI_PROVIDER=openai-compatible\n" ++
+                    "  together with AI_URL, AI_MODEL and AI_KEY.\n",
                 .{valid},
             );
             defer allocator.free(msg);
             std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
             // Exiting directly rather than returning keeps Zig from printing a
             // stack trace underneath an error that is already fully explained.
+            std.process.exit(1);
+        },
+        error.MissingProviderUrl, error.MissingProviderModel => {
+            // The compatible preset has no host of its own, so point at the
+            // exact setting that is missing rather than at an empty request.
+            const missing = if (err == error.MissingProviderUrl) "AI_URL" else "AI_MODEL";
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                RED ++ "Error: AI_PROVIDER=openai-compatible needs {s}." ++ RESET ++
+                    "\n  AI_URL is the base URL without /responses, AI_MODEL is sent unchanged." ++
+                    "\n  Alibaba Cloud Model Studio (百炼):\n" ++
+                    "    export AI_PROVIDER=openai-compatible\n" ++
+                    "    export AI_URL=https://dashscope.aliyuncs.com/compatible-mode/v1\n" ++
+                    "    export AI_MODEL=qwen-plus\n" ++
+                    "    export AI_KEY=sk-your-dashscope-key\n",
+                .{missing},
+            );
+            defer allocator.free(msg);
+            std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
             std.process.exit(1);
         },
         else => return err,
@@ -379,7 +400,7 @@ fn runRepl(
         // The label is dim and the model name is not, so the eye lands on the
         // value rather than on the word "Model".
         const model_line = if (config.provider) |selected|
-            try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}" ++ DIM ++ " · {s}\n" ++ RESET, .{ config.model, @tagName(selected) })
+            try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}" ++ DIM ++ " · {s}\n" ++ RESET, .{ config.model, selected.name() })
         else
             try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}\n", .{config.model});
         defer allocator.free(model_line);

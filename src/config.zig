@@ -69,7 +69,9 @@ fn envHasValue(env: *const std.process.Environ.Map, name: []const u8) bool {
 /// value is resolved with everything else by `resolve`.
 fn autodetectProvider(env: *const std.process.Environ.Map) ?Provider {
     for (std.enums.values(Provider)) |candidate| {
-        if (envHasValue(env, candidate.spec().api_key_env)) return candidate;
+        const spec = candidate.spec();
+        if (!spec.autodetect) continue;
+        if (envHasValue(env, spec.api_key_env)) return candidate;
     }
     return null;
 }
@@ -313,6 +315,14 @@ fn resolve(
         spec.model,
     );
     errdefer allocator.free(model);
+
+    // A preset that cannot know the vendor has no defaults to fall back on,
+    // so the settings it needs are reported by name instead of being sent to
+    // an empty host.
+    if (selected_provider == .openai_compatible) {
+        if (base_url.len == 0) return error.MissingProviderUrl;
+        if (model.len == 0) return error.MissingProviderModel;
+    }
 
     const reasoning_effort = try resolveOptionalSetting(allocator, env, "AI_REASONING_EFFORT", &file_config.reasoning_effort);
     errdefer if (reasoning_effort) |value| allocator.free(value);
@@ -584,6 +594,88 @@ test "explicit environment beats the preset" {
     // The trailing slash is trimmed so the request path is not doubled.
     try std.testing.expectEqualStrings("https://proxy.example/v1", config.base_url);
     try std.testing.expectEqualStrings("deepseek-v4-pro", config.model);
+}
+
+test "compatible provider takes its endpoint and model from the user" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{
+        .{ "AI_PROVIDER", "openai-compatible" },
+        .{ "AI_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/" },
+        .{ "AI_MODEL", "qwen-plus" },
+        .{ "AI_KEY", "sk-bailian" },
+    });
+    defer env.deinit();
+
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, Provider.openai_compatible), config.provider);
+    try std.testing.expectEqualStrings("https://dashscope.aliyuncs.com/compatible-mode/v1", config.base_url);
+    try std.testing.expectEqualStrings("qwen-plus", config.model);
+    try std.testing.expectEqualStrings("sk-bailian", config.api_key);
+}
+
+test "compatible provider reads the endpoint from the config file too" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "AI_PROVIDER", "compatible" }});
+    defer env.deinit();
+
+    var file_config = try testFile(allocator, &.{
+        .{ "AI_URL", "https://api.moonshot.cn/v1" },
+        .{ "AI_MODEL", "kimi-k2" },
+        .{ "AI_KEY", "sk-file" },
+    });
+    defer file_config.deinit(allocator);
+
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(?Provider, Provider.openai_compatible), config.provider);
+    try std.testing.expectEqualStrings("https://api.moonshot.cn/v1", config.base_url);
+    try std.testing.expectEqualStrings("kimi-k2", config.model);
+    try std.testing.expectEqualStrings("sk-file", config.api_key);
+}
+
+test "compatible provider reports the setting it still needs" {
+    const allocator = std.testing.allocator;
+
+    {
+        var env = try testEnv(allocator, &.{
+            .{ "AI_PROVIDER", "openai-compatible" },
+            .{ "AI_MODEL", "qwen-plus" },
+        });
+        defer env.deinit();
+        var file_config = ConfigFile{};
+        defer file_config.deinit(allocator);
+        try std.testing.expectError(error.MissingProviderUrl, resolve(allocator, &file_config, &env));
+    }
+
+    {
+        var env = try testEnv(allocator, &.{
+            .{ "AI_PROVIDER", "openai-compatible" },
+            .{ "AI_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1" },
+        });
+        defer env.deinit();
+        var file_config = ConfigFile{};
+        defer file_config.deinit(allocator);
+        try std.testing.expectError(error.MissingProviderModel, resolve(allocator, &file_config, &env));
+    }
+
+    // A blank value is as absent as an unset one; it must not be sent as the
+    // endpoint.
+    {
+        var env = try testEnv(allocator, &.{.{ "AI_PROVIDER", "openai-compatible" }});
+        defer env.deinit();
+        var file_config = try testFile(allocator, &.{
+            .{ "AI_URL", "" },
+            .{ "AI_MODEL", "qwen-plus" },
+        });
+        defer file_config.deinit(allocator);
+        try std.testing.expectError(error.MissingProviderUrl, resolve(allocator, &file_config, &env));
+    }
 }
 
 test "config file beats the preset and loses to the environment" {
