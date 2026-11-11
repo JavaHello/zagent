@@ -371,8 +371,8 @@ export OPENAI_API_KEY=sk-...
 
 ❯ list all .zig files in the current directory
   ⚙ shell {"command":"find . -name '*.zig' -type f"}
-  ✓ ./src/agent.zig
-./src/config.zig
+  ✓ ./src/agent/mod.zig
+./src/model/config.zig
 ...
 
 Assistant
@@ -519,8 +519,8 @@ body. Four behaviours are worth knowing:
 ```
 ❯ where is progressLabel defined?
   ⚙ grep {"pattern":"fn progressLabel"}
-  ✓ ./src/tools.zig:21:pub fn progressLabel(name: []const u8) ?[]const u8 {
-    ./src/tools.zig:1330:        const label = progressLabel(name) orelse return error.TestUnexpectedResult;
+  ✓ ./src/tools/progress.zig:11:pub fn progressLabel(name: []const u8) ?[]const u8 {
+    ./src/tools/progress.zig:38:        const label = progressLabel(name) orelse return error.TestUnexpectedResult;
 ```
 
 | Argument      | Required | Description                                                     |
@@ -844,22 +844,66 @@ The integration target builds the binary and runs the Python 3 suites, covering 
 
 ```
 src/
-  editor/      — Line editing, history, popup and raw terminal handling
+  main.zig       — CLI entry point, REPL loop
+  agent/         — The agent loop
+    mod.zig      — Call API → execute tools → repeat → check completion
+    prompt.zig   — The system prompt, the sub-agent prompt, and their limits
+  cli/           — The terminal session around the loop
+    commands.zig — Slash commands
+    completion.zig — Command and @-path completion
+    history.zig  — Prompt history: where it is stored, and when it is saved
+    runtime.zig  — The one thread that owns the terminal; workers only enqueue
+  model/         — The model client and its configuration
+    openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
+    provider.zig — Built-in provider presets
+    config.zig   — Configuration loading from the config file and environment
+    codex_auth.zig — ChatGPT/Codex device login and token refresh
+    status.zig   — Status and quota formatting
+  tools/         — The built-in tools, one file per tool
+    mod.zig      — Re-exports the tool API the rest of the program uses
+    bash.zig     — bash
+    read.zig     — read: one numbered page of a file
+    write.zig    — write: whole-file writes and exact-block edits
+    apply_patch.zig — apply_patch: a Git unified diff
+    ls.zig       — ls
+    rg.zig       — rg
+    grep.zig     — grep
+    fd.zig       — fd
+    find.zig     — find
+    http.zig     — http
+    search.zig   — What the four search tools share: backends, arguments, paging
+    result.zig   — ToolResult, the output limit, sanitising and truncation
+    args.zig     — Reading a call's JSON arguments
+    progress.zig — The label shown while a tool runs
+    util.zig     — Helpers several tools share
+    schema.zig   — The JSON schema of every built-in tool
+  host/          — Running a tool on the host
+    execution.zig — Worker process, deadline, bounded output, process-group cleanup
+    tool_worker.zig — The worker: parse one call, run the tool, print the result
+  mcp/           — Model Context Protocol
+    mod.zig      — Registry, tool aliases, loading a service's tools on demand
+    transport.zig — stdio JSON-RPC transport and framing
+  ui/            — Terminal presentation
+    screen.zig   — Screen buffer, scrolling, selection and copying
+    render.zig   — Markdown rendering
+    menu.zig     — Option parsing, choice menus, and reading the user's answer
+    spinner.zig  — The animation shown while a request or tool runs
+    banner.zig   — The startup wordmark: letterforms, palette, plain-text fallback
+    term.zig     — Raw mode, size, cursor and escape sequences
+    style.zig    — The SGR codes and styles everything else draws with
+    selection.zig — Turning a drag into the text to copy
+  diff/          — Unified diffs: reading one, applying one, drawing one (mod.zig)
+  state/         — What outlives a turn
+    memory.zig   — Durable notes: file format, local retrieval, edits
+    plan.zig     — The session plan: steps, snapshot form, prompt bullet
+    session.zig  — Session snapshots
+    workspace.zig — Trusted directories and the state directory inside them
+    scratch.zig  — The per-run scratch directory
+  util/          — Small shared modules
+    text.zig     — Sanitising, ANSI stripping and UTF-8 helpers
+    compact.zig  — Dropping tool results, deduplicating repeated reads
+  editor/        — Line editing, history, popup and raw terminal handling
   unicode_width/ — Terminal character widths and Unicode tables
-  main.zig     — CLI entry point, REPL loop
-  config.zig   — Configuration loading from the config file and environment
-  history.zig  — Prompt history: where it is stored, and when it is saved
-  provider.zig — Built-in provider presets
-  openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
-  tools.zig   — Tool implementations (bash, read, write,
-                apply_patch, ls, rg/grep, fd/find, http)
-  diff.zig    — Unified diffs: reading one, applying one, drawing one
-  agent.zig   — Agent loop: call API → execute tools → repeat → check completion
-  compact.zig — Dropping tool results, and deduplicating repeated reads
-  memory.zig  — Durable notes: file format, local retrieval, edits
-  plan.zig    — The session plan: steps, snapshot form, prompt bullet
-  banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
-  menu.zig    — Option parsing, choice menus, and reading the user's answer
 build.zig     — Zig build script
 ```
 

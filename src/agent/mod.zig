@@ -1,0 +1,2516 @@
+const std = @import("std");
+const openai = @import("../model/openai.zig");
+const tools = @import("../tools/mod.zig");
+const diff = @import("../diff/mod.zig");
+const text = @import("../util/text.zig");
+const menu = @import("../ui/menu.zig");
+const compact = @import("../util/compact.zig");
+const memory_mod = @import("../state/memory.zig");
+const plan_mod = @import("../state/plan.zig");
+const mcp = @import("../mcp/mod.zig");
+const scratch_mod = @import("../state/scratch.zig");
+const render = @import("../ui/render.zig");
+const term = @import("../ui/term.zig");
+const spinner = @import("../ui/spinner.zig");
+const Screen = @import("../ui/screen.zig").Screen;
+const ScreenLogWriter = @import("../ui/screen.zig").LogWriter;
+const Config = @import("../model/config.zig").Config;
+const Linenoise = @import("../editor/main.zig").Linenoise;
+
+const Message = openai.Message;
+const ToolCallData = openai.ToolCallData;
+
+// ANSI colour codes
+const sgr = @import("../ui/style.zig");
+const RESET = sgr.RESET;
+const BOLD = sgr.BOLD;
+const DIM = sgr.DIM;
+const CYAN = sgr.CYAN;
+const GREEN = sgr.GREEN;
+const YELLOW = sgr.YELLOW;
+const RED = sgr.RED;
+
+// The instructions a run starts with, and the limits around them, live in
+// prompt.zig; the loop below uses them by their own names.
+const agent_prompt = @import("prompt.zig");
+const SYSTEM_PROMPT = agent_prompt.SYSTEM_PROMPT;
+const max_continuations = agent_prompt.max_continuations;
+const max_empty_continuations = agent_prompt.max_empty_continuations;
+const continue_prompt = agent_prompt.continue_prompt;
+const restart_prompt = agent_prompt.restart_prompt;
+const steering_note = agent_prompt.steering_note;
+const CHOICE_PROMPT = agent_prompt.CHOICE_PROMPT;
+const dismissed_question_message = agent_prompt.dismissed_question_message;
+const error_preview_max = agent_prompt.error_preview_max;
+const subagent_max_iterations = agent_prompt.subagent_max_iterations;
+const max_subagent_task_bytes = agent_prompt.max_subagent_task_bytes;
+const max_subagent_context_bytes = agent_prompt.max_subagent_context_bytes;
+const min_subagent_timeout_seconds = agent_prompt.min_subagent_timeout_seconds;
+const max_subagent_timeout_seconds = agent_prompt.max_subagent_timeout_seconds;
+const default_subagent_timeout_seconds = agent_prompt.default_subagent_timeout_seconds;
+const buildSystemPrompt = agent_prompt.buildSystemPrompt;
+const buildSubagentPrompt = agent_prompt.buildSubagentPrompt;
+const subagent_omitted = agent_prompt.subagent_omitted;
+
+pub const Agent = struct {
+    interrupted: std.atomic.Value(bool) = .init(false),
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: openai.Client,
+    history: std.ArrayList(Message),
+    max_iterations: u32,
+    /// The terminal ask_user and the choice menus read from.
+    linenoise: *Linenoise,
+    form_context: ?*anyopaque = null,
+    /// Who puts a form of questions to the user. The full-screen runtime owns
+    /// the keyboard, so it presents the form instead of the terminal below.
+    form_callback: ?*const fn (?*anyopaque, []menu.Slot) anyerror!menu.Replies = null,
+    /// Which search programs the machine has. Decided once, in `init`, for the
+    /// same reason as `render_markdown`: a search should not have to ask the
+    /// filesystem a question whose answer cannot change while the agent runs.
+    search: tools.SearchBackends,
+    tool_env: *const std.process.Environ.Map,
+    session_path: ?[]u8,
+    session_id: ?[]u8 = null,
+    /// The working directory commands run in, named in the system prompt.
+    workspace: [:0]u8,
+    /// The private scratch directory this run owns, named in the system prompt.
+    /// Created once, at startup, so concurrent agents never share one path and
+    /// the model never has to ask for a place to work. Not a sandbox, and not
+    /// durable: a new session empties it and the process removes it on exit.
+    scratch: scratch_mod.Scratch,
+    /// Durable notes loaded at startup and updated by the remember tool.
+    memory: memory_mod.Memory,
+    /// The checklist of the work in progress. It lives in memory, is changed by
+    /// the plan tool and `/plan`, and is saved with the session rather than in
+    /// a file of its own. Named in the system prompt, which is rebuilt whenever
+    /// it changes rather than fixed at startup.
+    plan: plan_mod.Plan,
+    /// Whether to render the model's markdown for a terminal. Decided once, in
+    /// `init`, so the answer path never has to ask the operating system.
+    render_markdown: bool,
+    /// Whether the progress line for a wait may be animated. Decided once, in
+    /// `init`, next to `render_markdown` and by the same test — a terminal that
+    /// cannot do line editing is no place for a carriage return and an erase,
+    /// and neither is one where stdout is a file or a pager: the animation
+    /// takes a line of the terminal, and it must be the only writer to it.
+    animate_progress: bool,
+    terminal_title: term.Title,
+    /// The settings this agent was built from, borrowed: the agent that owns
+    /// them outlives every agent started from it. A sub-agent starts from the
+    /// same provider, model and key as the one that called it.
+    config: *const Config,
+    /// Whether this agent is the one on the terminal, or one a tool call
+    /// started. A sub-agent has no terminal, no session and no plan of its own.
+    role: Role = .main,
+    /// The agent that started this one. Its interrupt flag is checked too, so
+    /// Esc stops the whole tree rather than the outer turn alone.
+    parent: ?*Agent = null,
+    /// Where a sub-agent's answer is collected instead of printed. Null for the
+    /// agent on the terminal, which has a user to answer.
+    capture: ?*std.ArrayList(u8) = null,
+    /// Where the report of this turn starts in `capture`. The commentary that
+    /// precedes a round of tool calls is not part of it: only the reply that
+    /// stands on the finished work is.
+    capture_mark: usize = 0,
+    /// Wall-clock limit for a sub-agent's run. Null for the agent on the
+    /// terminal, whose limit is the user.
+    deadline: ?std.Io.Timestamp = null,
+    /// The task the model last announced, named in the terminal title. It is
+    /// kept across turns on purpose: a follow-up that announces no task of its
+    /// own still belongs to the work the title names, and dropping it at the
+    /// next prompt would leave the title with nothing to show.
+    current_task: []const u8 = "",
+    query_started: ?std.Io.Timestamp = null,
+    progress_prompt: ?[]const u8 = null,
+    /// Lines the user typed while this task was running. They are not a new
+    /// task: the worker drains them at its next request boundary and sends
+    /// them to the model inside the work in progress. The terminal thread
+    /// appends and the worker swaps the whole list out, so the mutex only
+    /// ever guards that hand-over.
+    inbox: std.ArrayList([]u8) = .empty,
+    inbox_mutex: std.Io.Mutex = .init,
+    /// Where the conversation is drawn when the interactive session owns the
+    /// screen. Null for a single query: answers then go straight to stdout, so
+    /// `zagent "q" > notes.md` stays clean.
+    screen: ?*Screen = null,
+    /// The MCP servers and the tools they brought. Borrowed rather than owned:
+    /// whoever started the agent outlives it, and the agent only reads this and
+    /// calls through it.
+    mcp_registry: *mcp.Registry,
+
+    pub const Role = enum {
+        /// The agent a person talks to: it owns the terminal, the session and
+        /// the plan.
+        main,
+        /// An agent a tool call started for one task. It reports back through
+        /// its caller instead of printing, and starts no session.
+        subagent,
+    };
+
+    const InitOptions = struct {
+        role: Role = .main,
+        /// The agent that starts this one, for a sub-agent. It lends the
+        /// working directory, the search programs and the interrupt flag, and
+        /// it must outlive the agent it starts.
+        parent: ?*Agent = null,
+        /// Where a sub-agent's answer goes.
+        capture: ?*std.ArrayList(u8) = null,
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        config: *const Config,
+        linenoise: *Linenoise,
+        env: *const std.process.Environ.Map,
+        mcp_registry: *mcp.Registry,
+    ) !Agent {
+        return initWith(allocator, io, config, linenoise, env, mcp_registry, .{});
+    }
+
+    fn initWith(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        config: *const Config,
+        linenoise: *Linenoise,
+        env: *const std.process.Environ.Map,
+        mcp_registry: *mcp.Registry,
+        options: InitOptions,
+    ) !Agent {
+        var history: std.ArrayList(Message) = .empty;
+        errdefer history.deinit(allocator);
+
+        var memory = try memory_mod.Memory.init(allocator, io, env);
+        errdefer memory.deinit();
+
+        // An empty plan: this process has no session yet, and whichever one
+        // `startSession` opens brings its own checklist with it.
+        var plan = plan_mod.Plan.init(allocator);
+        errdefer plan.deinit();
+
+        // A sub-agent works on the same machine as the agent that called it, so
+        // it is told about the same search programs rather than looking again.
+        const parent = options.parent;
+        const search = if (parent) |p| p.search else tools.detectSearchBackends(io, env);
+        var client = openai.Client.init(allocator, io, config.*);
+        client.search = search;
+        if (options.role == .subagent) client.builtin_omit = &subagent_omitted;
+        // A test transport is the one thing a sub-agent inherits that is not
+        // settings: the loop is driven without a socket, so the requests the
+        // sub-agent makes are scripted by the same test.
+        if (parent) |p| client.transport = p.client.transport;
+        const workspace: [:0]u8 = if (parent) |p|
+            try allocator.dupeSentinel(u8, p.workspace, 0)
+        else
+            try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+        errdefer allocator.free(workspace);
+        var scratch = try scratch_mod.Scratch.init(io, allocator, env);
+        errdefer scratch.deinit(allocator);
+        const system_content = switch (options.role) {
+            .main => try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, workspace, scratch.path, &plan),
+            .subagent => try buildSubagentPrompt(allocator, mcp_registry, memory.enabled, search, workspace, scratch.path),
+        };
+        errdefer allocator.free(system_content);
+        try history.append(allocator, .{
+            .role = "system",
+            .content = system_content,
+            .reasoning_content = null,
+            .tool_calls = null,
+            .tool_call_id = null,
+        });
+
+        // Only the agent a person talks to has a terminal to write on, a
+        // session to record, and a plan of its own. A sub-agent reports back
+        // through the tool result and leaves all three to its caller.
+        const interactive = options.role == .main;
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .client = client,
+            .history = history,
+            .max_iterations = if (interactive) config.max_iterations else @min(config.max_iterations, subagent_max_iterations),
+            .linenoise = linenoise,
+            .search = search,
+            .tool_env = env,
+            .session_path = null,
+            .workspace = workspace,
+            .scratch = scratch,
+            .memory = memory,
+            .plan = plan,
+            .config = config,
+            .role = options.role,
+            .parent = options.parent,
+            .capture = options.capture,
+            // The check is on stdout rather than on `linenoise.is_tty`, which
+            // describes stdin: `zagent "q" < file` with a terminal on stdout
+            // should still render, and `zagent "q" | less` must not.
+            .render_markdown = interactive and linenoise.term_supported and
+                (std.Io.File.stdout().isTty(io) catch false),
+            // stderr as well as stdout, unlike the renderer: the animation is
+            // written to stderr, and a run whose stdout is a file or a pager is
+            // one where the terminal belongs to something else.
+            .animate_progress = interactive and linenoise.term_supported and
+                (std.Io.File.stdout().isTty(io) catch false) and
+                (std.Io.File.stderr().isTty(io) catch false),
+            .mcp_registry = mcp_registry,
+            .terminal_title = term.Title.init(io, interactive and linenoise.term_supported),
+        };
+    }
+
+    pub fn deinit(self: *Agent) void {
+        if (self.current_task.len > 0) self.allocator.free(self.current_task);
+        for (self.inbox.items) |line| self.allocator.free(line);
+        self.inbox.deinit(self.allocator);
+        self.scratch.deinit(self.allocator);
+        self.allocator.free(self.workspace);
+        self.terminal_title.deinit();
+        for (self.history.items) |msg| msg.deinit(self.allocator);
+        self.history.deinit(self.allocator);
+        self.client.deinit();
+        self.memory.deinit();
+        self.plan.deinit();
+        if (self.session_path) |path| self.allocator.free(path);
+        if (self.session_id) |id| self.allocator.free(id);
+    }
+
+    /// Draw the conversation on `screen` instead of on the files the progress
+    /// lines normally use.
+    pub fn attachScreen(self: *Agent, screen: ?*Screen) void {
+        self.screen = screen;
+    }
+
+    /// One status or answer line: into the conversation when a screen owns it,
+    /// and to `file` otherwise. The file still matters for a redirected run,
+    /// where stdout belongs to another program and stderr carries progress.
+    fn emit(self: *Agent, file: std.Io.File, comptime fmt: []const u8, args: anytype) !void {
+        if (self.capture) |_| {
+            // A sub-agent has no terminal. Text meant for the conversation is
+            // kept for its report; its progress is nobody's business but its
+            // own, and the caller prints a line for the call already.
+            if (file.handle != std.Io.File.stdout().handle) return;
+            const message = try std.fmt.allocPrint(self.allocator, fmt, args);
+            defer self.allocator.free(message);
+            return self.writeLogOrStdout(message);
+        }
+        if (self.screen) |screen| {
+            if (screen.isActive()) {
+                const message = try std.fmt.allocPrint(self.allocator, fmt, args);
+                defer self.allocator.free(message);
+                return screen.writeLog(message);
+            }
+        }
+        try printFmt(file, self.io, self.allocator, fmt, args);
+    }
+
+    /// Clear conversation history (keeps the system prompt).
+    pub fn clearHistory(self: *Agent) void {
+        for (self.history.items[1..]) |msg| msg.deinit(self.allocator);
+        self.history.shrinkRetainingCapacity(1);
+        // A conversation that starts over starts from what outlived it: the
+        // prompt names the plan, which is state of the session rather than of
+        // the messages, so it is rebuilt rather than kept.
+        self.refreshSystemPrompt() catch {};
+        self.checkpoint() catch {};
+    }
+
+    /// Rebuild the system prompt in place from the state it describes. The
+    /// plan changes as the work moves, and the MCP directory grows when a
+    /// service is loaded, so the prompt is rebuilt at those points instead of
+    /// being fixed at startup. A failure leaves the previous prompt in place.
+    fn refreshSystemPrompt(self: *Agent) !void {
+        if (self.history.items.len == 0) return;
+        const content = switch (self.role) {
+            .main => try buildSystemPrompt(
+                self.allocator,
+                self.mcp_registry,
+                self.memory.enabled,
+                self.search,
+                self.workspace,
+                self.scratch.path,
+                &self.plan,
+            ),
+            // A sub-agent has no plan of its own and no session to describe:
+            // its prompt says what the task is and what the report holds.
+            .subagent => try buildSubagentPrompt(
+                self.allocator,
+                self.mcp_registry,
+                self.memory.enabled,
+                self.search,
+                self.workspace,
+                self.scratch.path,
+            ),
+        };
+        errdefer self.allocator.free(content);
+        if (self.history.items[0].content) |old| self.allocator.free(old);
+        self.history.items[0].content = content;
+    }
+
+    /// Switch only after the new snapshot has been created or fully validated.
+    pub fn startSession(self: *Agent, resume_id: ?[]const u8) !void {
+        const session = @import("../state/session.zig");
+        const id = if (resume_id) |value| try self.allocator.dupe(u8, value) else try session.newId(self.io, self.allocator);
+        errdefer self.allocator.free(id);
+        try session.validateId(id);
+        const relative = try std.fmt.allocPrint(self.allocator, "sessions/{s}.json", .{id});
+        defer self.allocator.free(relative);
+        const path = try @import("../state/workspace.zig").filePath(self.allocator, self.io, self.tool_env, relative);
+        errdefer self.allocator.free(path);
+        var loaded: session.Loaded = undefined;
+        if (resume_id != null) {
+            try std.Io.Dir.cwd().access(self.io, path, .{});
+            loaded = try session.load(self.io, self.allocator, path);
+        } else {
+            // A new session starts without a plan: the checklist belongs to
+            // the session the work was done in, not to this process.
+            loaded = .{ .messages = .empty, .plan = plan_mod.Plan.init(self.allocator) };
+            session.save(self.io, self.allocator, path, &.{}, &loaded.plan) catch |err| {
+                loaded.deinit(self.allocator);
+                return err;
+            };
+        }
+        defer loaded.deinit(self.allocator);
+        try self.history.ensureTotalCapacity(self.allocator, loaded.messages.items.len + 1);
+        // The system prompt names this process's working and scratch
+        // directories, so switching sessions replaces the messages only.
+        for (self.history.items[1..]) |message| message.deinit(self.allocator);
+        self.history.shrinkRetainingCapacity(1);
+        self.history.appendSliceAssumeCapacity(loaded.messages.items);
+        loaded.messages.clearRetainingCapacity();
+        // The plan of the session just opened replaces this process's; the old
+        // one goes into `loaded` and is freed with it.
+        std.mem.swap(plan_mod.Plan, &self.plan, &loaded.plan);
+        if (self.session_path) |old| self.allocator.free(old);
+        if (self.session_id) |old| self.allocator.free(old);
+        self.session_path = path;
+        self.session_id = id;
+        self.client.resetTokenCounters();
+        // The prompt names the plan's progress, so it is rebuilt for the plan
+        // this session brought rather than the one the process started with.
+        self.refreshSystemPrompt() catch {};
+        // Another session is another piece of work: the task the old one
+        // announced says nothing about this one.
+        self.forgetTask();
+    }
+
+    /// Drop the title's task label, leaving the activity to speak for itself.
+    fn forgetTask(self: *Agent) void {
+        if (self.current_task.len > 0) self.allocator.free(self.current_task);
+        self.current_task = "";
+        self.terminal_title.update("ready", "");
+    }
+
+    /// Restore the visible conversation from the saved messages, without
+    /// dispatching tools or changing the model history/checkpoint.
+    pub fn replayHistory(self: *Agent) !void {
+        if (self.history.items.len <= 1) return;
+        try self.emit(std.Io.File.stdout(), DIM ++ "  ── Restored session history ──\n" ++ RESET, .{});
+        for (self.history.items[1..]) |message| {
+            if (std.mem.eql(u8, message.role, "user")) {
+                if (message.content) |content| {
+                    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+                    defer aw.deinit();
+                    try aw.writer.writeAll("\n" ++ BOLD ++ GREEN ++ "❯" ++ RESET ++ " ");
+                    try text.writeSanitized(&aw.writer, content);
+                    try aw.writer.writeByte('\n');
+                    try self.writeLogOrStdout(aw.written());
+                }
+            } else if (std.mem.eql(u8, message.role, "assistant")) {
+                if (message.content) |content| {
+                    if (content.len > 0) {
+                        try self.answerHeader();
+                        try self.writeAnswer(content);
+                        try self.answerTrailer();
+                    }
+                }
+                if (message.tool_calls) |calls| {
+                    for (calls) |call| try self.announceToolCall(call);
+                }
+            } else if (std.mem.eql(u8, message.role, "tool")) {
+                if (message.content) |content| {
+                    const is_error = if (message.tool_status) |status| status.is_error else false;
+                    try self.previewToolResult(content, is_error);
+                }
+            }
+        }
+        try self.emit(std.Io.File.stdout(), DIM ++ "  ── End of restored history ──\n\n" ++ RESET, .{});
+    }
+
+    fn checkpoint(self: *Agent) !void {
+        if (self.session_path) |path| try @import("../state/session.zig").save(self.io, self.allocator, path, self.history.items[1..], &self.plan);
+    }
+
+    /// `/memory`: list what is saved, newest last.
+    pub fn listMemory(self: *Agent) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try self.memory.writeList(&aw.writer);
+        try self.writeLogOrStdout(aw.written());
+    }
+
+    /// `/remember <text>`: save a note by hand, as the model's remember tool
+    /// does, and make it part of this session's system prompt.
+    pub fn rememberCommand(self: *Agent, note: []const u8) !void {
+        if (!self.memory.enabled) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  memory is disabled\n" ++ RESET, .{});
+            return;
+        }
+        if (note.len == 0) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /remember <text>\n" ++ RESET, .{});
+            return;
+        }
+
+        const added = self.memory.add(note) catch |err| {
+            try self.emit(std.Io.File.stderr(), RED ++ "  ✗ could not remember: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        if (!added) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  already remembered\n" ++ RESET, .{});
+            return;
+        }
+        self.memory.save() catch |err| {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ remembered: {s}\n" ++ RESET, .{note});
+    }
+
+    /// `/forget <n|all>`: drop one numbered note, or every note.
+    pub fn forgetCommand(self: *Agent, argument: []const u8) !void {
+        if (!self.memory.enabled) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  memory is disabled\n" ++ RESET, .{});
+            return;
+        }
+        const arg = std.mem.trim(u8, argument, " \t");
+        if (arg.len == 0) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /forget <number> | /forget all\n" ++ RESET, .{});
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(arg, "all")) {
+            self.memory.clear();
+            self.memory.save() catch |err| {
+                try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
+                return;
+            };
+            try self.emit(std.Io.File.stderr(), DIM ++ "  all memories forgotten\n" ++ RESET, .{});
+            return;
+        }
+        const number = std.fmt.parseInt(usize, arg, 10) catch {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /forget <number> | /forget all\n" ++ RESET, .{});
+            return;
+        };
+        if (number == 0 or !self.memory.remove(number - 1)) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  no memory number {d} (see /memory)\n" ++ RESET, .{number});
+            return;
+        }
+        self.memory.save() catch |err| {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ memory could not be saved: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ forgot memory {d}\n" ++ RESET, .{number});
+    }
+
+    fn memorySearchTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        const parsed = std.json.parseFromSlice(struct {
+            query: []const u8,
+            limit: usize = 5,
+        }, self.allocator, arguments, .{}) catch {
+            return .{ .content = try self.allocator.dupe(u8, "Error: memory_search requires a query string and an optional integer limit (1-10)."), .is_error = true };
+        };
+        defer parsed.deinit();
+        const args = parsed.value;
+        if (std.mem.trim(u8, args.query, " \t\r\n").len == 0 or args.query.len > 512 or
+            !std.unicode.utf8ValidateSlice(args.query) or args.limit < 1 or args.limit > 10)
+        {
+            return .{ .content = try self.allocator.dupe(u8, "Error: query must be non-empty UTF-8 (at most 512 bytes); limit must be 1-10."), .is_error = true };
+        }
+        return .{
+            .content = try self.memory.search(self.allocator, args.query, args.limit, memory_mod.search_budget),
+            .is_error = !self.memory.enabled,
+        };
+    }
+
+    /// The remember tool: save one durable note and tell the model whether it
+    /// was new.
+    fn rememberTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        if (!self.memory.enabled) {
+            return .{
+                .content = try self.allocator.dupe(u8, "Memory is unavailable: no storage path could be resolved."),
+                .is_error = true,
+            };
+        }
+        const note = openai.extractStringArg(self.allocator, arguments, "text") catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: remember needs a non-empty 'text' string"),
+                .is_error = true,
+            };
+        };
+        defer self.allocator.free(note);
+
+        const parsed = try std.json.parseFromSlice(struct {
+            text: []const u8,
+            action: []const u8 = "add",
+            old_text: ?[]const u8 = null,
+        }, self.allocator, arguments, .{});
+        defer parsed.deinit();
+        // Stage edits so failed persistence cannot leave an unsaved note in
+        // the prompt while the tool reports success.
+        var staged = try memory_mod.Memory.initWithPath(self.allocator, self.io, null);
+        defer staged.deinit();
+        staged.enabled = true;
+        if (self.memory.path) |path| staged.path = try self.allocator.dupe(u8, path);
+        for (self.memory.entries.items) |entry| _ = try staged.add(entry);
+        const added = staged.edit(parsed.value.action, note, parsed.value.old_text) catch |err| switch (err) {
+            error.EmptyMemory => return .{
+                .content = try self.allocator.dupe(u8, "Error: remember needs a non-empty 'text' string"),
+                .is_error = true,
+            },
+            else => return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Memory edit failed: {s}", .{@errorName(err)}),
+                .is_error = true,
+            },
+        };
+        if (!added) {
+            return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Already in memory: {s}", .{note}),
+                .is_error = false,
+            };
+        }
+
+        staged.save() catch |err| {
+            return .{ .content = try std.fmt.allocPrint(self.allocator, "Memory save failed: {s}", .{@errorName(err)}), .is_error = true };
+        };
+        std.mem.swap(memory_mod.Memory, &self.memory, &staged);
+        return .{
+            .content = try std.fmt.allocPrint(self.allocator, "Memory {s}: {s}", .{ parsed.value.action, note }),
+            .is_error = false,
+        };
+    }
+
+    /// The plan tool: read the checklist, replace it, or move one step. The
+    /// plan is held in memory and saved with the session. The change reaches
+    /// the snapshot with the checkpoint that closes this tool batch, never
+    /// from here: a snapshot taken mid-batch would hold a call without its
+    /// result, and the next resume would refuse it.
+    fn planTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        const parsed = std.json.parseFromSlice(plan_mod.Arguments, self.allocator, arguments, .{}) catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: expected an object with an optional 'steps' array, or 'index' with 'status' or 'note'."),
+                .is_error = true,
+            };
+        };
+        defer parsed.deinit();
+        const args = parsed.value;
+
+        if (args.steps == null and args.index == null) {
+            // A read: the cheapest way for the model to get the plan back
+            // after a long stretch of unrelated tool results.
+            if (args.status != null or args.note != null) {
+                return .{
+                    .content = try self.allocator.dupe(u8, "Error: 'status' and 'note' change the step named by 'index'; add the index, or send 'steps' to replace the plan."),
+                    .is_error = true,
+                };
+            }
+            return .{ .content = try self.plan.describe(self.allocator), .is_error = false };
+        }
+        if (args.steps != null and args.index != null) {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: send either 'steps' or 'index', not both."),
+                .is_error = true,
+            };
+        }
+
+        if (args.steps) |raw_steps| {
+            var converted: std.ArrayList(plan_mod.NewStep) = .empty;
+            defer converted.deinit(self.allocator);
+            try converted.ensureTotalCapacity(self.allocator, raw_steps.len);
+            for (raw_steps) |step| {
+                const status = if (step.status) |label| plan_mod.Status.parse(label) orelse return .{
+                    .content = try std.fmt.allocPrint(self.allocator, "Error: step status '{s}' must be pending, active, done or blocked.", .{label}),
+                    .is_error = true,
+                } else null;
+                converted.appendAssumeCapacity(.{ .title = step.title, .status = status, .note = step.note });
+            }
+            self.plan.setSteps(converted.items) catch |err| return .{
+                .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
+                .is_error = true,
+            };
+            // The system prompt names the plan and where it stands, so the
+            // request after this call describes this plan rather than the one
+            // from startup. A read below changes nothing and rebuilds nothing.
+            self.refreshSystemPrompt() catch {};
+        } else {
+            const status = if (args.status) |label| plan_mod.Status.parse(label) orelse return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Error: status '{s}' must be pending, active, done or blocked.", .{label}),
+                .is_error = true,
+            } else null;
+            if (status == null and args.note == null) {
+                return .{
+                    .content = try self.allocator.dupe(u8, "Error: 'index' needs a 'status' or a 'note' to change."),
+                    .is_error = true,
+                };
+            }
+            self.plan.update(args.index.?, status, args.note) catch |err| switch (err) {
+                error.NoSuchStep => return .{
+                    .content = try std.fmt.allocPrint(self.allocator, "Error: there is no step {d}; the plan has {d}.", .{ args.index.?, self.plan.steps.items.len }),
+                    .is_error = true,
+                },
+                else => return .{
+                    .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
+                    .is_error = true,
+                },
+            };
+            self.refreshSystemPrompt() catch {};
+        }
+
+        return .{ .content = try self.plan.describe(self.allocator), .is_error = false };
+    }
+
+    /// `/plan`: show the checklist, or `/plan clear` to drop it.
+    pub fn planCommand(self: *Agent, argument: []const u8) !void {
+        const arg = std.mem.trim(u8, argument, " \t");
+        if (arg.len == 0) {
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer aw.deinit();
+            try self.plan.writeChecklist(&aw.writer);
+            return self.writeLogOrStdout(aw.written());
+        }
+        if (!std.ascii.eqlIgnoreCase(arg, "clear")) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /plan [clear]\n" ++ RESET, .{});
+            return;
+        }
+        if (self.plan.steps.items.len == 0) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  no plan to clear\n" ++ RESET, .{});
+            return;
+        }
+        self.plan.clear();
+        self.refreshSystemPrompt() catch {};
+        // The session snapshot is where the plan lives once this process is
+        // gone, so a cleared plan is saved before the command reports success.
+        self.checkpoint() catch |err| {
+            try self.emit(std.Io.File.stderr(), RED ++ "  ✗ plan cleared, but the session was not saved: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ plan cleared\n" ++ RESET, .{});
+    }
+
+    /// Settle unanswered calls after an interrupted query.
+    /// Called only after the worker has joined. Preserve completed tool results
+    /// and explicitly settle any calls that cancellation left unanswered.
+    pub fn finishInterruption(self: *Agent) !void {
+        var index = self.history.items.len;
+        while (index > 0) {
+            index -= 1;
+            const calls = self.history.items[index].tool_calls orelse continue;
+            for (calls) |call| {
+                var answered = false;
+                for (self.history.items[index + 1 ..]) |message| {
+                    if (message.tool_call_id) |id| {
+                        if (std.mem.eql(u8, id, call.id)) answered = true;
+                    }
+                }
+                if (answered) continue;
+                const content = try self.allocator.dupe(u8, "Task interrupted by user. Execution may have partially completed; inspect actual state before retrying.");
+                errdefer self.allocator.free(content);
+                const id = try self.allocator.dupe(u8, call.id);
+                errdefer self.allocator.free(id);
+                try self.history.append(self.allocator, .{
+                    .role = "tool",
+                    .content = content,
+                    .tool_call_id = id,
+                    .reasoning_content = null,
+                    .tool_calls = null,
+                });
+            }
+            break;
+        }
+        self.terminal_title.update("ready", self.current_task);
+        try self.checkpoint();
+    }
+
+    fn checkInterrupted(self: *Agent) !void {
+        if (self.interrupted.load(.acquire)) return error.Canceled;
+        // Esc belongs to the whole tree: the user stopped the work, not the
+        // outer turn alone, and a sub-agent that kept going would edit files
+        // after a task was called off.
+        if (self.parent) |parent| {
+            if (parent.interrupted.load(.acquire)) return error.Canceled;
+        }
+        // A sub-agent's run is bounded in time as well as in tool calls.
+        if (self.deadline) |deadline| {
+            if (deadline.untilNow(self.io, .awake).nanoseconds >= 0) return error.SubagentTimedOut;
+        }
+    }
+
+    /// Hand a line the user typed during a running task to that task. The
+    /// worker sends it with its next request, so the instruction reaches the
+    /// model now instead of queueing behind the answer it belongs to.
+    pub fn steer(self: *Agent, line: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, line);
+        errdefer self.allocator.free(owned);
+        // Appended under the lock so a drain cannot miss the allocation.
+        self.inbox_mutex.lockUncancelable(self.io);
+        defer self.inbox_mutex.unlock(self.io);
+        try self.inbox.append(self.allocator, owned);
+    }
+
+    /// Move the lines typed during the task into `into`, for a caller with no
+    /// request left to send them with. Ownership of the lines passes over.
+    pub fn takeSteering(self: *Agent, into: *std.ArrayList([]u8)) !void {
+        var lines = self.claimInbox();
+        defer lines.deinit(self.allocator);
+        var moved: usize = 0;
+        errdefer for (lines.items[moved..]) |line| self.allocator.free(line);
+        for (lines.items) |line| {
+            try into.append(self.allocator, line);
+            moved += 1;
+        }
+    }
+
+    /// Throw away guidance no request will carry: Esc drops it with the task.
+    pub fn clearSteering(self: *Agent) void {
+        var lines = self.claimInbox();
+        defer lines.deinit(self.allocator);
+        for (lines.items) |line| self.allocator.free(line);
+    }
+
+    /// Take the whole inbox, leaving an empty one behind. The list that comes
+    /// back is the caller's to free.
+    fn claimInbox(self: *Agent) std.ArrayList([]u8) {
+        self.inbox_mutex.lockUncancelable(self.io);
+        defer self.inbox_mutex.unlock(self.io);
+        const lines = self.inbox;
+        self.inbox = .empty;
+        return lines;
+    }
+
+    /// Put what the user typed during the task into the conversation, so the
+    /// next request carries it. Returns false when nothing arrived.
+    ///
+    /// Holding it back until a request boundary is the point: a request in
+    /// flight cannot take new input, and a line that cut it short would throw
+    /// away work the user asked for. The answer that is already streaming
+    /// finishes, and the guidance redirects the request after it.
+    fn injectSteering(self: *Agent) !bool {
+        var lines = self.claimInbox();
+        defer {
+            for (lines.items) |line| self.allocator.free(line);
+            lines.deinit(self.allocator);
+        }
+        if (lines.items.len == 0) return false;
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll(steering_note);
+        try aw.writer.writeAll("\n\n");
+        for (lines.items, 0..) |line, index| {
+            if (index > 0) try aw.writer.writeByte('\n');
+            try text.writeSanitized(&aw.writer, line);
+        }
+
+        try self.appendUserMessage(aw.written());
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ guidance from the terminal added to this task\n" ++ RESET, .{});
+        try self.checkpoint();
+        return true;
+    }
+
+    pub fn processQuery(self: *Agent, query: []const u8) !void {
+        self.query_started = std.Io.Timestamp.now(self.io, .awake);
+        defer self.query_started = null;
+        self.client.resetTokenCounters();
+        // Raw user input is never a terminal title, and the task last
+        // announced stays until the model announces a new one: the title
+        // describes the work in progress, not the line that started it.
+        self.terminal_title.update("thinking…", self.current_task);
+        self.processQueryInner(query) catch |err| {
+            self.terminal_title.update("error", self.current_task);
+            return err;
+        };
+        self.terminal_title.update("ready", self.current_task);
+        const elapsed_ms = self.query_started.?.untilNow(self.io, .awake).toMilliseconds();
+        const counts = self.client.tokenCounts();
+        try self.emit(std.Io.File.stderr(), DIM ++ "  Worked for {d}.{d}s · in {d} · out {d} tokens\n" ++ RESET, .{
+            @divTrunc(elapsed_ms, 1000),
+            @divTrunc(@mod(elapsed_ms, 1000), 100),
+            counts.input,
+            counts.output,
+        });
+        try self.checkInterrupted();
+        // The final answer settles the turn; its text is not a status protocol.
+        try self.emit(std.Io.File.stderr(), BOLD ++ GREEN ++ "  ✓ Turn finished" ++ RESET ++ "\n", .{});
+    }
+
+    fn progressOptions(self: *Agent) spinner.Options {
+        return .{
+            .enabled = self.animate_progress,
+            .screen = if (self.form_callback != null) self.screen else null,
+            .started = self.query_started,
+            .prompt = self.progress_prompt,
+            .first_frame_delay_ms = 0,
+            .in_tokens = &self.client.input_tokens,
+            .out_tokens = &self.client.output_tokens,
+        };
+    }
+
+    /// The task announcement comes from the main model's normal tool loop.
+    fn announceTask(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        const parsed = try std.json.parseFromSlice(struct { title: []const u8, description: []const u8 }, self.allocator, arguments, .{});
+        defer parsed.deinit();
+        const title = std.mem.trim(u8, parsed.value.title, " \t\r\n");
+        const description = std.mem.trim(u8, parsed.value.description, " \t\r\n");
+        const count = std.unicode.utf8CountCodepoints(title) catch return error.InvalidTaskTitle;
+        if (count == 0 or count >= 80 or description.len == 0 or !std.unicode.utf8ValidateSlice(description)) return error.InvalidTaskMetadata;
+        const owned = try self.allocator.dupe(u8, title);
+        if (self.current_task.len > 0) self.allocator.free(self.current_task);
+        self.current_task = owned;
+        self.terminal_title.update("thinking…", self.current_task);
+        try self.writeAnswer(description);
+        return .{ .content = try self.allocator.dupe(u8, "Task announced; the description is shown to the user."), .is_error = false };
+    }
+
+    /// The `subagent` tool: run one self-contained task in an agent of its own
+    /// and hand its report back as the tool result.
+    ///
+    /// The sub-agent is a second Agent in this process. It shares the provider,
+    /// the working directory, the MCP servers and the tool environment, but not
+    /// this conversation, this plan, this session or this terminal: its answer
+    /// is captured, and the caller prints the one line for the call. The plan
+    /// stays the caller's, which is why the report is a report and not a claim
+    /// of completion — the caller verifies the work before marking a step done.
+    ///
+    /// The error set is spelled out rather than inferred: this function starts
+    /// an agent that runs the tool loop that calls this function, and an
+    /// inferred set would have to be known before it can be.
+    fn subagentTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
+        if (self.role == .subagent) {
+            return .{
+                .content = try self.allocator.dupe(u8, "A sub-agent cannot start another sub-agent: do this task yourself and report back."),
+                .is_error = true,
+            };
+        }
+        const Arguments = struct {
+            task: []const u8,
+            context: ?[]const u8 = null,
+            timeout_seconds: ?u32 = null,
+        };
+        const parsed = std.json.parseFromSlice(Arguments, self.allocator, arguments, .{}) catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: subagent needs a 'task' string, and may take 'context' and 'timeout_seconds' (30-1800)."),
+                .is_error = true,
+            };
+        };
+        defer parsed.deinit();
+
+        const task = std.mem.trim(u8, parsed.value.task, " \t\r\n");
+        if (task.len == 0 or task.len > max_subagent_task_bytes or !std.unicode.utf8ValidateSlice(task)) {
+            return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's task must be non-empty UTF-8 of at most {d} bytes: say what to do, and leave documents in files it can read.", .{max_subagent_task_bytes}),
+                .is_error = true,
+            };
+        }
+        const seconds = parsed.value.timeout_seconds orelse default_subagent_timeout_seconds;
+        if (seconds < min_subagent_timeout_seconds or seconds > max_subagent_timeout_seconds) {
+            return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Error: timeout_seconds must be between {d} and {d}.", .{ min_subagent_timeout_seconds, max_subagent_timeout_seconds }),
+                .is_error = true,
+            };
+        }
+        const context: []const u8 = if (parsed.value.context) |value| std.mem.trim(u8, value, " \t\r\n") else "";
+        if (context.len > max_subagent_context_bytes) {
+            return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's context must be at most {d} bytes; put longer material in a file and name the path.", .{max_subagent_context_bytes}),
+                .is_error = true,
+            };
+        }
+
+        var report: std.ArrayList(u8) = .empty;
+        defer report.deinit(self.allocator);
+
+        // Starting the sub-agent is the one failure that is about this call
+        // rather than about the task: it is reported as an error result, so
+        // the model sees why its delegation went nowhere.
+        var child = initWith(self.allocator, self.io, self.config, self.linenoise, self.tool_env, self.mcp_registry, .{
+            .role = .subagent,
+            .parent = self,
+            .capture = &report,
+        }) catch |err| {
+            return .{
+                .content = try std.fmt.allocPrint(self.allocator, "The sub-agent could not start: {s}.", .{@errorName(err)}),
+                .is_error = true,
+            };
+        };
+        defer child.deinit();
+        // The sub-agent's requests were part of what this query cost, so their
+        // tokens are counted where the user reads the totals.
+        defer self.client.absorbUsage(&child.client);
+        // An interrupt from the caller is seen through `parent`; this is the
+        // other half of the bound, so a model that keeps exploring cannot hold
+        // the caller's turn open indefinitely.
+        child.deadline = std.Io.Timestamp.addDuration(
+            std.Io.Timestamp.now(self.io, .awake),
+            .fromSeconds(@intCast(seconds)),
+        );
+
+        var prompt: std.ArrayList(u8) = .empty;
+        defer prompt.deinit(self.allocator);
+        try prompt.appendSlice(self.allocator, task);
+        if (context.len > 0) {
+            try prompt.appendSlice(self.allocator, "\n\nWhat the agent that asked you already knows:\n");
+            try prompt.appendSlice(self.allocator, context);
+        }
+
+        child.processQuery(prompt.items) catch |err| {
+            return .{
+                .content = try std.fmt.allocPrint(self.allocator, "The sub-agent stopped: {s}. Whatever it changed is on disk; inspect it before retrying.", .{subagentFailure(err)}),
+                .is_error = true,
+            };
+        };
+
+        // The report is the reply that stands on the finished work: the
+        // commentary of earlier rounds stays in `report` before the mark.
+        const start = @min(child.capture_mark, report.items.len);
+        const answer = std.mem.trim(u8, report.items[start..], " \t\r\n");
+        if (answer.len == 0) {
+            return .{
+                .content = try self.allocator.dupe(u8, "The sub-agent finished without a report. Inspect the working directory for what it did."),
+                .is_error = true,
+            };
+        }
+        return .{
+            .content = try std.fmt.allocPrint(self.allocator, "Sub-agent report — verify it before marking a plan step done:\n{s}", .{answer}),
+            .is_error = false,
+        };
+    }
+
+    fn processQueryInner(self: *Agent, query: []const u8) !void {
+        try self.appendUserMessage(query);
+        try self.checkpoint();
+        self.terminal_title.update("thinking…", self.current_task);
+
+        try self.checkInterrupted();
+        const turn = try self.runToolLoop();
+        if (!turn.completed) return error.IterationLimitReached;
+    }
+
+    /// Send the conversation and wait, with the progress line animated for the
+    /// length of the wait.
+    ///
+    /// The spinner lives in these helpers rather than in the loop that calls
+    /// them: a `defer` in the loop body would still be in force while the tool
+    /// results are printed, and the next frame of the animation would erase
+    /// what was just printed. Here it ends before the caller writes a byte.
+    fn chatAnimated(self: *Agent, messages: []const Message, stream: *AnswerStream) !openai.ApiResponse {
+        try self.checkInterrupted();
+        self.terminal_title.update("thinking…", self.current_task);
+        var spin = spinner.Spinner.start(self.io, std.Io.File.stderr(), "thinking…", self.progressOptions());
+        defer spin.stop();
+        // The streamer stops the animation as soon as the first text arrives,
+        // so the answer and the spinner never fight over the same line.
+        stream.spin = &spin;
+        defer stream.spin = null;
+        return self.client.respondStreaming(messages, self.mcp_registry.functionJson(), stream.sink()) catch |err| {
+            spin.stop();
+            try self.reportHttpError();
+            return err;
+        };
+    }
+
+    /// Report what the server said about a request that failed. The client
+    /// keeps it instead of printing it, so that it can be said here — after
+    /// the animation has given the line back.
+    fn reportHttpError(self: *Agent) !void {
+        const message = self.client.takeHttpError() orelse return;
+        defer self.allocator.free(message);
+        try self.emit(std.Io.File.stderr(), RED ++ "  ✗ {s}\n" ++ RESET, .{message});
+    }
+
+    const Turn = struct {
+        /// How many tool calls the model made before its final answer.
+        tool_calls: usize,
+        /// False when the iteration budget ran out before an answer.
+        completed: bool,
+    };
+
+    /// Run the tool-call loop until the model answers or the iteration budget
+    /// runs out. The answer is printed and kept in the history.
+    fn runToolLoop(self: *Agent) !Turn {
+        var turn: Turn = .{ .tool_calls = 0, .completed = false };
+        var iteration: usize = 0;
+        // Text from replies that the token limit cut short. It is held back
+        // until the answer is complete, so the pieces print as the one reply
+        // they were meant to be instead of several half-rendered documents.
+        var carried: std.ArrayList(u8) = .empty;
+        defer carried.deinit(self.allocator);
+        // The answer streams into this for as long as the loop runs, so a
+        // reply cut short by the token limit keeps painting one document and
+        // tool-call commentary is shown as the model writes it.
+        const stream = try AnswerStream.init(self);
+        defer stream.deinit();
+        var continuations: usize = 0;
+        var empty_continuations: usize = 0;
+        // Where this turn's continuation fragments start in the history. When
+        // the turn settles they are folded into the answer, or dropped if the
+        // reply turned into a tool call, so no transport scaffolding is kept.
+        var continuation_start: ?usize = null;
+
+        while (iteration < self.max_iterations) : (iteration += 1) {
+            try self.checkInterrupted();
+            // A line typed while the last request was running goes out with
+            // this one: it belongs to the task in progress. A continuation
+            // chain is the exception — its fragments are folded or dropped
+            // when it settles, and the guidance would go with them, so it
+            // waits for the first boundary that is not part of a chain.
+            if (continuation_start == null) {
+                stream.flushPending() catch {};
+                _ = try self.injectSteering();
+            }
+            const response = self.chatAnimated(self.history.items, stream) catch |err| {
+                // Do not leave a continuation prompt as the last message for
+                // the next request to answer.
+                self.settleContinuations(&continuation_start, carried.items, null) catch {};
+                stream.flushPending() catch {};
+                try self.emit(std.Io.File.stderr(), RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
+                return err;
+            };
+            defer response.deinit(self.allocator);
+
+            if (std.mem.eql(u8, response.finish_reason, "length")) {
+                // The client already retried with a larger budget where its
+                // cap allowed it. What is left is to keep the text that was
+                // produced and ask for the rest, rather than lose the turn.
+                if (response.content) |partial| {
+                    if (continuations >= max_continuations) {
+                        try self.reportTruncation(stream, &continuation_start, carried.items, partial, response.reasoning_content);
+                        return error.ResponseTruncated;
+                    }
+                    continuations += 1;
+                    if (continuation_start == null) continuation_start = self.history.items.len;
+                    try carried.appendSlice(self.allocator, partial);
+                    try self.appendAssistantFragment(partial, response.reasoning_content);
+                    try self.emit(std.Io.File.stderr(), DIM ++ "  … reply cut off by the output limit; continuing where it stopped\n" ++ RESET, .{});
+                    try self.appendUserMessage(continue_prompt);
+                    continue;
+                }
+                if (empty_continuations >= max_empty_continuations) {
+                    try self.reportTruncation(stream, &continuation_start, carried.items, "", response.reasoning_content);
+                    return error.ResponseTruncated;
+                }
+                empty_continuations += 1;
+                if (continuation_start == null) continuation_start = self.history.items.len;
+                try self.emit(std.Io.File.stderr(), DIM ++ "  … reply cut off before any text; asking for a smaller step\n" ++ RESET, .{});
+                try self.appendUserMessage(if (carried.items.len > 0) continue_prompt else restart_prompt);
+                continue;
+            }
+            if (std.mem.eql(u8, response.finish_reason, "tool_calls")) {
+                const tool_calls = response.tool_calls orelse {
+                    self.settleContinuations(&continuation_start, carried.items, null) catch {};
+                    try self.emit(std.Io.File.stderr(), RED ++ "Error: finish_reason=tool_calls but no tool_calls\n" ++ RESET, .{});
+                    return error.InvalidResponse;
+                };
+
+                // A partial reply that led to a tool call is not the answer;
+                // drop its fragments before the call joins the conversation.
+                try self.settleContinuations(&continuation_start, "", null);
+                carried.clearRetainingCapacity();
+                // Any commentary the model streamed before the call is shown;
+                // finish its last line so the tool announcement starts fresh.
+                stream.flushPending() catch {};
+
+                // Clone tool calls so the assistant message can own them
+                {
+                    const owned_calls = try cloneToolCalls(self.allocator, tool_calls);
+                    errdefer {
+                        for (owned_calls) |c| c.deinit(self.allocator);
+                        self.allocator.free(owned_calls);
+                    }
+                    // Keep exact Responses output items alongside the UI summary.
+                    // This retains reasoning and function call IDs for stateless replay.
+                    const owned_content = if (response.content) |value| try self.allocator.dupe(u8, value) else null;
+                    errdefer if (owned_content) |value| self.allocator.free(value);
+                    const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
+                    errdefer if (owned_reasoning) |value| self.allocator.free(value);
+
+                    const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
+                    errdefer if (owned_items) |value| self.allocator.free(value);
+                    try self.history.append(self.allocator, .{
+                        .response_items = owned_items,
+                        .role = "assistant",
+                        .content = owned_content,
+                        .reasoning_content = owned_reasoning,
+                        .tool_calls = owned_calls,
+                        .tool_call_id = null,
+                    });
+                }
+
+                // Every question in this message is put to the user at once, so
+                // the answers can be revised before the form is submitted.
+                var asked: ?QuestionAnswers = try self.askQuestions(tool_calls);
+                defer if (asked) |prepared| prepared.deinit(self.allocator);
+
+                for (tool_calls, 0..) |call, index| {
+                    try self.checkInterrupted();
+                    const result = self.executeTool(call, index, if (asked) |*prepared| prepared else null) catch |err| blk: {
+                        if (self.interrupted.load(.acquire)) return error.Canceled;
+                        const error_content = try std.fmt.allocPrint(
+                            self.allocator,
+                            "Tool execution error for {s}: {s}",
+                            .{ call.name, @errorName(err) },
+                        );
+                        break :blk tools.ToolResult{
+                            .content = error_content,
+                            .is_error = true,
+                            .timed_out = err == error.Timeout,
+                        };
+                    };
+                    defer result.deinit(self.allocator);
+
+                    const result_content = try compact.deduplicateReadResult(self.allocator, self.history.items, call, result.content, result.is_error);
+                    errdefer self.allocator.free(result_content);
+                    const call_id = try self.allocator.dupe(u8, call.id);
+                    errdefer self.allocator.free(call_id);
+
+                    try self.history.append(self.allocator, .{
+                        .role = "tool",
+                        .content = result_content,
+                        .reasoning_content = null,
+                        .tool_calls = null,
+                        .tool_call_id = call_id,
+                        .tool_status = result.status(),
+                    });
+                }
+                // A sub-agent's report is the reply that stands on its finished
+                // work, not the commentary it wrote before asking for tools:
+                // the next round starts the text the caller reads back.
+                if (self.capture) |sink| self.capture_mark = sink.items.len;
+                try self.checkpoint();
+                turn.tool_calls += tool_calls.len;
+                // Continue: call API again with tool results
+            } else {
+                // Final answer
+                if (response.content) |content| {
+                    // Earlier pieces of this reply are already in the history;
+                    // print them together so markdown sees one document.
+                    var combined: ?[]u8 = null;
+                    defer if (combined) |buffered| self.allocator.free(buffered);
+                    const printed = if (carried.items.len > 0) blk: {
+                        combined = try std.mem.concat(self.allocator, u8, &.{ carried.items, content });
+                        break :blk combined.?;
+                    } else content;
+                    if (stream.started) {
+                        // The answer was already painted as it streamed; all
+                        // that is left is the pending line, table and trailer.
+                        try stream.finish();
+                    } else {
+                        // No stream reached the caller (a test transport, say):
+                        // render the whole answer at once as before.
+                        try self.answerHeader();
+                        try self.writeAnswer(printed);
+                        try self.answerTrailer();
+                    }
+
+                    if (continuation_start != null) {
+                        // Fold the pieces and prompts into the one reply they
+                        // make up; incomplete items are never replayed.
+                        try self.settleContinuations(&continuation_start, printed, response.reasoning_content);
+                    } else {
+                        const owned_content = try self.allocator.dupe(u8, content);
+                        errdefer self.allocator.free(owned_content);
+                        const owned_reasoning = if (response.reasoning_content) |value| try self.allocator.dupe(u8, value) else null;
+                        errdefer if (owned_reasoning) |value| self.allocator.free(value);
+
+                        const owned_items = if (response.response_items) |value| try self.allocator.dupe(u8, value) else null;
+                        errdefer if (owned_items) |value| self.allocator.free(value);
+                        try self.history.append(self.allocator, .{
+                            .response_items = owned_items,
+                            .role = "assistant",
+                            .content = owned_content,
+                            .reasoning_content = owned_reasoning,
+                            .tool_calls = null,
+                            .tool_call_id = null,
+                        });
+                    }
+                }
+                try self.checkpoint();
+                // A line typed while the answer was being written is part of
+                // this task too. Keep the turn open so the request after the
+                // answer acts on it, rather than handing it to a new task.
+                if (try self.injectSteering()) {
+                    turn.completed = false;
+                    stream.reopen();
+                    continue;
+                }
+                turn.completed = true;
+                break;
+            }
+        }
+
+        if (iteration == self.max_iterations) {
+            // Keep whatever the cut-off replies had produced, but not the
+            // prompts that asked for it.
+            try self.settleContinuations(&continuation_start, carried.items, null);
+            stream.flushPending() catch {};
+            try self.emit(std.Io.File.stderr(), RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{self.max_iterations});
+        }
+
+        return turn;
+    }
+
+    /// Put one form of questions to the user and take its answers. A single
+    /// question arrives here as a form of one, so both behave the same way.
+    ///
+    /// Returns one reply per question, in the order they were asked. A question
+    /// the user dismissed comes back dismissed, and the model decides for
+    /// itself what to do next.
+    fn askForm(self: *Agent, slots: []menu.Slot) !menu.Replies {
+        self.terminal_title.update("waiting for input", self.current_task);
+        if (self.form_callback) |present| return present(self.form_context, slots);
+
+        if (!self.linenoise.is_tty or !self.linenoise.term_supported or
+            !(std.Io.File.stderr().isTty(self.io) catch false))
+        {
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer aw.deinit();
+            var recommended: usize = 0;
+            for (slots) |*slot| {
+                try menu.writeMenu(&aw.writer, slot.text, slot.options);
+                // Nothing to read a choice from. Taking the recommendation
+                // keeps a piped or single-query run moving instead of stalling
+                // it.
+                const index = menu.recommendedIndex(slot.options) orelse continue;
+                slot.selected = index;
+                slot.answered = true;
+                recommended += 1;
+            }
+            try self.writeLogOrStdout(aw.written());
+            const hint = if (recommended > 0)
+                DIM ++ "  no terminal to read an answer from; taking the recommended option\n" ++ RESET
+            else
+                DIM ++ "  no terminal to read an answer from\n" ++ RESET;
+            try self.emit(std.Io.File.stderr(), "{s}", .{hint});
+            return menu.repliesFrom(self.allocator, slots);
+        }
+
+        return menu.resolve(self.allocator, slots, .{
+            .context = self,
+            .present = presentOnTerminal,
+            .read = readOnTerminal,
+        });
+    }
+
+    /// Draw a form on the terminal, which owns the keyboard in this mode.
+    fn presentOnTerminal(context: *anyopaque, slots: []menu.Slot, focus: ?usize) anyerror!menu.Outcome {
+        const self: *Agent = @ptrCast(@alignCast(context));
+        return menu.form(self.allocator, self.io, slots, true, focus);
+    }
+
+    /// Read the free text a free-text row asks for, on that same terminal.
+    fn readOnTerminal(context: *anyopaque) anyerror!menu.Line {
+        const self: *Agent = @ptrCast(@alignCast(context));
+        return self.readChoiceLine();
+    }
+
+    /// Turn one answer into the tool result the model reads. A dismissed
+    /// question is an error result: the model is told to decide by itself.
+    fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option) !tools.ToolResult {
+        if (try menu.describeReply(self.allocator, reply, options)) |line| {
+            return .{ .content = line, .is_error = false };
+        }
+        return .{
+            .content = try self.allocator.dupe(u8, dismissed_question_message),
+            .is_error = true,
+        };
+    }
+
+    /// Read the free text the "type your own answer" row asks for. Owned by the
+    /// caller, trimmed, and never empty: an empty line is no answer at all.
+    pub fn readChoiceLine(self: *Agent) !menu.Line {
+        // A menu answer is free text, not a slash command, so completion and
+        // hints are switched off for this read and restored afterwards.
+        const saved_completions = self.linenoise.completions_callback;
+        const saved_hints = self.linenoise.hints_callback;
+        const saved_popup = self.linenoise.popup_callback;
+        const saved_question = self.linenoise.question_input;
+        self.linenoise.completions_callback = null;
+        self.linenoise.hints_callback = null;
+        self.linenoise.popup_callback = null;
+        self.linenoise.question_input = true;
+        defer {
+            self.linenoise.completions_callback = saved_completions;
+            self.linenoise.hints_callback = saved_hints;
+            self.linenoise.popup_callback = saved_popup;
+            self.linenoise.question_input = saved_question;
+        }
+
+        var raw_line: ?[]const u8 = null;
+        while (true) {
+            if (self.screen) |screen| try screen.prepareInput();
+            raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {
+                // Esc is the way back to the options, not the end of the read.
+                error.Escaped => {
+                    if (self.screen) |screen| try screen.endInput();
+                    return .back;
+                },
+                error.Suspend => {
+                    // The custom-answer read is a normal line edit; suspension
+                    // gives the terminal back and resumes on the same text.
+                    if (self.screen) |screen| {
+                        try screen.suspendProcess();
+                    } else {
+                        @import("../ui/screen.zig").stopProcess();
+                    }
+                    continue;
+                },
+                else => return err,
+            };
+            if (self.screen) |screen| try screen.endInput();
+            break;
+        }
+        const line = raw_line orelse return .none;
+        defer self.allocator.free(line);
+
+        // The answer is part of the record even though the editor's rows are
+        // cleared once it is read.
+        if (self.screen) |screen| {
+            const echo = try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ CHOICE_PROMPT, line });
+            defer self.allocator.free(echo);
+            try screen.writeLog(echo);
+        }
+
+        const answer = std.mem.trim(u8, line, " \t\r\n");
+        if (answer.len == 0) return .none;
+        return .{ .answer = try self.allocator.dupe(u8, answer) };
+    }
+
+    /// The ask_user tool: put the model's question to the user and hand the
+    /// answer back as the tool result. `answers` holds what the form drawn for
+    /// this message already produced, when it covered this call.
+    fn askUser(self: *Agent, arguments: []const u8, answers: ?*QuestionAnswers, index: usize) !tools.ToolResult {
+        // Nobody is watching a sub-agent's run: its caller reads a report when
+        // it is over, and it has no keyboard to put a question on.
+        if (self.role == .subagent) {
+            return .{
+                .content = try self.allocator.dupe(u8, "No user is available to a sub-agent. Decide from what the task gives you, or report what blocks it."),
+                .is_error = true,
+            };
+        }
+        if (answers) |prepared| {
+            if (prepared.take(index)) |content| {
+                return .{ .content = content.text, .is_error = content.is_error };
+            }
+        }
+        const question = menu.parseAskUser(self.allocator, arguments) catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: ask_user needs a 'question' and a non-empty 'options' array"),
+                .is_error = true,
+            };
+        };
+        defer question.deinit(self.allocator);
+
+        var slots = [_]menu.Slot{menu.Slot.init(question.text, question.options.items)};
+        const replies = try self.askForm(&slots);
+        defer replies.deinit(self.allocator);
+        return self.questionResult(replies.items[0], question.options.items);
+    }
+
+    /// The answers to the ask_user calls of one message, aligned with the calls
+    /// themselves so the dispatch can find the one it needs.
+    const QuestionAnswers = struct {
+        items: []Slot,
+
+        /// What one tool result will say, once the call is dispatched.
+        const Content = struct { text: []const u8, is_error: bool };
+
+        const Slot = union(enum) {
+            /// Not a question of this form: the call is dispatched as usual.
+            none,
+            /// The prepared result. Owned here until it is taken.
+            content: Content,
+        };
+
+        fn deinit(self: QuestionAnswers, allocator: std.mem.Allocator) void {
+            for (self.items) |item| {
+                switch (item) {
+                    .content => |content| allocator.free(content.text),
+                    .none => {},
+                }
+            }
+            allocator.free(self.items);
+        }
+
+        /// Hand the prepared result to the dispatch, which then owns its text.
+        fn take(self: *QuestionAnswers, index: usize) ?Content {
+            if (index >= self.items.len) return null;
+            switch (self.items[index]) {
+                .none => return null,
+                .content => |content| {
+                    self.items[index] = .none;
+                    return content;
+                },
+            }
+        }
+    };
+
+    /// Put every question of this message to the user as one form, so an answer
+    /// can be revised with Tab before the form is submitted. A call whose
+    /// arguments do not parse is left out: `askUser` reports that as it always
+    /// has.
+    fn askQuestions(self: *Agent, calls: []const ToolCallData) !?QuestionAnswers {
+        // A sub-agent has no user to put a form to. Its questions reach the
+        // dispatcher unanswered, which reports them as an error result instead
+        // of drawing a menu on a terminal the sub-agent does not own.
+        if (self.role == .subagent) return null;
+        var questions_in_message: usize = 0;
+        for (calls) |call| {
+            if (std.mem.eql(u8, call.name, "ask_user")) questions_in_message += 1;
+        }
+        // One ask_user call is still a form, but there is nothing to Tab
+        // between; drawing it costs nothing and keeps one code path.
+        if (questions_in_message == 0) return null;
+
+        const items = try self.allocator.alloc(QuestionAnswers.Slot, calls.len);
+        @memset(items, .none);
+        var answers = QuestionAnswers{ .items = items };
+        errdefer answers.deinit(self.allocator);
+
+        var questions: std.ArrayList(menu.Question) = .empty;
+        defer {
+            for (questions.items) |question| question.deinit(self.allocator);
+            questions.deinit(self.allocator);
+        }
+        var slots: std.ArrayList(menu.Slot) = .empty;
+        defer slots.deinit(self.allocator);
+        var indexes: std.ArrayList(usize) = .empty;
+        defer indexes.deinit(self.allocator);
+
+        for (calls, 0..) |call, i| {
+            if (!std.mem.eql(u8, call.name, "ask_user")) continue;
+            const question = menu.parseAskUser(self.allocator, call.arguments) catch continue;
+            try questions.append(self.allocator, question);
+            try slots.append(self.allocator, menu.Slot.init(question.text, question.options.items));
+            try indexes.append(self.allocator, i);
+        }
+        if (slots.items.len == 0) return answers;
+
+        const replies = try self.askForm(slots.items);
+        defer replies.deinit(self.allocator);
+
+        // Replies and slots are both in the order the questions were asked, and
+        // each slot knows which call asked it.
+        for (replies.items, slots.items, indexes.items) |reply, slot, index| {
+            const result = try self.questionResult(reply, slot.options);
+            answers.items[index] = .{ .content = .{ .text = result.content, .is_error = result.is_error } };
+        }
+        return answers;
+    }
+
+    /// Append a user-role message, taking a copy of `message`.
+    fn appendUserMessage(self: *Agent, message: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(owned);
+        try self.history.append(self.allocator, .{
+            .role = "user",
+            .content = owned,
+            .reasoning_content = null,
+            .tool_calls = null,
+            .tool_call_id = null,
+        });
+    }
+
+    /// Keep an assistant reply fragment in the history, with its chain-of-
+    /// thought text when known. Thinking mode requires the reasoning to be
+    /// passed back on later tool-carrying turns, even when the reply that
+    /// followed it was cut short.
+    fn appendAssistantFragment(self: *Agent, partial: []const u8, reasoning: ?[]const u8) !void {
+        const owned = try self.allocator.dupe(u8, partial);
+        errdefer self.allocator.free(owned);
+        const owned_reasoning = if (reasoning) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (owned_reasoning) |value| self.allocator.free(value);
+        try self.history.append(self.allocator, .{
+            .role = "assistant",
+            .content = owned,
+            .reasoning_content = owned_reasoning,
+            .tool_calls = null,
+            .tool_call_id = null,
+        });
+    }
+
+    /// Remove the partial replies and prompts a continuation left in the
+    /// history, keeping their text as one assistant message when there is any.
+    /// A turn that ends in a tool call or an error must not leave the model's
+    /// transport scaffolding behind for the next request to read.
+    fn settleContinuations(self: *Agent, start: *?usize, keep: []const u8, reasoning: ?[]const u8) !void {
+        const index = start.* orelse return;
+        while (self.history.items.len > index) {
+            const message = self.history.items[self.history.items.len - 1];
+            self.history.items.len -= 1;
+            message.deinit(self.allocator);
+        }
+        start.* = null;
+        if (keep.len > 0) try self.appendAssistantFragment(keep, reasoning);
+    }
+
+    /// Give up on a reply the token limit keeps cutting short. What was
+    /// produced before is still worth printing: losing it would be worse than
+    /// the error that ends the turn.
+    fn reportTruncation(self: *Agent, stream: *AnswerStream, start: *?usize, carried: []const u8, partial: []const u8, reasoning: ?[]const u8) !void {
+        const answer = try std.mem.concat(self.allocator, u8, &.{ carried, partial });
+        defer self.allocator.free(answer);
+        try self.settleContinuations(start, answer, reasoning);
+        if (answer.len > 0) {
+            if (stream.started) {
+                try stream.finish();
+            } else {
+                try self.answerHeader();
+                try self.writeAnswer(answer);
+                try self.answerTrailer();
+            }
+        }
+        try self.emit(std.Io.File.stderr(), RED ++ "Error: model output still exceeds the token budget after automatic retries and continuations; split the task into smaller steps, or raise AI_MAX_TOKENS if the endpoint accepts more than DeepSeek's 8192.\n" ++ RESET, .{});
+    }
+
+    /// Announce a tool call on the line above whatever it prints.
+    ///
+    /// Most tools are one line of name and arguments. `apply_patch` is the
+    /// exception: its argument is the diff itself, and a JSON-escaped diff tells
+    /// nobody anything — so it is drawn instead, line by line, in the colours
+    /// the change would be read in.
+    fn announceToolCall(self: *Agent, call: ToolCallData) !void {
+        // A sub-agent's calls are steps inside one tool result: the caller
+        // already has a line for the call, and these would only crowd it.
+        if (self.capture != null) return;
+        // Written through a fixed buffer rather than built up in memory first:
+        // a patch is read as it is drawn, and a long one never has to be held
+        // whole to be shown.
+        var buf: [4096]u8 = undefined;
+
+        if (self.screen) |screen| {
+            if (screen.isActive()) {
+                var log_writer = screen.logWriter(&buf);
+                try self.writeToolCall(&log_writer.writer, call);
+                return log_writer.writer.flush();
+            }
+        }
+
+        var file_writer = std.Io.File.stderr().writerStreaming(self.io, &buf);
+        try self.writeToolCall(&file_writer.interface, call);
+        try file_writer.interface.flush();
+    }
+
+    fn writeToolCall(self: *Agent, w: *std.Io.Writer, call: ToolCallData) !void {
+        // A plan call carries a whole checklist as its arguments. Its JSON is
+        // unreadable on one terminal line, so the summary says what it does;
+        // the result below shows the checklist itself.
+        if (std.mem.eql(u8, call.name, "plan")) {
+            try w.writeAll(YELLOW ++ "  ⚙ plan" ++ RESET ++ " ");
+            if (!try plan_mod.writeCallSummary(w, self.allocator, call.arguments)) {
+                try text.writeSanitized(w, call.arguments);
+            }
+            try w.writeByte('\n');
+            return;
+        }
+        // A sub-agent call carries a whole task as its argument, so the line
+        // says what is being done rather than pasting the JSON of it. It is
+        // marked with a glyph and a colour of its own: this line starts a
+        // second agent, and nothing else on the terminal looks like it.
+        if (std.mem.eql(u8, call.name, "subagent")) {
+            try w.writeAll(CYAN ++ "  ⇢ subagent" ++ RESET ++ " ");
+            const task = openai.extractStringArg(self.allocator, call.arguments, "task") catch {
+                try text.writeSanitized(w, call.arguments);
+                try w.writeByte('\n');
+                return;
+            };
+            defer self.allocator.free(task);
+            try writeCallBrief(w, task);
+            try w.writeByte('\n');
+            return;
+        }
+        if (!std.mem.eql(u8, call.name, "apply_patch")) {
+            try w.writeAll(YELLOW ++ "  ⚙ ");
+            // A tool name and its arguments are model output like any other, so
+            // they are sanitised like any other: a call carrying an escape
+            // sequence gets to be read, not to repaint the line it is on.
+            try text.writeSanitized(w, call.name);
+            try w.writeAll(RESET ++ " ");
+            try text.writeSanitized(w, call.arguments);
+            try w.writeByte('\n');
+            return;
+        }
+
+        const patch_text = openai.extractStringArg(self.allocator, call.arguments, "patch") catch {
+            // Nothing to draw. What the model actually sent still goes up, so
+            // the call is visible; the dispatch reports what was wrong with it.
+            try w.writeAll(YELLOW ++ "  ⚙ apply_patch" ++ RESET ++ " ");
+            try text.writeSanitized(w, call.arguments);
+            try w.writeByte('\n');
+            return;
+        };
+        defer self.allocator.free(patch_text);
+
+        try w.writeAll(YELLOW ++ "  ⚙ apply_patch\n" ++ RESET);
+        try diff.render(w, patch_text);
+    }
+
+    /// Run one tool call. `index` and `answers` locate the result of a question
+    /// the form of this message has already put to the user, if there was one.
+    fn executeTool(self: *Agent, call: ToolCallData, index: usize, answers: ?*QuestionAnswers) !tools.ToolResult {
+        if (std.mem.eql(u8, call.name, "announce_task")) {
+            if (self.role == .subagent) {
+                return .{
+                    .content = try self.allocator.dupe(u8, "A sub-agent does not announce tasks: the agent that called you owns the terminal and the plan. Report back instead."),
+                    .is_error = true,
+                };
+            }
+            return self.announceTask(call.arguments);
+        }
+        self.terminal_title.update(call.name, self.current_task);
+        try self.announceToolCall(call);
+
+        const result: tools.ToolResult = blk: {
+            // A tool can run for minutes, so the wait gets the same animation
+            // the model calls do. The `defer` covers the dispatch and nothing
+            // else: below this block the result is previewed, and that has to
+            // land on a line the animation has already given back.
+            // A tool from an MCP server has a label too, built when the tool
+            // was listed: it names the server the call is going to, and it is
+            // this process's own string rather than one a server wrote.
+            var label_aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer label_aw.deinit();
+            const label = try self.callProgressLabel(call, &label_aw);
+            var options = self.progressOptions();
+            // A sub-agent works out of sight, so its line is coloured like
+            // its call: the user can tell a second agent at work from the
+            // main model thinking, without reading the words.
+            if (std.mem.eql(u8, call.name, "subagent")) options.style = CYAN;
+            var spin = if (label) |caption|
+                spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options)
+            else
+                spinner.Spinner.disabled(self.io);
+            defer spin.stop();
+
+            if (std.mem.eql(u8, call.name, "remember")) {
+                break :blk try self.rememberTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "memory_search")) {
+                break :blk try self.memorySearchTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "plan")) {
+                break :blk try self.planTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "subagent")) {
+                break :blk try self.subagentTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "ask_user")) {
+                break :blk try self.askUser(call.arguments, answers, index);
+            } else if (std.mem.eql(u8, call.name, mcp.Registry.loader_name)) {
+                break :blk try self.mcp_registry.loadTools(self.allocator, call.arguments);
+            } else if (std.mem.startsWith(u8, call.name, mcp.tool_prefix)) {
+                // A tool of a connected MCP server: the registry knows which
+                // server it belongs to and what the server calls it.
+                break :blk try self.mcp_registry.call(self.allocator, call.name, call.arguments);
+            } else {
+                break :blk try @import("../host/execution.zig").execute(self.io, self.allocator, self.tool_env, call.name, call.arguments);
+            }
+        };
+
+        // The one place the size limit is applied, whatever the tool was: the
+        // tools page and clip what they can, and this holds the line for the
+        // rest, an MCP server's answer included.
+        const clipped = try tools.clipOversized(self.allocator, result);
+        try self.previewToolResult(clipped.content, clipped.is_error);
+        return clipped;
+    }
+
+    /// The progress line's label for a tool call, or null for a tool that must
+    /// not have one. Most tools name themselves; a sub-agent names the task it
+    /// was handed, because it works with no output of its own on screen and
+    /// this line is the only sign of what it is doing.
+    ///
+    /// `buf` is where a built label lives. It must outlive the animation, so
+    /// the caller owns it and frees it after the spinner has stopped.
+    fn callProgressLabel(self: *Agent, call: ToolCallData, buf: *std.Io.Writer.Allocating) !?[]const u8 {
+        if (!std.mem.eql(u8, call.name, "subagent"))
+            return tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
+
+        buf.clearRetainingCapacity();
+        const task = openai.extractStringArg(self.allocator, call.arguments, "task") catch null;
+        defer if (task) |t| self.allocator.free(t);
+        const trimmed = if (task) |t| std.mem.trim(u8, t, " \t\r\n") else "";
+        if (trimmed.len == 0) {
+            try buf.writer.writeAll("subagent…");
+            return buf.written();
+        }
+        try buf.writer.writeAll("subagent · ");
+        // The task is model output, so it is flattened and sanitised the same
+        // way the call's own line shows it.
+        try writeCallBrief(&buf.writer, trimmed);
+        return buf.written();
+    }
+
+    /// Use the same result preview for live execution and restored messages.
+    fn previewToolResult(self: *Agent, content: []const u8, is_error: bool) !void {
+        if (self.capture != null) return;
+        // An error is shown whole, because its message is the point of it — but
+        // a result cut at the size limit is large even as an error, so even
+        // that one keeps to a readable share of the terminal.
+        const preview_len = if (is_error)
+            @min(content.len, error_preview_max)
+        else
+            @min(content.len, 200);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll(if (is_error) RED ++ "  ✗ " else DIM ++ "  ✓ ");
+        try text.writeSanitized(&aw.writer, content[0..preview_len]);
+        if (content.len > preview_len) try aw.writer.writeAll("...");
+        try aw.writer.writeAll("\n" ++ RESET);
+        try self.emit(std.Io.File.stderr(), "{s}", .{aw.written()});
+    }
+
+    /// Print the model's answer: rendered for a terminal, raw otherwise.
+    ///
+    /// The raw path matters as much as the rendered one. When stdout is a pipe
+    /// or a file the consumer is another program, and markdown is both the most
+    /// faithful representation and the one that loses nothing — stripping
+    /// markers would quietly cost a `| tee answer.md` user their structure.
+    fn writeAnswer(self: *Agent, content: []const u8) !void {
+        const stdout = std.Io.File.stdout();
+        if (!self.render_markdown) return self.writeLogOrStdout(content);
+
+        // A fixed buffer rather than `Writer.Allocating`: for a long answer the
+        // latter would hold the entire styled document in memory before
+        // printing a byte of it. This buffer is the renderer's only memory,
+        // whatever the size of the document.
+        var buf: [8192]u8 = undefined;
+
+        if (self.screen) |screen| {
+            if (screen.isActive()) {
+                var log_writer = screen.logWriter(&buf);
+                try render.render(&log_writer.writer, content, .{
+                    .width = term.usableWidth(term.columns(stdout)),
+                });
+                return log_writer.writer.flush();
+            }
+        }
+
+        var file_writer = stdout.writerStreaming(self.io, &buf);
+
+        try render.render(&file_writer.interface, content, .{
+            .width = term.usableWidth(term.columns(stdout)),
+        });
+        try file_writer.interface.flush();
+    }
+
+    /// Send finished bytes to the conversation, or to stdout when the
+    /// interactive screen is not in use.
+    fn writeLogOrStdout(self: *Agent, bytes: []const u8) !void {
+        // A sub-agent's answer is collected rather than printed: it reaches
+        // the caller as the tool result, not as text on a terminal it does
+        // not own.
+        if (self.capture) |sink| return sink.appendSlice(self.allocator, bytes);
+        if (self.screen) |screen| {
+            if (screen.isActive()) return screen.writeLog(bytes);
+        }
+        return std.Io.File.stdout().writeStreamingAll(self.io, bytes);
+    }
+
+    fn answerHeader(self: *Agent) !void {
+        if (self.capture != null) return;
+        if (self.screen) |screen| {
+            if (screen.isActive()) return screen.writeLog("\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+        }
+        const stdout = std.Io.File.stdout();
+        if (stdout.isTty(self.io) catch false) {
+            try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+        }
+    }
+
+    fn answerTrailer(self: *Agent) !void {
+        if (self.capture != null) return;
+        try self.writeLogOrStdout("\n");
+    }
+};
+
+/// Paints the answer as it streams from the model. The markdown renderer is
+/// fed one complete line at a time, so bold, fences, lists and tables render
+/// as they are written instead of appearing all at once when the request ends.
+///
+/// The struct is heap-allocated because the renderer holds a pointer to the
+/// writer that lives inside this struct; a copy would invalidate it.
+const AnswerStream = struct {
+    agent: *Agent,
+    allocator: std.mem.Allocator,
+    pending: std.ArrayList(u8) = .empty,
+    /// The renderer borrows table rows until the table is flushed. Keep those
+    /// lines separate from `pending`, which is compacted after every newline.
+    retained_lines: std.ArrayList([]u8) = .empty,
+    buf: [8192]u8 = undefined,
+    log_writer: ?ScreenLogWriter = null,
+    file_writer: ?std.Io.File.Writer = null,
+    renderer: ?render.Renderer = null,
+    /// Set once the first text delta has been shown, which is when the
+    /// "Assistant" header is printed and the spinner is given its line back.
+    started: bool = false,
+    finished: bool = false,
+    /// The spinner animating the wait for this turn. Stopped on the first
+    /// delta so it does not draw over the answer.
+    spin: ?*spinner.Spinner = null,
+
+    fn init(agent: *Agent) !*AnswerStream {
+        const allocator = agent.allocator;
+        const self = try allocator.create(AnswerStream);
+        self.* = .{ .agent = agent, .allocator = allocator };
+        errdefer self.deinit();
+
+        if (agent.render_markdown) {
+            const width = term.usableWidth(term.columns(std.Io.File.stdout()));
+            if (agent.screen) |screen| {
+                if (screen.isActive()) {
+                    self.log_writer = screen.logWriter(&self.buf);
+                    self.renderer = render.Renderer.init(&self.log_writer.?.writer, .{ .width = width });
+                }
+            }
+            if (self.renderer == null) {
+                self.file_writer = std.Io.File.stdout().writerStreaming(agent.io, &self.buf);
+                self.renderer = render.Renderer.init(&self.file_writer.?.interface, .{ .width = width });
+            }
+        }
+        return self;
+    }
+
+    fn clearRetainedLines(self: *AnswerStream) void {
+        for (self.retained_lines.items) |line| self.allocator.free(line);
+        self.retained_lines.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *AnswerStream) void {
+        self.clearRetainedLines();
+        self.retained_lines.deinit(self.allocator);
+        self.pending.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    fn sink(self: *AnswerStream) openai.StreamSink {
+        return .{ .context = self, .onText = onText };
+    }
+
+    fn onText(context: *anyopaque, delta: []const u8) void {
+        const self: *AnswerStream = @ptrCast(@alignCast(context));
+        self.feed(delta) catch {};
+    }
+
+    fn feed(self: *AnswerStream, delta: []const u8) !void {
+        if (delta.len == 0) return;
+        if (!self.started) {
+            self.started = true;
+            // The spinner owns the terminal's line until the first text is
+            // ready; stop it before anything else is written.
+            if (self.spin) |spin| spin.stop();
+            try self.agent.answerHeader();
+        }
+        try self.pending.appendSlice(self.allocator, delta);
+        try self.drainLines();
+    }
+
+    fn drainLines(self: *AnswerStream) !void {
+        while (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |nl| {
+            const line = self.pending.items[0..nl];
+            try self.emitLine(line);
+            const rest = self.pending.items[nl + 1 ..];
+            std.mem.copyForwards(u8, self.pending.items[0..rest.len], rest);
+            self.pending.shrinkRetainingCapacity(rest.len);
+        }
+    }
+
+    fn emitLine(self: *AnswerStream, line: []const u8) !void {
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
+        if (self.renderer) |*r| {
+            const owned = try self.allocator.dupe(u8, trimmed);
+            self.retained_lines.append(self.allocator, owned) catch |err| {
+                self.allocator.free(owned);
+                return err;
+            };
+            try r.feedLine(owned);
+            if (r.table.count == 0) self.clearRetainedLines();
+            // Push the line to the terminal now rather than waiting for the
+            // writer's buffer to fill; that is what makes the answer stream.
+            try r.flushWriter();
+        } else {
+            try self.agent.writeLogOrStdout(trimmed);
+            try self.agent.writeLogOrStdout("\n");
+        }
+    }
+
+    /// Emit the partial line still waiting for a newline, if there is one.
+    /// Called when a turn ends without a final answer so its last line does
+    /// not run into what is printed next.
+    fn flushPending(self: *AnswerStream) !void {
+        if (self.pending.items.len == 0) return;
+        try self.emitLine(self.pending.items);
+        self.pending.clearRetainingCapacity();
+    }
+
+    /// End the answer: flush any partial line and buffered table, then the
+    /// trailing blank line. Idempotent, so the defers in callers are safe.
+    fn finish(self: *AnswerStream) !void {
+        if (self.finished) return;
+        self.finished = true;
+        if (self.renderer == null and self.pending.items.len > 0) {
+            try self.agent.writeLogOrStdout(self.pending.items);
+            self.pending.clearRetainingCapacity();
+        } else {
+            try self.flushPending();
+        }
+        if (self.renderer) |*r| try r.finish();
+        self.clearRetainedLines();
+        if (self.started) try self.agent.answerTrailer();
+    }
+
+    /// Reopen the stream for another reply in the same turn. The next text
+    /// paints its own header and trailer, because a task that took fresh
+    /// guidance is answering a different question than the one before it.
+    fn reopen(self: *AnswerStream) void {
+        self.finished = false;
+        self.started = false;
+    }
+};
+
+test "streamed table rows survive pending buffer compaction and reallocation" {
+    const allocator = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const stream = try allocator.create(AnswerStream);
+    stream.* = .{
+        .agent = undefined, // emitLine's renderer path does not use the agent.
+        .allocator = allocator,
+        .renderer = render.Renderer.init(&output.writer, .{ .styled = false }),
+    };
+    defer stream.deinit();
+
+    const chunks = [_][]const u8{
+        "| Name | Value |\n| --- |",
+        " --- |\n| alpha | one |\n",
+        "| beta | two |\n",
+        "\nordinary text\n",
+        "not a table | still prose\n",
+    };
+    var document: std.ArrayList(u8) = .empty;
+    defer document.deinit(allocator);
+    for (chunks) |chunk| {
+        try document.appendSlice(allocator, chunk);
+        try stream.pending.appendSlice(allocator, chunk);
+        try stream.drainLines();
+        // Force the source allocation to be freed, even for small chunks.
+        const fresh = try allocator.dupe(u8, stream.pending.items);
+        stream.pending.deinit(allocator);
+        stream.pending = .empty;
+        defer allocator.free(fresh);
+        try stream.pending.appendSlice(allocator, fresh);
+    }
+    try stream.finish();
+    try std.testing.expectEqual(@as(usize, 0), stream.retained_lines.items.len);
+
+    var expected: std.Io.Writer.Allocating = .init(allocator);
+    defer expected.deinit();
+    try render.render(&expected.writer, document.items, .{ .styled = false });
+    try std.testing.expectEqualStrings(expected.written(), output.written());
+}
+
+fn cloneToolCalls(allocator: std.mem.Allocator, calls: []const ToolCallData) ![]ToolCallData {
+    const result = try allocator.alloc(ToolCallData, calls.len);
+    var i: usize = 0;
+    errdefer {
+        for (result[0..i]) |c| c.deinit(allocator);
+        allocator.free(result);
+    }
+    for (calls, 0..) |call, j| {
+        result[j] = .{
+            .id = try allocator.dupe(u8, call.id),
+            .name = try allocator.dupe(u8, call.name),
+            .arguments = try allocator.dupe(u8, call.arguments),
+        };
+        i = j + 1;
+    }
+    return result;
+}
+
+fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(message);
+    try file.writeStreamingAll(io, message);
+}
+
+/// Why a sub-agent stopped, in words a reader of the caller's conversation can
+/// use: the bounds it runs under have names of their own only here.
+fn subagentFailure(err: anyerror) []const u8 {
+    if (err == error.Canceled) return "the task was interrupted";
+    if (err == error.SubagentTimedOut) return "it ran past its time limit";
+    if (err == error.IterationLimitReached) return "it used up its tool calls on this task";
+    return @errorName(err);
+}
+
+/// The opening of a piece of model text, cut to one terminal line: a task is
+/// worth naming on the line that announces the call, and its newlines and its
+/// length are not. The cut never falls inside a character.
+fn writeCallBrief(w: *std.Io.Writer, raw: []const u8) !void {
+    const limit: usize = 120;
+    var used: usize = 0;
+    while (used < raw.len and used < limit) : (used += 1) {
+        if (raw[used] == '\n' or raw[used] == '\r') break;
+    }
+    while (used > 0 and used < raw.len and (raw[used] & 0xC0) == 0x80) used -= 1;
+    try text.writeSanitized(w, raw[0..used]);
+    if (used < raw.len) try w.writeAll("…");
+}
+
+/// A standalone agent with a hermetic environment for tests. The line editor
+/// and MCP registry live beside it because the agent only borrows them.
+const TestHarness = struct {
+    /// The agent creates its scratch directory at startup; `TMPDIR` points
+    /// here so that directory is removed with the test instead of littering
+    /// the host's temporary folder.
+    tmp: std.testing.TmpDir,
+    env: std.process.Environ.Map,
+    config: Config,
+    linenoise: Linenoise,
+    registry: mcp.Registry,
+    agent: Agent,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io) !*TestHarness {
+        const self = try allocator.create(TestHarness);
+        errdefer allocator.destroy(self);
+
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        const scratch_root = try self.tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(scratch_root);
+
+        self.env = .init(allocator);
+        errdefer self.env.deinit();
+        try self.env.put("TMPDIR", scratch_root);
+        try self.env.put("AI_URL", "http://127.0.0.1:1/v1");
+        try self.env.put("AI_MODEL", "test-model");
+        try self.env.put("AI_KEY", "test-key");
+        // No home/state directory: tests never resolve the developer's memory.
+        // Tests that need memory install their own storage explicitly.
+
+        self.config = try Config.load(allocator, io, &self.env);
+        errdefer self.config.deinit();
+
+        self.linenoise = Linenoise.init(allocator, io, &self.env);
+        errdefer self.linenoise.deinit();
+
+        self.registry = mcp.Registry.empty(allocator, io);
+        errdefer self.registry.deinit();
+
+        self.agent = try Agent.init(allocator, io, &self.config, &self.linenoise, &self.env, &self.registry);
+        return self;
+    }
+
+    fn deinit(self: *TestHarness, allocator: std.mem.Allocator) void {
+        self.agent.deinit();
+        self.registry.deinit();
+        self.linenoise.deinit();
+        self.config.deinit();
+        self.env.deinit();
+        self.tmp.cleanup();
+        allocator.destroy(self);
+    }
+};
+
+/// Scripted Responses bodies for `openai.Client`, so the loop can be driven
+/// without a socket. It records the budget of every request it is given.
+const MockTransport = struct {
+    replies: []const []const u8,
+    cursor: usize = 0,
+    /// Set to act like a user typing during the run: `steer_line` is handed to
+    /// the agent just before the reply to request `steer_at` is produced.
+    agent: ?*Agent = null,
+    steer_at: usize = 0,
+    steer_line: []const u8 = "",
+    budgets: std.ArrayList(u32) = .empty,
+    requests: std.ArrayList([]u8) = .empty,
+
+    fn send(context: *anyopaque, allocator: std.mem.Allocator, request: []const u8) anyerror![]u8 {
+        const self: *MockTransport = @ptrCast(@alignCast(context));
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
+        defer parsed.deinit();
+        const budget = parsed.value.object.get("max_output_tokens") orelse return error.InvalidRequest;
+        try self.budgets.append(allocator, @intCast(budget.integer));
+
+        const owned = try allocator.dupe(u8, request);
+        // Recorded before any later failure: the request did go out, and a
+        // caller that dies of `NoScriptedReply` still wants to read it.
+        self.requests.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+
+        if (self.agent) |agent| {
+            if (self.steer_at == self.cursor) try agent.steer(self.steer_line);
+        }
+        if (self.cursor >= self.replies.len) return error.NoScriptedReply;
+        const reply = self.replies[self.cursor];
+        self.cursor += 1;
+        return allocator.dupe(u8, reply);
+    }
+
+    fn deinit(self: *MockTransport, allocator: std.mem.Allocator) void {
+        for (self.requests.items) |request| allocator.free(request);
+        self.requests.deinit(allocator);
+        self.budgets.deinit(allocator);
+    }
+};
+
+const truncated_text =
+    "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"incomplete\",\"content\":[{\"type\":\"output_text\",\"text\":\"Half an \"}]}]}";
+
+const truncated_call =
+    "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"function_call\"}]}";
+
+const completed_answer =
+    "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer.\"}]}]}";
+
+const completed_split =
+    "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Split into chunks.\"}]}]}";
+
+/// Send fd 1 and 2 to /dev/null for the length of a test. The Zig test runner
+/// uses stdout as its protocol channel, and `runToolLoop` writes answers and
+/// progress directly to the process's standard files.
+const Silence = struct {
+    saved_out: std.Io.File,
+    saved_err: std.Io.File,
+    null_file: std.Io.File,
+
+    fn init(io: std.Io) !Silence {
+        const null_file = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .write_only });
+        errdefer null_file.close(io);
+        const saved_out = std.Io.File{ .handle = try duplicateFd(std.posix.STDOUT_FILENO), .flags = .{ .nonblocking = false } };
+        errdefer saved_out.close(io);
+        const saved_err = std.Io.File{ .handle = try duplicateFd(std.posix.STDERR_FILENO), .flags = .{ .nonblocking = false } };
+        errdefer saved_err.close(io);
+        try redirectFd(null_file.handle, std.posix.STDOUT_FILENO);
+        errdefer redirectFd(saved_out.handle, std.posix.STDOUT_FILENO) catch {};
+        try redirectFd(null_file.handle, std.posix.STDERR_FILENO);
+        return .{ .saved_out = saved_out, .saved_err = saved_err, .null_file = null_file };
+    }
+
+    fn deinit(self: *Silence, io: std.Io) void {
+        redirectFd(self.saved_out.handle, std.posix.STDOUT_FILENO) catch {};
+        redirectFd(self.saved_err.handle, std.posix.STDERR_FILENO) catch {};
+        self.saved_out.close(io);
+        self.saved_err.close(io);
+        self.null_file.close(io);
+    }
+};
+
+fn duplicateFd(fd: std.posix.fd_t) !std.posix.fd_t {
+    const result = std.posix.system.dup(fd);
+    if (std.posix.errno(result) != .SUCCESS) return error.DuplicateFdFailed;
+    return @intCast(result);
+}
+
+fn redirectFd(from: std.posix.fd_t, to: std.posix.fd_t) !void {
+    if (std.posix.errno(std.posix.system.dup2(from, to)) != .SUCCESS) return error.RedirectFdFailed;
+}
+
+test "main model announces the task through a built-in call without planning requests" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+    const reply =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"task\",\"name\":\"announce_task\",\"arguments\":\"{\\\"title\\\":\\\"修复终端标题\\\",\\\"description\\\":\\\"先定位标题逻辑，再修改并测试。\\\"}\"}]}";
+    var mock: MockTransport = .{ .replies = &.{ reply, completed_answer } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("不要把这段原文直接放到标题上");
+    const turn = try harness.agent.runToolLoop();
+    try std.testing.expect(turn.completed);
+    try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
+    try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
+    for (mock.requests.items) |body| {
+        const request = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer request.deinit();
+        try std.testing.expect(request.value.object.get("tools") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "先定位标题逻辑") != null);
+}
+
+test "a follow-up that announces no task keeps the one in the title" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+
+    const announced = try harness.agent.announceTask("{\"title\":\"修复终端标题\",\"description\":\"先定位标题逻辑。\"}");
+    announced.deinit(allocator);
+    try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
+
+    // The next line is answered without a task of its own: the title must not
+    // fall back to the application name alone between the two turns.
+    var mock: MockTransport = .{ .replies = &.{completed_answer} };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.processQuery("继续");
+    try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
+
+    // A new announcement replaces it: the title follows the latest task.
+    const replaced = try harness.agent.announceTask("{\"title\":\"别的任务\",\"description\":\"换一件事。\"}");
+    replaced.deinit(allocator);
+    try std.testing.expectEqualStrings("别的任务", harness.agent.current_task);
+}
+
+test "a subagent runs its own turn and reports back" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+
+    const call =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"sub\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"count the tests\\\"}\"}]}";
+    var mock: MockTransport = .{ .replies = &.{ call, completed_answer, completed_answer } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("delegate the counting");
+
+    const turn = try harness.agent.runToolLoop();
+    try std.testing.expect(turn.completed);
+    // One request per agent: the parent asks, the sub-agent answers, the parent
+    // answers with that report in hand.
+    try std.testing.expectEqual(@as(usize, 3), mock.requests.items.len);
+
+    // The sub-agent is a conversation of its own: its own prompt, none of the
+    // parent's messages, and none of the tools that belong to the terminal.
+    const child = mock.requests.items[1];
+    try std.testing.expect(std.mem.indexOf(u8, child, "You are a sub-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, child, "delegate the counting") == null);
+    for ([_][]const u8{ "\"ask_user\"", "\"announce_task\"", "\"subagent\"", "\"plan\"", "\"remember\"" }) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, child, name) == null);
+    }
+
+    // The parent reads back one report, not the sub-agent's transcript.
+    const parent = mock.requests.items[2];
+    try std.testing.expect(std.mem.indexOf(u8, parent, "Sub-agent report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent, "answer.") != null);
+}
+
+test "the sub-agent's progress line names its task and keeps to one line" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    var label: std.Io.Writer.Allocating = .init(allocator);
+    defer label.deinit();
+
+    // The task is model output: its newlines are flattened and its escape
+    // sequences dropped, because the line is read on a terminal.
+    const call: ToolCallData = .{
+        .id = "sub",
+        .name = "subagent",
+        .arguments = "{\"task\":\"count \\u001b[31mthe tests\\u001b[0m\\nquietly\"}",
+    };
+    try std.testing.expectEqualStrings(
+        "subagent · count the tests…",
+        (try harness.agent.callProgressLabel(call, &label)).?,
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, label.written(), 0x1b) == null);
+
+    // A call with no task yet still says who is at work, and a tool that is
+    // not a sub-agent keeps its own label.
+    const nameless: ToolCallData = .{ .id = "sub", .name = "subagent", .arguments = "{}" };
+    try std.testing.expectEqualStrings("subagent…", (try harness.agent.callProgressLabel(nameless, &label)).?);
+    const bash: ToolCallData = .{ .id = "b", .name = "bash", .arguments = "{}" };
+    try std.testing.expectEqualStrings("bash…", (try harness.agent.callProgressLabel(bash, &label)).?);
+    // A tool whose wait asks the user a question gets no line at all.
+    const ask: ToolCallData = .{ .id = "a", .name = "ask_user", .arguments = "{}" };
+    try std.testing.expectEqual(@as(?[]const u8, null), try harness.agent.callProgressLabel(ask, &label));
+}
+
+test "a subagent cannot start another one" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+
+    const outer =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"outer\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"outer task\\\"}\"}]}";
+    const inner =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"inner\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"inner task\\\"}\"}]}";
+    var mock: MockTransport = .{ .replies = &.{ outer, inner, completed_answer, completed_answer } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("delegate twice");
+
+    const turn = try harness.agent.runToolLoop();
+    try std.testing.expect(turn.completed);
+    try std.testing.expectEqual(@as(usize, 4), mock.requests.items.len);
+    // The refusal reaches the sub-agent as a tool result, so it finishes its own
+    // task instead of starting a third agent.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "cannot start another sub-agent") != null);
+}
+
+test "a line typed while the task runs joins the next request instead of a new turn" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+    // A tool call, then the answer. The user types while the call is answered,
+    // which is the window a long tool or a slow request opens.
+    const call =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"task\",\"name\":\"announce_task\",\"arguments\":\"{\\\"title\\\":\\\"调整任务\\\",\\\"description\\\":\\\"先看实现。\\\"}\"}]}";
+    var mock: MockTransport = .{
+        .replies = &.{ call, completed_split },
+        .agent = &harness.agent,
+        .steer_at = 0,
+        .steer_line = "also update the docs",
+    };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("Do the task");
+    const turn = try harness.agent.runToolLoop();
+
+    // One task, not two: the reply that follows the tool result is the only
+    // answer, and it was asked for with the line the user typed.
+    try std.testing.expect(turn.completed);
+    try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[0], "also update the docs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "function_call_output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "also update the docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "guidance for the work in progress") != null);
+
+    // The guidance is part of the conversation now, ahead of the answer.
+    try std.testing.expectEqual(@as(usize, 6), harness.agent.history.items.len);
+    const guidance = harness.agent.history.items[4];
+    try std.testing.expectEqualStrings("user", guidance.role);
+    try std.testing.expect(std.mem.indexOf(u8, guidance.content.?, "also update the docs") != null);
+    try std.testing.expectEqualStrings("assistant", harness.agent.history.items[5].role);
+    // Nothing is left waiting in the inbox once the turn settled.
+    try std.testing.expectEqual(@as(usize, 0), harness.agent.inbox.items.len);
+}
+
+test "task metadata requires title and description and fewer than 80 Unicode characters" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+    for ([_][]const u8{ "{}", "{\"title\":\"t\"}", "{\"title\":\"\",\"description\":\"d\"}", "{\"title\":\"t\",\"description\":\" \"}" }) |args| {
+        if (harness.agent.announceTask(args)) |result| {
+            result.deinit(allocator);
+            return error.ExpectedInvalidMetadata;
+        } else |_| {}
+        try std.testing.expectEqualStrings("", harness.agent.current_task);
+    }
+    var title: std.ArrayList(u8) = .empty;
+    defer title.deinit(allocator);
+    for (0..79) |_| try title.appendSlice(allocator, "题");
+    const valid = try std.json.Stringify.valueAlloc(allocator, .{ .title = title.items, .description = "测试" }, .{});
+    defer allocator.free(valid);
+    const result = try harness.agent.announceTask(valid);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings(title.items, harness.agent.current_task);
+    try title.appendSlice(allocator, "题");
+    const invalid = try std.json.Stringify.valueAlloc(allocator, .{ .title = title.items, .description = "测试" }, .{});
+    defer allocator.free(invalid);
+    try std.testing.expectError(error.InvalidTaskMetadata, harness.agent.announceTask(invalid));
+    try std.testing.expectEqualStrings(title.items[0 .. 79 * "题".len], harness.agent.current_task);
+}
+
+test "every tool a sub-agent is denied exists in the default set" {
+    // The deny list is names, so a rename in tools/schema.zig would silently
+    // hand a sub-agent a tool it must not have. This is the guard: the openai
+    // test checks that the names it is given are dropped, and this one checks
+    // the names still exist to be dropped.
+    const tool_schema = @import("../tools/schema.zig");
+    for (subagent_omitted) |name| {
+        var found = false;
+        for (tool_schema.builtin) |tool| {
+            if (std.mem.eql(u8, tool.name, name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "a truncated reply is continued and kept as one message" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    var mock: MockTransport = .{ .replies = &.{ truncated_text, completed_answer } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+
+    const turn = try blk: {
+        var quiet = try Silence.init(std.testing.io);
+        defer quiet.deinit(std.testing.io);
+        try harness.agent.appendUserMessage("Do the task");
+        break :blk harness.agent.runToolLoop();
+    };
+
+    try std.testing.expect(turn.completed);
+    // The default budget is already on the growth cap, so truncation is
+    // answered by a continuation rather than by a larger request.
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 8192, 8192 }, mock.budgets.items);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "Continue exactly where it stopped") != null);
+    // The partial reply and the prompt that asked for the rest are folded
+    // into one assistant message; no scaffolding is left in the history.
+    try std.testing.expectEqual(@as(usize, 3), harness.agent.history.items.len);
+    const answer = harness.agent.history.items[2];
+    try std.testing.expectEqualStrings("assistant", answer.role);
+    try std.testing.expectEqualStrings("Half an answer.", answer.content.?);
+    try std.testing.expect(answer.response_items == null);
+}
+
+test "a truncated tool call is retried in smaller steps without a dangling prompt" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    var mock: MockTransport = .{ .replies = &.{ truncated_call, completed_split } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+
+    const turn = try blk: {
+        var quiet = try Silence.init(std.testing.io);
+        defer quiet.deinit(std.testing.io);
+        try harness.agent.appendUserMessage("Do the task");
+        break :blk harness.agent.runToolLoop();
+    };
+
+    try std.testing.expect(turn.completed);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 8192, 8192 }, mock.budgets.items);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "Try again in smaller steps") != null);
+    try std.testing.expectEqual(@as(usize, 3), harness.agent.history.items.len);
+    try std.testing.expectEqualStrings("Split into chunks.", harness.agent.history.items[2].content.?);
+}
+
+test "a reply that never stops truncating is given up on and still kept" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    // One initial reply plus `max_continuations` continuations, all cut off.
+    var replies: [max_continuations + 1][]const u8 = undefined;
+    for (&replies) |*reply| reply.* = truncated_text;
+    var mock: MockTransport = .{ .replies = &replies };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+
+    const outcome = blk: {
+        var quiet = try Silence.init(std.testing.io);
+        defer quiet.deinit(std.testing.io);
+        try harness.agent.appendUserMessage("Do the task");
+        break :blk harness.agent.runToolLoop();
+    };
+    try std.testing.expectError(error.ResponseTruncated, outcome);
+
+    try std.testing.expectEqual(max_continuations + 1, mock.budgets.items.len);
+    // The fragments become one assistant answer, and the prompts that asked
+    // for them are gone, so the next request sees a proper conversation.
+    try std.testing.expectEqual(@as(usize, 3), harness.agent.history.items.len);
+    const answer = harness.agent.history.items[2].content.?;
+    try std.testing.expectEqual(@as(usize, (max_continuations + 1) * "Half an ".len), answer.len);
+    for (0..max_continuations + 1) |index| {
+        try std.testing.expectEqualStrings("Half an ", answer[index * "Half an ".len ..][0.."Half an ".len]);
+    }
+}

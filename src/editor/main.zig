@@ -1,5 +1,5 @@
 const std = @import("std");
-const ansi = @import("../style.zig");
+const ansi = @import("../ui/style.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ArrayList = std.ArrayList;

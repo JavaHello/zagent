@@ -1,5 +1,5 @@
 const std = @import("std");
-const ansi = @import("../style.zig");
+const ansi = @import("../ui/style.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const File = std.Io.File;

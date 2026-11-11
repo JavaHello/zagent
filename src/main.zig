@@ -1,17 +1,17 @@
 const std = @import("std");
-const Config = @import("config.zig").Config;
-const Agent = @import("agent.zig").Agent;
-const provider = @import("provider.zig");
-const history = @import("history.zig");
-const commands = @import("commands.zig");
-const mcp = @import("mcp.zig");
-const banner = @import("banner.zig");
-const term = @import("term.zig");
-const text = @import("text.zig");
-const Screen = @import("screen.zig").Screen;
+const Config = @import("model/config.zig").Config;
+const Agent = @import("agent/mod.zig").Agent;
+const provider = @import("model/provider.zig");
+const history = @import("cli/history.zig");
+const commands = @import("cli/commands.zig");
+const mcp = @import("mcp/mod.zig");
+const banner = @import("ui/banner.zig");
+const term = @import("ui/term.zig");
+const text = @import("util/text.zig");
+const Screen = @import("ui/screen.zig").Screen;
 const Linenoise = @import("editor/main.zig").Linenoise;
 
-const sgr = @import("style.zig");
+const sgr = @import("ui/style.zig");
 const RESET = sgr.RESET;
 const BOLD = sgr.BOLD;
 const DIM = sgr.DIM;
@@ -107,8 +107,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.items.len == 4 and std.mem.eql(u8, args.items[1], "--tool-worker")) {
-        const result = @import("tool_worker.zig").execute(io, allocator, env, args.items[2], args.items[3]) catch |err| tools_error: {
-            break :tools_error @import("tools.zig").ToolResult{
+        const result = @import("host/tool_worker.zig").execute(io, allocator, env, args.items[2], args.items[3]) catch |err| tools_error: {
+            break :tools_error @import("tools/mod.zig").ToolResult{
                 .content = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}),
                 .is_error = true,
                 .timed_out = err == error.Timeout,
@@ -143,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.items.len == 2 and (std.mem.eql(u8, args.items[1], "login") or std.mem.eql(u8, args.items[1], "logout"))) {
-        const auth = @import("codex_auth.zig");
+        const auth = @import("model/codex_auth.zig");
         const auth_path = try auth.path(allocator, env);
         defer allocator.free(auth_path);
         if (std.mem.eql(u8, args.items[1], "login")) {
@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
     // Trust must precede state loading, API requests and local MCP startup.
     // Administrative commands do not operate in the current workspace.
     if (!(args.items.len == 2 and std.mem.eql(u8, args.items[1], "models"))) {
-        const workspace = @import("workspace.zig");
+        const workspace = @import("state/workspace.zig");
         if (!try workspace.isTrusted(allocator, io, env)) {
             const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
             defer allocator.free(canonical);
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             try printToStderr(allocator, io, "\nTrust this directory?\n  {s}\nTrusted directories allow tool execution and local MCP servers.\n", .{canonical});
-            const menu = @import("menu.zig");
+            const menu = @import("ui/menu.zig");
             const options = [_]menu.Option{
                 .{ .label = "Don't trust and exit", .description = "", .recommended = false },
                 .{ .label = "Trust and continue", .description = "", .recommended = false },
@@ -227,7 +227,7 @@ pub fn main(init: std.process.Init) !void {
     defer config.deinit();
 
     if (args.items.len == 2 and std.mem.eql(u8, args.items[1], "models")) {
-        var client = @import("openai.zig").Client.init(allocator, io, config);
+        var client = @import("model/openai.zig").Client.init(allocator, io, config);
         defer client.deinit();
         const models = try client.listModels();
         defer allocator.free(models);
@@ -253,7 +253,7 @@ pub fn main(init: std.process.Init) !void {
     defer ln.deinit();
     // Show command, file, and reserved-extension candidates as the user types.
     ln.completions_callback = commands.complete;
-    ln.popup_callback = @import("completion.zig").candidates;
+    ln.popup_callback = @import("cli/completion.zig").candidates;
 
     const history_path = try openHistory(allocator, io, env, &ln);
     defer if (history_path) |path| allocator.free(path);
@@ -347,11 +347,11 @@ fn runRepl(
     defer agent.attachScreen(null);
     try screen.enter();
     defer screen.deinit();
-    var runtime = @import("runtime.zig").Runtime{ .agent = agent, .screen = &screen };
+    var runtime = @import("cli/runtime.zig").Runtime{ .agent = agent, .screen = &screen };
     if (screen.isActive()) {
         screen.buffered = true;
         agent.form_context = &runtime;
-        agent.form_callback = @import("runtime.zig").Runtime.presentForm;
+        agent.form_callback = @import("cli/runtime.zig").Runtime.presentForm;
         ln.tick_callback = tickRuntime;
         ln.scroll_callback = scrollRuntime;
         ln.mouse_callback = mouseRuntime;
@@ -546,7 +546,7 @@ fn runRepl(
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\nWorkspace: {s}\nScratch: {s}\nLast turn tokens (server usage or estimate): input {d}, output {d}\n", .{ config.model, agent.workspace, agent.scratch.path, counts.input, counts.output });
             defer allocator.free(msg);
             try writeOut(&screen, stdout, io, msg);
-            var status_client = @import("openai.zig").Client.init(allocator, io, config);
+            var status_client = @import("model/openai.zig").Client.init(allocator, io, config);
             defer status_client.deinit();
             const quota = status_client.quotaStatus() catch |err| {
                 try reportCommandError(allocator, &screen, io, "status: quota unavailable", err);
@@ -600,33 +600,33 @@ fn reportCommandError(
 /// The editor reports how many rows it needs at the bottom. Reserving them is
 /// what repaints the conversation when the prompt grows.
 fn layoutScreen(context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void {
-    const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    const runtime: *@import("cli/runtime.zig").Runtime = @ptrCast(@alignCast(context));
     runtime.screen.editor_frame = true;
     defer runtime.screen.editor_frame = false;
     try runtime.screen.reserveInput(rows, repaint);
 }
 
 fn tickRuntime(context: ?*anyopaque) anyerror!bool {
-    const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    const runtime: *@import("cli/runtime.zig").Runtime = @ptrCast(@alignCast(context));
     return runtime.tick();
 }
 
 fn interruptRuntime(context: ?*anyopaque) anyerror!void {
-    const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    const runtime: *@import("cli/runtime.zig").Runtime = @ptrCast(@alignCast(context));
     try runtime.interrupt();
 }
 
 fn questionRuntime(context: ?*anyopaque) anyerror!bool {
-    return @import("runtime.zig").Runtime.questionPending(context);
+    return @import("cli/runtime.zig").Runtime.questionPending(context);
 }
 
 fn mouseRuntime(context: ?*anyopaque, report: []const u8) anyerror!void {
-    const rt: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context orelse return));
+    const rt: *@import("cli/runtime.zig").Runtime = @ptrCast(@alignCast(context orelse return));
     try rt.screen.mouse(report);
 }
 
 fn scrollRuntime(context: ?*anyopaque, up: bool, page: bool) anyerror!void {
-    const runtime: *@import("runtime.zig").Runtime = @ptrCast(@alignCast(context));
+    const runtime: *@import("cli/runtime.zig").Runtime = @ptrCast(@alignCast(context));
     try runtime.screen.scroll(up, page);
 }
 
@@ -664,31 +664,31 @@ fn printToStderr(
 test {
     _ = @import("editor/main.zig");
     _ = @import("unicode_width/main.zig");
-    _ = @import("agent.zig");
-    _ = @import("status.zig");
-    _ = @import("execution.zig");
-    _ = @import("session.zig");
-    _ = @import("tool_worker.zig");
-    _ = @import("history.zig");
-    _ = @import("tools.zig");
-    _ = @import("diff.zig");
-    _ = @import("openai.zig");
-    _ = @import("config.zig");
-    _ = @import("provider.zig");
-    _ = @import("menu.zig");
-    _ = @import("completion.zig");
-    _ = @import("commands.zig");
-    _ = @import("compact.zig");
-    _ = @import("memory.zig");
-    _ = @import("style.zig");
-    _ = @import("term.zig");
-    _ = @import("screen.zig");
-    _ = @import("banner.zig");
-    _ = @import("text.zig");
-    _ = @import("render.zig");
-    _ = @import("spinner.zig");
-    _ = @import("mcp.zig");
-    _ = @import("mcp_transport.zig");
+    _ = @import("agent/mod.zig");
+    _ = @import("model/status.zig");
+    _ = @import("host/execution.zig");
+    _ = @import("state/session.zig");
+    _ = @import("host/tool_worker.zig");
+    _ = @import("cli/history.zig");
+    _ = @import("tools/mod.zig");
+    _ = @import("diff/mod.zig");
+    _ = @import("model/openai.zig");
+    _ = @import("model/config.zig");
+    _ = @import("model/provider.zig");
+    _ = @import("ui/menu.zig");
+    _ = @import("cli/completion.zig");
+    _ = @import("cli/commands.zig");
+    _ = @import("util/compact.zig");
+    _ = @import("state/memory.zig");
+    _ = @import("ui/style.zig");
+    _ = @import("ui/term.zig");
+    _ = @import("ui/screen.zig");
+    _ = @import("ui/banner.zig");
+    _ = @import("util/text.zig");
+    _ = @import("ui/render.zig");
+    _ = @import("ui/spinner.zig");
+    _ = @import("mcp/mod.zig");
+    _ = @import("mcp/transport.zig");
 }
 
 test "config loads" {
