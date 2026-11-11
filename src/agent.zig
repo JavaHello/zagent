@@ -174,6 +174,10 @@ pub const Agent = struct {
     /// takes a line of the terminal, and it must be the only writer to it.
     animate_progress: bool,
     terminal_title: term.Title,
+    /// The task the model last announced, named in the terminal title. It is
+    /// kept across turns on purpose: a follow-up that announces no task of its
+    /// own still belongs to the work the title names, and dropping it at the
+    /// next prompt would leave the title with nothing to show.
     current_task: []const u8 = "",
     query_started: ?std.Io.Timestamp = null,
     progress_prompt: ?[]const u8 = null,
@@ -328,6 +332,16 @@ pub const Agent = struct {
         self.session_path = path;
         self.session_id = id;
         self.client.resetTokenCounters();
+        // Another session is another piece of work: the task the old one
+        // announced says nothing about this one.
+        self.forgetTask();
+    }
+
+    /// Drop the title's task label, leaving the activity to speak for itself.
+    fn forgetTask(self: *Agent) void {
+        if (self.current_task.len > 0) self.allocator.free(self.current_task);
+        self.current_task = "";
+        self.terminal_title.update("ready", "");
     }
 
     /// Restore the visible conversation from the saved messages, without
@@ -547,7 +561,7 @@ pub const Agent = struct {
             }
             break;
         }
-        self.terminal_title.update("ready", "");
+        self.terminal_title.update("ready", self.current_task);
         try self.checkpoint();
     }
 
@@ -631,14 +645,10 @@ pub const Agent = struct {
         self.query_started = std.Io.Timestamp.now(self.io, .awake);
         defer self.query_started = null;
         self.client.resetTokenCounters();
-        // Never use raw user input as a terminal title.
-        if (self.current_task.len > 0) self.allocator.free(self.current_task);
-        self.current_task = "";
-        defer {
-            if (self.current_task.len > 0) self.allocator.free(self.current_task);
-            self.current_task = "";
-        }
-        self.terminal_title.update("thinking…", "");
+        // Raw user input is never a terminal title, and the task last
+        // announced stays until the model announces a new one: the title
+        // describes the work in progress, not the line that started it.
+        self.terminal_title.update("thinking…", self.current_task);
         self.processQueryInner(query) catch |err| {
             self.terminal_title.update("error", self.current_task);
             return err;
@@ -1812,6 +1822,31 @@ test "main model announces the task through a built-in call without planning req
         try std.testing.expect(request.value.object.get("tools") != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "先定位标题逻辑") != null);
+}
+
+test "a follow-up that announces no task keeps the one in the title" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+
+    const announced = try harness.agent.announceTask("{\"title\":\"修复终端标题\",\"description\":\"先定位标题逻辑。\"}");
+    announced.deinit(allocator);
+    try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
+
+    // The next line is answered without a task of its own: the title must not
+    // fall back to the application name alone between the two turns.
+    var mock: MockTransport = .{ .replies = &.{completed_answer} };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.processQuery("继续");
+    try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
+
+    // A new announcement replaces it: the title follows the latest task.
+    const replaced = try harness.agent.announceTask("{\"title\":\"别的任务\",\"description\":\"换一件事。\"}");
+    replaced.deinit(allocator);
+    try std.testing.expectEqualStrings("别的任务", harness.agent.current_task);
 }
 
 test "a line typed while the task runs joins the next request instead of a new turn" {
