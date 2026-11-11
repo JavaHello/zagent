@@ -57,7 +57,7 @@ acknowledgement from the system clipboard; command failures show an error notice
 All built-in filesystem, search, HTTP and shell tools run directly in the
 current working directory. They inherit the host environment (including credentials),
 filesystem permissions and network access. Start zagent in the intended project
-and only run trusted tasks. Zig compilation caches use `.zig-cache/global`.
+and only run trusted tasks.
 
 There is no sandbox or command safety filter. Tools can modify the host system
 with the current user's permissions. Local MCP servers also run directly and
