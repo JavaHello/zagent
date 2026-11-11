@@ -20,7 +20,7 @@ requests = []
 # the child writes its last reply, the caller answers.
 script = [
     ('subagent', {'task': 'Split the source tree into one file per tool.',
-                  'checkin_seconds': 0}),
+                  'title': 'Split the tree', 'checkin_seconds': 0}),
     ('report', {'summary': 'two of the four tools are split; nothing verified yet'}),
     ('subagent_stop', {'id': 's1'}),
     ('answer', {'text': 'Final report: two files split, the other two are untouched.'}),
@@ -124,6 +124,11 @@ try:
         assert 'two of the four tools are split' in report, report
         assert 'subagent_stop' in report and '"s1"' in report, report
         assert 'Final report' not in report, report
+        # The run was named when it was started, so the report names it the
+        # same way the terminal does, and the caller reading two of them can
+        # tell which run it is looking at.
+        assert 's1 "Split the tree" progress report' in report, report
+        assert '⇢ subagent' in result.stderr and 'Split the tree' in result.stderr, result.stderr
 
         # Stopped, the child is told twice: as the verdict on the report it was
         # waiting at, and again at the only boundary it had left.

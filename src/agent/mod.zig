@@ -46,6 +46,7 @@ const dismissed_question_message = agent_prompt.dismissed_question_message;
 const error_preview_max = agent_prompt.error_preview_max;
 const max_subagent_task_bytes = agent_prompt.max_subagent_task_bytes;
 const max_subagent_context_bytes = agent_prompt.max_subagent_context_bytes;
+const max_subagent_title_chars = agent_prompt.max_subagent_title_chars;
 const default_subagent_checkin_seconds = agent_prompt.default_subagent_checkin_seconds;
 const max_subagent_checkin_seconds = agent_prompt.max_subagent_checkin_seconds;
 const max_subagent_report_bytes = agent_prompt.max_subagent_report_bytes;
@@ -940,13 +941,14 @@ pub const Agent = struct {
         }
         const Arguments = struct {
             task: ?[]const u8 = null,
+            title: ?[]const u8 = null,
             context: ?[]const u8 = null,
             id: ?[]const u8 = null,
             checkin_seconds: ?u32 = null,
         };
         const parsed = std.json.parseFromSlice(Arguments, self.allocator, arguments, .{}) catch {
             return .{
-                .content = try self.allocator.dupe(u8, "Error: subagent takes a 'task' string to start a run, or the 'id' of a paused run to let it carry on; it may also take 'context' and 'checkin_seconds' (0-3600)."),
+                .content = try self.allocator.dupe(u8, "Error: subagent takes a 'task' string to start a run, or the 'id' of a paused run to let it carry on; it may also take 'title', 'context' and 'checkin_seconds' (0-3600)."),
                 .is_error = true,
             };
         };
@@ -985,11 +987,22 @@ pub const Agent = struct {
                 .is_error = true,
             };
         }
+        // The title is what the terminal calls this run while it works, so it
+        // is held to one readable line. Leaving it out is allowed — the call's
+        // line falls back to the opening of the task — but a title that would
+        // break that line is refused before a run starts on it.
+        const title = std.mem.trim(u8, parsed.value.title orelse "", " \t\r\n");
+        if (!validRunTitle(title)) {
+            return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Error: the title must be one line of at most {d} Unicode characters: it is the summary the terminal shows while the run works, and the task itself says the rest. Leave it out to fall back to the task.", .{max_subagent_title_chars}),
+                .is_error = true,
+            };
+        }
 
         // Starting the sub-agent is the one failure that is about this call
         // rather than about the task: it is reported as an error result, so
         // the model sees why its delegation went nowhere.
-        const run = self.startRun(task, context, checkin) catch |err| {
+        const run = self.startRun(task, context, title, checkin) catch |err| {
             return .{
                 .content = try std.fmt.allocPrint(self.allocator, "The sub-agent could not start: {s}.", .{@errorName(err)}),
                 .is_error = true,
@@ -1001,15 +1014,22 @@ pub const Agent = struct {
     /// Start one sub-agent and the task that runs it. The run owns the child,
     /// the handshake they share, and the buffer the child answers into; the
     /// caller of `subagent` only ever holds it by its id.
-    fn startRun(self: *Agent, task: []const u8, context: []const u8, checkin_seconds: u32) !*Run {
+    ///
+    /// `title` is the summary the terminal names the run with, and may be
+    /// empty: a run without one is named by its task on the lines that would
+    /// have shown it.
+    fn startRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, checkin_seconds: u32) !*Run {
         const run = try self.allocator.create(Run);
         errdefer self.allocator.destroy(run);
 
         self.run_counter += 1;
         const id = try std.fmt.allocPrint(self.allocator, "s{d}", .{self.run_counter});
         errdefer self.allocator.free(id);
+        const owned_title = try self.allocator.dupe(u8, title);
+        errdefer self.allocator.free(owned_title);
         run.* = .{
             .id = id,
+            .title = owned_title,
             .child = undefined,
             .supervisor = subagent.Supervisor.init(self.io, self.allocator),
             .started = std.Io.Timestamp.now(self.io, .awake),
@@ -1082,11 +1102,14 @@ pub const Agent = struct {
             .report => |report| {
                 defer self.allocator.free(report);
                 const elapsed_ms = run.started.untilNow(self.io, .awake).toMilliseconds();
+                var tag: std.Io.Writer.Allocating = .init(self.allocator);
+                defer tag.deinit();
+                try writeRunTag(&tag.writer, run);
                 return .{
                     .content = try std.fmt.allocPrint(
                         self.allocator,
                         "Sub-agent {s} progress report, {d}s in:\n{s}\n\nIt is paused at that report, waiting for you. Call subagent with id \"{s}\" to let it carry on; call subagent_stop with id \"{s}\" to stop it and take its final report.",
-                        .{ run.id, @divTrunc(elapsed_ms, 1000), report, run.id, run.id },
+                        .{ tag.written(), @divTrunc(elapsed_ms, 1000), report, run.id, run.id },
                     ),
                     .is_error = false,
                 };
@@ -1196,6 +1219,7 @@ pub const Agent = struct {
         run.capture.deinit(self.allocator);
         run.supervisor.deinit();
         self.allocator.free(run.id);
+        self.allocator.free(run.title);
         for (self.runs.items, 0..) |candidate, index| {
             if (candidate == run) {
                 _ = self.runs.swapRemove(index);
@@ -1927,18 +1951,14 @@ pub const Agent = struct {
             return;
         }
         // A sub-agent call carries a whole task as its argument, so the line
-        // says what is being done rather than pasting the JSON of it. It is
-        // marked with a glyph and a colour of its own: this line starts a
-        // second agent, and nothing else on the terminal looks like it.
+        // says what is being done rather than pasting the JSON of it: the title
+        // the caller named the run with, the run a resume names, or the opening
+        // of the task. It is marked with a glyph and a colour of its own: this
+        // line starts a second agent, and nothing else on the terminal looks
+        // like it.
         if (std.mem.eql(u8, call.name, "subagent")) {
             try w.writeAll(CYAN ++ "  ⇢ subagent" ++ RESET ++ " ");
-            const task = openai.extractStringArg(self.allocator, call.arguments, "task") catch {
-                try text.writeSanitized(w, call.arguments);
-                try w.writeByte('\n');
-                return;
-            };
-            defer self.allocator.free(task);
-            try writeCallBrief(w, task);
+            if (!try self.writeRunName(w, call.arguments)) try text.writeSanitized(w, call.arguments);
             try w.writeByte('\n');
             return;
         }
@@ -2040,10 +2060,52 @@ pub const Agent = struct {
         return clipped;
     }
 
+    /// What a `subagent` call is called on this terminal: the title the caller
+    /// named the run with, else the run a resume or a stop names — which knows
+    /// the title it was started with — else the opening of the task.
+    ///
+    /// Writes nothing and answers false when the arguments name none of them,
+    /// so the caller can fall back to whatever it has. All three are model
+    /// output, so they are flattened and sanitised the way any other line of
+    /// it is.
+    fn writeRunName(self: *Agent, w: *std.Io.Writer, arguments: []const u8) !bool {
+        const title = openai.extractStringArg(self.allocator, arguments, "title") catch null;
+        defer if (title) |value| self.allocator.free(value);
+        const named = if (title) |value| std.mem.trim(u8, value, " \t\r\n") else "";
+        if (named.len > 0) {
+            try writeCallBrief(w, named);
+            return true;
+        }
+
+        const id = openai.extractStringArg(self.allocator, arguments, "id") catch null;
+        defer if (id) |value| self.allocator.free(value);
+        if (id) |value| {
+            const run_id = std.mem.trim(u8, value, " \t\r\n");
+            if (run_id.len > 0) {
+                if (self.findRun(run_id)) |run| {
+                    if (run.title.len > 0) {
+                        try writeCallBrief(w, run.title);
+                        return true;
+                    }
+                }
+                try writeCallBrief(w, run_id);
+                return true;
+            }
+        }
+
+        const task = openai.extractStringArg(self.allocator, arguments, "task") catch return false;
+        defer self.allocator.free(task);
+        const trimmed = std.mem.trim(u8, task, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        try writeCallBrief(w, trimmed);
+        return true;
+    }
+
     /// The progress line's label for a tool call, or null for a tool that must
-    /// not have one. Most tools name themselves; a sub-agent names the task it
-    /// was handed, because it works with no output of its own on screen and
-    /// this line is the only sign of what it is doing.
+    /// not have one. Most tools name themselves; a sub-agent names the run it
+    /// works on — its title when it has one, otherwise the task it was handed
+    /// or the run it is resuming — because it works with no output of its own
+    /// on screen and this line is the only sign of what it is doing.
     ///
     /// `buf` is where a built label lives. It must outlive the animation, so
     /// the caller owns it and frees it after the spinner has stopped.
@@ -2052,32 +2114,29 @@ pub const Agent = struct {
         // its next report, so both get the same kind of line.
         if (std.mem.eql(u8, call.name, "subagent_stop")) {
             buf.clearRetainingCapacity();
-            try buf.writer.writeAll("subagent · stopping…");
+            try buf.writer.writeAll("subagent · ");
+            const id = openai.extractStringArg(self.allocator, call.arguments, "id") catch null;
+            defer if (id) |value| self.allocator.free(value);
+            // The run being stopped is still here, so it can name itself.
+            const stopped = if (id) |value| self.findRun(std.mem.trim(u8, value, " \t\r\n")) else null;
+            if (stopped) |run| {
+                if (run.title.len > 0) {
+                    try writeCallBrief(&buf.writer, run.title);
+                    try buf.writer.writeAll(" · ");
+                }
+            }
+            try buf.writer.writeAll("stopping…");
             return buf.written();
         }
         if (!std.mem.eql(u8, call.name, "subagent"))
             return tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
 
         buf.clearRetainingCapacity();
-        const task = openai.extractStringArg(self.allocator, call.arguments, "task") catch null;
-        defer if (task) |t| self.allocator.free(t);
-        const trimmed = if (task) |t| std.mem.trim(u8, t, " \t\r\n") else "";
-        if (trimmed.len == 0) {
-            // A resume names the run it is waiting on instead of a task.
-            const id = openai.extractStringArg(self.allocator, call.arguments, "id") catch null;
-            defer if (id) |value| self.allocator.free(value);
-            if (id) |value| {
-                try buf.writer.writeAll("subagent · ");
-                try writeCallBrief(&buf.writer, std.mem.trim(u8, value, " \t\r\n"));
-                return buf.written();
-            }
-            try buf.writer.writeAll("subagent…");
-            return buf.written();
-        }
         try buf.writer.writeAll("subagent · ");
-        // The task is model output, so it is flattened and sanitised the same
-        // way the call's own line shows it.
-        try writeCallBrief(&buf.writer, trimmed);
+        if (try self.writeRunName(&buf.writer, call.arguments)) return buf.written();
+        // A call that names nothing yet still says who is at work.
+        buf.clearRetainingCapacity();
+        try buf.writer.writeAll("subagent…");
         return buf.written();
     }
 
@@ -2174,6 +2233,11 @@ pub const Agent = struct {
 const Run = struct {
     /// The id the model names to resume or stop this run.
     id: []u8,
+    /// The summary the terminal shows while the run works, empty when the
+    /// caller gave none. Kept here rather than read back out of the arguments,
+    /// because a resume or a stop names only the id: the lines that report on
+    /// a run it did not just start still have to say which run they mean.
+    title: []u8,
     child: *Agent,
     supervisor: subagent.Supervisor,
     /// Where the child's answers are collected instead of printed. Owned here
@@ -2455,6 +2519,33 @@ fn writeCallBrief(w: *std.Io.Writer, raw: []const u8) !void {
     while (used > 0 and used < raw.len and (raw[used] & 0xC0) == 0x80) used -= 1;
     try text.writeSanitized(w, raw[0..used]);
     if (used < raw.len) try w.writeAll("…");
+}
+
+/// The id of a run, and the title it was started with when it has one: how a
+/// line about a run names it, so a caller reading one of two reports can tell
+/// which run it is reading.
+fn writeRunTag(w: *std.Io.Writer, run: *const Run) !void {
+    try w.writeAll(run.id);
+    if (run.title.len == 0) return;
+    try w.writeAll(" \"");
+    // The title was checked for control characters when the run started, so it
+    // is one line already.
+    try w.writeAll(run.title);
+    try w.writeByte('"');
+}
+
+/// Whether a caller's title can name a run on the terminal: UTF-8, at most
+/// `max_subagent_title_chars` characters, and one line — no control characters,
+/// so the line it lands on keeps its shape. An empty title is allowed: the run
+/// is then named by its task instead.
+fn validRunTitle(title: []const u8) bool {
+    if (title.len == 0) return true;
+    if (!std.unicode.utf8ValidateSlice(title)) return false;
+    for (title) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    const count = std.unicode.utf8CountCodepoints(title) catch return false;
+    return count <= max_subagent_title_chars;
 }
 
 /// A standalone agent with a hermetic environment for tests. The line editor
@@ -2795,6 +2886,8 @@ test "the sub-agent's progress line names its task and keeps to one line" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);
     defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
 
     var label: std.Io.Writer.Allocating = .init(allocator);
     defer label.deinit();
@@ -2812,6 +2905,21 @@ test "the sub-agent's progress line names its task and keeps to one line" {
     );
     try std.testing.expect(std.mem.indexOfScalar(u8, label.written(), 0x1b) == null);
 
+    // A call whose title names the run shows the title, not the task behind
+    // it: the title is the summary the caller chose for this line.
+    const titled: ToolCallData = .{
+        .id = "sub",
+        .name = "subagent",
+        .arguments = "{\"task\":\"count every test in the source tree\\\\nand report\",\"title\":\"count the tests\"}",
+    };
+    try std.testing.expectEqualStrings("subagent · count the tests", (try harness.agent.callProgressLabel(titled, &label)).?);
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    try harness.agent.writeToolCall(&line.writer, titled);
+    try std.testing.expect(std.mem.indexOf(u8, line.written(), "⇢ subagent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.written(), "count the tests") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.written(), "every test") == null);
+
     // A call with no task yet still says who is at work, and a tool that is
     // not a sub-agent keeps its own label.
     const nameless: ToolCallData = .{ .id = "sub", .name = "subagent", .arguments = "{}" };
@@ -2821,6 +2929,41 @@ test "the sub-agent's progress line names its task and keeps to one line" {
     // A tool whose wait asks the user a question gets no line at all.
     const ask: ToolCallData = .{ .id = "a", .name = "ask_user", .arguments = "{}" };
     try std.testing.expectEqual(@as(?[]const u8, null), try harness.agent.callProgressLabel(ask, &label));
+
+    // A stop names the run it stops, which still knows its title.
+    const run = try harness.agent.startRun("anything", "", "split the files", 3_600);
+    const halting: ToolCallData = .{ .id = "h", .name = "subagent_stop", .arguments = "{\"id\":\"s1\"}" };
+    try std.testing.expectEqualStrings("subagent · split the files · stopping…", (try harness.agent.callProgressLabel(halting, &label)).?);
+    // ...and a resume names it the same way, from the id alone.
+    const resuming: ToolCallData = .{ .id = "r", .name = "subagent", .arguments = "{\"id\":\"s1\"}" };
+    try std.testing.expectEqualStrings("subagent · split the files", (try harness.agent.callProgressLabel(resuming, &label)).?);
+    // The run was started only to be named, so it is stopped here: nothing
+    // waits on it, and the harness closes whatever is left at deinit.
+    harness.agent.abortRun(run);
+}
+
+test "a title that cannot be one line is refused before a run starts" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    // A title of eighty characters is one too many and a line break inside one
+    // would end the line early: both are refused, and neither starts a run.
+    var too_long: [80]u8 = undefined;
+    @memset(&too_long, 'a');
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.print("{{\"task\":\"anything\",\"title\":\"{s}\"}}", .{too_long});
+    const long = try harness.agent.subagentTool(aw.written());
+    defer long.deinit(allocator);
+    try std.testing.expect(long.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, long.content, "title") != null);
+
+    const broken = try harness.agent.subagentTool("{\"task\":\"anything\",\"title\":\"one\\ntwo\"}");
+    defer broken.deinit(allocator);
+    try std.testing.expect(broken.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, broken.content, "one line") != null);
+    try std.testing.expectEqual(@as(usize, 0), harness.agent.runs.items.len);
 }
 
 test "a subagent cannot start another one" {

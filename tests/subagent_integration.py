@@ -20,6 +20,7 @@ requests = []
 script = [
     ('subagent', {'task': '   '}),
     ('subagent', {'task': 'Run one command and report what it printed.',
+                  'title': 'Run one command',
                   'context': 'The workspace is empty; nothing needs cleaning up.'}),
     ('bash', {'command': "printf 'child ran a tool\\n'"}),
     ('answer', {'text': 'Ran bash. It printed one line; nothing else changed.'}),
@@ -151,9 +152,11 @@ try:
         # The sub-agent's scratch directory is gone with its agent.
         assert not Path(scratch_of(child[0])).exists(), 'the child scratch outlived the child'
 
-        # The caller's own answer is what the terminal shows.
+        # The caller's own answer is what the terminal shows, and the run's
+        # line on it is named by the title the caller gave, not by the task.
         assert 'Delegation done.' in result.stdout, result.stdout
         assert 'Ran bash' not in result.stdout, result.stdout
+        assert '⇢ subagent' in result.stderr and 'Run one command' in result.stderr, result.stderr
         print('PASS: sub-agent runs its own turn, keeps the caller session and reports back')
 finally:
     server.shutdown()
