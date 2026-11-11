@@ -59,6 +59,10 @@ const steering_note =
 // width() implementation correctly ignores ANSI SGR sequences.
 const CHOICE_PROMPT = BOLD ++ YELLOW ++ "choice" ++ RESET ++ " \xe2\x9d\xaf ";
 
+// What a dismissed question tells the model. Dismissing a question is not a
+// reason to stop the run: the model is told to carry on by itself.
+const dismissed_question_message = "The question was dismissed without an answer. If you can, decide yourself; otherwise explain what you need and stop.";
+
 const SYSTEM_PROMPT =
     \\You are zagent, a command-line AI assistant built with Zig. Be concise and direct.
     \\Tools and local MCP servers run on the host with the current user's permissions, working directory and network access, without a sandbox or command safety filter.
@@ -135,8 +139,10 @@ pub const Agent = struct {
     max_iterations: u32,
     /// The terminal ask_user and the choice menus read from.
     linenoise: *Linenoise,
-    choice_context: ?*anyopaque = null,
-    choice_callback: ?*const fn (?*anyopaque, []const u8, []const menu.Option) anyerror!?[]u8 = null,
+    form_context: ?*anyopaque = null,
+    /// Who puts a form of questions to the user. The full-screen runtime owns
+    /// the keyboard, so it presents the form instead of the terminal below.
+    form_callback: ?*const fn (?*anyopaque, []menu.Slot) anyerror!menu.Replies = null,
     /// Which search programs the machine has. Decided once, in `init`, for the
     /// same reason as `render_markdown`: a search should not have to ask the
     /// filesystem a question whose answer cannot change while the agent runs.
@@ -649,7 +655,7 @@ pub const Agent = struct {
     fn progressOptions(self: *Agent) spinner.Options {
         return .{
             .enabled = self.animate_progress,
-            .screen = if (self.choice_callback != null) self.screen else null,
+            .screen = if (self.form_callback != null) self.screen else null,
             .started = self.query_started,
             .prompt = self.progress_prompt,
             .first_frame_delay_ms = 0,
@@ -834,9 +840,14 @@ pub const Agent = struct {
                     });
                 }
 
-                for (tool_calls) |call| {
+                // Every question in this message is put to the user at once, so
+                // the answers can be revised before the form is submitted.
+                var asked: ?QuestionAnswers = try self.askQuestions(tool_calls);
+                defer if (asked) |prepared| prepared.deinit(self.allocator);
+
+                for (tool_calls, 0..) |call, index| {
                     try self.checkInterrupted();
-                    const result = self.executeTool(call) catch |err| blk: {
+                    const result = self.executeTool(call, index, if (asked) |*prepared| prepared else null) catch |err| blk: {
                         if (self.interrupted.load(.acquire)) return error.Canceled;
                         const error_content = try std.fmt.allocPrint(
                             self.allocator,
@@ -938,74 +949,100 @@ pub const Agent = struct {
         return turn;
     }
 
-    /// Show the offered options and return one line describing what the user
-    /// chose. Returns null when the question was dismissed and the model has
-    /// to decide on its own.
-    fn askChoice(self: *Agent, question: []const u8, options: []const menu.Option) !?[]u8 {
+    /// Put one form of questions to the user and take its answers. A single
+    /// question arrives here as a form of one, so both behave the same way.
+    ///
+    /// Returns one reply per question, in the order they were asked. A question
+    /// the user dismissed comes back dismissed, and the model decides for
+    /// itself what to do next.
+    fn askForm(self: *Agent, slots: []menu.Slot) !menu.Replies {
         self.terminal_title.update("waiting for input", self.current_task);
-        if (self.choice_callback) |choose| return choose(self.choice_context, question, options);
-        const recommended = menu.recommendedIndex(options);
+        if (self.form_callback) |present| return present(self.form_context, slots);
 
         if (!self.linenoise.is_tty or !self.linenoise.term_supported or
             !(std.Io.File.stderr().isTty(self.io) catch false))
         {
             var aw: std.Io.Writer.Allocating = .init(self.allocator);
             defer aw.deinit();
-            try menu.writeMenu(&aw.writer, question, options);
-            try self.writeLogOrStdout(aw.written());
-            // Nothing to read a choice from. Taking the recommendation keeps a
-            // piped or single-query run moving instead of stalling it.
-            if (recommended) |index| {
-                try self.emit(std.Io.File.stderr(), DIM ++ "  no terminal to read an answer from; taking the recommended option\n" ++ RESET, .{});
-                return try menu.describeAnswer(self.allocator, .{ .option = index }, options);
+            var recommended: usize = 0;
+            for (slots) |*slot| {
+                try menu.writeMenu(&aw.writer, slot.text, slot.options);
+                // Nothing to read a choice from. Taking the recommendation
+                // keeps a piped or single-query run moving instead of stalling
+                // it.
+                const index = menu.recommendedIndex(slot.options) orelse continue;
+                slot.selected = index;
+                slot.answered = true;
+                recommended += 1;
             }
-            try self.emit(std.Io.File.stderr(), DIM ++ "  no terminal to read an answer from\n" ++ RESET, .{});
-            return null;
+            try self.writeLogOrStdout(aw.written());
+            const hint = if (recommended > 0)
+                DIM ++ "  no terminal to read an answer from; taking the recommended option\n" ++ RESET
+            else
+                DIM ++ "  no terminal to read an answer from\n" ++ RESET;
+            try self.emit(std.Io.File.stderr(), "{s}", .{hint});
+            return menu.repliesFrom(self.allocator, slots);
         }
 
-        const selected = try menu.select(self.allocator, self.io, question, options);
-        switch (selected) {
-            .option => |index| return try menu.describeAnswer(self.allocator, .{ .option = index }, options),
-            .custom => {
-                const answer = try self.readChoiceLine() orelse {
-                    // End of input: fall back to the recommendation, if any.
-                    if (recommended) |index| return try menu.describeAnswer(self.allocator, .{ .option = index }, options);
-                    return null;
-                };
-                defer self.allocator.free(answer);
-                return try menu.describeAnswer(self.allocator, .{ .custom = answer }, options);
-            },
-            // A dismissed question is not a reason to stop the run: the model
-            // is told to carry on by itself. Esc at the menu dismisses it here
-            // too; stopping the task is the prompt's job.
-            .cancel => return null,
+        return menu.resolve(self.allocator, slots, .{
+            .context = self,
+            .present = presentOnTerminal,
+            .read = readOnTerminal,
+        });
+    }
+
+    /// Draw a form on the terminal, which owns the keyboard in this mode.
+    fn presentOnTerminal(context: *anyopaque, slots: []menu.Slot, focus: ?usize) anyerror!menu.Outcome {
+        const self: *Agent = @ptrCast(@alignCast(context));
+        return menu.form(self.allocator, self.io, slots, true, focus);
+    }
+
+    /// Read the free text a free-text row asks for, on that same terminal.
+    fn readOnTerminal(context: *anyopaque) anyerror!menu.Line {
+        const self: *Agent = @ptrCast(@alignCast(context));
+        return self.readChoiceLine();
+    }
+
+    /// Turn one answer into the tool result the model reads. A dismissed
+    /// question is an error result: the model is told to decide by itself.
+    fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option) !tools.ToolResult {
+        if (try menu.describeReply(self.allocator, reply, options)) |line| {
+            return .{ .content = line, .is_error = false };
         }
+        return .{
+            .content = try self.allocator.dupe(u8, dismissed_question_message),
+            .is_error = true,
+        };
     }
 
     /// Read the free text the "type your own answer" row asks for. Owned by the
     /// caller, trimmed, and never empty: an empty line is no answer at all.
-    pub fn readChoiceLine(self: *Agent) !?[]u8 {
+    pub fn readChoiceLine(self: *Agent) !menu.Line {
         // A menu answer is free text, not a slash command, so completion and
         // hints are switched off for this read and restored afterwards.
         const saved_completions = self.linenoise.completions_callback;
         const saved_hints = self.linenoise.hints_callback;
         const saved_popup = self.linenoise.popup_callback;
+        const saved_question = self.linenoise.question_input;
         self.linenoise.completions_callback = null;
         self.linenoise.hints_callback = null;
         self.linenoise.popup_callback = null;
+        self.linenoise.question_input = true;
         defer {
             self.linenoise.completions_callback = saved_completions;
             self.linenoise.hints_callback = saved_hints;
             self.linenoise.popup_callback = saved_popup;
+            self.linenoise.question_input = saved_question;
         }
 
         var raw_line: ?[]const u8 = null;
         while (true) {
             if (self.screen) |screen| try screen.prepareInput();
             raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {
-                error.CtrlC => {
+                // Esc is the way back to the options, not the end of the read.
+                error.Escaped => {
                     if (self.screen) |screen| try screen.endInput();
-                    return null;
+                    return .back;
                 },
                 error.Suspend => {
                     // The custom-answer read is a normal line edit; suspension
@@ -1022,7 +1059,7 @@ pub const Agent = struct {
             if (self.screen) |screen| try screen.endInput();
             break;
         }
-        const line = raw_line orelse return null;
+        const line = raw_line orelse return .none;
         defer self.allocator.free(line);
 
         // The answer is part of the record even though the editor's rows are
@@ -1034,13 +1071,19 @@ pub const Agent = struct {
         }
 
         const answer = std.mem.trim(u8, line, " \t\r\n");
-        if (answer.len == 0) return null;
-        return try self.allocator.dupe(u8, answer);
+        if (answer.len == 0) return .none;
+        return .{ .answer = try self.allocator.dupe(u8, answer) };
     }
 
     /// The ask_user tool: put the model's question to the user and hand the
-    /// answer back as the tool result.
-    fn askUser(self: *Agent, arguments: []const u8) !tools.ToolResult {
+    /// answer back as the tool result. `answers` holds what the form drawn for
+    /// this message already produced, when it covered this call.
+    fn askUser(self: *Agent, arguments: []const u8, answers: ?*QuestionAnswers, index: usize) !tools.ToolResult {
+        if (answers) |prepared| {
+            if (prepared.take(index)) |content| {
+                return .{ .content = content.text, .is_error = content.is_error };
+            }
+        }
         const question = menu.parseAskUser(self.allocator, arguments) catch {
             return .{
                 .content = try self.allocator.dupe(u8, "Error: ask_user needs a 'question' and a non-empty 'options' array"),
@@ -1049,14 +1092,97 @@ pub const Agent = struct {
         };
         defer question.deinit(self.allocator);
 
-        if (try self.askChoice(question.text, question.options.items)) |answer| {
-            return .{ .content = answer, .is_error = false };
+        var slots = [_]menu.Slot{menu.Slot.init(question.text, question.options.items)};
+        const replies = try self.askForm(&slots);
+        defer replies.deinit(self.allocator);
+        return self.questionResult(replies.items[0], question.options.items);
+    }
+
+    /// The answers to the ask_user calls of one message, aligned with the calls
+    /// themselves so the dispatch can find the one it needs.
+    const QuestionAnswers = struct {
+        items: []Slot,
+
+        /// What one tool result will say, once the call is dispatched.
+        const Content = struct { text: []const u8, is_error: bool };
+
+        const Slot = union(enum) {
+            /// Not a question of this form: the call is dispatched as usual.
+            none,
+            /// The prepared result. Owned here until it is taken.
+            content: Content,
+        };
+
+        fn deinit(self: QuestionAnswers, allocator: std.mem.Allocator) void {
+            for (self.items) |item| {
+                switch (item) {
+                    .content => |content| allocator.free(content.text),
+                    .none => {},
+                }
+            }
+            allocator.free(self.items);
         }
 
-        return .{
-            .content = try self.allocator.dupe(u8, "The question was dismissed without an answer. If you can, decide yourself; otherwise explain what you need and stop."),
-            .is_error = true,
-        };
+        /// Hand the prepared result to the dispatch, which then owns its text.
+        fn take(self: *QuestionAnswers, index: usize) ?Content {
+            if (index >= self.items.len) return null;
+            switch (self.items[index]) {
+                .none => return null,
+                .content => |content| {
+                    self.items[index] = .none;
+                    return content;
+                },
+            }
+        }
+    };
+
+    /// Put every question of this message to the user as one form, so an answer
+    /// can be revised with Tab before the form is submitted. A call whose
+    /// arguments do not parse is left out: `askUser` reports that as it always
+    /// has.
+    fn askQuestions(self: *Agent, calls: []const ToolCallData) !?QuestionAnswers {
+        var questions_in_message: usize = 0;
+        for (calls) |call| {
+            if (std.mem.eql(u8, call.name, "ask_user")) questions_in_message += 1;
+        }
+        // One ask_user call is still a form, but there is nothing to Tab
+        // between; drawing it costs nothing and keeps one code path.
+        if (questions_in_message == 0) return null;
+
+        const items = try self.allocator.alloc(QuestionAnswers.Slot, calls.len);
+        @memset(items, .none);
+        var answers = QuestionAnswers{ .items = items };
+        errdefer answers.deinit(self.allocator);
+
+        var questions: std.ArrayList(menu.Question) = .empty;
+        defer {
+            for (questions.items) |question| question.deinit(self.allocator);
+            questions.deinit(self.allocator);
+        }
+        var slots: std.ArrayList(menu.Slot) = .empty;
+        defer slots.deinit(self.allocator);
+        var indexes: std.ArrayList(usize) = .empty;
+        defer indexes.deinit(self.allocator);
+
+        for (calls, 0..) |call, i| {
+            if (!std.mem.eql(u8, call.name, "ask_user")) continue;
+            const question = menu.parseAskUser(self.allocator, call.arguments) catch continue;
+            try questions.append(self.allocator, question);
+            try slots.append(self.allocator, menu.Slot.init(question.text, question.options.items));
+            try indexes.append(self.allocator, i);
+        }
+        if (slots.items.len == 0) return answers;
+
+        const replies = try self.askForm(slots.items);
+        defer replies.deinit(self.allocator);
+
+        // Replies and slots are both in the order the questions were asked, and
+        // each slot knows which call asked it.
+        for (replies.items, slots.items, indexes.items) |reply, slot, index| {
+            const result = try self.questionResult(reply, slot.options);
+            answers.items[index] = .{ .content = .{ .text = result.content, .is_error = result.is_error } };
+        }
+        return answers;
     }
 
     /// Append a user-role message, taking a copy of `message`.
@@ -1182,7 +1308,9 @@ pub const Agent = struct {
         try diff.render(w, patch_text);
     }
 
-    fn executeTool(self: *Agent, call: ToolCallData) !tools.ToolResult {
+    /// Run one tool call. `index` and `answers` locate the result of a question
+    /// the form of this message has already put to the user, if there was one.
+    fn executeTool(self: *Agent, call: ToolCallData, index: usize, answers: ?*QuestionAnswers) !tools.ToolResult {
         if (std.mem.eql(u8, call.name, "announce_task")) return self.announceTask(call.arguments);
         self.terminal_title.update(call.name, self.current_task);
         try self.announceToolCall(call);
@@ -1207,7 +1335,7 @@ pub const Agent = struct {
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
-                break :blk try self.askUser(call.arguments);
+                break :blk try self.askUser(call.arguments, answers, index);
             } else if (std.mem.eql(u8, call.name, mcp.Registry.loader_name)) {
                 break :blk try self.mcp_registry.loadTools(self.allocator, call.arguments);
             } else if (std.mem.startsWith(u8, call.name, mcp.tool_prefix)) {

@@ -36,7 +36,8 @@ const HELP =
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
     \\  Wheel/PageUp/Down  Scroll output history
     \\  While running: commands remain available; typed text adjusts the task
-    \\  Questions   The menu owns the keyboard; Esc or Ctrl+C dismisses it
+    \\  Questions   The menu owns the keyboard; Esc or Ctrl+D dismisses it
+    \\  Own answer  Esc in the free-text row goes back to the options
     \\  Esc          Stop current task and discard input typed while it ran
     \\  Ctrl+Z       Suspend; resume with fg
     \\  Ctrl+D       Exit zagent
@@ -327,8 +328,8 @@ fn runRepl(
     var runtime = @import("runtime.zig").Runtime{ .agent = agent, .screen = &screen };
     if (screen.isActive()) {
         screen.buffered = true;
-        agent.choice_context = &runtime;
-        agent.choice_callback = @import("runtime.zig").Runtime.choose;
+        agent.form_context = &runtime;
+        agent.form_callback = @import("runtime.zig").Runtime.presentForm;
         ln.tick_callback = tickRuntime;
         ln.scroll_callback = scrollRuntime;
         ln.mouse_callback = mouseRuntime;
@@ -351,8 +352,8 @@ fn runRepl(
         ln.mouse_callback = null;
         ln.interrupt_callback = null;
         ln.handoff_callback = null;
-        agent.choice_callback = null;
-        agent.choice_context = null;
+        agent.form_callback = null;
+        agent.form_context = null;
     }
     // Fullscreen keeps its own blank prompt row at the bottom, so the
     // animation must not draw a second prompt above it.

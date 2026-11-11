@@ -57,13 +57,18 @@ try:
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1'}
         trust_workspace(directory, env)
         cases = [
-            (b'\r', None, 'recommended option: Beta'),
-            (b'\x1b[A\r', None, 'User selected: Alpha'),
-            (b'1\r', None, 'User selected: Alpha'),
-            (b'\x1b[B\r', '自己的方案'.encode() + b'\r', '自己的方案'),
-            (b'\x03', None, 'dismissed without an answer'),
-            (b'\x1b', None, 'dismissed without an answer'),
-            (b'\x04', None, 'dismissed without an answer'),
+            (b'\r', [], 'recommended option: Beta'),
+            (b'\x1b[A\r', [], 'User selected: Alpha'),
+            (b'1\r', [], 'User selected: Alpha'),
+            (b'\x1b[B\r', [(b'choice', '自己的方案'.encode() + b'\r')], '自己的方案'),
+            # Esc in the free-text row steps back to the options and the menu is
+            # drawn again; Enter then takes the recommendation.
+            (b'\x1b[B\r', [(b'choice', b'\x1b'), (b'Enter confirm', b'\r')], 'recommended option: Beta'),
+            # Ctrl+C is not a way out of a question: it is ignored, and the
+            # arrow that follows is what answers.
+            (b'\x03\x1b[A\r', [], 'User selected: Alpha'),
+            (b'\x1b', [], 'dismissed without an answer'),
+            (b'\x04', [], 'dismissed without an answer'),
         ]
         for keys, custom, expected in cases:
             previous_answers = len(answers)
@@ -75,7 +80,10 @@ try:
                                        env=env, stdin=slave, stdout=slave, stderr=slave)
             transcript = bytearray()
             sent = False
-            custom_sent = custom is None
+            # Each step waits for its marker before typing: the free-text row and
+            # the menu that Esc brings back look nothing alike.
+            steps = list(custom)
+            typed = 0
             deadline = time.monotonic() + 15
             try:
                 while process.poll() is None:
@@ -85,12 +93,13 @@ try:
                     if not sent and b'Enter confirm' in transcript:
                         os.write(master, keys)
                         sent = True
-                    if sent and not custom_sent and b'choice' in transcript:
+                    while sent and steps and steps[0][0] in transcript[typed:]:
+                        _, payload = steps.pop(0)
                         # The line editor probes the cursor column on startup.
-                        if b'\x1b[6n' in transcript:
+                        if b'\x1b[6n' in transcript[typed:]:
                             os.write(master, b'\x1b[1;1R')
-                        os.write(master, custom)
-                        custom_sent = True
+                        os.write(master, payload)
+                        typed = len(transcript)
                 assert process.returncode == 0, transcript.decode(errors='replace')
                 assert len(answers) == previous_answers + 1, answers
                 assert len(requests) == previous_requests + 2, requests
@@ -114,6 +123,8 @@ try:
         assert 'Enter confirm' not in piped.stdout + piped.stderr
         assert piped.stdout.count(task_description) == 1, piped.stdout
         assert '\x1b]2;' not in piped.stderr, piped.stderr
-        print('PASS: recommendation, arrows, number keys, custom text, Ctrl+C/Esc cancellation, terminal restoration and piped fallback')
+        print('PASS: recommendation, arrows, number keys, custom text, Esc in the free-text '
+              'row stepping back, Ctrl+C ignored, Esc/Ctrl+D cancellation, terminal '
+              'restoration and piped fallback')
 finally:
     server.shutdown()

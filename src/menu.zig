@@ -147,18 +147,69 @@ pub fn recommendedIndex(options: []const Option) ?usize {
     return null;
 }
 
+/// One question in a form, together with the answer given to it so far. The
+/// slices belong to the caller; the form only moves the answer around, which is
+/// what lets the user Tab back and change a question already answered.
+pub const Slot = struct {
+    text: []const u8,
+    options: []const Option,
+    /// Index into `options`, or `options.len` for the free-text row.
+    selected: usize = 0,
+    /// The user's own words, when they took the free-text row. Borrowed, and
+    /// cleared as soon as an option row is chosen instead.
+    custom: ?[]const u8 = null,
+    /// Confirmed with Enter. Tab can still come back to it.
+    answered: bool = false,
+
+    /// A question starts on its recommendation, or on the first option.
+    pub fn init(text: []const u8, options: []const Option) Slot {
+        return .{ .text = text, .options = options, .selected = recommendedIndex(options) orelse 0 };
+    }
+
+    /// How many rows this question offers: its options, plus the free-text row
+    /// when the form has one.
+    fn rowCount(self: Slot, allow_custom: bool) usize {
+        return self.options.len + @as(usize, @intFromBool(allow_custom));
+    }
+
+    /// What the user answered, for `describeAnswer`.
+    pub fn answer(self: Slot) Answer {
+        if (self.custom) |text| return .{ .custom = text };
+        if (self.options.len == 0) return .skip;
+        return .{ .option = @min(self.selected, self.options.len - 1) };
+    }
+};
+
 /// Keyboard state is independent of reads: a partial escape sequence never
 /// requires a blocking second read, and both CSI and application arrows work.
-const Selection = struct {
-    selected: usize,
-    count: usize,
+/// Each question in `slots` keeps its own selection, so moving between them
+/// loses nothing.
+const Form = struct {
+    slots: []Slot,
+    /// The question the keyboard belongs to.
+    focus: usize = 0,
+    /// A closed form has no free-text row: the trust prompt only offers labels.
+    allow_custom: bool = true,
     escape: enum { none, start, sequence } = .none,
 
-    const Action = enum { redraw, accept, cancel, ignore };
+    const Action = union(enum) {
+        redraw,
+        /// Type the answer to question `custom` by hand; the form is drawn
+        /// again once that line has been read.
+        custom: usize,
+        /// Every question is answered.
+        finish,
+        cancel,
+        ignore,
+    };
 
-    fn key(self: *Selection, byte: u8) Action {
-        if (byte == 3 or byte == 4) return .cancel;
-        if (byte == '\r' or byte == '\n') return .accept;
+    fn key(self: *Form, byte: u8) Action {
+        // Ctrl+C is not a way out of a question: it is pressed by habit, so it
+        // is ignored here and the question stays open. Ctrl+D keeps its
+        // end-of-input meaning, and the read loop turns a lone Esc into a
+        // cancellation.
+        if (byte == 4) return .cancel;
+        if (byte == '\r' or byte == '\n') return self.confirm();
         if (byte == 0x1b) {
             self.escape = .start;
             return .ignore;
@@ -171,26 +222,78 @@ const Selection = struct {
             if (byte < 0x40 or byte > 0x7e) return .ignore;
             self.escape = .none;
             switch (byte) {
-                'A', 'Z' => self.selected = (self.selected + self.count - 1) % self.count,
-                'B' => self.selected = (self.selected + 1) % self.count,
-                'H' => self.selected = 0,
-                'F' => self.selected = self.count - 1,
+                'A' => return self.move(-1),
+                'B' => return self.move(1),
+                // Shift+Tab and the other backwards keys: the previous question.
+                'Z' => return self.step(-1),
+                'H' => return self.jump(0),
+                'F' => return self.jump(self.rows() - 1),
                 else => return .ignore,
             }
-            return .redraw;
         }
         self.escape = .none;
         switch (byte) {
-            'k', 16 => self.selected = (self.selected + self.count - 1) % self.count,
-            'j', '\t', 14 => self.selected = (self.selected + 1) % self.count,
+            // Tab and Shift+Tab walk the questions, which is the point of
+            // drawing them together: an earlier answer can be revised.
+            '\t', 14 => return self.step(1),
+            'k', 16 => return self.move(-1),
+            'j' => return self.move(1),
             '1'...'9' => {
                 const index: usize = byte - '1';
-                if (index >= self.count) return .ignore;
-                self.selected = index;
+                if (index >= self.rows()) return .ignore;
+                self.slots[self.focus].selected = index;
             },
             else => return .ignore,
         }
         return .redraw;
+    }
+
+    fn rows(self: *Form) usize {
+        return self.slots[self.focus].rowCount(self.allow_custom);
+    }
+
+    fn move(self: *Form, delta: isize) Action {
+        const slot = &self.slots[self.focus];
+        const count: isize = @intCast(slot.rowCount(self.allow_custom));
+        slot.selected = @intCast(@mod(@as(isize, @intCast(slot.selected)) + delta, count));
+        return .redraw;
+    }
+
+    fn jump(self: *Form, index: usize) Action {
+        self.slots[self.focus].selected = index;
+        return .redraw;
+    }
+
+    /// Move the keyboard to another question, wrapping around.
+    fn step(self: *Form, delta: isize) Action {
+        const count: isize = @intCast(self.slots.len);
+        self.focus = @intCast(@mod(@as(isize, @intCast(self.focus)) + delta, count));
+        return .redraw;
+    }
+
+    /// Enter: take the focused row as this question's answer and move on to the
+    /// next question still without one. The last answer finishes the form.
+    fn confirm(self: *Form) Action {
+        const slot = &self.slots[self.focus];
+        if (self.allow_custom and slot.selected >= slot.options.len) return .{ .custom = self.focus };
+        slot.custom = null;
+        slot.answered = true;
+        if (self.nextUnanswered()) |index| {
+            self.focus = index;
+            return .redraw;
+        }
+        return .finish;
+    }
+
+    /// The next question without an answer, searching from the focused one, or
+    /// null when every question has one. The focused question is included: it
+    /// is only skipped when it has just been answered.
+    fn nextUnanswered(self: *Form) ?usize {
+        for (0..self.slots.len) |offset| {
+            const index = (self.focus + offset) % self.slots.len;
+            if (!self.slots[index].answered) return index;
+        }
+        return null;
     }
 };
 
@@ -217,37 +320,140 @@ pub const Choice = union(enum) {
     option: usize,
     /// The user chose to type their own answer.
     custom,
-    /// Ctrl+C, Ctrl+D or Esc on its own: this question is dismissed.
+    /// Ctrl+D or Esc on its own: this question is dismissed. Ctrl+C is not one
+    /// of the ways out of a question.
     cancel,
 };
+
+/// What reading the line for a free-text row produced.
+pub const Line = union(enum) {
+    /// The text the user typed. Owned by the caller of the reader.
+    answer: []u8,
+    /// Esc went back to the form: draw it again.
+    back,
+    /// End of input, or a line with nothing on it.
+    none,
+};
+
+/// How one question of a form was answered.
+pub const Reply = union(enum) {
+    /// Index into the question's options.
+    option: usize,
+    /// The user's own words. Owned by whoever holds the reply.
+    custom: []u8,
+    /// The form was dismissed before this question was answered.
+    dismissed,
+};
+
+/// The answers to a form, one per question, in the order they were asked.
+pub const Replies = struct {
+    items: []Reply,
+
+    pub fn deinit(self: Replies, allocator: std.mem.Allocator) void {
+        for (self.items) |reply| {
+            if (reply == .custom) allocator.free(reply.custom);
+        }
+        allocator.free(self.items);
+    }
+};
+
+/// The answers to `slots`, owned by the caller. A question still without an
+/// answer comes back dismissed, so answers given before the form was backed out
+/// of are kept rather than thrown away with it.
+pub fn repliesFrom(allocator: std.mem.Allocator, slots: []const Slot) !Replies {
+    const items = try allocator.alloc(Reply, slots.len);
+    var filled: usize = 0;
+    errdefer {
+        for (items[0..filled]) |reply| {
+            if (reply == .custom) allocator.free(reply.custom);
+        }
+        allocator.free(items);
+    }
+    for (slots, 0..) |slot, i| {
+        items[i] = if (!slot.answered) .dismissed else switch (slot.answer()) {
+            .option => |index| .{ .option = index },
+            .custom => |text| .{ .custom = try allocator.dupe(u8, text) },
+            .skip => .dismissed,
+        };
+        filled += 1;
+    }
+    return .{ .items = items };
+}
+
+/// Every question dismissed, which is what a form nobody could answer comes to.
+pub fn dismissedReplies(allocator: std.mem.Allocator, count: usize) !Replies {
+    const items = try allocator.alloc(Reply, count);
+    @memset(items, .dismissed);
+    return .{ .items = items };
+}
+
+/// The line describing one reply for the model, or null when the question was
+/// dismissed and the model has to decide on its own.
+pub fn describeReply(allocator: std.mem.Allocator, reply: Reply, options: []const Option) !?[]u8 {
+    return switch (reply) {
+        .option => |index| try describeAnswer(allocator, .{ .option = index }, options),
+        .custom => |text| try describeAnswer(allocator, .{ .custom = text }, options),
+        .dismissed => null,
+    };
+}
 
 /// A lone Esc is told apart from an arrow key by waiting this long for the rest
 /// of the sequence. It matches the wait the line editor uses for the same
 /// question, so one key is never read as a sequence here and as Esc there.
 const escape_timeout_ms = 100;
 
-/// Put the question to the user and let the menu own the keyboard until it is
-/// answered or dismissed. Draw on stderr so redirected stdout receives no
-/// cursor control sequences.
-pub fn select(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !Choice {
-    return selectMenu(allocator, io, question, options, true);
+/// What the form came to.
+pub const Outcome = union(enum) {
+    /// Every question has an answer: read `Slot.answer` for each one.
+    answered,
+    /// The user chose to type the answer to question `custom`: read the line,
+    /// store it on that slot, and call `form` again.
+    custom: usize,
+    /// Ctrl+D or Esc: the whole form is dismissed.
+    cancel,
+};
+
+/// The most option rows one question shows at a time; more scroll inside it.
+const visible_window: usize = 5;
+
+/// How many rows a form draws: the blank line it starts with, a header per
+/// question, the option rows of the widest question, and the hint line.
+/// Reserving for the widest question keeps the reservation valid while the
+/// keyboard moves between them.
+pub fn formRows(slots: []const Slot, allow_custom: bool) usize {
+    var options: usize = 1;
+    for (slots) |slot| {
+        const rows = @min(slot.rowCount(allow_custom), visible_window);
+        if (rows > options) options = rows;
+    }
+    return slots.len + options + 2;
 }
 
-/// A closed menu with no free-text row; defaults to the first option.
-pub fn selectOnly(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !Choice {
-    return selectMenu(allocator, io, question, options, false);
-}
+/// Put one or more questions to the user and let the form own the keyboard
+/// until every question is answered or the form is dismissed. Draw on stderr so
+/// redirected stdout receives no cursor control sequences.
+///
+/// The questions of one message are drawn together: Tab and Shift+Tab move
+/// between them, so an answer given to a question further up can still be
+/// changed before the form is submitted. The free-text row is not typed here —
+/// choosing it returns `custom` and the caller reads the line, which is how Esc
+/// in that line gets back to the form.
+///
+/// `focus` is the question the keyboard starts on, which is the one the user was
+/// on when the form was last left. Null starts on the first question still
+/// without an answer.
+pub fn form(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom: bool, focus: ?usize) !Outcome {
+    if (slots.len == 0) return .cancel;
+    var state = Form{ .slots = slots, .allow_custom = allow_custom };
+    if (focus) |index| {
+        state.focus = @min(index, slots.len - 1);
+    } else {
+        // Start on the first question still without an answer, so a form
+        // entered again after an answer was typed carries on where the user
+        // left off.
+        state.focus = state.nextUnanswered() orelse return .answered;
+    }
 
-/// How many rows `select` draws for this many options: the blank line it starts
-/// with, the question, the option rows and the hint line.
-pub fn rowsFor(options_len: usize, allow_custom: bool) usize {
-    const rows: usize = options_len + @as(usize, @intFromBool(allow_custom));
-    const visible: usize = if (rows > 5) 5 else rows;
-    return visible + 3;
-}
-
-fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option, allow_custom: bool) !Choice {
-    if (options.len == 0) return .cancel;
     const out = std.Io.File.stderr();
     var raw = try RawTerminal.initKeepingInput(io, std.Io.File.stdin(), out);
     defer raw.deinit();
@@ -257,48 +463,171 @@ fn selectMenu(allocator: std.mem.Allocator, io: std.Io, question: []const u8, op
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("\r\n");
-    try writeRow(&aw.writer, allocator, question, term.columns(out));
-    try out.writeStreamingAll(io, aw.written());
 
-    var state = Selection{ .selected = recommendedIndex(options) orelse 0, .count = options.len + @intFromBool(allow_custom) };
-    const visible = @min(state.count, 5);
-    var drawn = false;
+    var drawn: usize = 0;
     while (true) {
         aw.clearRetainingCapacity();
-        if (drawn) try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{visible + 1});
-        const first = @min(state.selected -| (visible / 2), state.count - visible);
-        for (first..first + visible) |i| {
-            var row: std.Io.Writer.Allocating = .init(allocator);
-            defer row.deinit();
-            try row.writer.print("  {s} {d}) ", .{ if (i == state.selected) ">" else " ", i + 1 });
-            if (i < options.len) {
-                const option = options[i];
-                try row.writer.writeAll(option.label);
-                if (recommendedIndex(options) == i) try row.writer.writeAll(" (recommended)");
-                if (option.description.len > 0) try row.writer.print("  {s}", .{option.description});
-            } else try row.writer.writeAll("Other / 自定义回答");
-            if (i == state.selected) try aw.writer.writeAll(sgr.BOLD_CYAN);
-            try writeRow(&aw.writer, allocator, row.written(), term.columns(out));
+        if (drawn > 0) try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn});
+        const rows = try drawForm(allocator, &aw.writer, &state, term.columns(out));
+        // A shorter form leaves the tail of the taller one it replaces behind.
+        if (drawn > rows) {
+            for (0..drawn - rows) |_| try aw.writer.writeAll(sgr.ERASE_LINE_END ++ "\r\n");
+            try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn - rows});
         }
-        try writeRow(&aw.writer, allocator, "  ↑/↓ select · Enter confirm · Ctrl+C or Esc cancel", term.columns(out));
         try out.writeStreamingAll(io, aw.written());
-        drawn = true;
+        drawn = rows;
 
         while (true) {
             const byte = try raw.readByte() orelse return .cancel;
             // Esc opens a sequence only when more bytes follow; on its own it
-            // dismisses the question, like the other ways out of a menu. Esc
-            // stops the task at the prompt instead: a question is a detour in
-            // the run, and backing out of it should not throw the run away.
+            // dismisses the form, like the other ways out of a menu. Esc stops
+            // the task at the prompt instead: a question is a detour in the
+            // run, and backing out of it should not throw the run away.
             if (byte == 0x1b and !try raw.waitReadable(io, escape_timeout_ms)) return .cancel;
             switch (state.key(byte)) {
-                .accept => return if (state.selected < options.len) .{ .option = state.selected } else .custom,
+                .finish => return .answered,
+                .custom => |index| return .{ .custom = index },
                 .cancel => return .cancel,
                 .redraw => break,
                 .ignore => {},
             }
         }
     }
+}
+
+/// Draw a form and read the line a free-text row asks for. Both the plain
+/// terminal and the full-screen runtime hand in their own pair, so a form is
+/// answered the same way in either.
+pub const Reader = struct {
+    context: *anyopaque,
+    /// Put `slots` to the user with the keyboard on `focus` first — null when
+    /// the form should start on the first unanswered question — and take the
+    /// keys until one question is acted on.
+    present: *const fn (*anyopaque, []Slot, ?usize) anyerror!Outcome,
+    /// Read the line of a free-text row.
+    read: *const fn (*anyopaque) anyerror!Line,
+};
+
+/// Answer the questions of one form. The free-text row is resolved here rather
+/// than in `form`, which is what keeps Esc in that line returning to the form:
+/// the questions stay open until every one is answered or the form is left.
+pub fn resolve(allocator: std.mem.Allocator, slots: []Slot, reader: Reader) !Replies {
+    // The typed answers live here, not on the stack of one iteration: the form
+    // keeps showing them, and they must stay valid until the replies are made.
+    var typed: std.ArrayList([]u8) = .empty;
+    defer {
+        for (typed.items) |text| allocator.free(text);
+        typed.deinit(allocator);
+    }
+
+    // Which question the keyboard goes back to when the form is drawn again.
+    // Null lets the form carry on at the first question still without an answer.
+    var focus: ?usize = null;
+
+    loop: while (true) {
+        switch (try reader.present(reader.context, slots, focus)) {
+            .answered => return repliesFrom(allocator, slots),
+            .custom => |index| switch (try reader.read(reader.context)) {
+                .answer => |text| {
+                    try typed.append(allocator, text);
+                    const slot = &slots[index];
+                    slot.custom = text;
+                    slot.selected = slot.options.len;
+                    slot.answered = true;
+                    focus = null;
+                },
+                // Esc in the free-text row: back to the options of the same
+                // question, where Enter lands on the recommendation rather
+                // than asking for the same line again.
+                .back => {
+                    const slot = &slots[index];
+                    slot.selected = recommendedIndex(slot.options) orelse 0;
+                    focus = index;
+                },
+                // End of input: take the recommendation when the question has
+                // one, so a half-typed form still settles instead of stalling.
+                .none => {
+                    const slot = &slots[index];
+                    if (recommendedIndex(slot.options)) |option| {
+                        slot.selected = option;
+                        slot.answered = true;
+                        focus = null;
+                        continue :loop;
+                    }
+                    return repliesFrom(allocator, slots);
+                },
+            },
+            .cancel => return repliesFrom(allocator, slots),
+        }
+    }
+}
+
+/// Draw every question, with the option rows of the one that has the keyboard,
+/// and return how many rows were drawn.
+fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, columns: usize) !usize {
+    var rows: usize = 0;
+    for (state.slots, 0..) |slot, i| {
+        var header: std.Io.Writer.Allocating = .init(allocator);
+        defer header.deinit();
+        try header.writer.writeAll("  ");
+        if (state.slots.len > 1) try header.writer.print("{d}/{d} ", .{ i + 1, state.slots.len });
+        try header.writer.writeAll(slot.text);
+        // An answered question shows its answer, which is what makes a wrong one
+        // visible before the form is submitted.
+        if (slot.answered) {
+            if (slot.custom) |text|
+                try header.writer.print("  → {s}", .{text})
+            else if (slot.options.len > 0)
+                try header.writer.print("  → {s}", .{slot.options[@min(slot.selected, slot.options.len - 1)].label});
+        }
+        if (i == state.focus) try w.writeAll(sgr.BOLD_CYAN);
+        try writeRow(w, allocator, header.written(), columns);
+        rows += 1;
+    }
+
+    const slot = state.slots[state.focus];
+    const count = slot.rowCount(state.allow_custom);
+    const visible = @min(count, visible_window);
+    const first = @min(slot.selected -| (visible / 2), count - visible);
+    for (first..first + visible) |i| {
+        var row: std.Io.Writer.Allocating = .init(allocator);
+        defer row.deinit();
+        try row.writer.print("    {s} {d}) ", .{ if (i == slot.selected) ">" else " ", i + 1 });
+        if (i < slot.options.len) {
+            const option = slot.options[i];
+            try row.writer.writeAll(option.label);
+            if (recommendedIndex(slot.options) == i) try row.writer.writeAll(" (recommended)");
+            if (option.description.len > 0) try row.writer.print("  {s}", .{option.description});
+        } else try row.writer.writeAll("Other / 自定义回答");
+        if (i == slot.selected) try w.writeAll(sgr.BOLD_CYAN);
+        try writeRow(w, allocator, row.written(), columns);
+        rows += 1;
+    }
+
+    var hint: std.Io.Writer.Allocating = .init(allocator);
+    defer hint.deinit();
+    try hint.writer.writeAll("  ");
+    if (state.slots.len > 1) try hint.writer.writeAll("Tab/Shift+Tab question · ");
+    try hint.writer.writeAll("↑/↓ select · Enter confirm · Esc cancel");
+    try writeRow(w, allocator, hint.written(), columns);
+    return rows + 1;
+}
+
+/// A closed menu with no free-text row; defaults to the first option. The
+/// ask_user questions go through `resolve` instead, because an answer typed at
+/// them has to be read back with the line editor.
+pub fn selectOnly(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !Choice {
+    var slots = [_]Slot{Slot.init(question, options)};
+    return switch (try form(allocator, io, &slots, false, null)) {
+        .answered => switch (slots[0].answer()) {
+            .option => |index| .{ .option = index },
+            .custom => .cancel,
+            .skip => .cancel,
+        },
+        // Without a free-text row there is nothing to type.
+        .custom => .cancel,
+        .cancel => .cancel,
+    };
 }
 
 /// Write the numbered menu. Only the first option marked recommended is
@@ -376,21 +705,134 @@ const test_options = [_]Option{
     .{ .label = "Skip tests", .description = "", .recommended = false },
 };
 
-test "keyboard menu navigates arrows, wraps, and confirms explicitly" {
-    var state = Selection{ .selected = 0, .count = 3 };
+fn expectAction(expected: std.meta.Tag(Form.Action), action: Form.Action) !void {
+    try std.testing.expectEqual(expected, std.meta.activeTag(action));
+}
+
+const two_options_a = [_]Option{
+    .{ .label = "Alpha", .description = "", .recommended = false },
+    .{ .label = "Beta", .description = "", .recommended = true },
+};
+const two_options_b = [_]Option{
+    .{ .label = "Gamma", .description = "", .recommended = false },
+    .{ .label = "Delta", .description = "", .recommended = true },
+};
+
+test "the form navigates options, arrows and both tabs" {
+    var slots = [_]Slot{ Slot.init("First?", &two_options_a), Slot.init("Second?", &two_options_b) };
+    var state = Form{ .slots = &slots };
+    // Each question starts on its recommendation.
+    try std.testing.expectEqual(@as(usize, 1), slots[0].selected);
+    try std.testing.expectEqual(@as(usize, 1), slots[1].selected);
+
+    // Arrows, vim keys and numbers move inside the focused question only.
     for ("\x1b[A") |byte| _ = state.key(byte);
-    try std.testing.expectEqual(@as(usize, 2), state.selected);
-    for ("\x1bOB") |byte| _ = state.key(byte);
-    try std.testing.expectEqual(@as(usize, 0), state.selected);
-    try std.testing.expectEqual(Selection.Action.redraw, state.key('2'));
-    try std.testing.expectEqual(@as(usize, 1), state.selected);
-    try std.testing.expectEqual(Selection.Action.accept, state.key('\r'));
-    try std.testing.expectEqual(Selection.Action.cancel, state.key(3));
-    try std.testing.expectEqual(Selection.Action.cancel, state.key(4));
-    for ("\x1b[1;5B") |byte| _ = state.key(byte);
-    try std.testing.expectEqual(@as(usize, 2), state.selected);
-    _ = state.key('\t');
-    try std.testing.expectEqual(@as(usize, 0), state.selected);
+    try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
+    try expectAction(.redraw, state.key('2'));
+    try std.testing.expectEqual(@as(usize, 1), slots[0].selected);
+    _ = state.key('j');
+    try std.testing.expectEqual(@as(usize, 2), slots[0].selected);
+    _ = state.key('j');
+    try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
+
+    // Tab goes to the next question, Shift+Tab back to the previous one.
+    try expectAction(.redraw, state.key('\t'));
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+    try expectAction(.redraw, state.key('j'));
+    try std.testing.expectEqual(@as(usize, 2), slots[1].selected);
+    // The first question kept the selection it had when the keyboard left it.
+    try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
+    for ("\x1b[Z") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 0), state.focus);
+    // Tab wraps around, so the last question leads back to the first.
+    for ("\x1b[Z") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+
+    // A habitual Ctrl+C leaves the form alone; Ctrl+D dismisses it.
+    try expectAction(.ignore, state.key(3));
+    try expectAction(.cancel, state.key(4));
+}
+
+test "an answered question can be changed before the form is submitted" {
+    var slots = [_]Slot{ Slot.init("First?", &two_options_a), Slot.init("Second?", &two_options_b) };
+    var state = Form{ .slots = &slots };
+
+    // Enter answers the focused question and moves on to the next unanswered.
+    try expectAction(.redraw, state.key('\r'));
+    try std.testing.expect(slots[0].answered);
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+
+    // Shift+Tab goes back, the answer is still the one given, and it can be
+    // replaced without the form forgetting the question already answered.
+    for ("\x1b[Z") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 0), state.focus);
+    _ = state.key('1');
+    try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
+    try expectAction(.redraw, state.key('\r'));
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+    try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
+
+    // The last answer finishes the form.
+    try expectAction(.finish, state.key('\r'));
+    try std.testing.expect(slots[1].answered);
+}
+
+test "the free-text row asks the caller for a line instead of answering" {
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    var state = Form{ .slots = &slots };
+    // Two options plus the free-text row, which is row 3.
+    _ = state.key('3');
+    try std.testing.expectEqual(@as(usize, 2), slots[0].selected);
+    const action = state.key('\r');
+    try expectAction(.custom, action);
+    try std.testing.expectEqual(@as(usize, 0), switch (action) {
+        .custom => |index| index,
+        else => unreachable,
+    });
+    try std.testing.expect(!slots[0].answered);
+}
+
+test "a typed answer is the slot's answer until an option replaces it" {
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    slots[0].custom = "my own words";
+    slots[0].answered = true;
+    try std.testing.expectEqualStrings("my own words", slots[0].answer().custom);
+
+    // Choosing an option row again drops the typed answer.
+    var state = Form{ .slots = &slots };
+    _ = state.key('1');
+    _ = state.key('\r');
+    try std.testing.expect(slots[0].custom == null);
+    try std.testing.expectEqual(Answer{ .option = 0 }, slots[0].answer());
+}
+
+test "the form draws every question and the options of the focused one" {
+    const allocator = std.testing.allocator;
+    var slots = [_]Slot{
+        Slot.init("First question?", &two_options_a),
+        Slot.init("Second question?", &two_options_b),
+    };
+    var state = Form{ .slots = &slots };
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    // Two headers, the two option rows and the free-text row of the focused
+    // question, and the hint.
+    try std.testing.expectEqual(@as(usize, 6), try drawForm(allocator, &aw.writer, &state, 80));
+
+    const text = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "1/2 First question?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2/2 Second question?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1) Alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Other / 自定义回答") != null);
+    // Only the focused question shows its rows.
+    try std.testing.expect(std.mem.indexOf(u8, text, "1) Gamma") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Tab/Shift+Tab question") != null);
+
+    // An answered question shows what it was answered with.
+    slots[0].answered = true;
+    aw.clearRetainingCapacity();
+    _ = try drawForm(allocator, &aw.writer, &state, 80);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "First question?  → Beta") != null);
 }
 
 test "menu rows fit CJK text and flatten model control characters" {
@@ -493,10 +935,124 @@ test "the description names the recommendation" {
     try std.testing.expectEqualStrings("The user did not pick one of the options and answered: neither", custom);
 }
 
-test "the menu asks for the rows it draws, however many options there are" {
-    // A blank line, the question, the option rows and the hint.
-    try std.testing.expectEqual(@as(usize, 5), rowsFor(1, true));
-    try std.testing.expectEqual(@as(usize, 6), rowsFor(3, false));
-    // The visible window stops at five rows; more options scroll inside it.
-    try std.testing.expectEqual(@as(usize, 8), rowsFor(9, true));
+/// A stand-in for the terminal: it answers the first question still without an
+/// answer, and hands back the scripted lines for the free-text row.
+const FakeReader = struct {
+    /// One entry per free-text read: the line to type, or null for Esc.
+    lines: []const ?[]const u8 = &.{},
+    reads: usize = 0,
+    calls: usize = 0,
+    /// The question the form was last asked to start on.
+    focus: ?usize = null,
+
+    fn present(context: *anyopaque, slots: []Slot, focus: ?usize) anyerror!Outcome {
+        const self: *FakeReader = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        self.focus = focus;
+        // The form is asked to start on a question: answer that one, the way
+        // Enter on it would.
+        if (focus) |index| {
+            const slot = &slots[index];
+            slot.answered = true;
+            return .answered;
+        }
+        for (slots, 0..) |*slot, i| {
+            if (slot.answered) continue;
+            if (slot.selected >= slot.options.len) return .{ .custom = i };
+            slot.answered = true;
+            return .answered;
+        }
+        return .answered;
+    }
+
+    fn read(context: *anyopaque) anyerror!Line {
+        const self: *FakeReader = @ptrCast(@alignCast(context));
+        const line = if (self.reads < self.lines.len) self.lines[self.reads] else null;
+        self.reads += 1;
+        const typed = line orelse return .back;
+        return .{ .answer = try std.testing.allocator.dupe(u8, typed) };
+    }
+};
+
+test "a typed answer is the reply, and Esc in that line goes back to the options" {
+    const allocator = std.testing.allocator;
+
+    // Typed text answers the question.
+    var typed_slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    typed_slots[0].selected = 2;
+    var typed_reader = FakeReader{ .lines = &.{"my own words"} };
+    const typed = try resolve(allocator, &typed_slots, .{
+        .context = &typed_reader,
+        .present = FakeReader.present,
+        .read = FakeReader.read,
+    });
+    defer typed.deinit(allocator);
+    try std.testing.expectEqualStrings("my own words", typed.items[0].custom);
+    try std.testing.expect(typed_slots[0].answered);
+
+    // Esc returns to the options, where Enter takes the recommendation.
+    var escaped_slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    escaped_slots[0].selected = 2;
+    var escaped_reader = FakeReader{ .lines = &.{null} };
+    const escaped = try resolve(allocator, &escaped_slots, .{
+        .context = &escaped_reader,
+        .present = FakeReader.present,
+        .read = FakeReader.read,
+    });
+    defer escaped.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), escaped_reader.calls);
+    // The keyboard went back to the same question, not to the first one.
+    try std.testing.expectEqual(@as(?usize, 0), escaped_reader.focus);
+    try std.testing.expectEqual(@as(usize, 1), escaped_slots[0].selected);
+    try std.testing.expectEqual(@as(usize, 1), switch (escaped.items[0]) {
+        .option => |index| index,
+        else => unreachable,
+    });
+}
+
+test "replies keep the answers given before the form was left" {
+    const allocator = std.testing.allocator;
+    // The first question was answered, the second was not: leaving the form
+    // must not throw the first answer away.
+    var slots = [_]Slot{ Slot.init("First?", &two_options_a), Slot.init("Second?", &two_options_b) };
+    slots[0].answered = true;
+    const replies = try repliesFrom(allocator, &slots);
+    defer replies.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), switch (replies.items[0]) {
+        .option => |index| index,
+        else => unreachable,
+    });
+    try std.testing.expect(switch (replies.items[1]) {
+        .dismissed => true,
+        else => false,
+    });
+}
+
+test "the form asks for the rows it draws, however many options there are" {
+    var one = [_]Slot{Slot.init("Which?", &two_options_a)};
+    // The blank line, the question, its two options and the free-text row, and
+    // the hint.
+    try std.testing.expectEqual(@as(usize, 6), formRows(&one, true));
+    try std.testing.expectEqual(@as(usize, 5), formRows(&one, false));
+
+    // Every question gets a header of its own.
+    var two = [_]Slot{ Slot.init("First?", &two_options_a), Slot.init("Second?", &two_options_b) };
+    try std.testing.expectEqual(@as(usize, 7), formRows(&two, true));
+
+    // The visible window stops at five option rows; more options scroll inside
+    // it, so a long list does not push the conversation off the screen.
+    const many = [_]Option{
+        .{ .label = "1", .description = "", .recommended = false },
+        .{ .label = "2", .description = "", .recommended = false },
+        .{ .label = "3", .description = "", .recommended = false },
+        .{ .label = "4", .description = "", .recommended = false },
+        .{ .label = "5", .description = "", .recommended = false },
+        .{ .label = "6", .description = "", .recommended = false },
+        .{ .label = "7", .description = "", .recommended = false },
+        .{ .label = "8", .description = "", .recommended = false },
+        .{ .label = "9", .description = "", .recommended = false },
+    };
+    var wide = [_]Slot{Slot.init("Which one?", &many)};
+    try std.testing.expectEqual(@as(usize, 8), formRows(&wide, true));
 }

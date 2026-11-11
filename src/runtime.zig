@@ -11,24 +11,24 @@ pub const Runtime = struct {
     future: ?std.Io.Future(void) = null,
     done: std.atomic.Value(bool) = .init(false),
     queue: std.ArrayList([]u8) = .empty,
-    /// The question the worker is waiting on. The worker publishes it under the
-    /// mutex and sleeps; the main thread draws the menu, because it is the one
-    /// owner of the keyboard, and publishes the answer back.
+    /// The form the worker is waiting on. The worker publishes its questions
+    /// under the mutex and sleeps; the main thread draws them, because it is the
+    /// one owner of the keyboard, and publishes the answers back.
     question_mutex: std.Io.Mutex = .init,
-    question: ?Question = null,
+    request: ?Request = null,
     question_waiting: std.atomic.Value(bool) = .init(false),
     question_served: std.atomic.Value(bool) = .init(false),
     /// Set while the main thread is answering: the free-text row is read with
     /// the same editor, so it must not hand the keyboard back to itself.
     question_serving: std.atomic.Value(bool) = .init(false),
 
-    const Question = struct {
-        /// Borrowed from the worker, which keeps them alive until it is served.
-        text: []const u8,
-        options: []const menu.Option,
-        choice: menu.Choice = .cancel,
-        /// The free text of a `custom` choice; owned by this runtime.
-        answer: ?[]u8 = null,
+    const Request = struct {
+        /// Borrowed from the worker, which keeps them alive until the form is
+        /// answered: it waits, and does nothing else, while it is on screen.
+        slots: []menu.Slot,
+        /// The answers, published back for the worker to take. Owned here until
+        /// it does.
+        replies: ?menu.Replies = null,
     };
 
     pub fn busy(self: *Runtime) bool {
@@ -48,10 +48,10 @@ pub const Runtime = struct {
     fn dropQuestion(self: *Runtime) void {
         self.question_mutex.lockUncancelable(self.agent.io);
         defer self.question_mutex.unlock(self.agent.io);
-        if (self.question) |asked| {
-            if (asked.answer) |answer| self.agent.allocator.free(answer);
+        if (self.request) |request| {
+            if (request.replies) |replies| replies.deinit(self.agent.allocator);
         }
-        self.question = null;
+        self.request = null;
         self.question_waiting.store(false, .release);
     }
 
@@ -123,42 +123,36 @@ pub const Runtime = struct {
         self.screen.writeLog("\n") catch {};
     }
 
-    /// The worker's side of a question: publish it and wait for the main
-    /// thread, which owns the keyboard, to put it to the user. Nothing is drawn
-    /// or read here — a worker that touched the terminal would fight the menu
-    /// for the same keys.
-    pub fn choose(context: ?*anyopaque, question: []const u8, options: []const menu.Option) !?[]u8 {
+    /// The worker's side of a form: publish the questions and wait for the main
+    /// thread, which owns the keyboard, to put them to the user. Nothing is
+    /// drawn or read here — a worker that touched the terminal would fight the
+    /// form for the same keys.
+    pub fn presentForm(context: ?*anyopaque, slots: []menu.Slot) !menu.Replies {
         const self: *Runtime = @ptrCast(@alignCast(context));
         self.question_mutex.lockUncancelable(self.agent.io);
-        self.question = .{ .text = question, .options = options };
+        self.request = .{ .slots = slots };
         self.question_served.store(false, .release);
         self.question_mutex.unlock(self.agent.io);
         self.question_waiting.store(true, .release);
 
-        // Short sleeps: the answer is published by the main thread, and an
+        // Short sleeps: the answers are published by the main thread, and an
         // interrupt cancels this sleep, so the wait ends either way.
         while (!self.question_served.load(.acquire)) {
             try self.agent.io.sleep(.fromMilliseconds(20), .awake);
         }
 
         self.question_mutex.lockUncancelable(self.agent.io);
-        const asked = self.question orelse Question{ .text = question, .options = options };
-        self.question = null;
-        // Cleared under the mutex: the main thread must see the question is
+        const replies = if (self.request) |request| request.replies else null;
+        self.request = null;
+        // Cleared under the mutex: the main thread must see the form is
         // consumed before it looks for the next one, or it would draw the same
-        // menu twice.
+        // questions twice.
         self.question_waiting.store(false, .release);
         self.question_mutex.unlock(self.agent.io);
-        defer if (asked.answer) |answer| self.agent.allocator.free(answer);
 
-        return switch (asked.choice) {
-            .option => |index| try menu.describeAnswer(self.agent.allocator, .{ .option = index }, options),
-            .custom => if (asked.answer) |answer|
-                try menu.describeAnswer(self.agent.allocator, .{ .custom = answer }, options)
-            else
-                null,
-            .cancel => null,
-        };
+        // A dropped form is a dismissed one, so the worker always has an answer
+        // for every question, even when the run was interrupted under it.
+        return replies orelse menu.dismissedReplies(self.agent.allocator, slots.len);
     }
 
     /// Whether a question is waiting for the keyboard: the editor stops reading
@@ -169,72 +163,83 @@ pub const Runtime = struct {
         return self.question_waiting.load(.acquire);
     }
 
-    /// Put every pending question to the user, one menu each, and hand each
-    /// answer back to the worker. The caller owns the keyboard: it has already
+    /// Put every pending question to the user, as one form, and hand the
+    /// answers back to the worker. The caller owns the keyboard: it has already
     /// parked the line editor and the terminal's prompt rows are free.
     pub fn serveQuestions(self: *Runtime) !void {
         self.question_serving.store(true, .release);
         defer self.question_serving.store(false, .release);
         while (self.question_waiting.load(.acquire)) {
             self.question_mutex.lockUncancelable(self.agent.io);
-            const asked = self.question orelse {
+            const request = self.request orelse {
                 self.question_mutex.unlock(self.agent.io);
                 return;
             };
             self.question_mutex.unlock(self.agent.io);
 
-            // The question takes the rows the prompt had, so the conversation
-            // above it stays where it is instead of scrolling under the menu.
-            try self.reserveRows(menu.rowsFor(asked.options.len, true));
-            const choice = menu.select(self.agent.allocator, self.agent.io, asked.text, asked.options) catch |err| {
-                self.screen.endInput() catch {};
-                return err;
-            };
-            try self.screen.endInput();
+            try self.serveForm(request.slots);
 
-            switch (choice) {
-                // A dismissed question leaves the run alone: the worker gets
-                // no answer and decides for itself what to do next.
-                .cancel => try self.settle(.cancel, null),
-                .option => |index| try self.settle(.{ .option = index }, null),
-                .custom => {
-                    const answer = try self.agent.readChoiceLine();
-                    if (answer) |text| {
-                        defer self.agent.allocator.free(text);
-                        try self.settle(.custom, text);
-                    } else {
-                        // Nothing typed: the question is dismissed, not answered.
-                        try self.settle(.cancel, null);
-                    }
-                },
-            }
-
-            // Wait for the worker to take the answer before looking for the
-            // next question; otherwise this loop would draw the same menu again.
+            // Wait for the worker to take the answers before looking for the
+            // next form; otherwise this loop would draw the same one again.
             while (self.question_waiting.load(.acquire)) {
                 try self.agent.io.sleep(.fromMilliseconds(2), .awake);
             }
         }
     }
 
-    /// Reserve bottom rows for the menu the way the editor does for its own.
+    /// One form, from its questions to either an answer for every one of them
+    /// or a dismissal. Esc in the free-text row steps back to the form, so it
+    /// is drawn again until it is settled instead of being thrown away.
+    fn serveForm(self: *Runtime, slots: []menu.Slot) !void {
+        const replies = menu.resolve(self.agent.allocator, slots, .{
+            .context = self,
+            .present = presentOnScreen,
+            .read = readOnScreen,
+        }) catch |err| {
+            self.screen.endInput() catch {};
+            // The worker must not be left waiting for an answer that is never
+            // coming: it gets a dismissed form, and the run carries on.
+            self.settle(menu.dismissedReplies(self.agent.allocator, slots.len) catch return err) catch {};
+            return err;
+        };
+        try self.settle(replies);
+    }
+
+    /// Draw the form in the rows the prompt had, so the conversation above it
+    /// stays where it is instead of scrolling under the menu.
+    fn presentOnScreen(context: *anyopaque, slots: []menu.Slot, focus: ?usize) anyerror!menu.Outcome {
+        const self: *Runtime = @ptrCast(@alignCast(context));
+        try self.reserveRows(menu.formRows(slots, true));
+        const outcome = menu.form(self.agent.allocator, self.agent.io, slots, true, focus) catch |err| {
+            self.screen.endInput() catch {};
+            return err;
+        };
+        try self.screen.endInput();
+        return outcome;
+    }
+
+    /// Read the free text a free-text row asks for, with the same editor.
+    fn readOnScreen(context: *anyopaque) anyerror!menu.Line {
+        const self: *Runtime = @ptrCast(@alignCast(context));
+        return self.agent.readChoiceLine();
+    }
+
+    /// Reserve bottom rows for the form the way the editor does for its own.
     fn reserveRows(self: *Runtime, rows: usize) !void {
         self.screen.editor_frame = true;
         defer self.screen.editor_frame = false;
         try self.screen.reserveInput(rows, true);
     }
 
-    /// Publish the user's answer to the worker waiting in `choose`.
-    fn settle(self: *Runtime, choice: menu.Choice, answer: ?[]const u8) !void {
-        const owned = if (answer) |text| try self.agent.allocator.dupe(u8, text) else null;
+    /// Publish the answers to the worker waiting in `presentForm`.
+    fn settle(self: *Runtime, replies: menu.Replies) !void {
         self.question_mutex.lockUncancelable(self.agent.io);
         defer self.question_mutex.unlock(self.agent.io);
-        if (self.question) |*asked| {
-            asked.choice = choice;
-            if (asked.answer) |old| self.agent.allocator.free(old);
-            asked.answer = owned;
-        } else if (owned) |text| {
-            self.agent.allocator.free(text);
+        if (self.request) |*request| {
+            if (request.replies) |old| old.deinit(self.agent.allocator);
+            request.replies = replies;
+        } else {
+            replies.deinit(self.agent.allocator);
         }
         self.question_served.store(true, .release);
     }

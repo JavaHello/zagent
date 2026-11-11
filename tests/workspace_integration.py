@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-trust-') as temporary:
     rejected = run(first, stdin='yes\n')
     assert rejected.returncode != 0 and 'Not trusted' in rejected.stderr
     assert not state.exists(), 'piped input must not grant trust'
-    for keys in (b'\r', b'\x1b[B\x1b[A\r', b'\x03', b'\x04'):
+    for keys in (b'\r', b'\x1b[B\x1b[A\r', b'\x1b', b'\x04'):
         code, output = interact(first, env, keys)
         assert code != 0 and not state.exists(), output
 

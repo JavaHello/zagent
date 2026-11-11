@@ -354,23 +354,46 @@ decision only you can make — the agent calls `ask_user` and you get a menu:
 
 ```
   Which approach should I use?
-  > 1) Rewrite in place (recommended)  Keeps the history intact.
-    2) New file  Leaves the original alone.
-    3) Other / 自定义回答
-  ↑/↓ select · Enter confirm · Ctrl+C or Esc cancel
+    > 1) Rewrite in place (recommended)  Keeps the history intact.
+      2) New file  Leaves the original alone.
+      3) Other / 自定义回答
+  ↑/↓ select · Enter confirm · Esc cancel
 ```
 
-Use ↑/↓ (or j/k and Tab) to move, then Enter to confirm. The recommended option
-is selected initially, or the first option if none is recommended. Number keys
-1–9 also move the selection. Choose Other to type your own answer; Ctrl+C,
-Ctrl+D or Esc dismisses the question and the agent carries on from there on its
-own. Esc stops the task at the prompt, not at a menu: backing out of a question
-should not throw the run away. In the fullscreen session the menu takes the rows
-the prompt had, so nothing typed at a menu reaches the input box or steers the
-task: the keyboard belongs to the question until it is answered. Two or more
-questions arrive one after another, each taking the keyboard in turn. With no
-terminal to type at (piped input, or an unsupported terminal) the recommended
-option is taken and the agent says so. Interactive menus also work in
+Use ↑/↓ (or j/k) to move within a question, then Enter to confirm. The
+recommended option is selected initially, or the first option if none is
+recommended. Number keys 1–9 also move the selection. Choose Other to type your
+own answer; Esc there goes back to the option list, so a mistyped start costs
+nothing. Ctrl+D or Esc at the list dismisses the question and the agent carries
+on from there on its own; Ctrl+C is deliberately not a way out, because it is
+pressed by habit. Esc stops the task at the prompt, not at a question: backing
+out of a question should not throw the run away. In the fullscreen session the
+menu takes the rows the prompt had, so nothing typed at a menu reaches the input
+box or steers the task: the keyboard belongs to the question until it is
+answered.
+
+Several questions asked in one message are drawn as one form, and Tab and
+Shift+Tab move between them:
+
+```
+  1/3 Which approach should I use?  → Rewrite in place
+  2/3 Which tests should I run?  → Full suite
+  3/3 Anything else I should know?
+    > 1) No
+      2) Yes (recommended)
+      3) Other / 自定义回答
+  Tab/Shift+Tab question · ↑/↓ select · Enter confirm · Esc cancel
+```
+
+Enter answers the question that has the keyboard and moves on to the next one
+still without an answer; the last answer submits the form. Answered questions
+show what they were answered with, and Tab or Shift+Tab reaches them again, so a
+wrong answer can be changed until the form is submitted. Only the question with
+the keyboard shows its option rows, which keeps a long form on screen. Leaving
+the form keeps the answers already given and dismisses the rest.
+
+With no terminal to type at (piped input, or an unsupported terminal) the
+recommended option is taken and the agent says so. Interactive menus also work in
 single-query mode and render on stderr.
 
 ### HTTP requests
@@ -643,9 +666,9 @@ ones that change session state wait for the task to end.
 
 Press **Esc** to interrupt the current task, terminate its running tools, and
 discard input typed while it ran, keeping your own draft. If a completion popup
-is open, Esc only closes the popup, and if a question menu is open, Esc only
-dismisses that question and the task carries on. Completed actions are not
-undone.
+is open, Esc only closes the popup, and if a question is open, Esc only steps
+back through it — out of the free-text row to its options, and out of the menu
+to a dismissal — and the task carries on. Completed actions are not undone.
 File search skips `.git`, build caches and `node_modules`, and bounds traversal
 to keep large workspaces responsive. File selection inserts an `@path` reference
 (paths with spaces are quoted); it does not attach file contents automatically.

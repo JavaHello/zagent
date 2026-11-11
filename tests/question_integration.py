@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""A question owns the prompt rows: the menu answers it, the input box does not.
+"""A question owns the prompt rows: the form answers it, the input box does not.
 
-Two ask_user calls arrive in one message, so this also covers the batch: each
-question takes the keyboard in turn, the last row of each menu is free text, and
-nothing typed at the menu reaches the running task as guidance. A second turn
-dismisses a question with Ctrl+C and the task carries on without it.
+Two ask_user calls arrive in one message, so this also covers the batch: they are
+drawn as one form, each with its own rows, and Tab and Shift+Tab walk between
+them — an answer given to a question further up can be changed before the form is
+submitted. The last row of each question is free text, and nothing typed at the
+form reaches the running task as guidance. Esc in the free-text row steps back to
+the options instead of interrupting the run, Ctrl+C is not a way out of a
+question at all, and a dismissed question lets the task carry on.
 """
 import fcntl
 import http.server
@@ -105,22 +108,51 @@ try:
         try:
             until(lambda: clean().count(b'\xe2\x9d\xaf ') > 0, b'the prompt')
 
-            # Turn one: two questions in one message.
+            # Turn one: two questions in one message, drawn as one form. The
+            # first question has the keyboard: stray typing belongs to it, and
+            # Enter answers it with the recommendation.
             os.write(master, b'ask me twice\r')
-
-            # The first menu has the keyboard: stray typing belongs to it, an
-            # arrow key moves the selection, Enter answers.
+            until(lambda: drawn('1/2 First question?'), b'the form')
             until(lambda: drawn('1) Alpha'), b'first question')
             settle()
             os.write(master, b'zz')
-            os.write(master, b'\x1b[A\r')
+            os.write(master, b'\r')
 
-            # The second question follows, and its last row types an answer.
-            until(lambda: drawn('1) Gamma'), b'second question')
+            # The second question takes the keyboard, and the first one shows
+            # the answer it was given.
+            mark = len(transcript)
+            until(lambda: drawn('1) Gamma', mark), b'second question')
+            until(lambda: drawn('1/2 First question?  \u2192 Beta', mark), b'the first answer')
+
+            # Shift+Tab walks back to the question already answered: the wrong
+            # answer can still be changed, and after an arrow key the answer is
+            # the other option. That is the whole point of one form.
+            settle()
+            mark = len(transcript)
+            os.write(master, b'\x1b[Z')
+            until(lambda: drawn('1) Alpha', mark), b'the first question again')
+            settle()
+            os.write(master, b'\x1b[A\r')
+            mark = len(transcript)
+            until(lambda: drawn('1) Gamma', mark), b'the second question again')
+            until(lambda: drawn('1/2 First question?  \u2192 Alpha', mark), b'the changed answer')
+
+            # The second question's last row types an answer.
             settle()
             os.write(master, b'3\r')
-            until(lambda: b'choice' in clean(), b'the free-text prompt')
-            if b'\x1b[6n' in transcript:
+            until(lambda: b'choice' in clean()[mark:], b'the free-text prompt')
+            if b'\x1b[6n' in transcript[mark:]:
+                os.write(master, b'\x1b[1;1R')
+            # Esc in the free-text row goes back to the options: it is neither a
+            # dismissal nor an interruption of the run.
+            mark = len(transcript)
+            os.write(master, b'\x1b')
+            until(lambda: drawn('1) Gamma', mark), b'the options again')
+            settle()
+            assert b'interrupted' not in clean(), transcript
+            os.write(master, b'3\r')
+            until(lambda: b'choice' in clean()[mark:], b'the free-text row again')
+            if b'\x1b[6n' in transcript[mark:]:
                 os.write(master, b'\x1b[1;1R')
             os.write(master, b'my own words\r')
             until(lambda: b'Turn complete' in clean(), b'the answer')
@@ -135,12 +167,17 @@ try:
             # Both tool results reached the model in the same request.
             assert len([r for r in requests if r.get('tools')]) == 2, requests
 
-            # Turn two: Ctrl+C dismisses the question and the task goes on.
+            # Turn two: Ctrl+C is not a way out of a question, Esc dismisses it
+            # and the task goes on.
             mark = len(transcript)
             os.write(master, b'cancel please\r')
             until(lambda: drawn('1) Alpha', mark), b'the cancelled question')
             settle()
             os.write(master, b'\x03')
+            settle(0.3)
+            assert len(answers) == 2, 'Ctrl+C must not answer or dismiss a question'
+            assert process.poll() is None, transcript
+            os.write(master, b'\x1b')
             until(lambda: len(answers) == 3, b'the dismissed result')
             assert 'dismissed without an answer' in answers[2][1], answers
 
@@ -148,8 +185,10 @@ try:
             until(lambda: b'Goodbye!' in transcript, b'the exit')
             assert process.wait(timeout=5) == 0
             assert termios.tcgetattr(slave) == original, 'raw terminal was not restored'
-            print('PASS: questions share the prompt rows and take the keyboard, the last row '
-                  'types an answer, Ctrl+C dismisses one, and menu keys never steer the task')
+            print('PASS: questions share the prompt rows, one form holds them all, Tab and '
+                  'Shift+Tab revise an answer already given, the last row types an answer or '
+                  'steps back to the options, Ctrl+C is ignored, Esc dismisses one, and form '
+                  'keys never steer the task')
         finally:
             if process.poll() is None:
                 process.kill()
