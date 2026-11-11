@@ -231,39 +231,35 @@ pub fn main(init: std.process.Init) !void {
     defer if (history_path) |path| allocator.free(path);
 
     // The MCP servers are started before the first question, because the tools
-    // they bring are part of what the question is asked with. Everything about
-    // them is written to stderr: stdout belongs to the answer, and
-    // `zagent "..." > notes.md` must stay clean.
+    // they bring are part of what the question is asked with.
     var problems: std.ArrayList([]u8) = .empty;
     defer {
         for (problems.items) |problem| allocator.free(problem);
         problems.deinit(allocator);
     }
     const stderr = std.Io.File.stderr();
+    // What came of the servers is collected rather than printed: the
+    // interactive session takes the terminal over and starts on a blank
+    // screen, so a line written now would be erased before it could be read.
+    // It is drawn under the wordmark instead. Only the per-server "starting"
+    // progress stays live, because that is what the wait looks like.
+    var report: std.Io.Writer.Allocating = .init(allocator);
+    defer report.deinit();
     var watcher = McpProgress{ .io = io, .allocator = allocator };
     var registry = mcp.Registry.connect(allocator, io, env, &problems, .{
         .context = &watcher,
         .started = McpProgress.started,
     }) catch |err| failed: {
-        try printToStderr(allocator, io, YELLOW ++ "  ⚠ mcp: no servers were read: {s}\n" ++ RESET, .{@errorName(err)});
+        try report.writer.print(YELLOW ++ "  ⚠ mcp: no servers were read: {s}\n" ++ RESET, .{@errorName(err)});
         break :failed mcp.Registry.empty(allocator, io);
     };
     // Declared before the agent, because the agent borrows it and the defers
     // run in reverse: the agent has to be gone before this one is freed.
     defer registry.deinit();
-    {
-        var buf: [4096]u8 = undefined;
-        var file_writer = stderr.writerStreaming(io, &buf);
-        for (problems.items) |problem| {
-            try file_writer.interface.print(YELLOW ++ "  ⚠ {s}\n" ++ RESET, .{problem});
-        }
-        try registry.writeStartup(&file_writer.interface);
-        try file_writer.interface.flush();
-        if (registry.functionJson().len > 0) {
-            try file_writer.interface.writeAll(DIM ++ "\n" ++ RESET);
-            try file_writer.interface.flush();
-        }
+    for (problems.items) |problem| {
+        try report.writer.print(YELLOW ++ "  ⚠ {s}\n" ++ RESET, .{problem});
     }
+    try registry.writeStartup(&report.writer);
 
     var agent = try Agent.init(allocator, io, config, &ln, env, &registry);
     defer agent.deinit();
@@ -274,6 +270,13 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (args.items.len > query_start) {
+        // No wordmark and no screen in this mode, so the report goes out here,
+        // to stderr: stdout belongs to the answer, and `zagent "..." > notes.md`
+        // stays clean.
+        if (report.written().len > 0) {
+            try stderr.writeStreamingAll(io, report.written());
+            try stderr.writeStreamingAll(io, "\n");
+        }
         if (agent.session_id) |id| {
             try printToStderr(allocator, io, "Session: {s} (resume: zagent --resume {s})\n", .{ id, id });
         }
@@ -283,7 +286,7 @@ pub fn main(init: std.process.Init) !void {
         try agent.processQuery(query);
     } else {
         // Interactive REPL mode
-        try runRepl(allocator, io, env, &agent, config, &ln, history_path, &registry);
+        try runRepl(allocator, io, env, &agent, config, &ln, history_path, &registry, report.written());
         if (agent.session_id) |id| {
             try printToStderr(allocator, io, "Resume session: zagent --resume {s}\n", .{id});
         }
@@ -299,6 +302,7 @@ fn runRepl(
     ln: *Linenoise,
     history_path: ?[]const u8,
     registry: *const mcp.Registry,
+    mcp_report: []const u8,
 ) !void {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
@@ -357,6 +361,9 @@ fn runRepl(
             .mode = banner.detect(env, ln.term_supported and (stdout.isTty(io) catch false)),
             .columns = if (screen.isActive()) screen.cols else term.columns(stdout),
         });
+        // The startup report belongs to the header, and the terminal was taken
+        // over after the servers were started: this is where it can be read.
+        if (mcp_report.len > 0) try aw.writer.writeAll(mcp_report);
         try aw.writer.writeByte('\n');
         try writeOut(&screen, stdout, io, aw.written());
     }

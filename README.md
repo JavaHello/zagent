@@ -539,6 +539,10 @@ every HTTP request, `timeoutMs` says how long a request waits for an answer
 
 ```
   ⚙ mcp: starting "filesystem"…
+
+  ███████╗ █████╗  ██████╗ ███████╗███╗   ██╗████████╗
+  ...
+  ✦ an AI agent in your terminal
   ✓ mcp: filesystem — 11 tools, 2025-06-18
 
 ❯ what is in /tmp?
@@ -548,6 +552,10 @@ every HTTP request, `timeoutMs` says how long a request waits for an answer
   ✓ [FILE] notes.md
     [DIR] projects
 ```
+
+`⚙ starting` is written while a server is being started; the `✓`/`✗` report is
+drawn under the wordmark once the session owns the terminal, so it stays in the
+conversation instead of being overwritten by the screen.
 
 `/mcp` lists the servers, their transport, the revision each one settled on,
 and what each brought. Seven behaviours are worth knowing:
