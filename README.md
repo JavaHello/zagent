@@ -513,7 +513,25 @@ with `+++ /dev/null` and a hunk that removes them. Git's `a/` and `b/` prefixes
 are stripped, and everything else `git diff` writes around a diff is ignored, so
 its output applies as it comes.
 
-Five behaviours are worth knowing:
+A rename is one of those things `git diff` writes around a diff, and it is
+applied as a rename rather than as the pair of headers it looks like:
+
+```
+diff --git a/greet.txt b/hello.txt
+similarity index 100%
+rename from greet.txt
+rename to hello.txt
+```
+
+That section is the whole change — nothing is read or rewritten, the file
+simply has another name, mode and timestamps included. A rename that changes
+text as well carries the usual `---`/`+++` hunks, which are matched against the
+old file and written under the new one. The `rename from`/`rename to` lines are
+the only place a rename is read from: a patch whose `---` and `+++` name two
+different files and has them is refused, because that is also what a mistyped
+path looks like.
+
+Six behaviours are worth knowing:
 
 - **All or nothing.** Every hunk of every file is matched before anything is
   written, so a patch whose third hunk fails leaves the tree exactly as it was.
@@ -529,8 +547,15 @@ Five behaviours are worth knowing:
 - **Line endings and final newlines are preserved.** A patch that touches one
   line of a CRLF file does not rewrite every other line, and a file that did not
   end with a newline does not gain one unless a line is added at the end.
-- **Renames are refused rather than inferred.** A patch naming two different
-  files is an error; delete and create in two steps instead.
+- **Renames are applied, not inferred.** A git rename section moves the file and
+  reports where it came from. Two headers that merely disagree — no `rename
+  from`/`rename to` in sight — are an error, and so is a rename onto a file that
+  is already there or from one that is not; delete and create in two steps
+  instead.
+- **Mode changes and copies are refused.** A section that changes only a file's
+  permissions, or that copies one to a second name, is not something a text
+  patch can carry out, so the whole patch comes back with that said rather than
+  half applied.
 
 ### MCP servers
 

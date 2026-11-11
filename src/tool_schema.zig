@@ -85,7 +85,7 @@ pub const write = ToolDefinition{
 
 pub const apply_patch = ToolDefinition{
     .name = "apply_patch",
-    .description = "Apply a unified diff to one or more files, in the standard '--- a/path' and '+++ b/path' headers plus '@@ ... @@' hunks. Counts and line numbers are forgiving, but the context and removed lines have to match the file exactly, and a hunk whose text matches nowhere, or in two places, is refused. Create a file with '--- /dev/null' and delete one with '+++ /dev/null'; renames are not supported.",
+    .description = "Apply a unified diff to one or more files, in the standard '--- a/path' and '+++ b/path' headers plus '@@ ... @@' hunks. Counts and line numbers are forgiving, but the context and removed lines have to match the file exactly, and a hunk whose text matches nowhere, or in two places, is refused. Create a file with '--- /dev/null' and delete one with '+++ /dev/null'. A rename is written the way git writes it: 'diff --git a/old b/new' with 'rename from old' and 'rename to new', plus '--- a/old' and '+++ b/new' hunks when the text changes too.",
     .parameters_json =
     \\{"type":"object","properties":{"patch":{"type":"string","description":"The unified diff to apply, with its newlines"}},"required":["patch"]}
     ,

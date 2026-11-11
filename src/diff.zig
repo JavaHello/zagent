@@ -12,10 +12,16 @@
 //! Nothing is written until every file of the patch has been rebuilt in memory,
 //! so a patch whose last hunk fails leaves the tree exactly as it was.
 //!
-//! What is deliberately not supported: renames (a patch whose two headers name
-//! different files is refused rather than quietly deleting one of them), binary
-//! hunks, and the line shifting that lets `patch(1)` apply a hunk to text it
-//! does not quite match.
+//! What is deliberately not supported: binary hunks, mode changes, and the line
+//! shifting that lets `patch(1)` apply a hunk to text it does not quite match.
+//!
+//! A rename is read the way git writes one — a `diff --git a/old b/new` section
+//! with `rename from`/`rename to`, and either no `---`/`+++` pair at all
+//! (nothing but the name changes) or one whose hunks apply to the old file —
+//! because that is the form that says "rename" rather than "these two headers
+//! disagree". A bare `--- old` / `+++ new` with no such section is still
+//! refused: that is what a mistyped path looks like, and the pair of headers is
+//! the one part of a patch whose mismatch is more likely a typo than an intent.
 
 const std = @import("std");
 const sgr = @import("style.zig");
@@ -34,11 +40,14 @@ const render_max_lines: usize = 400;
 /// Longest patch line drawn, for the same reason.
 const render_max_line_bytes: usize = 2000;
 
-pub const Action = enum { modified, created, deleted };
+pub const Action = enum { modified, created, deleted, renamed };
 
 /// One file the patch changed, as it was changed. Owns `path`.
 pub const FileStat = struct {
+    /// The file's path after the patch: the new name of a rename.
     path: []const u8,
+    /// For a rename, the path the file had before. Owned; null otherwise.
+    from: ?[]const u8 = null,
     action: Action,
     added: usize,
     removed: usize,
@@ -53,14 +62,19 @@ pub const Outcome = union(enum) {
 
     pub fn deinit(self: Outcome, allocator: std.mem.Allocator) void {
         switch (self) {
-            .applied => |stats| {
-                for (stats) |stat| allocator.free(stat.path);
-                allocator.free(stats);
-            },
+            .applied => |stats| freeStats(allocator, stats),
             .failed => |message| allocator.free(message),
         }
     }
 };
+
+fn freeStats(allocator: std.mem.Allocator, stats: []const FileStat) void {
+    for (stats) |stat| {
+        allocator.free(stat.path);
+        if (stat.from) |from| allocator.free(from);
+    }
+    allocator.free(stats);
+}
 
 /// Parse `patch_text` and apply it to the files it names, relative to the
 /// working directory.
@@ -107,12 +121,16 @@ pub fn apply(allocator: std.mem.Allocator, io: std.Io, patch_text: []const u8) !
         // Only the entries that were built: the rest of the allocation is
         // uninitialised, and freeing a pointer read out of it is not a thing
         // that can be undone.
-        for (stats[0..filled]) |stat| allocator.free(stat.path);
+        for (stats[0..filled]) |stat| {
+            allocator.free(stat.path);
+            if (stat.from) |from| allocator.free(from);
+        }
         allocator.free(stats);
     }
     for (plans.items, 0..) |plan, i| {
         stats[i] = .{
             .path = try allocator.dupe(u8, plan.path),
+            .from = if (plan.old_path) |old| try allocator.dupe(u8, old) else null,
             .action = plan.action,
             .added = plan.added,
             .removed = plan.removed,
@@ -132,8 +150,7 @@ pub fn apply(allocator: std.mem.Allocator, io: std.Io, patch_text: []const u8) !
                     "wrote {d} file(s), then could not write '{s}': {s}. The tree is part-patched; check those files",
                     .{ i, plan.path, @errorName(err) },
                 );
-            for (stats) |stat| allocator.free(stat.path);
-            allocator.free(stats);
+            freeStats(allocator, stats);
             return .{ .failed = message };
         };
     }
@@ -141,32 +158,76 @@ pub fn apply(allocator: std.mem.Allocator, io: std.Io, patch_text: []const u8) !
     return .{ .applied = stats };
 }
 
-/// Write one planned file, or remove it for a deletion.
+/// Write one planned file: a new body for a modified or created file, the same
+/// bytes under a new name for a rename, nothing at all but a removal for a
+/// deletion.
 fn writePlan(io: std.Io, plan: Plan) !void {
-    const content = plan.content orelse {
-        try std.Io.Dir.cwd().deleteFile(io, plan.path);
-        return;
-    };
+    const cwd = std.Io.Dir.cwd();
+    switch (plan.action) {
+        .deleted => try cwd.deleteFile(io, plan.path),
+        .renamed => {
+            const old = plan.old_path.?;
+            const content = plan.content orelse {
+                // Nothing but the name changes, so nothing has to be rewritten:
+                // a plain rename keeps the bytes, the mode and the timestamps.
+                if (std.Io.Dir.path.dirname(plan.path)) |dir_path| {
+                    cwd.createDirPath(io, dir_path) catch {};
+                }
+                return cwd.rename(old, cwd, plan.path, io);
+            };
+            // The body is rewritten, so the mode has to be carried across by
+            // hand: an executable script that is renamed stays executable.
+            var permissions: ?std.Io.Dir.Permissions = null;
+            if (cwd.statFile(io, old, .{})) |stat| {
+                permissions = stat.permissions;
+            } else |_| {}
+            try writeBytes(io, plan.path, content, permissions);
+            // On a case-insensitive file system a rename that only changes case
+            // writes the file it is about to delete, so the deletion is skipped
+            // when both names turn out to be the one file.
+            if (!sameFile(io, old, plan.path)) try cwd.deleteFile(io, old);
+        },
+        else => try writeBytes(io, plan.path, plan.content.?, null),
+    }
+}
 
-    if (std.Io.Dir.path.dirname(plan.path)) |dir_path| {
+fn writeBytes(io: std.Io, path: []const u8, content: []const u8, permissions: ?std.Io.Dir.Permissions) !void {
+    if (std.Io.Dir.path.dirname(path)) |dir_path| {
         std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
     }
-    const file = try std.Io.Dir.cwd().createFile(io, plan.path, .{});
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
     try file.writeStreamingAll(io, content);
+    if (permissions) |perms| file.setPermissions(io, perms) catch {};
+}
+
+/// Whether two paths name one file on disk. Only a rename asks: it is what keeps
+/// a case-only rename on a case-insensitive file system from deleting the file
+/// it has just written.
+fn sameFile(io: std.Io, a: []const u8, b: []const u8) bool {
+    var buf_a: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var buf_b: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len_a = std.Io.Dir.cwd().realPathFile(io, a, &buf_a) catch return false;
+    const len_b = std.Io.Dir.cwd().realPathFile(io, b, &buf_b) catch return false;
+    return std.mem.eql(u8, buf_a[0..len_a], buf_b[0..len_b]);
 }
 
 /// What one file of a patch came to, once every hunk of it has been matched.
 const Plan = struct {
+    /// The path the file has after the patch.
     path: []const u8,
+    /// For a rename, the path it had before. Owned; null otherwise.
+    old_path: ?[]const u8,
     action: Action,
-    /// The file's new contents, or null for a deletion. Owned.
+    /// The file's new contents, or null for a deletion, and for a rename that
+    /// changes nothing but the name. Owned.
     content: ?[]u8,
     added: usize,
     removed: usize,
 
     fn deinit(self: Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
+        if (self.old_path) |old| allocator.free(old);
         if (self.content) |content| allocator.free(content);
     }
 };
@@ -181,42 +242,75 @@ fn planFile(
     file: FilePatch,
     diag: *Diagnostic,
 ) (error{ OutOfMemory, BadPatch })!Plan {
+    // Two names that are not the same name are a rename, and a rename read out
+    // of two headers alone is how a mistyped path turns into a lost file. So the
+    // difference is only taken as a rename when the patch said so in git's own
+    // words; a bare pair that disagrees is refused, and the agent can delete and
+    // create instead, in two patches whose results it can check.
+    const rename = file.renamed and file.old_path != null and file.new_path != null and
+        !std.mem.eql(u8, file.old_path.?, file.new_path.?);
+
+    if (!rename) {
+        if (file.old_path) |old| {
+            if (file.new_path) |new| {
+                if (!std.mem.eql(u8, old, new)) {
+                    diag.say("the patch names two different files, '{s}' and '{s}'. A rename is sent the way git writes it — 'diff --git a/{s} b/{s}' with 'rename from' and 'rename to', or with '--- a/{s}' and '+++ b/{s}' hunks — and anything else is a create of the new file plus a delete of the old one", .{ old, new, old, new, old, new });
+                    return error.BadPatch;
+                }
+            }
+        }
+    }
+
     const action: Action = if (file.old_path == null)
         .created
     else if (file.new_path == null)
         .deleted
+    else if (rename)
+        .renamed
     else
         .modified;
+    // The name the file had before the patch: the old side of a rename, and the
+    // file a patch against one name changes.
+    const original_path = file.old_path orelse file.new_path.?;
+    // The name the file has after it.
     const path = file.new_path orelse file.old_path.?;
-
-    // Two names that are not the same name are a rename, and a rename applied
-    // by halves is how a mistyped header turns into a lost file. The agent can
-    // delete and create instead, in two patches whose results it can check.
-    if (file.old_path) |old| {
-        if (file.new_path) |new| {
-            if (!std.mem.eql(u8, old, new)) {
-                diag.say("the patch names two different files, '{s}' and '{s}': renames are not supported, so patch the new file and delete the old one in two steps", .{ old, new });
-                return error.BadPatch;
-            }
-        }
-    }
 
     if (action == .created and pathExists(io, path)) {
         diag.say("'{s}' already exists, so it cannot be created: send it as a patch against the file it is now", .{path});
         return error.BadPatch;
     }
+    if (action == .renamed) {
+        if (!pathExists(io, original_path)) {
+            diag.say("'{s}' cannot be renamed because it does not exist: a rename has to start from a file the tree has", .{original_path});
+            return error.BadPatch;
+        }
+        // Checking before reading rather than while writing: the new name is
+        // what the patch would otherwise overwrite without saying so.
+        if (pathExists(io, path)) {
+            diag.say("the rename target '{s}' already exists, so '{s}' cannot be renamed onto it: move it away first, or patch it in place", .{ path, original_path });
+            return error.BadPatch;
+        }
+    }
+
+    // A rename that changes nothing but the name is not read at all: the bytes
+    // are the old file's, and moving them is cheaper and more exact than
+    // rebuilding them from the lines they split into.
+    if (action == .renamed and file.hunks.len == 0) {
+        return buildPlan(allocator, path, original_path, action, null, 0, 0);
+    }
 
     const original: []u8 = if (action == .created)
         try allocator.dupe(u8, "")
     else
-        std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_file_bytes)) catch |err| {
+        std.Io.Dir.cwd().readFileAlloc(io, original_path, allocator, .limited(max_file_bytes)) catch |err| {
             if (err == error.StreamTooLong) {
-                diag.say("'{s}' is larger than the {d} MB this tool reads", .{ path, max_file_bytes / (1024 * 1024) });
+                diag.say("'{s}' is larger than the {d} MB this tool reads", .{ original_path, max_file_bytes / (1024 * 1024) });
                 return error.BadPatch;
             }
-            diag.say("'{s}' could not be read ({s}): it has to exist before it can be patched, and a new file is sent with '--- /dev/null'", .{ path, @errorName(err) });
+            diag.say("'{s}' could not be read ({s}): it has to exist before it can be patched, and a new file is sent with '--- /dev/null'", .{ original_path, @errorName(err) });
             return error.BadPatch;
         };
+
     defer allocator.free(original);
 
     var source = try readLines(allocator, original);
@@ -245,8 +339,8 @@ fn planFile(
         // `locate` has more than one way to find nothing, and each explains
         // itself; `describeMiss` is for the one that has nothing to say yet.
         const already_said = diag.written().len;
-        const at = locate(diag, path, source.lines.items, consumed, hunk, stated, anchor) orelse {
-            if (diag.written().len == already_said) describeMiss(diag, path, source.lines.items, hunk, stated);
+        const at = locate(diag, original_path, source.lines.items, consumed, hunk, stated, anchor) orelse {
+            if (diag.written().len == already_said) describeMiss(diag, original_path, source.lines.items, hunk, stated);
             return error.BadPatch;
         };
         if (oldSideLen(hunk) > 0) anchor = .{ .stated = stated, .actual = at };
@@ -302,8 +396,24 @@ fn planFile(
         content = try joined.toOwnedSlice();
     }
 
+    return buildPlan(allocator, path, if (action == .renamed) original_path else null, action, content, added, removed);
+}
+
+/// The plan for one file, taking its own copy of both names.
+fn buildPlan(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    old_path: ?[]const u8,
+    action: Action,
+    content: ?[]u8,
+    added: usize,
+    removed: usize,
+) error{OutOfMemory}!Plan {
+    const owned_path = try allocator.dupe(u8, path);
+    const owned_old = if (old_path) |old| try allocator.dupe(u8, old) else null;
     return .{
-        .path = try allocator.dupe(u8, path),
+        .path = owned_path,
+        .old_path = owned_old,
         .action = action,
         .content = content,
         .added = added,
@@ -564,6 +674,9 @@ const FilePatch = struct {
     old_path: ?[]const u8,
     /// Null when the header was `/dev/null`, i.e. the file is being deleted.
     new_path: ?[]const u8,
+    /// Whether the patch says in git's own words that these two names are one
+    /// rename, rather than two headers that happen to disagree.
+    renamed: bool = false,
     hunks: []Hunk,
 
     fn deinit(self: FilePatch, allocator: std.mem.Allocator) void {
@@ -571,6 +684,58 @@ const FilePatch = struct {
         if (self.new_path) |path| allocator.free(path);
         for (self.hunks) |hunk| hunk.deinit(allocator);
         allocator.free(self.hunks);
+    }
+};
+
+/// What a git section says about the file before its hunks: the file it is
+/// about, the mode change it may announce, and the `rename from`/`rename to`
+/// pair that makes it a rename.
+///
+/// Kept between the lines that carry it rather than read where it is used,
+/// because a rename's two names are written before the headers that repeat them,
+/// and because a rename with no hunks at all has nothing else to be read from.
+/// Owns its names.
+const Section = struct {
+    /// The name the section starts from: the `rename from` line.
+    from: ?[]const u8 = null,
+    /// The name it goes to: the `rename to` line.
+    to: ?[]const u8 = null,
+    /// The file `diff --git` says the section is about. Kept for the refusals
+    /// that have no rename lines to name a file with.
+    subject: ?[]const u8 = null,
+    /// The line the section began on, so a refusal can point at it.
+    line: usize = 0,
+    /// A section whose mode changed, which this tool cannot carry out:
+    /// refusing beats applying half of a patch.
+    mode_changed: bool = false,
+    /// `copy from`/`copy to`. A copy leaves the original in place, so reading it
+    /// as a rename would delete a file the patch never mentions again.
+    copy: bool = false,
+
+    fn deinit(self: *Section, allocator: std.mem.Allocator) void {
+        self.clear(allocator);
+        self.* = .{};
+    }
+
+    fn clear(self: *Section, allocator: std.mem.Allocator) void {
+        if (self.from) |from| allocator.free(from);
+        if (self.to) |to| allocator.free(to);
+        if (self.subject) |subject| allocator.free(subject);
+        self.from = null;
+        self.to = null;
+        self.subject = null;
+        self.line = 0;
+        self.mode_changed = false;
+        self.copy = false;
+    }
+
+    fn isRename(self: Section) bool {
+        return self.from != null and self.to != null and !std.mem.eql(u8, self.from.?, self.to.?);
+    }
+
+    /// The file to name when explaining what this section cannot be applied as.
+    fn named(self: Section) []const u8 {
+        return self.from orelse self.to orelse self.subject orelse "a file";
     }
 };
 
@@ -631,16 +796,53 @@ fn parse(allocator: std.mem.Allocator, patch_text: []const u8, diag: *Diagnostic
     }
 
     var cursor: Cursor = .{ .lines = all.items };
+    // Git's metadata for the file whose hunks are being read, or for the rename
+    // that has none.
+    var section: Section = .{};
+    defer section.deinit(allocator);
+
     while (cursor.take()) |raw| {
         const line = std.mem.trimEnd(u8, raw, " \t");
+
+        if (std.mem.startsWith(u8, line, "diff --git ")) {
+            // Whatever the section before this one announced and never got to
+            // apply is finished here: a rename that changes nothing but the name
+            // is the whole of its section.
+            if (try finishSection(&section, diag)) |file_patch| {
+                try appendFile(allocator, &files, file_patch, diag);
+            }
+            section.clear(allocator);
+            section.line = cursor.i;
+            section.subject = try diffGitSubject(allocator, line);
+            continue;
+        }
+        if (gitMeta(line)) |what| {
+            // A section that git did not open with `diff --git` is still a
+            // section, and its first metadata line is where it starts.
+            if (section.line == 0) section.line = cursor.i;
+            switch (what) {
+                // A rename is read from these two lines and from nowhere else:
+                // they are the only part of a git patch that says "one file, two
+                // names" rather than "these headers disagree", and git writes
+                // both for every rename it finds, hunks or none.
+                .rename_from => try setSectionPath(allocator, &section.from, line["rename from ".len..]),
+                .rename_to => try setSectionPath(allocator, &section.to, line["rename to ".len..]),
+                .copy => section.copy = true,
+                .mode => section.mode_changed = true,
+            }
+            continue;
+        }
         if (isDecoration(line)) continue;
 
         if (std.mem.startsWith(u8, line, "--- ")) {
-            if (files.items.len >= max_files) {
-                diag.say("the patch changes more than {d} files", .{max_files});
-                return error.BadPatch;
-            }
-            try files.append(allocator, try parseFile(allocator, &cursor, line, diag));
+            // A copy with hunks is still a copy: its hunks would land, and then
+            // the original would be deleted as though this were a rename.
+            try rejectCopy(&section, diag);
+            const file_patch = try parseFile(allocator, &cursor, line, &section, diag);
+            // The section's names are the file's now; the next file starts a new
+            // one.
+            section.clear(allocator);
+            try appendFile(allocator, &files, file_patch, diag);
             continue;
         }
 
@@ -648,26 +850,116 @@ fn parse(allocator: std.mem.Allocator, patch_text: []const u8, diag: *Diagnostic
         return error.BadPatch;
     }
 
+    // A rename with no hunks is the last thing in a patch as often as it is the
+    // first, so the section is finished here too.
+    if (try finishSection(&section, diag)) |file_patch| {
+        try appendFile(allocator, &files, file_patch, diag);
+    }
+
     if (files.items.len == 0) {
-        diag.say("no file headers found: a patch starts with '--- a/path' followed by '+++ b/path'", .{});
+        diag.say("no file headers found: a patch starts with '--- a/path' followed by '+++ b/path', or with a git 'diff --git a/path b/path' section", .{});
         return error.BadPatch;
     }
 
     return .{ .files = try files.toOwnedSlice(allocator) };
 }
 
+/// The git metadata lines that decide what a section means, as opposed to the
+/// ones that only say what it came from and are skipped as decoration.
+const Meta = enum { rename_from, rename_to, copy, mode };
+
+fn gitMeta(line: []const u8) ?Meta {
+    if (std.mem.startsWith(u8, line, "rename from ")) return .rename_from;
+    if (std.mem.startsWith(u8, line, "rename to ")) return .rename_to;
+    if (std.mem.startsWith(u8, line, "copy from ") or std.mem.startsWith(u8, line, "copy to ")) return .copy;
+    if (std.mem.startsWith(u8, line, "old mode ") or std.mem.startsWith(u8, line, "new mode ")) return .mode;
+    return null;
+}
+
+fn appendFile(
+    allocator: std.mem.Allocator,
+    files: *std.ArrayList(FilePatch),
+    file: FilePatch,
+    diag: *Diagnostic,
+) (error{ OutOfMemory, BadPatch })!void {
+    if (files.items.len >= max_files) {
+        var given = file;
+        given.deinit(allocator);
+        diag.say("the patch changes more than {d} files", .{max_files});
+        return error.BadPatch;
+    }
+    try files.append(allocator, file);
+}
+
+/// The `b/` side of a `diff --git` line: the file the section is about.
+///
+/// Only ever used to name a file in a refusal, so a line this cannot read — a
+/// quoted name, say — is no loss: the rename lines are what an apply needs, and
+/// they are read on their own.
+fn diffGitSubject(allocator: std.mem.Allocator, line: []const u8) error{OutOfMemory}!?[]const u8 {
+    const rest = line["diff --git ".len..];
+    const split = std.mem.indexOf(u8, rest, " b/") orelse return null;
+    return headerPath(allocator, rest[split + 1 ..]);
+}
+
+fn setSectionPath(allocator: std.mem.Allocator, slot: *?[]const u8, rest: []const u8) error{OutOfMemory}!void {
+    const path = (try headerPath(allocator, rest)) orelse return;
+    if (slot.*) |old| allocator.free(old);
+    slot.* = path;
+}
+
+/// A copy is not a rename, and the difference is a file: this tool would land
+/// the copied hunks and then take the original away.
+fn rejectCopy(section: *Section, diag: *Diagnostic) error{BadPatch}!void {
+    if (!section.copy) return;
+    diag.say("the section on line {d} copies into '{s}', which this tool does not do: send the copied file as a new file and leave the original where it is", .{ section.line, section.named() });
+    return error.BadPatch;
+}
+
+/// Finish a section that ended without hunks. A rename needs none — the two
+/// names are the whole change — and anything else has nothing this tool can do.
+fn finishSection(section: *Section, diag: *Diagnostic) error{ BadPatch, OutOfMemory }!?FilePatch {
+    try rejectCopy(section, diag);
+    if ((section.from == null) != (section.to == null)) {
+        diag.say("the section on line {d} has only one of 'rename from' and 'rename to': a rename names the file it starts from and the file it becomes, and '{s}' cannot be moved on one of them", .{ section.line, section.named() });
+        return error.BadPatch;
+    }
+    if (section.isRename()) {
+        const from = section.from.?;
+        const to = section.to.?;
+        section.from = null;
+        section.to = null;
+        return FilePatch{
+            .old_path = from,
+            .new_path = to,
+            .renamed = true,
+            .hunks = &.{},
+        };
+    }
+    if (section.mode_changed) {
+        diag.say("the section on line {d} changes only the mode of '{s}', and this tool does not change permissions: a patch here has to change text", .{ section.line, section.named() });
+        return error.BadPatch;
+    }
+    return null;
+}
+
 /// Read one file of a patch: its `+++` header and every hunk up to the next
 /// file, or the end.
+///
+/// `section` is what the git metadata before the headers said, which is where
+/// a rename's two names are already known and where the headers may only agree.
 fn parseFile(
     allocator: std.mem.Allocator,
     cursor: *Cursor,
     old_line: []const u8,
+    section: *Section,
     diag: *Diagnostic,
 ) (error{ OutOfMemory, BadPatch })!FilePatch {
     const header_number = cursor.i;
     var file: FilePatch = .{
         .old_path = try headerPath(allocator, old_line[4..]),
         .new_path = null,
+        .renamed = section.isRename(),
         .hunks = &.{},
     };
     errdefer {
@@ -688,6 +980,16 @@ fn parseFile(
     }
     file.new_path = try headerPath(allocator, plus[4..]);
 
+    // Git's rename lines are the authority on a rename's two names, and the
+    // headers repeat them. Agreement is required: a patch that says one thing in
+    // 'rename to' and another in '+++' is a patch whose file would go missing.
+    if (section.from) |from| {
+        try adoptSectionPath(allocator, &file.old_path, from, "---", header_number, diag);
+    }
+    if (section.to) |to| {
+        try adoptSectionPath(allocator, &file.new_path, to, "+++", header_number, diag);
+    }
+
     if (file.old_path == null and file.new_path == null) {
         diag.say("the header on line {d} is '/dev/null' on both sides, which names no file", .{header_number});
         return error.BadPatch;
@@ -704,6 +1006,10 @@ fn parseFile(
 
     while (cursor.peek()) |raw| {
         const line = std.mem.trimEnd(u8, raw, " \t");
+        // The next section begins here, and its own `rename from`/`rename to`
+        // lines have to be read by the caller's loop rather than skipped as
+        // decoration of this file.
+        if (std.mem.startsWith(u8, line, "diff --git ")) break;
         if (isDecoration(line)) {
             _ = cursor.take();
             continue;
@@ -899,6 +1205,31 @@ fn headerPath(allocator: std.mem.Allocator, rest: []const u8) !?[]const u8 {
         trimmed;
     if (stripped.len == 0) return null;
     return try allocator.dupe(u8, stripped);
+}
+
+/// Make one side of a file header agree with the name the git section gave it.
+///
+/// A header that names nothing — `/dev/null` — takes the section's name, since
+/// the rename lines are the only place a rename's names are written in full. A
+/// header that names another file is refused: between "rename to b" and
+/// "+++ b/other" only one can be what the patch meant, and a guess here either
+/// renames onto the wrong file or leaves the right one behind.
+fn adoptSectionPath(
+    allocator: std.mem.Allocator,
+    slot: *?[]const u8,
+    name: []const u8,
+    marker: []const u8,
+    header_number: usize,
+    diag: *Diagnostic,
+) (error{ OutOfMemory, BadPatch })!void {
+    if (slot.*) |header| {
+        if (!std.mem.eql(u8, header, name)) {
+            diag.say("the '{s}' header on line {d} names '{s}', but the rename in the same section names '{s}': a rename has to name the same file in both places", .{ marker, header_number, header, name });
+            return error.BadPatch;
+        }
+        return;
+    }
+    slot.* = try allocator.dupe(u8, name);
 }
 
 /// Parse `@@ -old_start,old_count +new_start,new_count @@`, with both counts
@@ -1212,7 +1543,7 @@ test "malformed and unsupported patches fail without touching files" {
         "--- {0s}/note.txt\n+++ {0s}/note.txt\n@@ -1 +1 @@\n-original \n+new\n",
         "--- {0s}/note.txt\n+++ /dev/null\n@@ -0,0 +1 @@\n+not a deletion\n",
         "diff --git a/note.txt b/note.txt\nGIT binary patch\nliteral 3\nKcmZQzWC8#H2mk;8\n",
-        "diff --git a/note.txt b/other.txt\nsimilarity index 100%\nrename from note.txt\nrename to other.txt\n",
+        "diff --git a/note.txt b/other.txt\nrename from note.txt\n",
     };
     inline for (cases) |body| {
         const patch = if (comptime std.mem.indexOf(u8, body, "{0s}") != null)
@@ -1226,6 +1557,191 @@ test "malformed and unsupported patches fail without touching files" {
         try expectFileContent(allocator, &tmp, "note.txt", "original\n");
         try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "other.txt", allocator, .limited(1024)));
     }
+}
+
+test "git renames apply as renames, with and without hunks" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    // Nothing but the name changes, so git writes no headers and no hunks: the
+    // two rename lines are the whole section.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "note.txt", .data = "one\ntwo\nthree\n" });
+    {
+        const patch = try patchFor(allocator, dir,
+            \\diff --git a/{0s}/note.txt b/{0s}/moved.txt
+            \\similarity index 100%
+            \\rename from {0s}/note.txt
+            \\rename to {0s}/moved.txt
+        );
+        defer allocator.free(patch);
+        const outcome = try applyOk(allocator, patch);
+        defer outcome.deinit(allocator);
+        try testing.expectEqual(@as(usize, 1), outcome.applied.len);
+        const stat = outcome.applied[0];
+        try testing.expectEqual(Action.renamed, stat.action);
+        try testing.expectEqual(@as(usize, 0), stat.added);
+        try testing.expectEqual(@as(usize, 0), stat.removed);
+        const expected_to = try std.fmt.allocPrint(allocator, "{s}/moved.txt", .{dir});
+        defer allocator.free(expected_to);
+        const expected_from = try std.fmt.allocPrint(allocator, "{s}/note.txt", .{dir});
+        defer allocator.free(expected_from);
+        try testing.expectEqualStrings(expected_to, stat.path);
+        try testing.expectEqualStrings(expected_from, stat.from.?);
+        try expectFileContent(allocator, &tmp, "moved.txt", "one\ntwo\nthree\n");
+        try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "note.txt", allocator, .limited(1024)));
+    }
+
+    // A rename that also changes the text: the hunks are matched against the old
+    // file, and the result is written under the new name, in a directory that
+    // the patch does not have to mention.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "note.txt", .data = "one\ntwo\nthree\n" });
+    {
+        const patch = try patchFor(allocator, dir,
+            \\diff --git a/{0s}/note.txt b/{0s}/nested/renamed.txt
+            \\similarity index 66%
+            \\rename from {0s}/note.txt
+            \\rename to {0s}/nested/renamed.txt
+            \\index 1111111..2222222 100644
+            \\--- {0s}/note.txt
+            \\+++ {0s}/nested/renamed.txt
+            \\@@ -1,2 +1,2 @@
+            \\ one
+            \\-two
+            \\+TWO
+        );
+        defer allocator.free(patch);
+        const outcome = try applyOk(allocator, patch);
+        defer outcome.deinit(allocator);
+        try testing.expectEqual(@as(usize, 1), outcome.applied.len);
+        try testing.expectEqual(Action.renamed, outcome.applied[0].action);
+        try testing.expectEqual(@as(usize, 1), outcome.applied[0].added);
+        try testing.expectEqual(@as(usize, 1), outcome.applied[0].removed);
+        try expectFileContent(allocator, &tmp, "nested/renamed.txt", "one\nTWO\nthree\n");
+        try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "note.txt", allocator, .limited(1024)));
+    }
+
+    // A rename with no hunks into a directory that is not there yet: the move is
+    // still a move, and the directory is made for it.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "note.txt", .data = "kept as it is\n" });
+    {
+        const patch = try patchFor(allocator, dir,
+            \\diff --git a/{0s}/note.txt b/{0s}/deep/inside/moved.txt
+            \\similarity index 100%
+            \\rename from {0s}/note.txt
+            \\rename to {0s}/deep/inside/moved.txt
+        );
+        defer allocator.free(patch);
+        const outcome = try applyOk(allocator, patch);
+        defer outcome.deinit(allocator);
+        try testing.expectEqual(@as(usize, 1), outcome.applied.len);
+        try testing.expectEqual(Action.renamed, outcome.applied[0].action);
+        try expectFileContent(allocator, &tmp, "deep/inside/moved.txt", "kept as it is\n");
+        try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "note.txt", allocator, .limited(1024)));
+    }
+
+    // Two renames with a patch between them: what a section said belongs to the
+    // file that follows it, not to the next section that repeats it.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "a\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.txt", .data = "b\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "keep.txt", .data = "old\n" });
+    {
+        const patch = try patchFor(allocator, dir,
+            \\diff --git a/{0s}/a.txt b/{0s}/a2.txt
+            \\similarity index 100%
+            \\rename from {0s}/a.txt
+            \\rename to {0s}/a2.txt
+            \\diff --git a/{0s}/keep.txt b/{0s}/keep.txt
+            \\--- {0s}/keep.txt
+            \\+++ {0s}/keep.txt
+            \\@@ -1 +1 @@
+            \\-old
+            \\+new
+            \\diff --git a/{0s}/b.txt b/{0s}/b2.txt
+            \\similarity index 100%
+            \\rename from {0s}/b.txt
+            \\rename to {0s}/b2.txt
+        );
+        defer allocator.free(patch);
+        const outcome = try applyOk(allocator, patch);
+        defer outcome.deinit(allocator);
+        try testing.expectEqual(@as(usize, 3), outcome.applied.len);
+        const actions = [_]Action{ .renamed, .modified, .renamed };
+        for (outcome.applied, actions) |stat, action| try testing.expectEqual(action, stat.action);
+        try expectFileContent(allocator, &tmp, "a2.txt", "a\n");
+        try expectFileContent(allocator, &tmp, "b2.txt", "b\n");
+        try expectFileContent(allocator, &tmp, "keep.txt", "new\n");
+        for ([_][]const u8{ "a.txt", "b.txt" }) |gone| {
+            try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, gone, allocator, .limited(1024)));
+        }
+    }
+}
+
+test "renames that cannot be carried out are refused without touching either name" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "note.txt", .data = "original\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "taken.txt", .data = "kept\n" });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+    const cases = .{
+        // The new name is already someone else's file.
+        "diff --git a/{0s}/note.txt b/{0s}/taken.txt\nsimilarity index 100%\nrename from {0s}/note.txt\nrename to {0s}/taken.txt\n",
+        // The old name is not there, so there is nothing to rename.
+        "diff --git a/{0s}/missing.txt b/{0s}/elsewhere.txt\nsimilarity index 100%\nrename from {0s}/missing.txt\nrename to {0s}/elsewhere.txt\n",
+        // Half a rename says nothing about where the file goes.
+        "diff --git a/{0s}/note.txt b/{0s}/moved.txt\nrename from {0s}/note.txt\n",
+        // The rename and the headers below it disagree about the new name.
+        "diff --git a/{0s}/note.txt b/{0s}/moved.txt\nrename from {0s}/note.txt\nrename to {0s}/moved.txt\n--- {0s}/note.txt\n+++ {0s}/elsewhere.txt\n@@ -1 +1 @@\n-original\n+new\n",
+        // A copy keeps the original, which a rename cannot express.
+        "diff --git a/{0s}/note.txt b/{0s}/copied.txt\ncopy from {0s}/note.txt\ncopy to {0s}/copied.txt\n",
+        "diff --git a/{0s}/note.txt b/{0s}/copied.txt\ncopy from {0s}/note.txt\ncopy to {0s}/copied.txt\n--- {0s}/note.txt\n+++ {0s}/copied.txt\n@@ -1 +1 @@\n-original\n+new\n",
+        // Only the mode changes, and this tool has nothing to change it with.
+        "diff --git a/{0s}/note.txt b/{0s}/note.txt\nold mode 100644\nnew mode 100755\n",
+    };
+    inline for (cases) |body| {
+        errdefer std.debug.print("rename refusal case did not refuse: {s}\n", .{body});
+        const patch = try patchFor(allocator, dir, body);
+        defer allocator.free(patch);
+        const message = try applyRefused(allocator, patch);
+        defer allocator.free(message);
+        try testing.expect(message.len > 0);
+        try expectFileContent(allocator, &tmp, "note.txt", "original\n");
+        try expectFileContent(allocator, &tmp, "taken.txt", "kept\n");
+        for ([_][]const u8{ "moved.txt", "elsewhere.txt", "copied.txt" }) |absent| {
+            try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, absent, allocator, .limited(1024)));
+        }
+    }
+}
+
+test "a rename is planned with the rest of the patch, so a failure leaves both names alone" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "note.txt", .data = "original\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "other.txt", .data = "different\n" });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const patch = try patchFor(allocator, try fixturePath(&tmp, &buf),
+        \\diff --git a/{0s}/note.txt b/{0s}/moved.txt
+        \\similarity index 100%
+        \\rename from {0s}/note.txt
+        \\rename to {0s}/moved.txt
+        \\--- {0s}/other.txt
+        \\+++ {0s}/other.txt
+        \\@@ -1 +1 @@
+        \\-expected
+        \\+done
+    );
+    defer allocator.free(patch);
+    const message = try applyRefused(allocator, patch);
+    defer allocator.free(message);
+    try testing.expect(std.mem.indexOf(u8, message, "other.txt") != null);
+    try expectFileContent(allocator, &tmp, "note.txt", "original\n");
+    try expectFileContent(allocator, &tmp, "other.txt", "different\n");
+    try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "moved.txt", allocator, .limited(1024)));
 }
 
 test "patch byte and file count limits are refused before any write" {

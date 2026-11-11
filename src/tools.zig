@@ -591,6 +591,10 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
                     .modified => try aw.writer.print("+{d} -{d}", .{ stat.added, stat.removed }),
                     .created => try aw.writer.print("new, +{d}", .{stat.added}),
                     .deleted => try aw.writer.print("deleted, -{d}", .{stat.removed}),
+                    .renamed => {
+                        try aw.writer.print("renamed from {s}", .{stat.from orelse stat.path});
+                        if (stat.added != 0 or stat.removed != 0) try aw.writer.print(", +{d} -{d}", .{ stat.added, stat.removed });
+                    },
                 }
                 try aw.writer.writeByte(')');
             }
@@ -1838,6 +1842,39 @@ test "apply patch changes the file and says what it changed" {
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Applied 1 file: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "note.txt (+1 -1)") != null);
+}
+
+test "a rename is reported as one, with the name the file came from" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "one\ntwo\nthree\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    const patch = try std.fmt.allocPrint(allocator,
+        \\diff --git a/{0s}/note.txt b/{0s}/renamed.txt
+        \\similarity index 66%
+        \\rename from {0s}/note.txt
+        \\rename to {0s}/renamed.txt
+        \\--- {0s}/note.txt
+        \\+++ {0s}/renamed.txt
+        \\@@ -2 +2 @@
+        \\-two
+        \\+TWO
+    , .{dir});
+    defer allocator.free(patch);
+
+    const result = try applyPatch(io, allocator, patch);
+    defer result.deinit(allocator);
+
+    const expected = try std.fmt.allocPrint(allocator, "Applied 1 file: {s}/renamed.txt (renamed from {s}/note.txt, +1 -1)", .{ dir, dir });
+    defer allocator.free(expected);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings(expected, result.content);
 }
 
 test "a patch that does not fit is an error the model can act on" {
