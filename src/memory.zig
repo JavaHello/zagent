@@ -5,11 +5,13 @@
 //! entry per `- ` line; comments and blank lines are ignored. A failed read
 //! or write never takes the agent down: memory is an aid, not a dependency.
 const std = @import("std");
+const tools = @import("tools.zig");
 
 pub const max_entries: usize = 200;
 pub const max_entry_bytes: usize = 500;
-/// Maximum bytes returned by a memory lookup.
-pub const search_budget: usize = 4_000;
+/// Maximum bytes returned by a memory lookup: the same limit one tool result is
+/// held to, so a lookup the model asked for is not cut down after it is built.
+pub const search_budget: usize = tools.max_output_bytes;
 
 fn containsFolded(text: []const u8, term: []const u8) bool {
     if (term.len > text.len) return false;
@@ -380,9 +382,12 @@ test "memory lookup never returns a partial note or exceeds its byte budget" {
         defer allocator.free(note);
         _ = try memory.add(note);
     }
-    const result = try memory.search(allocator, "tmux", 10, search_budget);
+    // A budget only some of these notes can fill proves both halves: no note
+    // comes back in part, and the total stays inside what the caller allowed.
+    const budget = search_budget / 10;
+    const result = try memory.search(allocator, "tmux", 10, budget);
     defer allocator.free(result);
-    try std.testing.expect(result.len <= search_budget);
+    try std.testing.expect(result.len <= budget);
     var lines = std.mem.tokenizeScalar(u8, result, '\n');
     var count: usize = 0;
     while (lines.next()) |line| {

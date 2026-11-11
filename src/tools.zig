@@ -38,6 +38,69 @@ pub const ToolResult = struct {
     }
 };
 
+/// The one limit on a tool result. A tool that pages its output (`read`, `ls`,
+/// the searches) shapes each page to fit under it, and `clipOversized` holds
+/// the line for whatever gets past them, an MCP server's answer among it.
+///
+/// No tool description quotes this number. The model is not asked to budget a
+/// call against a size, and a result that still lands over the limit comes back
+/// as an error naming it, so the next call can be narrowed rather than the
+/// model reading a silently cut answer.
+pub const max_output_bytes: usize = 40 * 1024;
+
+/// Room one page of a paged tool (`read`, `ls`, the searches) may fill. A
+/// little under `max_output_bytes`, so the line each page appends — where the
+/// next one starts, or which single row was too long — still fits under the
+/// limit the finished result is held to.
+pub const page_room_bytes: usize = max_output_bytes - 256;
+
+/// Cut a result down to `max_output_bytes` when a tool let more through, and
+/// report the cut as an error so the model narrows the call. Takes ownership of
+/// `result.content`, which is freed here.
+pub fn clipOversized(allocator: std.mem.Allocator, result: ToolResult) !ToolResult {
+    if (result.content.len <= max_output_bytes) return result;
+    const total = result.content.len;
+    const notice = try std.fmt.allocPrint(
+        allocator,
+        "\n[Output truncated: {d} bytes came back, over the {d} KiB limit for one tool result. Narrow the request to see the rest.]",
+        .{ total, max_output_bytes / 1024 },
+    );
+    defer allocator.free(notice);
+    // The notice counts against the limit, and the text keeps whole characters.
+    const kept = truncateUtf8(result.content, max_output_bytes - notice.len);
+    const content = try std.fmt.allocPrint(allocator, "{s}{s}", .{ kept, notice });
+    allocator.free(result.content);
+    return .{
+        .content = content,
+        .is_error = true,
+        .exit_code = result.exit_code,
+        .timed_out = result.timed_out,
+        .truncated = true,
+    };
+}
+
+test "a result over the limit is cut there, kept whole and reported as an error" {
+    const a = std.testing.allocator;
+
+    const small = ToolResult{ .content = try a.dupe(u8, "kept"), .is_error = false };
+    const untouched = try clipOversized(a, small);
+    defer untouched.deinit(a);
+    try std.testing.expect(!untouched.is_error and !untouched.truncated);
+    try std.testing.expectEqualStrings("kept", untouched.content);
+
+    // Enough three byte characters that the cut lands inside one of them.
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(a);
+    while (big.items.len <= max_output_bytes) try big.appendSlice(a, "你");
+    const clipped = try clipOversized(a, .{ .content = try big.toOwnedSlice(a), .is_error = false, .exit_code = 3 });
+    defer clipped.deinit(a);
+    try std.testing.expect(clipped.is_error and clipped.truncated);
+    try std.testing.expectEqual(@as(?u8, 3), clipped.exit_code);
+    try std.testing.expect(clipped.content.len <= max_output_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clipped.content));
+    try std.testing.expect(std.mem.indexOf(u8, clipped.content, "40 KiB limit") != null);
+}
+
 /// A label for the animation shown while `name` runs, or null for a tool that
 /// must not have one.
 ///
@@ -74,15 +137,22 @@ test "shell status survives empty output, stderr, signals and truncation" {
         .{ .command = "printf out; printf err >&2; exit 7", .prefix = "Exit code: 7\nout\nstderr: err", .is_error = true },
         .{ .command = "printf warning >&2", .prefix = "Exit code: 0\n", .is_error = false },
         .{ .command = "kill -TERM $$", .prefix = "Exit code: unavailable (termination: ", .is_error = true },
-        .{ .command = "printf '%10000s' ''; exit 9", .prefix = "Exit code: 9\n", .is_error = true },
+        .{ .command = "printf '%50000s' ''; exit 9", .prefix = "Exit code: 9\n", .is_error = true },
     };
     for (cases) |case| {
         const result = try executeShell(std.testing.io, std.testing.allocator, case.command);
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.is_error, result.is_error);
         try std.testing.expect(std.mem.startsWith(u8, result.content, case.prefix));
-        try std.testing.expect(result.content.len < 10000);
+        try std.testing.expect(result.content.len <= max_output_bytes);
     }
+    // Output past the limit is cut there rather than kept whole, and the cut
+    // keeps the status line first.
+    const long = try executeShell(std.testing.io, std.testing.allocator, "printf '%50000s' ''");
+    defer long.deinit(std.testing.allocator);
+    try std.testing.expectEqual(max_output_bytes, long.content.len);
+    try std.testing.expect(long.truncated);
+    try std.testing.expect(std.mem.endsWith(u8, long.content, "... (truncated)"));
 }
 
 pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
@@ -90,12 +160,26 @@ pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u
 }
 
 pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []const u8, env: ?*const std.process.Environ.Map) !ToolResult {
-    const result = try std.process.run(allocator, io, .{
+    // Read far more than one result may hold, so an output that runs past the
+    // limit comes back as the beginning of itself and says so, instead of being
+    // refused whole. Only an output that outruns this is given up on.
+    const read_window = 1024 * 1024;
+    const result = std.process.run(allocator, io, .{
         .argv = &[_][]const u8{ "bash", "--noprofile", "--norc", "-c", command },
         .environ_map = env,
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    });
+        .stdout_limit = .limited(read_window),
+        .stderr_limit = .limited(read_window),
+    }) catch |err| switch (err) {
+        // std refuses the whole result once a limit is passed, so there is
+        // nothing of it to keep; the model is told how to read it in parts
+        // rather than being left with a bare error name.
+        error.StreamTooLong => return toolError(
+            allocator,
+            "Error: the command wrote more than a megabyte of output. Redirect it to a file, or pipe it through head or tail, to read it in parts.",
+            .{},
+        ),
+        else => |other| return other,
+    };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
@@ -135,7 +219,7 @@ pub fn executeShellWithEnv(io: std.Io, allocator: std.mem.Allocator, command: []
     return finalizeResultLimited(allocator, aw.written(), .{
         .is_error = exit_code == null or exit_code.? != 0,
         .exit_code = exit_code,
-    }, 8192);
+    }, max_output_bytes);
 }
 
 test "read takes a 1-based offset and a line limit" {
@@ -201,7 +285,8 @@ test "read streams a page from deep in a large file" {
     try std.testing.expect(full.truncated);
     try std.testing.expect(std.mem.startsWith(u8, full.content, "L1: xxx"));
     try std.testing.expect(std.mem.indexOf(u8, full.content, "Line 1 alone is longer") != null);
-    try std.testing.expect(full.content.len <= 8192 + 128);
+    // The page plus its notice stays inside the limit a result is held to.
+    try std.testing.expect(full.content.len <= max_output_bytes);
 }
 
 test "read continues at a line boundary the model has not seen" {
@@ -211,7 +296,10 @@ test "read continues at a line boundary the model has not seen" {
     defer tmp.cleanup();
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(a);
-    for (0..1200) |index| try buffer.print(a, "line {d}\n", .{index});
+    // More lines than one page holds, so the first page has to stop and say
+    // where the next one starts.
+    var index: usize = 0;
+    while (buffer.items.len <= page_room_bytes * 2) : (index += 1) try buffer.print(a, "line {d}\n", .{index});
     try tmp.dir.writeFile(io, .{ .sub_path = "lines.txt", .data = buffer.items });
     const path = try tmp.dir.realPathFileAlloc(io, "lines.txt", a);
     defer a.free(path);
@@ -241,7 +329,7 @@ test "read cuts a line longer than a page without splitting a character" {
     defer tmp.cleanup();
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(a);
-    for (0..3000) |_| try buffer.appendSlice(a, "你");
+    while (buffer.items.len <= page_room_bytes) try buffer.appendSlice(a, "你");
     try tmp.dir.writeFile(io, .{ .sub_path = "utf8", .data = buffer.items });
     const path = try tmp.dir.realPathFileAlloc(io, "utf8", a);
     defer a.free(path);
@@ -254,8 +342,8 @@ test "read cuts a line longer than a page without splitting a character" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Line 1 alone is longer") != null);
     // The line was given all the room its prefix left, cut back to a character.
     const room = std.mem.indexOf(u8, result.content, "\n").? - "L1: ".len;
-    try std.testing.expect(room <= 8192 - "L1: ".len);
-    try std.testing.expect(room > 8192 - "L1: ".len - 3);
+    try std.testing.expect(room <= page_room_bytes - "L1: ".len);
+    try std.testing.expect(room > page_room_bytes - "L1: ".len - 3);
     try std.testing.expectEqual(@as(usize, 0), room % 3);
 }
 
@@ -266,14 +354,16 @@ test "search pages sort names, preserve status, and expose continuation" {
     try std.testing.expectEqualStrings("m\nz\n", sorted.content);
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(a);
-    for (0..600) |_| try buffer.appendSlice(a, "one matching line\n");
+    const page_lines = page_room_bytes / "one matching line\n".len;
+    while (buffer.items.len < (page_lines + 100) * "one matching line\n".len)
+        try buffer.appendSlice(a, "one matching line\n");
     const data = buffer.items;
     const first = try searchPage(a, data, 0, false, .{ .is_error = true, .exit_code = 2 });
     defer first.deinit(a);
     try std.testing.expect(first.is_error);
     try std.testing.expectEqual(@as(?u8, 2), first.exit_code);
     try std.testing.expect(first.truncated);
-    const cursor = 7800 / "one matching line\n".len;
+    const cursor = page_room_bytes / "one matching line\n".len;
     const marker = try std.fmt.allocPrint(a, "offset={d}", .{cursor});
     defer a.free(marker);
     try std.testing.expect(std.mem.indexOf(u8, first.content, marker) != null);
@@ -335,9 +425,6 @@ pub const ReadPage = struct {
     /// Number of lines to read; null reads as many as the output page holds.
     limit: ?usize = null,
 };
-
-/// Output cap for one read, the same page size the other tools report in.
-const read_output_limit = 8192;
 
 pub fn optionalUnsigned(value: ?std.json.Value, minimum: usize) !?usize {
     const field = value orelse return null;
@@ -474,15 +561,15 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
     // The one line that is longer than a page can hold, when that is why.
     var cut_line: ?usize = null;
     while (page.limit == null or shown < page.limit.?) {
-        const ending = readLine(reader, allocator, &current, read_output_limit) catch |err|
+        const ending = readLine(reader, allocator, &current, page_room_bytes) catch |err|
             return toolError(allocator, "Error reading '{s}': {s}", .{ path, @errorName(err) });
         if (ending == .eof) break;
         // A page ends on a line boundary, and the line prefix counts against it.
-        if (body.items.len + linePrefixWidth(line) + current.items.len + 1 > read_output_limit) {
+        if (body.items.len + linePrefixWidth(line) + current.items.len + 1 > page_room_bytes) {
             if (shown == 0) {
                 // A single line fills the page and more: pass on its beginning
                 // so the model has somewhere to start, and say where it stops.
-                const room = read_output_limit - linePrefixWidth(line) - 1;
+                const room = page_room_bytes - linePrefixWidth(line) - 1;
                 try appendNumberedLine(&body, allocator, line, truncateUtf8(current.items, room));
                 cut_line = line;
             } else resumes_at = line;
@@ -511,7 +598,7 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
     if (cut_line) |number| {
         defer allocator.free(normalized);
         return .{
-            .content = try std.fmt.allocPrint(allocator, "{s}\n[Line {d} alone is longer than the {d}-byte output limit and was cut; read the rest of it with bash.]", .{ body_text, number, read_output_limit }),
+            .content = try std.fmt.allocPrint(allocator, "{s}\n[Line {d} alone is longer than a page holds and was cut; read the rest of it with bash.]", .{ body_text, number }),
             .is_error = false,
             .truncated = true,
         };
@@ -578,7 +665,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
             defer allocator.free(content);
             // Sanitised like any other result: the message quotes lines of the
             // patch, which the model wrote.
-            return finalizeResultLimited(allocator, content, .{ .is_error = true }, 8192);
+            return finalizeResultLimited(allocator, content, .{ .is_error = true }, max_output_bytes);
         },
         .applied => |stats| {
             var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -598,7 +685,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
                 }
                 try aw.writer.writeByte(')');
             }
-            return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, 8192);
+            return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, max_output_bytes);
         },
     }
 }
@@ -686,7 +773,7 @@ pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, p
     var index = @min(page.offset, entries.items.len);
     while (index < entries.items.len and index - page.offset < page.limit) : (index += 1) {
         const entry = entries.items[index];
-        if (aw.written().len + entry.len > 7800) break;
+        if (aw.written().len + entry.len > page_room_bytes) break;
         try aw.writer.writeAll(entry);
     }
     const truncated = index < entries.items.len;
@@ -1041,7 +1128,7 @@ fn runSearch(
 
 fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, sort: bool, status: ToolStatus) !ToolResult {
     if (offset == 0 and std.mem.eql(u8, output, "(no matches)"))
-        return finalizeResultLimited(allocator, output, status, 8192);
+        return finalizeResultLimited(allocator, output, status, max_output_bytes);
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(allocator);
     var it = std.mem.tokenizeScalar(u8, output, '\n');
@@ -1053,7 +1140,7 @@ fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, s
     var oversized = false;
     while (index < lines.items.len) : (index += 1) {
         const line = lines.items[index];
-        if (aw.written().len + line.len + 1 > 7800) {
+        if (aw.written().len + line.len + 1 > page_room_bytes) {
             if (aw.written().len == 0) {
                 try aw.writer.writeAll("[One result exceeds the page size; narrow the search with a more specific pattern.]\n");
                 oversized = true;
@@ -1065,7 +1152,7 @@ fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, s
     }
     const truncated = index < lines.items.len;
     if (truncated) try aw.writer.print("[More results; continue with offset={d}.]\n", .{index});
-    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = status.is_error, .exit_code = status.exit_code, .truncated = truncated or oversized }, 8192);
+    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = status.is_error, .exit_code = status.exit_code, .truncated = truncated or oversized }, max_output_bytes);
 }
 
 /// The grep tool: search file contents with a regular expression.
@@ -1114,10 +1201,6 @@ pub fn fd(io: std.Io, allocator: std.mem.Allocator, args: FindArgs) !ToolResult 
     defer allocator.free(argv);
     return runSearch(io, allocator, argv, false, args.offset);
 }
-
-/// Longest response text the model is shown. Larger than the cap the other
-/// tools use, because an API response cut off mid-JSON is useless.
-pub const http_max_content: usize = 32 * 1024;
 
 /// How many redirects a request without a body is followed through.
 const http_max_redirects: u16 = 5;
@@ -1369,7 +1452,7 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
         defer aw.deinit();
         try aw.writer.print("Saved {d} bytes to '{s}'\n", .{ written, path });
         try aw.writer.writeAll(head_aw.written());
-        return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, http_max_content);
+        return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, max_output_bytes);
     }
 
     const body_text = if (has_body)
@@ -1388,7 +1471,7 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
         try aw.writer.writeAll("(empty body)");
     }
 
-    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = http_error, .truncated = body_text.len == http_max_content }, http_max_content);
+    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = http_error, .truncated = body_text.len == max_output_bytes }, max_output_bytes);
 }
 
 /// Write the status line and every response header. Takes the head's parts
@@ -1427,7 +1510,7 @@ fn responseHasBody(response: *const std.http.Client.Response) bool {
     return status.class() != .informational;
 }
 
-/// Read the response body into memory, stopping at `http_max_content` rather
+/// Read the response body into memory, stopping at `max_output_bytes` rather
 /// than failing, so an oversized body still shows its beginning.
 fn readResponseBody(allocator: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
     const decompress_buffer = try allocDecompressBuffer(allocator, response.head.content_encoding);
@@ -1439,17 +1522,17 @@ fn readResponseBody(allocator: std.mem.Allocator, response: *std.http.Client.Res
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    while (aw.written().len < http_max_content) {
+    while (aw.written().len < max_output_bytes) {
         // A short read is not the end of the body: the stream reports zero when
         // nothing has arrived yet, so only EndOfStream or the cap ends this
         // loop. Stopping at the cap leaves the rest unread, which deinit closes
         // the connection over rather than draining.
-        _ = reader.stream(&aw.writer, .limited(http_max_content - aw.written().len)) catch |err| switch (err) {
+        _ = reader.stream(&aw.writer, .limited(max_output_bytes - aw.written().len)) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
     }
-    if (aw.written().len < http_max_content) try checkResponseBodyComplete(response);
+    if (aw.written().len < max_output_bytes) try checkResponseBodyComplete(response);
     return aw.toOwnedSlice();
 }
 
@@ -1944,7 +2027,7 @@ test "tool status preserves failures and records actual truncation not printed s
 }
 
 fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    return finalizeToolContentLimited(allocator, raw, 8192);
+    return finalizeToolContentLimited(allocator, raw, max_output_bytes);
 }
 
 /// Turn text that came from outside this program into what the model is shown:
@@ -1953,12 +2036,16 @@ fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 pub fn finalizeResultLimited(allocator: std.mem.Allocator, raw: []const u8, status: ToolStatus, max_len: usize) !ToolResult {
     const normalized = try normalizeToolText(allocator, raw);
     defer allocator.free(normalized);
+    // A result held at the limit is an error even when the tool itself
+    // succeeded: what the model has in hand is part of an answer, and it has to
+    // narrow the call rather than read the rest as if it were all of it.
+    const clipped = normalized.len > max_len;
     return .{
         .content = try finalizeToolContentLimited(allocator, normalized, max_len),
-        .is_error = status.is_error,
+        .is_error = status.is_error or clipped,
         .exit_code = status.exit_code,
         .timed_out = status.timed_out,
-        .truncated = status.truncated or normalized.len > max_len,
+        .truncated = status.truncated or clipped,
     };
 }
 
@@ -2163,24 +2250,24 @@ test "http request reports a url it cannot use" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "valid URL") != null);
 }
 
-test "http content is truncated at its own larger limit" {
+test "a response body is truncated at the result limit, not at its own" {
     const allocator = std.testing.allocator;
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(allocator);
-    for (0..http_max_content + 512) |_| try raw.append(allocator, 'x');
+    for (0..max_output_bytes + 512) |_| try raw.append(allocator, 'x');
 
-    const finalized = try finalizeToolContentLimited(allocator, raw.items, http_max_content);
+    const finalized = try finalizeToolContentLimited(allocator, raw.items, max_output_bytes);
     defer allocator.free(finalized);
 
     try std.testing.expect(std.mem.endsWith(u8, finalized, "\n... (truncated)"));
-    try std.testing.expect(finalized.len <= http_max_content);
+    try std.testing.expect(finalized.len <= max_output_bytes);
 }
 
 test "finalize tool content truncates on utf8 boundary" {
     const allocator = std.testing.allocator;
     var repeated: std.ArrayList(u8) = .empty;
     defer repeated.deinit(allocator);
-    for (0..1500) |_| {
+    while (repeated.items.len <= max_output_bytes) {
         try repeated.appendSlice(allocator, "你好");
     }
 

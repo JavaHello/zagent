@@ -63,6 +63,11 @@ const CHOICE_PROMPT = BOLD ++ YELLOW ++ "choice" ++ RESET ++ " \xe2\x9d\xaf ";
 // reason to stop the run: the model is told to carry on by itself.
 const dismissed_question_message = "The question was dismissed without an answer. If you can, decide yourself; otherwise explain what you need and stop.";
 
+/// How much of a failing tool result the terminal shows. A result cut at the
+/// size limit is long even when it is an error, and the first two kilobytes
+/// already name what went wrong and where.
+const error_preview_max = 2_000;
+
 const SYSTEM_PROMPT =
     \\You are zagent, a command-line AI assistant built with Zig. Be concise and direct.
     \\Tools and local MCP servers run on the host with the current user's permissions, working directory and network access, without a sandbox or command safety filter.
@@ -1347,13 +1352,23 @@ pub const Agent = struct {
             }
         };
 
-        try self.previewToolResult(result.content, result.is_error);
-        return result;
+        // The one place the size limit is applied, whatever the tool was: the
+        // tools page and clip what they can, and this holds the line for the
+        // rest, an MCP server's answer included.
+        const clipped = try tools.clipOversized(self.allocator, result);
+        try self.previewToolResult(clipped.content, clipped.is_error);
+        return clipped;
     }
 
     /// Use the same result preview for live execution and restored messages.
     fn previewToolResult(self: *Agent, content: []const u8, is_error: bool) !void {
-        const preview_len = if (is_error) content.len else @min(content.len, 200);
+        // An error is shown whole, because its message is the point of it — but
+        // a result cut at the size limit is large even as an error, so even
+        // that one keeps to a readable share of the terminal.
+        const preview_len = if (is_error)
+            @min(content.len, error_preview_max)
+        else
+            @min(content.len, 200);
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         try aw.writer.writeAll(if (is_error) RED ++ "  ✗ " else DIM ++ "  ✓ ");

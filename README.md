@@ -10,7 +10,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use (function calling)** — the agent can execute tools to help you:
   - `bash` — run Bash commands
-  - `read` — read a file page by page: `offset` (1-based first line) and `limit` (line count); every returned line is prefixed `L<number>: ` so a line reference can be read straight off it, and a page is capped near 8192 bytes
+  - `read` — read a file page by page: `offset` (1-based first line) and `limit` (line count); every returned line is prefixed `L<number>: ` so a line reference can be read straight off it
   - `write` — create/overwrite with `content`, or replace one exact, unique block with `old_text`/`new_text` (atomic, preserving permissions)
   - `apply_patch` — change a file by applying a unified diff, which is then shown to you as a coloured diff
   - `ls` — list directory contents
@@ -66,6 +66,15 @@ inherit the host environment; configured `env` entries add or override variables
 Tool calls retain a 180-second default limit
 (`bash.timeout_seconds` accepts 1–3600), output bounds and process-group cleanup.
 Commands use `bash --noprofile --norc -c`, not `/bin/sh`.
+
+One tool result is held to 40 KiB. A tool that can page its output — `read`,
+`ls`, `rg`, `grep`, `fd`, `find` — stops a page short of that and names the
+`offset` the next page starts at; a `bash` command or `http` response that runs
+past it is cut at the limit and marked `... (truncated)`; anything else that
+still lands over it, an MCP server's answer included, comes back cut at the
+limit and reported as an error naming it, so the model narrows the call instead
+of reading a cut answer as a complete one. No tool description quotes the
+number: the limit lives in the code, not in the prompt.
 
 Every run creates one private scratch directory at startup (mode `0700`, a
 random name under `$TMPDIR`, or `/tmp` if unset) and names it, together with the
@@ -171,7 +180,7 @@ Saved notes are not injected into the system prompt. The model uses
 `memory_search` on demand before relying on past preferences, project conventions,
 decisions or workarounds. Local keyword retrieval supports case-insensitive English
 and unspaced Chinese (character bigrams), ranks by relevance then recency, and
-returns up to 5 notes by default (maximum 10), within 4,000 bytes. This is lexical,
+returns up to 5 notes by default (maximum 10). This is lexical,
 not semantic search; retry with shorter keywords or synonyms when needed.
 Exact duplicate notes are still ignored on save.
 `remember` can add, replace or delete an exact note; `/memory` lists all notes,
@@ -454,7 +463,7 @@ body. Four behaviours are worth knowing:
 | `glob`        | no       | `grep` only: search only files whose name matches, e.g. `*.zig` |
 | `ignore_case` | no       | `grep` only: match case-insensitively |
 | `context_lines` | no     | `rg` / `grep`: number of surrounding lines before and after matches (integer >= 0; default 0) |
-| `max_matches` | no       | `rg` / `grep`: maximum matching lines **per file**, not globally (integer >= 1; default unlimited); the output byte limit still applies |
+| `max_matches` | no       | `rg` / `grep`: maximum matching lines **per file**, not globally (integer >= 1; default unlimited); the result limit below still applies |
 
 Default tool registration is decided once at startup from `PATH`: prefer `rg`
 over `grep`, and `fd` over `find`. These are four independent tools: calling
@@ -473,8 +482,9 @@ Four behaviours are worth knowing:
   paths by default; `hidden` and `no_ignore` can override those defaults.
   `grep` and `find` include hidden and ignored paths, but prune `.git`.
 - **Limits.** A search that returns more than 256 KB is refused rather than cut
-  short, and the message says how to narrow it. What does come back is shown up
-  to 8 KB, marked `... (truncated)` beyond that.
+  short, and the message says how to narrow it. What does come back arrives one
+  page at a time: the page names the `offset` the next one starts at, and a
+  single result longer than the page is reported instead of being cut.
 - **Regex flavour.** `grep`'s pattern is an extended regular expression —
   `+`, `?`, `|` and `()` are operators, as they are in `rg`. More advanced
   regex syntax can differ between the two programs.
