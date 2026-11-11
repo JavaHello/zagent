@@ -22,6 +22,7 @@ pub const all = [_]Command{
     .{ .name = "/clear", .description = "Clear conversation history" },
     .{ .name = "/new", .description = "Create a new session and empty the scratch directory" },
     .{ .name = "/session", .description = "Show the current session ID and resume command" },
+    .{ .name = "/plan", .description = "Show the plan: /plan [clear]" },
     .{ .name = "/memory", .description = "List saved memories" },
     .{ .name = "/remember", .description = "Save a note to memory: /remember <text>" },
     .{ .name = "/forget", .description = "Remove a saved note: /forget <n|all>" },

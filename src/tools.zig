@@ -124,6 +124,7 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
         .{ .name = "http", .label = "http…" },
         .{ .name = "remember", .label = "remember…" },
         .{ .name = "memory_search", .label = "searching memory…" },
+        .{ .name = "plan", .label = "plan…" },
     };
     for (labels) |entry| {
         if (std.mem.eql(u8, name, entry.name)) return entry.label;

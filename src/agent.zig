@@ -6,6 +6,7 @@ const text = @import("text.zig");
 const menu = @import("menu.zig");
 const compact = @import("compact.zig");
 const memory_mod = @import("memory.zig");
+const plan_mod = @import("plan.zig");
 const mcp = @import("mcp.zig");
 const scratch_mod = @import("scratch.zig");
 const render = @import("render.zig");
@@ -91,6 +92,7 @@ fn buildSystemPrompt(
     search: tools.SearchBackends,
     workspace: []const u8,
     scratch: []const u8,
+    plan: *const plan_mod.Plan,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -132,6 +134,12 @@ fn buildSystemPrompt(
         try aw.writer.writeAll("\n- Memory holds lasting preferences and project facts only, never transient status or secrets. Consult it before relying on past preferences, conventions or decisions and before replacing or deleting a note; prefer current instructions and verified facts over stale notes, and correct obsolete notes instead of adding contradictions.\n");
     }
 
+    // The plan is the one piece of session state named in the prompt itself: a
+    // cleared conversation loses the messages, while the checklist in memory
+    // keeps the map of the work. The prompt is rebuilt whenever the plan
+    // changes, so the bullet never describes an older one.
+    try plan.writePromptNote(&aw.writer);
+
     return aw.toOwnedSlice();
 }
 
@@ -164,6 +172,11 @@ pub const Agent = struct {
     scratch: scratch_mod.Scratch,
     /// Durable notes loaded at startup and updated by the remember tool.
     memory: memory_mod.Memory,
+    /// The checklist of the work in progress. It lives in memory, is changed by
+    /// the plan tool and `/plan`, and is saved with the session rather than in
+    /// a file of its own. Named in the system prompt, which is rebuilt whenever
+    /// it changes rather than fixed at startup.
+    plan: plan_mod.Plan,
     /// Whether to render the model's markdown for a terminal. Decided once, in
     /// `init`, so the answer path never has to ask the operating system.
     render_markdown: bool,
@@ -211,6 +224,11 @@ pub const Agent = struct {
         var memory = try memory_mod.Memory.init(allocator, io, env);
         errdefer memory.deinit();
 
+        // An empty plan: this process has no session yet, and whichever one
+        // `startSession` opens brings its own checklist with it.
+        var plan = plan_mod.Plan.init(allocator);
+        errdefer plan.deinit();
+
         const search = tools.detectSearchBackends(io, env);
         var client = openai.Client.init(allocator, io, config);
         client.search = search;
@@ -218,7 +236,7 @@ pub const Agent = struct {
         errdefer allocator.free(workspace);
         var scratch = try scratch_mod.Scratch.init(io, allocator, env);
         errdefer scratch.deinit(allocator);
-        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, workspace, scratch.path);
+        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, workspace, scratch.path, &plan);
         errdefer allocator.free(system_content);
         try history.append(allocator, .{
             .role = "system",
@@ -241,6 +259,7 @@ pub const Agent = struct {
             .workspace = workspace,
             .scratch = scratch,
             .memory = memory,
+            .plan = plan,
             // The check is on stdout rather than on `linenoise.is_tty`, which
             // describes stdin: `zagent "q" < file` with a terminal on stdout
             // should still render, and `zagent "q" | less` must not.
@@ -268,6 +287,7 @@ pub const Agent = struct {
         self.history.deinit(self.allocator);
         self.client.deinit();
         self.memory.deinit();
+        self.plan.deinit();
         if (self.session_path) |path| self.allocator.free(path);
         if (self.session_id) |id| self.allocator.free(id);
     }
@@ -296,7 +316,31 @@ pub const Agent = struct {
     pub fn clearHistory(self: *Agent) void {
         for (self.history.items[1..]) |msg| msg.deinit(self.allocator);
         self.history.shrinkRetainingCapacity(1);
+        // A conversation that starts over starts from what outlived it: the
+        // prompt names the plan, which is state of the session rather than of
+        // the messages, so it is rebuilt rather than kept.
+        self.refreshSystemPrompt() catch {};
         self.checkpoint() catch {};
+    }
+
+    /// Rebuild the system prompt in place from the state it describes. The
+    /// plan changes as the work moves, and the MCP directory grows when a
+    /// service is loaded, so the prompt is rebuilt at those points instead of
+    /// being fixed at startup. A failure leaves the previous prompt in place.
+    fn refreshSystemPrompt(self: *Agent) !void {
+        if (self.history.items.len == 0) return;
+        const content = try buildSystemPrompt(
+            self.allocator,
+            self.mcp_registry,
+            self.memory.enabled,
+            self.search,
+            self.workspace,
+            self.scratch.path,
+            &self.plan,
+        );
+        errdefer self.allocator.free(content);
+        if (self.history.items[0].content) |old| self.allocator.free(old);
+        self.history.items[0].content = content;
     }
 
     /// Switch only after the new snapshot has been created or fully validated.
@@ -309,29 +353,38 @@ pub const Agent = struct {
         defer self.allocator.free(relative);
         const path = try @import("workspace.zig").filePath(self.allocator, self.io, self.tool_env, relative);
         errdefer self.allocator.free(path);
-        var loaded: std.ArrayList(Message) = .empty;
-        defer {
-            for (loaded.items) |message| message.deinit(self.allocator);
-            loaded.deinit(self.allocator);
-        }
+        var loaded: session.Loaded = undefined;
         if (resume_id != null) {
             try std.Io.Dir.cwd().access(self.io, path, .{});
             loaded = try session.load(self.io, self.allocator, path);
         } else {
-            try session.save(self.io, self.allocator, path, &.{});
+            // A new session starts without a plan: the checklist belongs to
+            // the session the work was done in, not to this process.
+            loaded = .{ .messages = .empty, .plan = plan_mod.Plan.init(self.allocator) };
+            session.save(self.io, self.allocator, path, &.{}, &loaded.plan) catch |err| {
+                loaded.deinit(self.allocator);
+                return err;
+            };
         }
-        try self.history.ensureTotalCapacity(self.allocator, loaded.items.len + 1);
+        defer loaded.deinit(self.allocator);
+        try self.history.ensureTotalCapacity(self.allocator, loaded.messages.items.len + 1);
         // The system prompt names this process's working and scratch
         // directories, so switching sessions replaces the messages only.
         for (self.history.items[1..]) |message| message.deinit(self.allocator);
         self.history.shrinkRetainingCapacity(1);
-        self.history.appendSliceAssumeCapacity(loaded.items);
-        loaded.clearRetainingCapacity();
+        self.history.appendSliceAssumeCapacity(loaded.messages.items);
+        loaded.messages.clearRetainingCapacity();
+        // The plan of the session just opened replaces this process's; the old
+        // one goes into `loaded` and is freed with it.
+        std.mem.swap(plan_mod.Plan, &self.plan, &loaded.plan);
         if (self.session_path) |old| self.allocator.free(old);
         if (self.session_id) |old| self.allocator.free(old);
         self.session_path = path;
         self.session_id = id;
         self.client.resetTokenCounters();
+        // The prompt names the plan's progress, so it is rebuilt for the plan
+        // this session brought rather than the one the process started with.
+        self.refreshSystemPrompt() catch {};
         // Another session is another piece of work: the task the old one
         // announced says nothing about this one.
         self.forgetTask();
@@ -381,7 +434,7 @@ pub const Agent = struct {
     }
 
     fn checkpoint(self: *Agent) !void {
-        if (self.session_path) |path| try @import("session.zig").save(self.io, self.allocator, path, self.history.items[1..]);
+        if (self.session_path) |path| try @import("session.zig").save(self.io, self.allocator, path, self.history.items[1..], &self.plan);
     }
 
     /// `/memory`: list what is saved, newest last.
@@ -529,6 +582,113 @@ pub const Agent = struct {
             .content = try std.fmt.allocPrint(self.allocator, "Memory {s}: {s}", .{ parsed.value.action, note }),
             .is_error = false,
         };
+    }
+
+    /// The plan tool: read the checklist, replace it, or move one step. The
+    /// plan is held in memory and saved with the session. The change reaches
+    /// the snapshot with the checkpoint that closes this tool batch, never
+    /// from here: a snapshot taken mid-batch would hold a call without its
+    /// result, and the next resume would refuse it.
+    fn planTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        const parsed = std.json.parseFromSlice(plan_mod.Arguments, self.allocator, arguments, .{}) catch {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: expected an object with an optional 'steps' array, or 'index' with 'status' or 'note'."),
+                .is_error = true,
+            };
+        };
+        defer parsed.deinit();
+        const args = parsed.value;
+
+        if (args.steps == null and args.index == null) {
+            // A read: the cheapest way for the model to get the plan back
+            // after a long stretch of unrelated tool results.
+            if (args.status != null or args.note != null) {
+                return .{
+                    .content = try self.allocator.dupe(u8, "Error: 'status' and 'note' change the step named by 'index'; add the index, or send 'steps' to replace the plan."),
+                    .is_error = true,
+                };
+            }
+            return .{ .content = try self.plan.describe(self.allocator), .is_error = false };
+        }
+        if (args.steps != null and args.index != null) {
+            return .{
+                .content = try self.allocator.dupe(u8, "Error: send either 'steps' or 'index', not both."),
+                .is_error = true,
+            };
+        }
+
+        if (args.steps) |raw_steps| {
+            var converted: std.ArrayList(plan_mod.NewStep) = .empty;
+            defer converted.deinit(self.allocator);
+            try converted.ensureTotalCapacity(self.allocator, raw_steps.len);
+            for (raw_steps) |step| {
+                const status = if (step.status) |label| plan_mod.Status.parse(label) orelse return .{
+                    .content = try std.fmt.allocPrint(self.allocator, "Error: step status '{s}' must be pending, active, done or blocked.", .{label}),
+                    .is_error = true,
+                } else null;
+                converted.appendAssumeCapacity(.{ .title = step.title, .status = status, .note = step.note });
+            }
+            self.plan.setSteps(converted.items) catch |err| return .{
+                .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
+                .is_error = true,
+            };
+            // The system prompt names the plan and where it stands, so the
+            // request after this call describes this plan rather than the one
+            // from startup. A read below changes nothing and rebuilds nothing.
+            self.refreshSystemPrompt() catch {};
+        } else {
+            const status = if (args.status) |label| plan_mod.Status.parse(label) orelse return .{
+                .content = try std.fmt.allocPrint(self.allocator, "Error: status '{s}' must be pending, active, done or blocked.", .{label}),
+                .is_error = true,
+            } else null;
+            if (status == null and args.note == null) {
+                return .{
+                    .content = try self.allocator.dupe(u8, "Error: 'index' needs a 'status' or a 'note' to change."),
+                    .is_error = true,
+                };
+            }
+            self.plan.update(args.index.?, status, args.note) catch |err| switch (err) {
+                error.NoSuchStep => return .{
+                    .content = try std.fmt.allocPrint(self.allocator, "Error: there is no step {d}; the plan has {d}.", .{ args.index.?, self.plan.steps.items.len }),
+                    .is_error = true,
+                },
+                else => return .{
+                    .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
+                    .is_error = true,
+                },
+            };
+            self.refreshSystemPrompt() catch {};
+        }
+
+        return .{ .content = try self.plan.describe(self.allocator), .is_error = false };
+    }
+
+    /// `/plan`: show the checklist, or `/plan clear` to drop it.
+    pub fn planCommand(self: *Agent, argument: []const u8) !void {
+        const arg = std.mem.trim(u8, argument, " \t");
+        if (arg.len == 0) {
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer aw.deinit();
+            try self.plan.writeChecklist(&aw.writer);
+            return self.writeLogOrStdout(aw.written());
+        }
+        if (!std.ascii.eqlIgnoreCase(arg, "clear")) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /plan [clear]\n" ++ RESET, .{});
+            return;
+        }
+        if (self.plan.steps.items.len == 0) {
+            try self.emit(std.Io.File.stderr(), DIM ++ "  no plan to clear\n" ++ RESET, .{});
+            return;
+        }
+        self.plan.clear();
+        self.refreshSystemPrompt() catch {};
+        // The session snapshot is where the plan lives once this process is
+        // gone, so a cleared plan is saved before the command reports success.
+        self.checkpoint() catch |err| {
+            try self.emit(std.Io.File.stderr(), RED ++ "  ✗ plan cleared, but the session was not saved: {s}\n" ++ RESET, .{@errorName(err)});
+            return;
+        };
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ plan cleared\n" ++ RESET, .{});
     }
 
     /// Settle unanswered calls after an interrupted query.
@@ -1291,6 +1451,17 @@ pub const Agent = struct {
     }
 
     fn writeToolCall(self: *Agent, w: *std.Io.Writer, call: ToolCallData) !void {
+        // A plan call carries a whole checklist as its arguments. Its JSON is
+        // unreadable on one terminal line, so the summary says what it does;
+        // the result below shows the checklist itself.
+        if (std.mem.eql(u8, call.name, "plan")) {
+            try w.writeAll(YELLOW ++ "  ⚙ plan" ++ RESET ++ " ");
+            if (!try plan_mod.writeCallSummary(w, self.allocator, call.arguments)) {
+                try text.writeSanitized(w, call.arguments);
+            }
+            try w.writeByte('\n');
+            return;
+        }
         if (!std.mem.eql(u8, call.name, "apply_patch")) {
             try w.writeAll(YELLOW ++ "  ⚙ ");
             // A tool name and its arguments are model output like any other, so
@@ -1343,6 +1514,8 @@ pub const Agent = struct {
                 break :blk try self.rememberTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
+            } else if (std.mem.eql(u8, call.name, "plan")) {
+                break :blk try self.planTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments, answers, index);
             } else if (std.mem.eql(u8, call.name, mcp.Registry.loader_name)) {

@@ -25,6 +25,7 @@ const HELP =
     \\  /clear       Clear conversation history
     \\  /new         Create a new session and empty the scratch directory
     \\  /session     Show the current session ID and resume command
+    \\  /plan        Show the plan; /plan clear drops it
     \\  /memory      List saved memories
     \\  /remember <text>  Save a note to memory
     \\  /forget <n|all>   Remove a saved note
@@ -486,7 +487,11 @@ fn runRepl(
         try ln.history.add(line);
         if (history_path) |path| history.save(io, ln, path);
 
-        if (runtime.busy() and line[0] == '/' and
+        // Only the bare `/plan` reads while a task runs: `/plan clear` changes
+        // state the worker is still using, so it waits like the other commands
+        // that do.
+        const plan_read_only = std.mem.eql(u8, line, "/plan");
+        if (runtime.busy() and line[0] == '/' and !plan_read_only and
             !std.mem.eql(u8, line, "/status") and !std.mem.eql(u8, line, "/help") and
             !std.mem.eql(u8, line, "/model") and !std.mem.eql(u8, line, "/mcp") and !std.mem.eql(u8, line, "/session") and
             !std.mem.eql(u8, line, "/quit") and !std.mem.eql(u8, line, "/exit"))
@@ -525,6 +530,9 @@ fn runRepl(
         } else if (std.mem.eql(u8, line, "/clear")) {
             agent.clearHistory();
             try writeOut(&screen, stdout, io, DIM ++ "Conversation history cleared.\n" ++ RESET);
+        } else if (std.mem.eql(u8, line, "/plan") or std.mem.startsWith(u8, line, "/plan ")) {
+            const argument = std.mem.trim(u8, line["/plan".len..], " \t");
+            agent.planCommand(argument) catch |err| try reportCommandError(allocator, &screen, io, "plan", err);
         } else if (std.mem.eql(u8, line, "/memory")) {
             agent.listMemory() catch |err| try reportCommandError(allocator, &screen, io, "memory", err);
         } else if (std.mem.eql(u8, line, "/remember") or std.mem.startsWith(u8, line, "/remember ")) {

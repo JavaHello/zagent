@@ -20,6 +20,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `ask_user` — put a question to you as an interactive selection menu
 - **MCP servers** — start servers described in `mcp.json` and give the tools they offer to the model beside the built-in ones
 - **Multi-turn tool chaining** — the agent loops until the task is complete
+- **Session plan** — the model keeps a checklist of the work in progress through the `plan` tool, held in memory and saved with the session, and the system prompt names it with its progress; it survives `/clear` and comes back with a resumed session, where the conversation does not. `/plan` shows it
 - **Task announcement from the main model** — the built-in `announce_task` call provides a `title` and `description` of the goal and approach, without a separate planning request. The description is displayed to the user; terminal titles use the generated title, never raw input. Both the submitted title and the entire terminal title stay below 80 Unicode characters, and a follow-up turn that announces no task of its own keeps the task already in the title.
 - **Completion check** — after a turn that used tools, an independent judge request decides whether your request is really finished, and sends the agent back to work when it is not
 - **Choice menus** — when a request is ambiguous, the agent offers concrete options to choose from instead of guessing, with the one it recommends marked
@@ -149,6 +150,9 @@ API configuration. Invalid or mismatched session files are reported rather than
 silently discarded. Interrupted tool batches may have filesystem effects;
 inspect the workspace when resuming.
 
+A snapshot carries the conversation, its tool results and the plan of the work
+in progress, so resuming restores all three.
+
 Transient network errors and HTTP 408/429/500/502/503/504 responses are retried up
 to three attempts. Exhausted tool iterations, and output still cut off after
 bounded continuations, return an error instead of reporting completion.
@@ -167,6 +171,49 @@ earlier result instead of repeating it, while both calls and results stay
 paired — a Responses request must answer every `function_call` with its
 `function_call_output`, and the assistant message replays the exact output
 items it was given.
+
+What must outlive a cleared conversation therefore lives beside the messages
+rather than in them: the plan below is kept in memory and saved into the
+session snapshot, and the system prompt names it with how far along it is, so
+the next request after a `/clear` or a resume picks the work up from the plan
+instead of from a history that is no longer there.
+
+## Plan
+
+Work that takes more than a few steps is tracked in a checklist of one line per
+step, marked as it moves:
+
+```text
+Plan 2/5 done. Next: 3. Wire the plan tool
+1. [x] Read the tool schemas
+2. [x] Write src/plan.zig
+   note: compiles
+3. [ ] Wire the plan tool
+4. [!] Run the integration test
+   note: waits for the mock endpoint
+```
+
+The model owns the checklist through the `plan` tool, which has three shapes: no
+arguments returns the checklist with its progress and the step to take next,
+`steps` replaces the whole plan, and `index` with `status` or `note` moves one
+step without the rest being rewritten. `[ ]` is pending, `[~]` is the step in
+hand, `[x]` is done and `[!]` is blocked; an optional `note:` line under a step
+carries why. At most 50 steps of 200 bytes each.
+
+The plan is runtime state of the session, not a file of its own: it lives in
+memory while zagent runs and is written into the session snapshot next to the
+messages, so `/clear` keeps it, `--resume` brings it back and `/new` starts
+without one. The snapshot is saved after each completed tool batch, so a plan
+reaches disk with the batch whose call changed it.
+
+The system prompt carries one bullet about the plan: how many steps are done
+and which one comes next. It is rebuilt when the plan changes and when history
+is cleared, so it always describes the plan rather than the conversation. That
+bullet is the point of keeping the plan apart from the messages — the
+conversation is a workstation that gets emptied, and the checklist is one of
+the few things that survives it.
+
+`/plan` prints the checklist and `/plan clear` empties it.
 
 ## Memory
 
@@ -695,6 +742,7 @@ and what each brought. Seven behaviours are worth knowing:
 | `/clear`      | Clear conversation history       |
 | `/new`        | Create a new session and empty the scratch directory |
 | `/session`    | Show the current session ID and resume command |
+| `/plan`       | Show the plan; `/plan clear` drops it |
 | `/memory`     | List saved memories              |
 | `/remember <text>` | Save a note to memory        |
 | `/forget <n\|all>` | Remove a saved note, or all of them |
@@ -807,6 +855,7 @@ src/
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
   compact.zig — Dropping tool results, and deduplicating repeated reads
   memory.zig  — Durable notes: file format, local retrieval, edits
+  plan.zig    — The session plan: steps, snapshot form, prompt bullet
   banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer
 build.zig     — Zig build script

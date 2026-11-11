@@ -39,6 +39,7 @@ pub fn build(b: *std.Build) void {
         "tests/workspace_integration.py",
         "tests/search_dispatch_integration.py",
         "tests/memory_integration.py",
+        "tests/plan_integration.py",
         "tests/streaming_integration.py",
         "tests/execution_integration.py",
         "tests/completion_integration.py",

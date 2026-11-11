@@ -163,12 +163,20 @@ pub const remember = ToolDefinition{
     ,
 };
 
+pub const plan = ToolDefinition{
+    .name = "plan",
+    .description = "Read or update the plan for the work in progress: with no arguments it returns the plan, with 'steps' it replaces the whole plan, and with 'index' plus 'status' or 'note' it updates one step. The plan belongs to the session — it is saved with it and restored when it is resumed — so it, not the message history, is the map of long work.",
+    .parameters_json =
+    \\{"type":"object","properties":{"steps":{"type":"array","description":"The complete ordered plan, replacing the current one: one short line per step that can be verified on its own. At most 50 steps.","maxItems":50,"items":{"type":"object","properties":{"title":{"type":"string","description":"One line: what this step accomplishes"},"status":{"type":"string","enum":["pending","active","done","blocked"],"description":"Defaults to pending; at most one step is active"},"note":{"type":"string","description":"Optional one-line reason kept under the step, for example why it is blocked"}},"required":["title"]}},"index":{"type":"integer","minimum":1,"description":"1-based step to update, when 'steps' is omitted"},"status":{"type":"string","enum":["pending","active","done","blocked"],"description":"New status for that step"},"note":{"type":"string","description":"New note for that step; an empty string removes the old one"}},"required":[]}
+    ,
+};
+
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
     memory_search, bash,          read, write, apply_patch, ls,
     rg,            fd,            grep, find,  http,        ask_user,
-    remember,      announce_task,
+    remember,      announce_task, plan,
 };
 
 test "built-in definitions have valid schemas and unique names" {

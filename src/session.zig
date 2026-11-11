@@ -1,6 +1,7 @@
 //! Durable conversations. API configuration and credentials are excluded.
 const std = @import("std");
 const openai = @import("openai.zig");
+const plan_mod = @import("plan.zig");
 const Message = openai.Message;
 // Persisted fields are required: old snapshot shapes are not migrated.
 const StoredMessage = struct {
@@ -12,7 +13,30 @@ const StoredMessage = struct {
     response_items: ?[]const u8,
     tool_status: ?@import("tools.zig").ToolStatus,
 };
-const Snapshot = struct { version: u32, workspace: []const u8, messages: []StoredMessage };
+/// The plan travels with the conversation: it is state of the session, not a
+/// file of its own, so the snapshot carries it next to the messages.
+const Snapshot = struct {
+    version: u32,
+    workspace: []const u8,
+    messages: []StoredMessage,
+    plan: []plan_mod.Stored,
+};
+/// Bumped when a field is added, so an older snapshot is refused instead of
+/// resumed with half its state.
+const schema_version: u32 = 2;
+
+/// What a session holds: its messages and the plan of the work in progress.
+pub const Loaded = struct {
+    messages: std.ArrayList(Message),
+    plan: plan_mod.Plan,
+
+    pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
+        for (self.messages.items) |message| message.deinit(allocator);
+        self.messages.deinit(allocator);
+        self.plan.deinit();
+        self.* = undefined;
+    }
+};
 
 pub fn newId(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
@@ -39,11 +63,18 @@ test "session IDs are unique and cannot escape the session directory" {
     try std.testing.expectError(error.InvalidSessionId, validateId("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
 }
 
-pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages: []Message) !void {
+pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages: []Message, plan: *const plan_mod.Plan) !void {
     const cwd = std.Io.Dir.cwd();
     const workspace = try cwd.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(workspace);
-    const data = try std.json.Stringify.valueAlloc(allocator, .{ .version = @as(u32, 1), .workspace = workspace, .messages = messages }, .{});
+    const steps = try plan.stored(allocator);
+    defer allocator.free(steps);
+    const data = try std.json.Stringify.valueAlloc(allocator, .{
+        .version = schema_version,
+        .workspace = workspace,
+        .messages = messages,
+        .plan = steps,
+    }, .{});
     defer allocator.free(data);
     const temporary = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(temporary);
@@ -55,18 +86,19 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages
     try cwd.rename(temporary, cwd, path, io);
 }
 
-/// Returns an owned list with canonical static role strings, ready for Agent.
+/// Returns owned messages with canonical static role strings, ready for Agent,
+/// together with the plan the session carries.
 /// A missing session is a new conversation. A corrupt/wrong-workspace one fails.
-pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(Message) {
+pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Loaded {
     const cwd = std.Io.Dir.cwd();
     const data = cwd.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return .empty,
+        error.FileNotFound => return .{ .messages = .empty, .plan = plan_mod.Plan.init(allocator) },
         else => return err,
     };
     defer allocator.free(data);
     const parsed = try std.json.parseFromSlice(Snapshot, allocator, data, .{});
     defer parsed.deinit();
-    if (parsed.value.version != 1) return error.UnsupportedSessionVersion;
+    if (parsed.value.version != schema_version) return error.UnsupportedSessionVersion;
     const workspace = try cwd.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(workspace);
     if (!std.mem.eql(u8, workspace, parsed.value.workspace)) return error.SessionWorkspaceMismatch;
@@ -115,10 +147,16 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.Arr
         try messages.append(allocator, message);
     }
     if (pending != null) return error.InvalidSessionToolSequence;
-    return messages;
+    const plan = restored: {
+        var value = plan_mod.Plan.init(allocator);
+        errdefer value.deinit();
+        try value.restore(parsed.value.plan);
+        break :restored value;
+    };
+    return .{ .messages = messages, .plan = plan };
 }
 
-test "session roundtrip retains tool calls and reasoning" {
+test "session roundtrip retains tool calls, reasoning and the plan" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -127,32 +165,39 @@ test "session roundtrip retains tool calls and reasoning" {
     defer allocator.free(directory);
     const path = try std.fs.path.join(allocator, &.{ directory, "session.json" });
     defer allocator.free(path);
+    var plan = plan_mod.Plan.init(allocator);
+    defer plan.deinit();
+    try plan.setSteps(&.{
+        .{ .title = "read the code", .status = .done },
+        .{ .title = "write the module", .status = .active, .note = "half way" },
+    });
     var calls = [_]openai.ToolCallData{.{ .id = "1", .name = "shell", .arguments = "{}" }};
     var messages = [_]Message{
         .{ .role = "assistant", .content = null, .reasoning_content = "plan", .tool_calls = &calls, .tool_call_id = null, .response_items = "[{\"type\":\"reasoning\",\"id\":\"rs1\",\"summary\":[],\"encrypted_content\":\"opaque-token\"},{\"type\":\"function_call\",\"call_id\":\"1\",\"name\":\"shell\",\"arguments\":\"{}\"}]" },
         .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true, .truncated = true } },
     };
-    try save(io, allocator, path, &messages);
+    try save(io, allocator, path, &messages, &plan);
     var loaded = try load(io, allocator, path);
-    defer {
-        for (loaded.items) |message| message.deinit(allocator);
-        loaded.deinit(allocator);
-    }
-    try std.testing.expectEqual(@as(usize, 2), loaded.items.len);
-    try std.testing.expectEqualStrings("plan", loaded.items[0].reasoning_content.?);
-    try std.testing.expectEqualStrings(messages[0].response_items.?, loaded.items[0].response_items.?);
-    try std.testing.expectEqualStrings("shell", loaded.items[0].tool_calls.?[0].name);
-    try std.testing.expectEqualStrings("done", loaded.items[1].content.?);
-    try std.testing.expectEqualDeep(messages[1].tool_status, loaded.items[1].tool_status);
-    try save(io, allocator, path, messages[0..1]);
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), loaded.messages.items.len);
+    try std.testing.expectEqualStrings("plan", loaded.messages.items[0].reasoning_content.?);
+    try std.testing.expectEqualStrings(messages[0].response_items.?, loaded.messages.items[0].response_items.?);
+    try std.testing.expectEqualStrings("shell", loaded.messages.items[0].tool_calls.?[0].name);
+    try std.testing.expectEqualStrings("done", loaded.messages.items[1].content.?);
+    try std.testing.expectEqualDeep(messages[1].tool_status, loaded.messages.items[1].tool_status);
+    try std.testing.expectEqual(@as(usize, 2), loaded.plan.steps.items.len);
+    try std.testing.expectEqual(plan_mod.Status.active, loaded.plan.steps.items[1].status);
+    try std.testing.expectEqualStrings("half way", loaded.plan.steps.items[1].note.?);
+    try save(io, allocator, path, messages[0..1], &plan);
     try std.testing.expectError(error.InvalidSessionToolSequence, load(io, allocator, path));
 }
 
 test "snapshots reject removed fields and require the current schema" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.MissingField, std.json.parseFromSlice(StoredMessage, a, "{\"role\":\"tool\",\"content\":\"old\",\"reasoning_content\":null,\"tool_calls\":null,\"tool_call_id\":\"1\"}", .{}));
-    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Snapshot, a, "{\"version\":1,\"workspace\":\"\",\"messages\":[],\"scratch_dirs\":[]}", .{}));
-    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"workspace\":\"\",\"messages\":[]}", .{}));
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Snapshot, a, "{\"version\":2,\"workspace\":\"\",\"messages\":[],\"plan\":[],\"scratch_dirs\":[]}", .{}));
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .{}));
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"version\":2,\"workspace\":\"\",\"messages\":[]}", .{}));
 }
 
 test "a missing session starts empty but malformed JSON is rejected" {
@@ -166,7 +211,8 @@ test "a missing session starts empty but malformed JSON is rejected" {
     defer a.free(path);
     var loaded = try load(io, a, path);
     defer loaded.deinit(a);
-    try std.testing.expectEqual(@as(usize, 0), loaded.items.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), loaded.plan.steps.items.len);
     try tmp.dir.writeFile(io, .{ .sub_path = "session.json", .data = "{" });
     try std.testing.expectError(error.UnexpectedEndOfInput, load(io, a, path));
 }
@@ -181,8 +227,11 @@ test "sessions reject incompatible versions and another workspace" {
     const path = try std.fs.path.join(a, &.{ directory, "session.json" });
     defer a.free(path);
     const cases = [_]struct { data: []const u8, expected: anyerror }{
-        .{ .data = "{\"version\":2,\"workspace\":\"\",\"messages\":[]}", .expected = error.UnsupportedSessionVersion },
-        .{ .data = "{\"version\":1,\"workspace\":\"\",\"messages\":[]}", .expected = error.SessionWorkspaceMismatch },
+        .{ .data = "{\"version\":3,\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .expected = error.UnsupportedSessionVersion },
+        // A snapshot from before the plan was part of the session is refused,
+        // not resumed without the state it never had.
+        .{ .data = "{\"version\":1,\"workspace\":\"\",\"messages\":[]}", .expected = error.MissingField },
+        .{ .data = "{\"version\":2,\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .expected = error.SessionWorkspaceMismatch },
     };
     for (cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "session.json", .data = case.data });
@@ -199,20 +248,19 @@ test "saving creates parent directories and replaces an older checkpoint" {
     defer a.free(directory);
     const path = try std.fs.path.join(a, &.{ directory, "nested", "session.json" });
     defer a.free(path);
+    var plan = plan_mod.Plan.init(a);
+    defer plan.deinit();
     var messages = [_]Message{
         .{ .role = "user", .content = "调查问题", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
         .{ .role = "assistant", .content = "检查完成", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    try save(io, a, path, &messages);
+    try save(io, a, path, &messages, &plan);
     // A shorter snapshot must replace the old data without trailing bytes.
-    try save(io, a, path, messages[0..1]);
+    try save(io, a, path, messages[0..1], &plan);
     var loaded = try load(io, a, path);
-    defer {
-        for (loaded.items) |message| message.deinit(a);
-        loaded.deinit(a);
-    }
-    try std.testing.expectEqual(@as(usize, 1), loaded.items.len);
-    try std.testing.expectEqualStrings("调查问题", loaded.items[0].content.?);
+    defer loaded.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
+    try std.testing.expectEqualStrings("调查问题", loaded.messages.items[0].content.?);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "nested/session.json.tmp", .{}));
 }
 
@@ -225,6 +273,8 @@ test "sessions reject orphaned reordered and interrupted tool results" {
     defer a.free(directory);
     const path = try std.fs.path.join(a, &.{ directory, "session.json" });
     defer a.free(path);
+    var plan = plan_mod.Plan.init(a);
+    defer plan.deinit();
     var calls = [_]openai.ToolCallData{
         .{ .id = "first", .name = "read_file", .arguments = "{}" },
         .{ .id = "second", .name = "shell", .arguments = "{}" },
@@ -241,21 +291,18 @@ test "sessions reject orphaned reordered and interrupted tool results" {
     var empty_calls = [_]Message{.{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = calls[0..0], .tool_call_id = null }};
     var user_calls = [_]Message{.{ .role = "user", .content = null, .reasoning_content = null, .tool_calls = &calls, .tool_call_id = null }};
     for ([_][]Message{ &orphan, &reordered, &interrupted, &missing, &duplicate, &empty_calls, &user_calls }) |messages| {
-        try save(io, a, path, messages);
+        try save(io, a, path, messages, &plan);
         try std.testing.expectError(error.InvalidSessionToolSequence, load(io, a, path));
     }
-    try save(io, a, path, &invalid_role);
+    try save(io, a, path, &invalid_role, &plan);
     try std.testing.expectError(error.InvalidSessionRole, load(io, a, path));
 
     var valid = [_]Message{ assistant, first, second, .{ .role = "assistant", .content = "完成 ✓", .reasoning_content = null, .tool_calls = null, .tool_call_id = null } };
-    try save(io, a, path, &valid);
+    try save(io, a, path, &valid, &plan);
     var loaded = try load(io, a, path);
-    defer {
-        for (loaded.items) |message| message.deinit(a);
-        loaded.deinit(a);
-    }
-    try std.testing.expectEqual(@as(usize, 4), loaded.items.len);
-    try std.testing.expectEqualStrings("first", loaded.items[1].tool_call_id.?);
-    try std.testing.expectEqualStrings("second", loaded.items[2].tool_call_id.?);
-    try std.testing.expectEqualStrings("完成 ✓", loaded.items[3].content.?);
+    defer loaded.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), loaded.messages.items.len);
+    try std.testing.expectEqualStrings("first", loaded.messages.items[1].tool_call_id.?);
+    try std.testing.expectEqualStrings("second", loaded.messages.items[2].tool_call_id.?);
+    try std.testing.expectEqualStrings("完成 ✓", loaded.messages.items[3].content.?);
 }
