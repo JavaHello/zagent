@@ -69,9 +69,9 @@ pub const bash = ToolDefinition{
 
 pub const read = ToolDefinition{
     .name = "read",
-    .description = "Read a file or a line range, with output capped near 8192 bytes.",
+    .description = "Read a file or one page of it, numbered by line, with output capped near 8192 bytes.",
     .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"start_line":{"type":"integer","minimum":1,"description":"First line to read, 1-based and inclusive; defaults to 1"},"end_line":{"type":"integer","minimum":1,"description":"Last line to read, inclusive and >= start_line; defaults to end of file"},"start_column":{"type":"integer","minimum":1,"description":"1-based byte column on start_line; use the exact continuation cursor returned after truncation, defaults to 1"}},"required":["path"]}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"integer","minimum":1,"description":"1-based number of the first line to read; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to read; defaults to as many as the output page holds"}},"required":["path"]}
     ,
 };
 

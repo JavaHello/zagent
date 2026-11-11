@@ -10,7 +10,7 @@ const Message = openai.Message;
 /// The marker standing in for a read whose output is already in the history.
 /// The reference it carries is only a pointer, which is why the original
 /// result it names is never treated as a cache hit.
-const duplicate_marker = "[Duplicate read omitted: same path, line range and content SHA-256={s}. See earlier tool result {s} in this context.]";
+const duplicate_marker = "[Duplicate read omitted: same path, page and content SHA-256={s}. See earlier tool result {s} in this context.]";
 
 /// Keep one full copy of identical read output in the live context. Do not
 /// treat a marker as a cache hit: once the original result is gone, the model
@@ -65,18 +65,18 @@ fn readKey(allocator: std.mem.Allocator, call: openai.ToolCallData, content: []c
     if (parsed.value != .object) return null;
     const path = parsed.value.object.get("path") orelse return null;
     if (path != .string) return null;
-    const range = @import("tools.zig").parseReadRange(allocator, call.arguments) catch |err| switch (err) {
+    const page = @import("tools.zig").parseReadPage(allocator, call.arguments) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return null,
     };
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(path.string);
-    // A length prefix prevents a path from being confused with range bytes.
-    var fields: [32]u8 = undefined;
+    // A length prefix prevents a path from being confused with page bytes.
+    var fields: [24]u8 = undefined;
     std.mem.writeInt(u64, fields[0..8], @intCast(path.string.len), .little);
-    std.mem.writeInt(u64, fields[8..16], @intCast(range.start_line), .little);
-    std.mem.writeInt(u64, fields[16..24], @intCast(range.end_line orelse 0), .little);
-    std.mem.writeInt(u64, fields[24..32], @intCast(range.start_column), .little);
+    std.mem.writeInt(u64, fields[8..16], @intCast(page.offset), .little);
+    // 0 is a limit no caller can ask for, so it marks the page that has none.
+    std.mem.writeInt(u64, fields[16..24], @intCast(page.limit orelse 0), .little);
     hash.update(&fields);
     hash.update(content);
     return hash.finalResult();
@@ -92,7 +92,7 @@ test "read deduplication compares effective arguments and contents only in live 
     const duplicate = try deduplicateReadResult(a, &messages, .{
         .id = "new",
         .name = "read",
-        .arguments = "{ \"start_line\": 1, \"path\": \"a.zig\" }",
+        .arguments = "{ \"offset\": 1, \"path\": \"a.zig\" }",
     }, "file contents", false);
     defer a.free(duplicate);
     try std.testing.expect(std.mem.startsWith(u8, duplicate, "[Duplicate read omitted:"));
@@ -101,14 +101,14 @@ test "read deduplication compares effective arguments and contents only in live 
     const Case = struct { name: []const u8 = "read", args: []const u8 = "{\"path\":\"a.zig\"}", content: []const u8 = "file contents", is_error: bool = false };
     for ([_]Case{
         .{ .args = "{\"path\":\"b.zig\"}" },
-        .{ .args = "{\"path\":\"a.zig\",\"start_line\":2}" },
-        .{ .args = "{\"path\":\"a.zig\",\"start_column\":2}" },
-        .{ .args = "{\"path\":\"a.zig\",\"end_line\":5}" },
+        .{ .args = "{\"path\":\"a.zig\",\"offset\":2}" },
+        .{ .args = "{\"path\":\"a.zig\",\"limit\":1}" },
+        .{ .args = "{\"path\":\"a.zig\",\"offset\":1,\"limit\":5}" },
         .{ .content = "changed contents" },
         .{ .is_error = true },
         .{ .name = "bash" },
         .{ .args = "invalid json" },
-        .{ .args = "{\"path\":\"a.zig\",\"start_line\":0}" },
+        .{ .args = "{\"path\":\"a.zig\",\"offset\":0}" },
     }) |case| {
         const result = try deduplicateReadResult(a, &messages, .{ .id = "new", .name = case.name, .arguments = case.args }, case.content, case.is_error);
         defer a.free(result);

@@ -26,13 +26,13 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
                 };
             };
             defer allocator.free(path);
-            const range = tools.parseReadRange(allocator, arguments) catch {
+            const range = tools.parseReadPage(allocator, arguments) catch {
                 break :blk .{
-                    .content = try allocator.dupe(u8, "Error: start_line and end_line must be positive integers (1-based, inclusive), with end_line >= start_line"),
+                    .content = try allocator.dupe(u8, "Error: read takes a path plus an optional 'offset' (1-based first line) and 'limit' (line count), both integers of at least 1"),
                     .is_error = true,
                 };
             };
-            break :blk try tools.readFileRange(io, allocator, path, range);
+            break :blk try tools.readFilePage(io, allocator, path, range);
         } else if (std.mem.eql(u8, name, "write")) {
             const path = openai.extractStringArg(allocator, arguments, "path") catch {
                 break :blk .{
@@ -138,7 +138,7 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
     };
 }
 
-test "read dispatch preserves defaults and forwards inclusive ranges" {
+test "read dispatch forwards the page the caller asked for" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var env = std.process.Environ.Map.init(a);
@@ -153,18 +153,19 @@ test "read dispatch preserves defaults and forwards inclusive ranges" {
     const full = try execute(io, a, &env, "read", defaults);
     defer full.deinit(a);
     try std.testing.expect(!full.is_error);
-    try std.testing.expectEqualStrings("first\nsecond\nthird", full.content);
-    const args = try std.json.Stringify.valueAlloc(a, .{ .path = path, .start_line = 2, .end_line = 2 }, .{});
+    try std.testing.expectEqualStrings("L1: first\nL2: second\nL3: third\n", full.content);
+    const args = try std.json.Stringify.valueAlloc(a, .{ .path = path, .offset = 2, .limit = 1 }, .{});
     defer a.free(args);
-    const range = try execute(io, a, &env, "read", args);
-    defer range.deinit(a);
-    try std.testing.expect(!range.is_error);
-    try std.testing.expectEqualStrings("second\n", range.content);
-    const invalid = try std.json.Stringify.valueAlloc(a, .{ .path = path, .start_line = 0 }, .{});
+    const page = try execute(io, a, &env, "read", args);
+    defer page.deinit(a);
+    try std.testing.expect(!page.is_error);
+    try std.testing.expectEqualStrings("L2: second\n[Output truncated; continue with offset=3 (1-based line number).]", page.content);
+    const invalid = try std.json.Stringify.valueAlloc(a, .{ .path = path, .offset = 0 }, .{});
     defer a.free(invalid);
     const rejected = try execute(io, a, &env, "read", invalid);
     defer rejected.deinit(a);
     try std.testing.expect(rejected.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.content, "offset") != null);
     // Shared parser for both advertised backend names.
     for ([_][]const u8{ "rg", "grep" }) |name| {
         const invalid_search = try execute(io, a, &env, name, "{\"pattern\":\"x\",\"max_matches\":0}");
@@ -232,13 +233,13 @@ test "read write and ls operate on an existing file" {
     defer a.free(args);
     const before = try execute(io, a, &env, "read", args);
     defer before.deinit(a);
-    try std.testing.expectEqualStrings("before\n", before.content);
+    try std.testing.expectEqualStrings("L1: before\n", before.content);
     const edited = try execute(io, a, &env, "write", args);
     defer edited.deinit(a);
     try std.testing.expect(!edited.is_error);
     const after = try execute(io, a, &env, "read", args);
     defer after.deinit(a);
-    try std.testing.expectEqualStrings("after\n", after.content);
+    try std.testing.expectEqualStrings("L1: after\n", after.content);
     const dir_args = try std.json.Stringify.valueAlloc(a, .{ .path = std.fs.path.dirname(path).? }, .{});
     defer a.free(dir_args);
     const listed = try execute(io, a, &env, "ls", dir_args);
