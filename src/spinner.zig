@@ -34,51 +34,6 @@ const erase = "\r" ++ sgr.CLEAR_LINE;
 /// Columns the two spaces and the frame take before the label.
 const indent_width = 4;
 
-/// A label its owner can still change while the animation runs.
-///
-/// A wait whose length is known before it starts — a request, a tool — names
-/// itself once and a borrowed slice is enough. A sub-agent's wait is the other
-/// kind: its caller draws the line before the child knows what the work will
-/// turn out to be called, and the child renames the line as it goes. The owner
-/// writes and the animation task reads, so the text is copied under a mutex
-/// instead of shared through a pointer.
-pub const LiveLabel = struct {
-    io: std.Io,
-    mutex: std.Io.Mutex = .init,
-    text: [max_len]u8 = undefined,
-    len: usize = 0,
-
-    /// Long enough for a task title and what the child is doing with it, short
-    /// enough that the line stays the terminal's business: `formatLine`
-    /// shortens it further to fit the window.
-    pub const max_len = 200;
-
-    pub fn init(io: std.Io) LiveLabel {
-        return .{ .io = io };
-    }
-
-    pub fn set(self: *LiveLabel, label: []const u8) void {
-        // Cut on a codepoint boundary: half a character is not shorter text,
-        // it is a broken cell on the terminal.
-        var len = @min(label.len, max_len);
-        while (len > 0 and len < label.len and (label[len] & 0xC0) == 0x80) len -= 1;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        @memcpy(self.text[0..len], label[0..len]);
-        self.len = len;
-    }
-
-    /// A copy taken under the lock, so the animation formats from its own
-    /// buffer rather than from text the owner may be replacing.
-    fn read(self: *LiveLabel, buf: []u8) []const u8 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const len = @min(self.len, buf.len);
-        @memcpy(buf[0..len], self.text[0..len]);
-        return buf[0..len];
-    }
-};
-
 pub const Options = struct {
     /// In interactive mode publish frames for the foreground instead of writing.
     screen: ?*Screen = null,
@@ -100,9 +55,6 @@ pub const Options = struct {
     /// colour of its own, so a job that is not the main model's — a
     /// sub-agent's, say — is told apart from it at a glance.
     style: []const u8 = sgr.DIM,
-    /// A label its owner may replace while the wait runs; when it is set, the
-    /// label handed to `start` is only what the line says until then.
-    live: ?*LiveLabel = null,
     /// How long to wait before drawing the first frame, so that a request
     /// answered at once never flashes a line.
     first_frame_delay_ms: i64 = 200,
@@ -180,8 +132,6 @@ fn animate(
     io.sleep(.fromMilliseconds(options.first_frame_delay_ms), .awake) catch return;
 
     var index: usize = 0;
-    // Outside the loop so a frame never resets the text its owner published.
-    var live_buf: [LiveLabel.max_len]u8 = undefined;
     while (true) : (index += 1) {
         const elapsed_ms = (options.started orelse started).untilNow(io, .awake).toMilliseconds();
         if (started.untilNow(io, .awake).toMilliseconds() >= options.max_duration_ms) return;
@@ -190,16 +140,13 @@ fn animate(
         // user waits, and a frame too wide for it wraps, half of it surviving
         // the erase that follows.
         const budget = term.usableWidth(term.columns(file));
-        // Read every frame, not once: the owner may be renaming the line while
-        // it runs, which is the whole point of a live label.
-        const current = if (options.live) |live| live.read(&live_buf) else label;
 
         var buf: [256]u8 = undefined;
         const line = formatLine(
             &buf,
             options.style,
             frames[index % frames.len],
-            current,
+            label,
             @divTrunc(elapsed_ms, std.time.ms_per_s),
             budget,
             if (options.in_tokens) |p| p.load(.monotonic) else null,
@@ -365,61 +312,6 @@ test "screen progress publishes text without inline cursor controls" {
     try expect(std.mem.indexOf(u8, progress, "thinking…") != null);
     try expect(std.mem.indexOfScalar(u8, progress, '\r') == null);
     try expect(std.mem.indexOf(u8, progress, "\x1b[2K") == null);
-}
-
-test "a live label keeps the text its owner last published" {
-    var live = LiveLabel.init(std.testing.io);
-    live.set("subagent · count the tests…");
-    var buf: [LiveLabel.max_len]u8 = undefined;
-    try expectEqualStrings("subagent · count the tests…", live.read(&buf));
-
-    live.set("subagent · 数测试");
-    try expectEqualStrings("subagent · 数测试", live.read(&buf));
-}
-
-test "a live label is cut on a codepoint boundary and set from any task" {
-    var live = LiveLabel.init(std.testing.io);
-    // Three bytes per character and longer than the limit, so the cut has to
-    // fall between two of them rather than inside one.
-    const phrase = "数测试的结构与渲染入口都需要看清楚，这样报告才有用。";
-    const wide = phrase ++ phrase ++ phrase ++ phrase;
-    try expect(wide.len > LiveLabel.max_len);
-    live.set(wide);
-    var buf: [LiveLabel.max_len]u8 = undefined;
-    const kept = live.read(&buf);
-    try expect(kept.len <= LiveLabel.max_len);
-    try expect(kept.len % 3 == 0);
-    try expect(std.unicode.utf8ValidateSlice(kept));
-    try expect(std.mem.startsWith(u8, wide, kept));
-}
-
-test "the animation renames its line when the label changes under it" {
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const file = try tmp.dir.createFile(io, "probe", .{});
-    defer file.close(io);
-
-    var live = LiveLabel.init(io);
-    live.set("subagent · starting");
-    var spin = Spinner.start(io, file, "subagent · starting", .{
-        .enabled = true,
-        .live = &live,
-        .first_frame_delay_ms = 0,
-        .frame_interval_ms = 1,
-    });
-    try io.sleep(.fromMilliseconds(30), .awake);
-    // The whole point: the owner renames the wait while it is still drawn.
-    live.set("subagent · 数测试");
-    try io.sleep(.fromMilliseconds(30), .awake);
-    spin.stop();
-
-    const written = try tmp.dir.readFileAlloc(io, "probe", std.testing.allocator, .limited(1 << 16));
-    defer std.testing.allocator.free(written);
-    try expect(std.mem.indexOf(u8, written, "subagent · starting") != null);
-    try expect(std.mem.indexOf(u8, written, "subagent · 数测试") != null);
 }
 
 test "work status stays above the input prompt and clears both rows on stop" {
