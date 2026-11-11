@@ -237,10 +237,10 @@ test "read takes a 1-based offset and a line limit" {
     try std.testing.expectEqual(@as(?usize, 50), page.limit);
 }
 
-test "read prefixes every line with L and the number it has in the file" {
-    try std.testing.expectEqual(@as(usize, 4), linePrefixWidth(1));
-    try std.testing.expectEqual(@as(usize, 9), linePrefixWidth(999999));
-    try std.testing.expectEqual(@as(usize, 10), linePrefixWidth(1000000));
+test "read prefixes every line with the number it has in the file" {
+    try std.testing.expectEqual(@as(usize, 2), linePrefixWidth(1));
+    try std.testing.expectEqual(@as(usize, 7), linePrefixWidth(999999));
+    try std.testing.expectEqual(@as(usize, 8), linePrefixWidth(1000000));
 }
 
 test "read streams a page from deep in a large file" {
@@ -263,14 +263,14 @@ test "read streams a page from deep in a large file" {
     defer page.deinit(a);
     try std.testing.expect(!page.is_error);
     try std.testing.expectEqualStrings(
-        "L2: one\nL3: two\n[Output truncated; continue with offset=4 (1-based line number).]",
+        "2:one\n3:two\n[Output truncated; continue with offset=4 (1-based line number).]",
         page.content,
     );
     try std.testing.expect(page.truncated);
 
     const tail = try readFilePage(io, a, path, .{ .offset = 4 });
     defer tail.deinit(a);
-    try std.testing.expectEqualStrings("L4: last\n", tail.content);
+    try std.testing.expectEqualStrings("4:last\n", tail.content);
     try std.testing.expect(!tail.truncated);
 
     // A page past the last line has nothing to show, and says so.
@@ -283,7 +283,7 @@ test "read streams a page from deep in a large file" {
     defer full.deinit(a);
     try std.testing.expect(!full.is_error);
     try std.testing.expect(full.truncated);
-    try std.testing.expect(std.mem.startsWith(u8, full.content, "L1: xxx"));
+    try std.testing.expect(std.mem.startsWith(u8, full.content, "1:xxx"));
     try std.testing.expect(std.mem.indexOf(u8, full.content, "Line 1 alone is longer") != null);
     // The page plus its notice stays inside the limit a result is held to.
     try std.testing.expect(full.content.len <= max_output_bytes);
@@ -307,7 +307,7 @@ test "read continues at a line boundary the model has not seen" {
     const first = try readFilePage(io, a, path, .{});
     defer first.deinit(a);
     try std.testing.expect(first.truncated);
-    try std.testing.expect(std.mem.startsWith(u8, first.content, "L1: line 0\n"));
+    try std.testing.expect(std.mem.startsWith(u8, first.content, "1:line 0\n"));
     // Every row is a whole line; the next page starts at the first one skipped.
     const rows = std.mem.count(u8, first.content, "\n");
     const hint = try std.fmt.allocPrint(a, "offset={d} ", .{rows + 1});
@@ -317,7 +317,7 @@ test "read continues at a line boundary the model has not seen" {
 
     const next = try readFilePage(io, a, path, .{ .offset = rows + 1, .limit = 1 });
     defer next.deinit(a);
-    const expected = try std.fmt.allocPrint(a, "L{d}: line {d}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ rows + 1, rows, rows + 2 });
+    const expected = try std.fmt.allocPrint(a, "{d}:line {d}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ rows + 1, rows, rows + 2 });
     defer a.free(expected);
     try std.testing.expectEqualStrings(expected, next.content);
 }
@@ -341,9 +341,9 @@ test "read cuts a line longer than a page without splitting a character" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "你") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Line 1 alone is longer") != null);
     // The line was given all the room its prefix left, cut back to a character.
-    const room = std.mem.indexOf(u8, result.content, "\n").? - "L1: ".len;
-    try std.testing.expect(room <= page_room_bytes - "L1: ".len);
-    try std.testing.expect(room > page_room_bytes - "L1: ".len - 3);
+    const room = std.mem.indexOf(u8, result.content, "\n").? - "1:".len;
+    try std.testing.expect(room <= page_room_bytes - "1:".len);
+    try std.testing.expect(room > page_room_bytes - "1:".len - 3);
     try std.testing.expectEqual(@as(usize, 0), room % 3);
 }
 
@@ -491,23 +491,22 @@ fn skipLine(reader: *std.Io.Reader) !bool {
     }
 }
 
-/// Bytes a numbered line spends before its text: `L`, the digits, `:` and a
-/// space. The digits are not padded, so the cost is measured per line.
+/// Bytes a numbered line spends before its text: the digits and a `:`. The
+/// digits are not padded, so the cost is measured per line.
 fn linePrefixWidth(number: usize) usize {
     var digits: usize = 1;
     var rest = number;
     while (rest >= 10) : (rest /= 10) digits += 1;
-    return digits + 3;
+    return digits + 1;
 }
 
-/// Number a line as `L42: `, so a model reading the page can copy a reference
+/// Number a line as `42:`, so a model reading the page can copy a reference
 /// that reads as one, rather than a bare figure in a column it has to count.
 fn appendNumberedLine(body: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, line_text: []const u8) !void {
     var digits_buf: [20]u8 = undefined;
     const digits = std.fmt.bufPrint(&digits_buf, "{d}", .{number}) catch unreachable;
-    try body.append(allocator, 'L');
     try body.appendSlice(allocator, digits);
-    try body.appendSlice(allocator, ": ");
+    try body.append(allocator, ':');
     try body.appendSlice(allocator, line_text);
     try body.append(allocator, '\n');
 }

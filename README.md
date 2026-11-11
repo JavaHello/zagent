@@ -10,7 +10,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use (function calling)** — the agent can execute tools to help you:
   - `bash` — run Bash commands
-  - `read` — read a file page by page: `offset` (1-based first line) and `limit` (line count); every returned line is prefixed `L<number>: ` so a line reference can be read straight off it
+  - `read` — read a file page by page: `offset` (1-based first line) and `limit` (line count); every returned line is prefixed `<number>:` so a line reference can be read straight off it
   - `write` — create/overwrite with `content`, or replace one exact, unique block with `old_text`/`new_text` (atomic, preserving permissions)
   - `apply_patch` — change a file by applying a unified diff, which is then shown to you as a coloured diff
   - `ls` — list directory contents
