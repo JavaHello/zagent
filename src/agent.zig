@@ -12,7 +12,6 @@ const scratch_mod = @import("scratch.zig");
 const render = @import("render.zig");
 const term = @import("term.zig");
 const spinner = @import("spinner.zig");
-const tool_schema = @import("tool_schema.zig");
 const Screen = @import("screen.zig").Screen;
 const ScreenLogWriter = @import("screen.zig").LogWriter;
 const Config = @import("config.zig").Config;
@@ -216,38 +215,15 @@ fn buildSubagentPrompt(
     return aw.toOwnedSlice();
 }
 
-/// The built-in tools a sub-agent is given, chosen by the search programs the
-/// machine has.
+/// What a sub-agent is not given, by name, out of the default tool set.
 ///
-/// The list is explicit rather than the default set minus a few: a sub-agent
-/// cannot ask the user anything, cannot announce a task on a terminal it does
-/// not own, cannot move the parent's plan, cannot write the shared memory and
-/// cannot start another sub-agent.
-const subagent_tools_rg_fd = [_]tool_schema.ToolDefinition{
-    tool_schema.memory_search, tool_schema.bash, tool_schema.read, tool_schema.write,
-    tool_schema.apply_patch,   tool_schema.ls,   tool_schema.http, tool_schema.rg,
-    tool_schema.fd,
-};
-const subagent_tools_rg_find = [_]tool_schema.ToolDefinition{
-    tool_schema.memory_search, tool_schema.bash, tool_schema.read, tool_schema.write,
-    tool_schema.apply_patch,   tool_schema.ls,   tool_schema.http, tool_schema.rg,
-    tool_schema.find,
-};
-const subagent_tools_grep_fd = [_]tool_schema.ToolDefinition{
-    tool_schema.memory_search, tool_schema.bash, tool_schema.read, tool_schema.write,
-    tool_schema.apply_patch,   tool_schema.ls,   tool_schema.http, tool_schema.grep,
-    tool_schema.fd,
-};
-const subagent_tools_grep_find = [_]tool_schema.ToolDefinition{
-    tool_schema.memory_search, tool_schema.bash, tool_schema.read, tool_schema.write,
-    tool_schema.apply_patch,   tool_schema.ls,   tool_schema.http, tool_schema.grep,
-    tool_schema.find,
-};
-
-fn subagentTools(search: tools.SearchBackends) []const tool_schema.ToolDefinition {
-    if (search.rg) return if (search.fd) &subagent_tools_rg_fd else &subagent_tools_rg_find;
-    return if (search.fd) &subagent_tools_grep_fd else &subagent_tools_grep_find;
-}
+/// Expressed as what it lacks rather than as a list of what it keeps: a
+/// sub-agent cannot ask the user anything, cannot announce a task on a terminal
+/// it does not own, cannot move the parent's plan, cannot write the shared
+/// memory and cannot start another sub-agent. Everything else — including the
+/// search programs this machine has — comes from the same startup defaults the
+/// agent on the terminal uses, so there is one place that decides them.
+const subagent_omitted = [_][]const u8{ "ask_user", "announce_task", "plan", "remember", "subagent" };
 
 pub const Agent = struct {
     interrupted: std.atomic.Value(bool) = .init(false),
@@ -392,7 +368,7 @@ pub const Agent = struct {
         const search = if (parent) |p| p.search else tools.detectSearchBackends(io, env);
         var client = openai.Client.init(allocator, io, config.*);
         client.search = search;
-        if (options.role == .subagent) client.builtin_tools = subagentTools(search);
+        if (options.role == .subagent) client.builtin_omit = &subagent_omitted;
         // A test transport is the one thing a sub-agent inherits that is not
         // settings: the loop is driven without a socket, so the requests the
         // sub-agent makes are scripted by the same test.
@@ -2544,6 +2520,21 @@ test "task metadata requires title and description and fewer than 80 Unicode cha
     defer allocator.free(invalid);
     try std.testing.expectError(error.InvalidTaskMetadata, harness.agent.announceTask(invalid));
     try std.testing.expectEqualStrings(title.items[0 .. 79 * "题".len], harness.agent.current_task);
+}
+
+test "every tool a sub-agent is denied exists in the default set" {
+    // The deny list is names, so a rename in tool_schema.zig would silently
+    // hand a sub-agent a tool it must not have. This is the guard: the openai
+    // test checks that the names it is given are dropped, and this one checks
+    // the names still exist to be dropped.
+    const tool_schema = @import("tool_schema.zig");
+    for (subagent_omitted) |name| {
+        var found = false;
+        for (tool_schema.builtin) |tool| {
+            if (std.mem.eql(u8, tool.name, name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "a truncated reply is continued and kept as one message" {

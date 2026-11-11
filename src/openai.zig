@@ -42,6 +42,49 @@ test "search registration follows installed backends and advertises renamed file
     }
 }
 
+test "omitted names drop from the startup defaults and search selection still applies" {
+    const allocator = std.testing.allocator;
+    // The five tools a sub-agent must not hold, as src/agent.zig names them.
+    const omit = [_][]const u8{ "ask_user", "announce_task", "plan", "remember", "subagent" };
+    for ([_]search_tools.SearchBackends{ .{}, .{ .rg = true }, .{ .fd = true }, .{ .rg = true, .fd = true } }) |search| {
+        const body = try buildRequestWithToolSelection(allocator, "test", &.{}, 100, .{ .omit = &omit }, false, search);
+        defer allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        var names: std.StringHashMap(void) = .init(allocator);
+        defer names.deinit();
+        for (parsed.value.object.get("tools").?.array.items) |tool| {
+            try names.put(tool.object.get("name").?.string, {});
+        }
+        try std.testing.expectEqual(@as(usize, 9), names.count());
+        for ([_][]const u8{ "memory_search", "bash", "read", "write", "apply_patch", "ls", "http" }) |name| {
+            try std.testing.expect(names.contains(name));
+        }
+        for (omit) |name| try std.testing.expect(!names.contains(name));
+        try std.testing.expectEqual(search.rg, names.contains("rg"));
+        try std.testing.expectEqual(!search.rg, names.contains("grep"));
+        try std.testing.expectEqual(search.fd, names.contains("fd"));
+        try std.testing.expectEqual(!search.fd, names.contains("find"));
+    }
+}
+
+test "omitted names leave an explicit builtin slice unchanged" {
+    const allocator = std.testing.allocator;
+    const explicit = [_]ToolDefinition{ tool_schema.read, tool_schema.ask_user };
+    const body = try buildRequestWithToolSelection(allocator, "test", &.{}, 100, .{
+        .builtin = &explicit,
+        .omit = &.{"ask_user"},
+    }, false, .{ .rg = true, .fd = true });
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const tools = parsed.value.object.get("tools").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tools.len);
+    for (tools, [_][]const u8{ "read", "ask_user" }) |tool, name| {
+        try std.testing.expectEqualStrings(name, tool.object.get("name").?.string);
+    }
+}
+
 test "tool selection composes runtime subsets and MCP schemas without mutating definitions" {
     const a = std.testing.allocator;
     var selected: std.ArrayList(ToolDefinition) = .empty;
@@ -222,6 +265,10 @@ pub const Client = struct {
     /// Borrowed definitions; callers may replace this slice between requests.
     /// The slice and its strings must remain valid for each request's duration.
     builtin_tools: ?[]const ToolDefinition = null,
+    /// Names dropped from the startup default set, for a role that must not
+    /// have every tool. Ignored when `builtin_tools` is set, because an
+    /// explicit slice is used unchanged.
+    builtin_omit: []const []const u8 = &.{},
     /// Set only by tests; see `Transport`.
     transport: ?Transport = null,
     /// Live token accounting, read by the spinner while a request is in
@@ -360,7 +407,7 @@ pub const Client = struct {
     /// Use the same request projection as the live counter, including tool
     /// schemas and the Codex adapter, without sending or authenticating.
     pub fn estimateRequestTokens(self: *Client, messages: []const Message, extra_tools: []const []const u8) !u64 {
-        const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, .{ .builtin = self.builtin_tools, .extra = extra_tools }, true, self.search);
+        const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools }, true, self.search);
         defer self.allocator.free(ordinary);
         if (self.codex_auth_path != null) {
             const adapted = try codexRequest(self.allocator, ordinary, self.codex_options);
@@ -393,7 +440,7 @@ pub const Client = struct {
                 self.model,
                 messages,
                 max_tokens,
-                .{ .builtin = self.builtin_tools, .extra = extra_tools },
+                .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools },
                 true,
                 self.search,
             );
@@ -708,6 +755,11 @@ const Request = struct {
 pub const ToolSelection = struct {
     /// null selects startup defaults; an explicit slice is used unchanged.
     builtin: ?[]const ToolDefinition = null,
+    /// Tool names dropped from the startup defaults. A role that must not have
+    /// every tool is then described by the few names it lacks, rather than by
+    /// every combination of the startup search programs. Applies to the
+    /// default set only: an explicit `builtin` is still used unchanged.
+    omit: []const []const u8 = &.{},
     extra: []const []const u8 = &.{},
 };
 
@@ -734,6 +786,7 @@ pub fn buildRequestWithToolSelection(
                 if (std.mem.eql(u8, tool.name, "grep") and search.rg) continue;
                 if (std.mem.eql(u8, tool.name, "fd") and !search.fd) continue;
                 if (std.mem.eql(u8, tool.name, "find") and search.fd) continue;
+                if (isOmitted(selected.omit, tool.name)) continue;
             }
             try functions.append(arena, try tool.function(arena));
         }
@@ -749,6 +802,14 @@ pub fn buildRequestWithToolSelection(
         .input = input,
         .tools = if (selection != null) functions.items else null,
     }, .{ .emit_null_optional_fields = false });
+}
+
+/// Whether `name` is one of the tool names `omit` lists.
+fn isOmitted(omit: []const []const u8, name: []const u8) bool {
+    for (omit) |entry| {
+        if (std.mem.eql(u8, entry, name)) return true;
+    }
+    return false;
 }
 
 fn stringField(value: std.json.Value, key: []const u8) ![]const u8 {
