@@ -9,7 +9,7 @@ const banner = @import("ui/banner.zig");
 const term = @import("ui/term.zig");
 const text = @import("util/text.zig");
 const Screen = @import("ui/screen.zig").Screen;
-const Linenoise = @import("editor/main.zig").Linenoise;
+const Linenoise = @import("editor/linenoise.zig").Linenoise;
 
 const sgr = @import("ui/style.zig");
 const RESET = sgr.RESET;
@@ -662,8 +662,8 @@ fn printToStderr(
 // The other modules are only reachable from `main`, which a test build never
 // analyzes, so their tests would otherwise be dropped from `zig build test`.
 test {
-    _ = @import("editor/main.zig");
-    _ = @import("unicode_width/main.zig");
+    _ = @import("editor/linenoise.zig");
+    _ = @import("unicode_width/wcwidth.zig");
     _ = @import("agent/mod.zig");
     _ = @import("model/status.zig");
     _ = @import("host/execution.zig");

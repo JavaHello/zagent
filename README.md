@@ -907,7 +907,14 @@ src/
     text.zig     — Sanitising, ANSI stripping and UTF-8 helpers
     compact.zig  — Dropping tool results, deduplicating repeated reads
   editor/        — Line editing, history, popup and raw terminal handling
+    linenoise.zig — The editor: read loop, key handling, popups and paste
+    state.zig    — One edit in progress: buffer, cursor, rows and popup
+    history.zig  — Prompt history: storage format and saving
+    term.zig     — Raw mode, key reads and terminal size
+    unicode.zig  — Moving by character and word across UTF-8
   unicode_width/ — Terminal character widths and Unicode tables
+    wcwidth.zig  — wcwidth, wcswidth and sliceWidth
+    manual.zig, table_wide.zig, table_zero.zig — The width tables
 build.zig     — Zig build script
 ```
 

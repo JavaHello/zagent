@@ -15,7 +15,7 @@ const spinner = @import("../ui/spinner.zig");
 const Screen = @import("../ui/screen.zig").Screen;
 const ScreenLogWriter = @import("../ui/screen.zig").LogWriter;
 const Config = @import("../model/config.zig").Config;
-const Linenoise = @import("../editor/main.zig").Linenoise;
+const Linenoise = @import("../editor/linenoise.zig").Linenoise;
 
 const Message = openai.Message;
 const ToolCallData = openai.ToolCallData;

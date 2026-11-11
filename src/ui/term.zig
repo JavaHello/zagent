@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const wcwidth = @import("../unicode_width/main.zig").wcwidth;
+const wcwidth = @import("../unicode_width/wcwidth.zig").wcwidth;
 const text = @import("../util/text.zig");
 const ansi = @import("style.zig");
 

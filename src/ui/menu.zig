@@ -1,7 +1,7 @@
 const std = @import("std");
 const term = @import("term.zig");
 const sanitize = @import("../util/text.zig");
-const RawTerminal = @import("../editor/main.zig").RawTerminal;
+const RawTerminal = @import("../editor/linenoise.zig").RawTerminal;
 
 // ANSI colour codes
 const sgr = @import("style.zig");

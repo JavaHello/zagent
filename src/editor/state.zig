@@ -5,7 +5,7 @@ const ArrayList = std.ArrayList;
 const File = std.Io.File;
 const math = std.math;
 
-const Linenoise = @import("main.zig").Linenoise;
+const Linenoise = @import("linenoise.zig").Linenoise;
 const History = @import("history.zig").History;
 const unicode = @import("unicode.zig");
 const width = unicode.width;
@@ -129,7 +129,7 @@ pub const LinenoiseState = struct {
     cols: usize,
     max_rows: usize = 0,
     viewport_start: usize = 0,
-    popup_items: []@import("main.zig").PopupItem = &.{},
+    popup_items: []@import("linenoise.zig").PopupItem = &.{},
     popup_selected: usize = 0,
     popup_rows: usize = 0,
     /// Recalled commands must not divert subsequent arrows into completion.
@@ -960,7 +960,7 @@ test "accept popup keeps transferred buffer alive on redraw allocation failure" 
                 defer state.freePopup();
                 try state.buf.appendSlice(allocator, "before suffix");
                 state.pos = 6;
-                const Item = @import("main.zig").PopupItem;
+                const Item = @import("linenoise.zig").PopupItem;
                 {
                     const value = try allocator.dupe(u8, "replacement");
                     errdefer allocator.free(value);
@@ -1074,10 +1074,10 @@ fn recordLayout(context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void 
     record.calls += 1;
 }
 
-fn testPopup(allocator: Allocator, io: std.Io, input: []const u8) ![]@import("main.zig").PopupItem {
+fn testPopup(allocator: Allocator, io: std.Io, input: []const u8) ![]@import("linenoise.zig").PopupItem {
     _ = io;
     _ = input;
-    const items = try allocator.alloc(@import("main.zig").PopupItem, 2);
+    const items = try allocator.alloc(@import("linenoise.zig").PopupItem, 2);
     items[0] = .{
         .value = try allocator.dupe(u8, "@a"),
         .label = try allocator.dupe(u8, "alpha.zig"),
