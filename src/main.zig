@@ -25,7 +25,6 @@ const HELP =
     \\  /clear       Clear conversation history
     \\  /new         Create a new session (preserve the previous one)
     \\  /session     Show the current session ID and resume command
-    \\  /compact     Summarize older messages to free context
     \\  /memory      List saved memories
     \\  /remember <text>  Save a note to memory
     \\  /forget <n|all>   Remove a saved note
@@ -477,8 +476,6 @@ fn runRepl(
         } else if (std.mem.eql(u8, line, "/clear")) {
             agent.clearHistory();
             try writeOut(&screen, stdout, io, DIM ++ "Conversation history cleared.\n" ++ RESET);
-        } else if (std.mem.eql(u8, line, "/compact")) {
-            agent.compactCommand() catch |err| try reportCommandError(allocator, &screen, io, "compact", err);
         } else if (std.mem.eql(u8, line, "/memory")) {
             agent.listMemory() catch |err| try reportCommandError(allocator, &screen, io, "memory", err);
         } else if (std.mem.eql(u8, line, "/remember") or std.mem.startsWith(u8, line, "/remember ")) {

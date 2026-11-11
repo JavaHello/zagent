@@ -22,7 +22,6 @@ pub const all = [_]Command{
     .{ .name = "/clear", .description = "Clear conversation history" },
     .{ .name = "/new", .description = "Create a new session (preserve the previous one)" },
     .{ .name = "/session", .description = "Show the current session ID and resume command" },
-    .{ .name = "/compact", .description = "Summarize older messages to free context" },
     .{ .name = "/memory", .description = "List saved memories" },
     .{ .name = "/remember", .description = "Save a note to memory: /remember <text>" },
     .{ .name = "/forget", .description = "Remove a saved note: /forget <n|all>" },
@@ -103,9 +102,8 @@ test "complete offers every command matching the prefix" {
 
     const c = try complete(allocator, "/c");
     defer freeCompletions(allocator, c);
-    try std.testing.expectEqual(@as(usize, 2), c.len);
+    try std.testing.expectEqual(@as(usize, 1), c.len);
     try std.testing.expectEqualStrings("/clear", c[0]);
-    try std.testing.expectEqualStrings("/compact", c[1]);
 
     const e = try complete(allocator, "/e");
     defer freeCompletions(allocator, e);

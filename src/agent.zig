@@ -74,7 +74,6 @@ const SYSTEM_PROMPT =
     \\- Do not read or expose sensitive information, including environment variable values, secrets or tokens in configuration files, passwords and private keys. Avoid commands or broad searches that could reveal them; use only non-sensitive fields needed for the task, and never include secrets in tool arguments, output, logs or memory.
     \\- Use ask_user with concrete options when ambiguity or a user-only decision blocks progress; recommend one option. Decide routine details yourself.
     \\- Save durable preferences, project facts and decisions with remember, not transient status or secrets. Correct obsolete notes rather than adding contradictions.
-    \\- Call compact_context with your own summary before history becomes unwieldy; no automatic threshold or separate summarizer runs. Preserve goals, constraints, decisions, paths, commands, changes, results and next steps; save durable facts separately.
     \\- Call drop_context with the call ids of tool output you no longer need: each named result becomes a short marker naming the tool and call id, and both stay paired. Use it when a large output has served its purpose, and re-run the tool if you need the output again.
     \\- Finish with a concise final answer after the work and necessary validation. Clearly explain partial work, failures or blockers rather than claiming success.
 ;
@@ -372,39 +371,9 @@ pub const Agent = struct {
         return .{ .content = content, .is_error = false };
     }
 
-    /// Fold the messages before a safe cut into one summary. Returns false
-    /// when there is nothing safe to compact or the model could not produce a
-    /// summary; in both cases the history is left as it was, because losing
-    /// the conversation is worse than exceeding the budget by one turn.
-    fn compactHistory(self: *Agent, turn_start: ?*usize, keep_messages: u32, provided_summary: []const u8) !bool {
-        const cut = compact.findCut(self.history.items, keep_messages) orelse return false;
-        const before = compact.estimateTokens(self.history.items);
-        const summary = compact.sanitizeSummary(self.allocator, provided_summary) catch return false;
-        defer self.allocator.free(summary);
-
-        const shift = compact.install(self.allocator, &self.history, cut, summary) catch |err| {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ⚠ context compaction skipped: {s}\n" ++ RESET, .{@errorName(err)});
-            return false;
-        };
-        if (turn_start) |index| {
-            if (index.* >= cut) {
-                index.* -= shift;
-            } else {
-                // The turn began in the summarized range; move its index to
-                // the first retained message.
-                index.* = @min(index.*, 2);
-            }
-        }
-        self.checkpoint() catch {};
-
-        const after = compact.estimateTokens(self.history.items);
-        try self.emit(std.Io.File.stderr(), DIM ++ "  ⟳ compacted {d} earlier messages (~{d} tokens freed)\n" ++ RESET, .{ cut - 2, before -| after });
-        return true;
-    }
-
     /// Replace the content of the tool result answering `call_id`, taking
-    /// ownership of `content`. This is how the requests that rewrite their own
-    /// results — compaction and dropping — answer themselves.
+    /// ownership of `content`. This is how a request that rewrites its own
+    /// result — a drop — answers itself.
     fn replaceToolResult(self: *Agent, call_id: []const u8, content: []const u8) !void {
         for (self.history.items) |*message| {
             const id = message.tool_call_id orelse continue;
@@ -415,15 +384,6 @@ pub const Agent = struct {
         }
         // Nothing to answer. The content is still the caller's allocation.
         self.allocator.free(content);
-    }
-
-    /// `/compact`: explicitly summarize the older part of the conversation.
-    pub fn compactCommand(self: *Agent) !void {
-        if (compact.findCut(self.history.items, 16) == null) {
-            try self.emit(std.Io.File.stderr(), DIM ++ "  nothing to compact yet\n" ++ RESET, .{});
-            return;
-        }
-        try self.processQuery("Compact the earlier conversation now: call compact_context with a concise summary preserving goals, constraints, decisions, important paths, commands, changes, errors, outcomes, open work and next steps. Keep the most recent 16 messages verbatim. Do not execute other work.");
     }
 
     /// `/memory`: list what is saved, newest last.
@@ -673,12 +633,9 @@ pub const Agent = struct {
         try self.appendUserMessage(query);
         try self.checkpoint();
         self.terminal_title.update("thinking…", self.current_task);
-        // Compaction during the turn moves this history boundary down;
-        // `runToolLoop` updates it.
-        var turn_start = self.history.items.len;
 
         try self.checkInterrupted();
-        const turn = try self.runToolLoop(&turn_start);
+        const turn = try self.runToolLoop();
         if (!turn.completed) return error.IterationLimitReached;
     }
 
@@ -723,11 +680,7 @@ pub const Agent = struct {
 
     /// Run the tool-call loop until the model answers or the iteration budget
     /// runs out. The answer is printed and kept in the history.
-    fn runToolLoop(self: *Agent, turn_start: ?*usize) !Turn {
-        // Tests drive the loop directly, without a query around it; give them
-        // a boundary of their own rather than making the caller invent one.
-        var local_turn_start = self.history.items.len;
-        const start = turn_start orelse &local_turn_start;
+    fn runToolLoop(self: *Agent) !Turn {
         var turn: Turn = .{ .tool_calls = 0, .completed = false };
         var iteration: usize = 0;
         // Text from replies that the token limit cut short. It is held back
@@ -858,22 +811,9 @@ pub const Agent = struct {
                         .tool_status = result.status(),
                     });
                 }
-                // Complete every call/result pair before moving history.
-                // Compaction runs before drops: a drop names a call, and a call
-                // a summary has already swallowed can only be reported as
-                // unknown, never silently written into the summary.
-                var compacted: ?bool = null;
-                for (tool_calls) |call| {
-                    if (!std.mem.eql(u8, call.name, "compact_context")) continue;
-                    const keep = compactKeep(self.allocator, call.arguments) catch continue;
-                    const summary = compactSummary(self.allocator, call.arguments) catch continue;
-                    defer self.allocator.free(summary);
-                    if (compacted == null) compacted = try self.compactHistory(start, keep, summary);
-                    try self.replaceToolResult(call.id, try self.allocator.dupe(u8, if (compacted.?)
-                        "Context compacted. Earlier messages were replaced by a summary; recent messages are preserved."
-                    else
-                        "Context unchanged: nothing safe to compact or no usable summary could be produced."));
-                }
+                // Complete every call/result pair before rewriting results: a
+                // drop names a call, and its marker has to replace a result
+                // that is already in the history.
                 for (tool_calls) |call| {
                     if (!std.mem.eql(u8, call.name, "drop_context")) continue;
                     const ids = dropContextIds(self.allocator, call.arguments) catch {
@@ -884,7 +824,7 @@ pub const Agent = struct {
                     const report = try compact.dropToolResults(self.allocator, self.history.items, ids);
                     try self.replaceToolResult(call.id, try std.fmt.allocPrint(
                         self.allocator,
-                        "Dropped {d} tool result(s), freeing ~{d} bytes of context. Already dropped: {d}. Unknown or summarized: {d}. Kept because a deduplicated read points at them: {d}.",
+                        "Dropped {d} tool result(s), freeing ~{d} bytes of context. Already dropped: {d}. Unknown or not in context: {d}. Kept because a deduplicated read points at them: {d}.",
                         .{ report.dropped, report.freed_bytes, report.repeated, report.unknown, report.referenced },
                     ));
                 }
@@ -1210,15 +1150,6 @@ pub const Agent = struct {
                 break :blk try self.createTempDir(call.arguments);
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "compact_context")) {
-                _ = compactKeep(self.allocator, call.arguments) catch {
-                    break :blk .{ .content = try self.allocator.dupe(u8, "Error: keep_messages must be an integer of at least 2."), .is_error = true };
-                };
-                const summary = compactSummary(self.allocator, call.arguments) catch {
-                    break :blk .{ .content = try self.allocator.dupe(u8, "Error: provide a non-empty UTF-8 summary of at most 6000 bytes."), .is_error = true };
-                };
-                self.allocator.free(summary);
-                break :blk .{ .content = try self.allocator.dupe(u8, "Context compaction requested; it runs after this tool batch finishes."), .is_error = false };
             } else if (std.mem.eql(u8, call.name, "drop_context")) {
                 const ids = dropContextIds(self.allocator, call.arguments) catch {
                     break :blk .{ .content = try self.allocator.dupe(u8, invalid_drop_message), .is_error = true };
@@ -1513,16 +1444,6 @@ fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptim
     try file.writeStreamingAll(io, message);
 }
 
-fn compactKeep(allocator: std.mem.Allocator, arguments: []const u8) !u32 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidCompactKeep;
-    for (parsed.value.object.keys()) |key| if (!std.mem.eql(u8, key, "summary") and !std.mem.eql(u8, key, "keep_messages")) return error.InvalidCompactKeep;
-    const value = parsed.value.object.get("keep_messages") orelse return 16;
-    if (value != .integer or value.integer < 2 or value.integer > std.math.maxInt(u32)) return error.InvalidCompactKeep;
-    return @intCast(value.integer);
-}
-
 /// The call ids a `drop_context` call names, each copied so the caller owns
 /// the whole list. Unknown keys are rejected rather than ignored: a misspelt
 /// `call_ids` would otherwise drop nothing and look like it had worked.
@@ -1555,47 +1476,6 @@ fn dropContextIds(allocator: std.mem.Allocator, arguments: []const u8) ![]const 
 fn dropContextIdsDeinit(allocator: std.mem.Allocator, ids: []const []const u8) void {
     for (ids) |id| allocator.free(id);
     allocator.free(ids);
-}
-
-fn compactSummary(allocator: std.mem.Allocator, arguments: []const u8) ![]const u8 {
-    const summary = try openai.extractStringArg(allocator, arguments, "summary");
-    errdefer allocator.free(summary);
-    if (std.mem.trim(u8, summary, " \t\r\n").len == 0 or summary.len > compact.max_summary_bytes or !std.unicode.utf8ValidateSlice(summary)) return error.InvalidSummary;
-    return summary;
-}
-
-test "compaction requires a bounded non-empty UTF-8 summary" {
-    const a = std.testing.allocator;
-    for ([_][]const u8{ "{}", "{\"summary\":\" \"}", "{\"summary\":42}", "[]" }) |args| {
-        if (compactSummary(a, args)) |summary| {
-            a.free(summary);
-            return error.ExpectedInvalidSummary;
-        } else |_| {}
-    }
-    const oversized = try a.alloc(u8, compact.max_summary_bytes + 1);
-    defer a.free(oversized);
-    @memset(oversized, 'x');
-    const args = try std.json.Stringify.valueAlloc(a, .{ .summary = oversized }, .{});
-    defer a.free(args);
-    try std.testing.expectError(error.InvalidSummary, compactSummary(a, args));
-    const valid = try compactSummary(a, "{\"summary\":\"保留目标与下一步\",\"keep_messages\":4}");
-    defer a.free(valid);
-    try std.testing.expectEqualStrings("保留目标与下一步", valid);
-}
-
-test "model chooses compaction retention with safe bounds" {
-    const a = std.testing.allocator;
-    try std.testing.expectEqual(@as(u32, 16), try compactKeep(a, "{}"));
-    try std.testing.expectEqual(@as(u32, 4), try compactKeep(a, "{\"keep_messages\":4}"));
-    for ([_][]const u8{
-        "{\"keep_messages\":0}",  "{\"keep_messages\":1}",
-        "{\"keep_messages\":-1}", "{\"keep_messages\":\"4\"}",
-        "not json",
-    }) |invalid| {
-        if (compactKeep(a, invalid)) |_| {
-            return error.ExpectedInvalidRetention;
-        } else |_| {}
-    }
 }
 
 test "a drop request is a bounded list of call ids" {
@@ -1768,7 +1648,7 @@ test "main model submits task metadata through a built-in call without planning 
     defer mock.deinit(allocator);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("不要把这段原文直接放到标题上");
-    const turn = try harness.agent.runToolLoop(null);
+    const turn = try harness.agent.runToolLoop();
     try std.testing.expect(turn.completed);
     try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
     try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
@@ -1806,135 +1686,6 @@ test "task metadata requires title and description and fewer than 80 Unicode cha
     defer allocator.free(invalid);
     try std.testing.expectError(error.InvalidTaskMetadata, harness.agent.setTask(invalid));
     try std.testing.expectEqualStrings(title.items[0 .. 79 * "题".len], harness.agent.current_task);
-}
-
-test "compaction replaces old turns with a summary and keeps the recent ones" {
-    const allocator = std.testing.allocator;
-    const harness = try TestHarness.init(allocator, std.testing.io);
-    defer harness.deinit(allocator);
-
-    try harness.agent.appendUserMessage("one");
-    try harness.agent.appendAssistantText("answer one");
-    try harness.agent.appendUserMessage("two");
-    try harness.agent.appendAssistantText("answer two");
-    try harness.agent.appendUserMessage("three");
-    try harness.agent.appendAssistantText("answer three");
-    try harness.agent.appendUserMessage("four");
-    try harness.agent.appendAssistantText("answer four");
-
-    var mock: MockTransport = .{ .replies = &.{completed_answer} };
-    defer mock.deinit(allocator);
-    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
-
-    {
-        var quiet = try Silence.init(std.testing.io);
-        defer quiet.deinit(std.testing.io);
-        try std.testing.expect(try harness.agent.compactHistory(null, 2, "Earlier answer."));
-    }
-
-    // system, summary, then the newest turn verbatim.
-    try std.testing.expectEqual(@as(usize, 4), harness.agent.history.items.len);
-    try std.testing.expectEqualStrings("system", harness.agent.history.items[0].role);
-    const summary = harness.agent.history.items[1].content.?;
-    try std.testing.expect(std.mem.indexOf(u8, summary, "Earlier conversation summary") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "answer.") != null);
-    try std.testing.expectEqualStrings("four", harness.agent.history.items[2].content.?);
-    try std.testing.expectEqualStrings("answer four", harness.agent.history.items[3].content.?);
-}
-
-test "compact command asks the main model to submit its summary" {
-    const allocator = std.testing.allocator;
-    const harness = try TestHarness.init(allocator, std.testing.io);
-    defer harness.deinit(allocator);
-    var quiet = try Silence.init(std.testing.io);
-    defer quiet.deinit(std.testing.io);
-    for (0..12) |_| {
-        try harness.agent.appendUserMessage("old question");
-        try harness.agent.appendAssistantText("old answer");
-    }
-    const call = "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"compact\",\"name\":\"compact_context\",\"arguments\":\"{\\\"summary\\\":\\\"User goals, decisions and next steps.\\\"}\"}]}";
-    var mock: MockTransport = .{ .replies = &.{ call, completed_answer } };
-    defer mock.deinit(allocator);
-    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
-    try harness.agent.compactCommand();
-    try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
-    for (mock.requests.items) |body| {
-        const request = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-        defer request.deinit();
-        try std.testing.expect(request.value.object.get("tools") != null);
-    }
-    try std.testing.expect(std.mem.indexOf(u8, harness.agent.history.items[1].content.?, "User goals, decisions and next steps.") != null);
-}
-
-test "model compaction waits for the whole tool batch and coalesces requests" {
-    const allocator = std.testing.allocator;
-    for ([_]bool{ true, false }) |usable_summary| {
-        const harness = try TestHarness.init(allocator, std.testing.io);
-        defer harness.deinit(allocator);
-        var quiet = try Silence.init(std.testing.io);
-        defer quiet.deinit(std.testing.io);
-        for (0..3) |_| {
-            try harness.agent.appendUserMessage("old question");
-            try harness.agent.appendAssistantText("old answer");
-        }
-        const arguments = try std.json.Stringify.valueAlloc(allocator, .{
-            .summary = "Old questions answered.",
-            .keep_messages = @as(u32, if (usable_summary) 4 else 100),
-        }, .{});
-        defer allocator.free(arguments);
-        const Call = struct { type: []const u8 = "function_call", call_id: []const u8, name: []const u8, arguments: []const u8 };
-        const reply = try std.json.Stringify.valueAlloc(allocator, .{
-            .status = "completed",
-            .output = [_]Call{
-                .{ .call_id = "compact1", .name = "compact_context", .arguments = arguments },
-                .{ .call_id = "list", .name = "ls", .arguments = "{\"path\":\".\"}" },
-                .{ .call_id = "compact2", .name = "compact_context", .arguments = "{\"summary\":\"Second summary.\"}" },
-            },
-        }, .{});
-        defer allocator.free(reply);
-        var mock: MockTransport = .{ .replies = &.{ reply, completed_answer } };
-        defer mock.deinit(allocator);
-        harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
-        var start: usize = 5;
-        const turn = try harness.agent.runToolLoop(&start);
-        try std.testing.expect(turn.completed);
-        try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
-        const next_request = mock.requests.items[1];
-        const request = try std.json.parseFromSlice(std.json.Value, allocator, next_request, .{});
-        defer request.deinit();
-        try std.testing.expect(request.value.object.get("tools") != null);
-        for ([_][]const u8{ "compact1", "compact2", "list" }) |id| {
-            try std.testing.expect(std.mem.indexOf(u8, next_request, id) != null);
-        }
-        try std.testing.expect(std.mem.indexOf(u8, next_request, if (usable_summary) "Context compacted." else "Context unchanged:") != null);
-        try std.testing.expectEqual(@as(usize, if (usable_summary) 7 else 12), harness.agent.history.items.len);
-        try std.testing.expectEqual(@as(usize, if (usable_summary) 2 else 5), start);
-        const call_index: usize = if (usable_summary) 2 else 7;
-        try std.testing.expectEqual(@as(usize, 3), harness.agent.history.items[call_index].tool_calls.?.len);
-        for (harness.agent.history.items[call_index + 1 ..][0..3]) |message| {
-            try std.testing.expectEqualStrings("tool", message.role);
-            try std.testing.expect(message.tool_call_id != null);
-        }
-        if (!usable_summary) try std.testing.expectEqualStrings("old question", harness.agent.history.items[1].content.?);
-    }
-}
-
-test "model compaction with no safe range leaves history intact" {
-    const allocator = std.testing.allocator;
-    const harness = try TestHarness.init(allocator, std.testing.io);
-    defer harness.deinit(allocator);
-    var quiet = try Silence.init(std.testing.io);
-    defer quiet.deinit(std.testing.io);
-    try harness.agent.appendUserMessage("short conversation");
-    const call = "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"compact\",\"name\":\"compact_context\",\"arguments\":\"{\\\"summary\\\":\\\"Short conversation.\\\"}\"}]}";
-    var mock: MockTransport = .{ .replies = &.{ call, completed_answer } };
-    defer mock.deinit(allocator);
-    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
-    const turn = try harness.agent.runToolLoop(null);
-    try std.testing.expect(turn.completed);
-    try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "Context unchanged:") != null);
-    try std.testing.expectEqualStrings("short conversation", harness.agent.history.items[1].content.?);
 }
 
 /// Append one assistant call and the result that answers it, owning every
@@ -1988,7 +1739,7 @@ test "dropping tool output happens after the batch and keeps the call paired" {
     defer mock.deinit(allocator);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
 
-    const turn = try harness.agent.runToolLoop(null);
+    const turn = try harness.agent.runToolLoop();
     try std.testing.expect(turn.completed);
     try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
 
@@ -2000,35 +1751,12 @@ test "dropping tool output happens after the batch and keeps the call paired" {
     try std.testing.expect(std.mem.indexOf(u8, next, "function_call_output") != null);
     const report = harness.agent.history.items[5].content.?;
     try std.testing.expect(std.mem.indexOf(u8, report, "Dropped 1 tool result(s)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "Unknown or summarized: 1") != null);
-    // Nothing was summarized: the dropped turn is still two messages, and the
+    try std.testing.expect(std.mem.indexOf(u8, report, "Unknown or not in context: 1") != null);
+    // Nothing was rewritten: the dropped turn is still two messages, and the
     // final answer is the only thing the batch appended besides the report.
     try std.testing.expectEqual(@as(usize, 7), harness.agent.history.items.len);
     try std.testing.expectEqualStrings("assistant", harness.agent.history.items[2].role);
     try std.testing.expectEqualStrings("big", harness.agent.history.items[2].tool_calls.?[0].id);
-}
-
-test "large history does not trigger compaction without a model request" {
-    const allocator = std.testing.allocator;
-    const harness = try TestHarness.init(allocator, std.testing.io);
-    defer harness.deinit(allocator);
-    var quiet = try Silence.init(std.testing.io);
-    defer quiet.deinit(std.testing.io);
-    const large = try allocator.alloc(u8, 200_000);
-    defer allocator.free(large);
-    @memset(large, 'x');
-    for (0..3) |_| {
-        try harness.agent.appendUserMessage("old question");
-        try harness.agent.appendAssistantText(large);
-    }
-    var mock: MockTransport = .{ .replies = &.{completed_answer} };
-    defer mock.deinit(allocator);
-    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
-    const turn = try harness.agent.runToolLoop(null);
-    try std.testing.expect(turn.completed);
-    try std.testing.expectEqual(@as(usize, 1), mock.requests.items.len);
-    try std.testing.expectEqual(@as(usize, 8), harness.agent.history.items.len);
-    try std.testing.expectEqualStrings(large, harness.agent.history.items[2].content.?);
 }
 
 test "a truncated reply is continued and kept as one message" {
@@ -2044,7 +1772,7 @@ test "a truncated reply is continued and kept as one message" {
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
         try harness.agent.appendUserMessage("Do the task");
-        break :blk harness.agent.runToolLoop(null);
+        break :blk harness.agent.runToolLoop();
     };
 
     try std.testing.expect(turn.completed);
@@ -2074,7 +1802,7 @@ test "a truncated tool call is retried in smaller steps without a dangling promp
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
         try harness.agent.appendUserMessage("Do the task");
-        break :blk harness.agent.runToolLoop(null);
+        break :blk harness.agent.runToolLoop();
     };
 
     try std.testing.expect(turn.completed);
@@ -2100,7 +1828,7 @@ test "a reply that never stops truncating is given up on and still kept" {
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
         try harness.agent.appendUserMessage("Do the task");
-        break :blk harness.agent.runToolLoop(null);
+        break :blk harness.agent.runToolLoop();
     };
     try std.testing.expectError(error.ResponseTruncated, outcome);
 

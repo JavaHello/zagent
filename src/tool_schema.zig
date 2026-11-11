@@ -161,14 +161,6 @@ pub const set_task = ToolDefinition{
     ,
 };
 
-pub const compact_context = ToolDefinition{
-    .name = "compact_context",
-    .description = "Replace older conversation messages with a summary you provide, preserving recent messages. Include goals, constraints, decisions, relevant paths, commands, changes, errors, outcomes, open tasks and next steps. No separate summarization request runs. Choose keep_messages (default 16, minimum 2). Compaction happens after the whole tool batch; the first valid request sets summary and retention. No safe range or invalid summary leaves history unchanged.",
-    .parameters_json =
-    \\{"type":"object","properties":{"summary":{"type":"string","minLength":1,"description":"Your summary of the earlier conversation, at most 6000 UTF-8 bytes; preserve everything needed to continue"},"keep_messages":{"type":"integer","minimum":2,"maximum":4294967295,"description":"Recent messages to preserve verbatim; defaults to 16. Safe tool boundaries may retain fewer messages."}},"required":["summary"],"additionalProperties":false}
-    ,
-};
-
 pub const drop_context = ToolDefinition{
     .name = "drop_context",
     .description = "Drop the output of earlier tool calls you no longer need, so later requests stop paying for it. Each named result is replaced by a short marker naming the tool and call id; the call and its result stay paired, which is what keeps the next request valid. Runs after the whole tool batch finishes. A result already dropped is left alone, an id no live result answers is reported, and a result a deduplicated read points at is kept. Re-run the tool if you need the output again.",
@@ -188,9 +180,9 @@ pub const remember = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,            read,         write,    apply_patch, ls,
-    rg,            fd,              grep,         find,     http,        ask_user,
-    remember,      compact_context, drop_context, temp_dir, set_task,
+    memory_search, bash,         read,     write,    apply_patch, ls,
+    rg,            fd,           grep,     find,     http,        ask_user,
+    remember,      drop_context, temp_dir, set_task,
 };
 
 test "built-in definitions have valid schemas and unique names" {

@@ -135,30 +135,16 @@ Transient network errors and HTTP 408/429/500/502/503/504 responses are retried 
 to three attempts. Exhausted tool iterations, and output still cut off after
 bounded continuations, return an error instead of reporting completion.
 
-## Context compaction
+## Context
 
-A long conversation eventually costs more context than the model has. The main
-model decides when to call `compact_context`; there is no automatic token
-threshold or separate compaction-decision request. The operation runs after
-the current tool batch finishes. Older messages are replaced by one summary,
-with the model choosing the recent-message retention target through the tool's
-`keep_messages` argument (default 16, minimum 2).
-
-The main model supplies the `summary` directly in the tool call (non-empty,
-at most 6000 UTF-8 bytes); no separate summarization request or summary system
-prompt runs. Include goals, constraints, decisions, relevant paths and commands,
-changes, errors, outcomes, open tasks and next steps. The split keeps each tool
-result attached to its assistant call. Invalid summaries or no safe range leave
-history untouched. The first valid call in a batch sets summary and retention.
-`/compact` asks the main model to call the same tool on demand, retaining a
-target of 16 recent messages.
-
-### Dropping tool output
-
-Summarizing is not the only way context is wasted: a turn that read half a
-repository keeps paying for that output long after it served its purpose. When
-the model no longer needs one of its own earlier results, it names the call id
-and calls `drop_context` with `call_ids` (at most 64 ids of 512 bytes each).
+A long conversation eventually costs more context than the model has, and a
+turn that read half a repository keeps paying for that output long after it
+served its purpose. Nothing shrinks the history on its own: there is no
+compaction step, no summary request and no automatic token threshold, because
+the model cannot reliably judge how much of its own context is still needed.
+`/clear` starts over. Otherwise the model decides, result by result: when it no
+longer needs one of its own earlier outputs, it names the call id and calls
+`drop_context` with `call_ids` (at most 64 ids of 512 bytes each).
 Each named result is replaced by a one-line marker naming the tool and the call
 id, and the drop runs after the current tool batch finishes.
 
@@ -166,8 +152,8 @@ Only the result text changes. The assistant call and the result stay paired,
 because a Responses request must answer every `function_call` with its
 `function_call_output`, and the assistant message replays the exact output
 items it was given; deleting either side would break the next request. Ids that
-no live result answers — a compacted call, a typo — are reported back, a second
-drop of the same call is a no-op, and a result a deduplicated read still points
+no live result answers — a typo, a call that never ran — are reported back, a
+second drop of the same call is a no-op, and a result a deduplicated read still points
 at is kept rather than replaced by an empty reference. Re-run the tool if the
 output turns out to be needed again.
 
@@ -612,7 +598,6 @@ and what each brought. Seven behaviours are worth knowing:
 | `/clear`      | Clear conversation history       |
 | `/new`        | Create a new session, preserving the previous one |
 | `/session`    | Show the current session ID and resume command |
-| `/compact`    | Summarize older messages to free context |
 | `/memory`     | List saved memories              |
 | `/remember <text>` | Save a note to memory        |
 | `/forget <n\|all>` | Remove a saved note, or all of them |
@@ -704,7 +689,7 @@ src/
                 apply_patch, ls, rg/grep, fd/find, http)
   diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
-  compact.zig — Context budget, safe cut points, summary installation, dropping tool results
+  compact.zig — Dropping tool results, and deduplicating repeated reads
   memory.zig  — Durable notes: file format, prompt section, extraction
   banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer
