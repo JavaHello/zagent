@@ -88,13 +88,11 @@ fn buildSystemPrompt(
     // Both paths stay fixed for the life of the process, so the model is told
     // them once, at startup, instead of having to ask for a scratch directory.
     try aw.writer.print(
-        "\n- Working directory: {s} — the project the user is asking about. Read and edit its files there, and run commands from it." ++
-            "\n- Scratch directory for this run: {s} (mode 0700, unique to this process). Use it for complex or multi-step work," ++
-            " and for anything that would change the user's system, settings or user configuration — prototypes," ++
-            " throwaway scripts, downloads, build experiments, generated files — instead of the workspace, so the" ++
-            " user's files and host configuration stay untouched; copy only the finished deliverable back. The path" ++
-            " is data: an ordinary host directory, not a sandbox. Files left there survive the run; an empty" ++
-            " directory is removed when it ends.\n",
+        "\n- Working directory: {s} — the project to read, edit and run commands in." ++
+            "\n- Scratch directory for this run: {s} (0700, unique per process). Put prototypes, throwaway scripts," ++
+            " downloads and build experiments there rather than in the workspace, and copy back only the finished" ++
+            " deliverable. It is an ordinary host directory, not a sandbox: files outlive the run, and an empty" ++
+            " directory is removed at exit.\n",
         .{ workspace, scratch },
     );
     if (registry.functionJson().len > 0) {
