@@ -1203,12 +1203,6 @@ pub const Agent = struct {
         });
     }
 
-    /// Keep a partial reply in the history, without reasoning, so the next
-    /// request can continue it. Incomplete output must not be replayed.
-    fn appendAssistantText(self: *Agent, partial: []const u8) !void {
-        try self.appendAssistantFragment(partial, null);
-    }
-
     /// Keep an assistant reply fragment in the history, with its chain-of-
     /// thought text when known. Thinking mode requires the reasoning to be
     /// passed back on later tool-carrying turns, even when the reply that

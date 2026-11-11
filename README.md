@@ -138,7 +138,9 @@ zagent --resume <session-id> "Continue the task"
 ```
 
 Resume retains the ID and model context. Missing, invalid or corrupt IDs fail
-without creating an empty session. Session files contain conversation and tool
+without creating an empty session. Snapshots must match the current schema;
+missing fields and removed fields are rejected rather than migrated.
+Session files contain conversation and tool
 data: do not commit sensitive snapshots or resume the same ID concurrently.
 
 Snapshots are saved after each completed tool batch and answer. Sessions are
@@ -623,7 +625,7 @@ every HTTP request, `timeoutMs` says how long a request waits for an answer
   ███████╗ █████╗  ██████╗ ███████╗███╗   ██╗████████╗
   ...
   ✦ an AI agent in your terminal
-  ✓ mcp: filesystem — 11 tools, 2025-06-18
+  ✓ mcp: filesystem — 11 tools, 2026-07-28
 
 ❯ what is in /tmp?
   ⚙ load_mcp_tools {"server":"filesystem"}
@@ -640,12 +642,10 @@ conversation instead of being overwritten by the screen.
 `/mcp` lists the servers, their transport, the revision each one settled on,
 and what each brought. Seven behaviours are worth knowing:
 
-- **Revisions.** zagent speaks the current MCP revision, `2026-07-28`, in which
-  every request carries the protocol version and the client's capabilities and
-  nothing is negotiated up front. Servers written for the revision before it
-  are opened the old way, with an `initialize` handshake: the client asks the
-  current question first, and falls back when the answer is a server that has
-  never heard of it. `/mcp` shows which revision each server ended up on.
+- **Revisions.** zagent supports only MCP `2026-07-28`: every request carries
+  the protocol version and the client's capabilities. Discovery failures and
+  older revisions are reported directly; there is no `initialize` handshake
+  fallback. `/mcp` shows the revision for connected servers.
 - **Naming.** A tool name outside letters, digits, `_` and `-` — or over 64
   characters, which is what an OpenAI-compatible endpoint accepts — is fitted to
   what the endpoint takes; a name that has to be cut keeps a hash of the whole

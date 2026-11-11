@@ -115,14 +115,6 @@ pub const History = struct {
 
         try writer.flush();
     }
-
-    /// Sets the maximum number of history items. If more history
-    /// items than len exist, this will truncate the history to the
-    /// len most recent items.
-    pub fn setMaxLen(self: *Self, len: usize) !void {
-        self.max_len = len;
-        self.truncate();
-    }
 };
 
 /// Reads the history from `path`, which the caller may spell either absolutely

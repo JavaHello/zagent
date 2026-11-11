@@ -29,7 +29,7 @@ AI_PROVIDER=deepseek /path/to/zagent/zig-out/bin/zagent '分析项目结构，�
 
 支持 `AI_URL`、`AI_MODEL`、`AI_KEY` 覆盖服务商默认值。主对话和完成检查统一调用 `POST <AI_URL>/responses`，不会回退到 Chat Completions。`AI_URL` 填基础地址，不包含 `/responses`；`AI_MODEL` 原样发送。`AI_MAX_TOKENS` 对应 Responses 的初始 `max_output_tokens`（默认 8192，即 DeepSeek 对话模型的上限）。响应因 token 上限被截断时，保持输入不变，自动将预算翻倍重试，最多重试 3 次，自动增长上限为 8192；不会执行截断响应中的工具调用。默认值已等于该上限，因此只有把 `AI_MAX_TOKENS` 配得更小时才会触发翻倍。若文本仍被截断，zagent 会保留已生成的部分，并让模型从断点继续（最多 8 次）；被截断的工具调用则改为要求模型分步重试（最多 2 次）。全部失败后才打印已生成内容并以 `ResponseTruncated` 结束。
 
-工具定义使用 Responses 的扁平结构，工具结果通过 `call_id` 关联。请求设置 `store: false`，保留并回放全部输出 items（包括加密推理数据）；会话恢复也保留这些数据。旧版会话的消息、函数调用和结果会转换为 Responses 输入，旧的自由文本 `reasoning_content` 不会作为推理 item 发送。
+工具定义使用 Responses 的扁平结构，工具结果通过 `call_id` 关联。请求设置 `store: false`，保留并回放全部输出 items（包括加密推理数据）；会话恢复也保留这些数据。只接受包含当前字段的会话快照，不迁移旧格式或忽略已删除字段。自由文本 `reasoning_content` 不会作为推理 item 发送。
 
 配置文件位于 `$XDG_CONFIG_HOME/zagent` 或 `~/.config/zagent`，也支持该目录内的 `config` 文件；环境变量优先。支持 `AI_PROVIDER`、`AI_URL`、`AI_KEY`、`AI_MODEL`、`AI_MAX_TOKENS`、`AI_MAX_ITERATIONS`、`AI_REASONING_EFFORT`、`AI_SERVICE_TIER`。完整配置见 [zagent.example.conf](zagent.example.conf)。不要将 key 写入版本库。Markdown 根据终端能力自动渲染，管道和文件输出保留原始 Markdown，无需配置开关。
 
@@ -127,6 +127,8 @@ zig build test-integration
 ```
 
 端到端测试通过本地模拟 API 驱动真实 zagent，覆盖文件编辑、补丁、搜索、工作目录隔离、符号链接逃逸、环境变量隔离、网络隔离、服务错误重试、会话恢复、执行上限退出状态和运行期间替换二进制。
+
+MCP 只支持 `2026-07-28` 协议。发现失败或服务仅支持旧协议时直接报错，不再回退到 `initialize` 握手，也不保存或回传旧协议的 HTTP session ID。
 
 MCP 使用上下文懒加载：启动时仍连接服务、发现工具，但模型初始只接收服务名称、简短描述和 `load_mcp_tools` 入口。用户问题需要某个服务时，模型按名称加载，后续请求才包含该服务的工具描述和参数 schema；已加载服务在当前进程内持续可用。可在 `mcp.json` 的服务项中设置 `description`，未设置时回退到服务 instructions 的摘要（目录描述最多 320 字节）；完整 instructions 在加载时返回。这不延迟服务启动或连接。
 

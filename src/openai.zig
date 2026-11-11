@@ -13,7 +13,7 @@ const growth_cap: u32 = @import("config.zig").max_output_tokens_ceiling;
 test "search registration follows installed backends and advertises renamed filesystem tools" {
     const allocator = std.testing.allocator;
     for ([_]search_tools.SearchBackends{ .{}, .{ .rg = true }, .{ .fd = true }, .{ .rg = true, .fd = true } }) |search| {
-        const body = try buildRequestWithSearch(allocator, "test", &.{}, 100, .included, &.{}, false, search);
+        const body = try buildRequestWithToolSelection(allocator, "test", &.{}, 100, .{}, false, search);
         defer allocator.free(body);
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
@@ -112,15 +112,6 @@ test "tool selection distinguishes omitted empty and MCP-only sets" {
     }
 }
 
-test "default tool selection matches compatible request entry point" {
-    const a = std.testing.allocator;
-    const default = try buildRequestWithToolSelection(a, "test", &.{}, 100, .{}, true, .{ .rg = true });
-    defer a.free(default);
-    const compatible = try buildRequestWithSearch(a, "test", &.{}, 100, .included, &.{}, true, .{ .rg = true });
-    defer a.free(compatible);
-    try std.testing.expectEqualStrings(compatible, default);
-}
-
 test "tool definitions escape names and descriptions when writing JSON" {
     const a = std.testing.allocator;
     const custom = ToolDefinition{ .name = "custom\"name", .description = "line\n中文", .parameters_json = "{\"type\":\"object\",\"properties\":{}}" };
@@ -153,7 +144,7 @@ pub const Message = struct {
     tool_call_id: ?[]const u8,
     /// Exact Responses output items, including encrypted reasoning.
     response_items: ?[]const u8 = null,
-    /// Local execution metadata; null in older snapshots or for non-tool messages.
+    /// Local execution metadata; null for non-tool messages.
     tool_status: ?search_tools.ToolStatus = null,
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
@@ -358,28 +349,6 @@ pub const Client = struct {
         return message;
     }
 
-    /// Send a Responses API request and return the parsed response.
-    ///
-    /// `extra_tools` are the tools that are not built in — one JSON function
-    /// object each, from the MCP servers that are connected. They are offered
-    /// beside the built-in ones, so the model can call either.
-    pub fn respond(self: *Client, messages: []const Message, extra_tools: []const []const u8) !ApiResponse {
-        return self.respondWith(messages, .included, extra_tools, null);
-    }
-
-    /// Same as `respond`, but the request is streamed and every text delta is
-    /// handed to `sink.onText` as it arrives, so the caller can paint the
-    /// answer while the model is still writing it.
-    pub fn respondStreaming(self: *Client, messages: []const Message, extra_tools: []const []const u8, sink: StreamSink) !ApiResponse {
-        return self.respondWith(messages, .included, extra_tools, sink);
-    }
-
-    /// Send a request that advertises no tools, for the completion judge. It
-    /// must not be able to answer with a tool call, MCP ones included.
-    pub fn respondWithoutTools(self: *Client, messages: []const Message) !ApiResponse {
-        return self.respondWith(messages, .omitted, &.{}, null);
-    }
-
     /// Use the same request projection as the live counter, including tool
     /// schemas and the Codex adapter, without sending or authenticating.
     pub fn estimateRequestTokens(self: *Client, messages: []const Message, extra_tools: []const []const u8) !u64 {
@@ -393,12 +362,12 @@ pub const Client = struct {
         return estimateTokens(ordinary);
     }
 
-    fn respondWith(
+    /// Stream a Responses request with built-in and MCP tools.
+    pub fn respondStreaming(
         self: *Client,
         messages: []const Message,
-        tools: Tools,
         extra_tools: []const []const u8,
-        sink: ?StreamSink,
+        sink: StreamSink,
     ) !ApiResponse {
         const response_url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{std.mem.trimEnd(u8, self.base_url, "/")});
         defer self.allocator.free(response_url);
@@ -416,20 +385,15 @@ pub const Client = struct {
                 self.model,
                 messages,
                 max_tokens,
-                if (tools == .included) .{ .builtin = self.builtin_tools, .extra = extra_tools } else null,
-                sink != null or self.codex_auth_path != null,
+                .{ .builtin = self.builtin_tools, .extra = extra_tools },
+                true,
                 self.search,
             );
             defer self.allocator.free(ordinary_json);
             const req_json = if (self.codex_auth_path != null) try codexRequest(self.allocator, ordinary_json, self.codex_options) else try self.allocator.dupe(u8, ordinary_json);
             defer self.allocator.free(req_json);
 
-            const response = if (self.codex_auth_path != null)
-                try self.performStreamWithRetry(response_url, auth_header, req_json, sink orelse .{ .context = self, .onText = discardText })
-            else if (sink) |stream_sink|
-                try self.performStreamWithRetry(response_url, auth_header, req_json, stream_sink)
-            else
-                try self.performResponseWithRetry(response_url, auth_header, req_json);
+            const response = try self.performStreamWithRetry(response_url, auth_header, req_json, sink);
             if (!std.mem.eql(u8, response.finish_reason, "length")) return response;
             // Discard this attempt's partial output and retry the same input,
             // so completed tools are not repeated and incomplete calls are
@@ -439,18 +403,6 @@ pub const Client = struct {
             if (attempt >= 3 or max_tokens >= growth_cap) return response;
             response.deinit(self.allocator);
             max_tokens = @min(growth_cap, @max(@as(u32, 1), max_tokens *| 2));
-        }
-    }
-
-    fn performResponseWithRetry(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8) !ApiResponse {
-        var attempt: u32 = 0;
-        while (true) : (attempt += 1) {
-            return self.performResponseFetch(response_url, auth_header, req_json) catch |err| {
-                if (attempt >= 2 or (!isRecoverableFetchError(err) and !self.retryable_http_error)) return err;
-                self.resetHttpClient();
-                try self.io.sleep(.fromMilliseconds(1000 * (@as(i64, 1) << @intCast(attempt))), .awake);
-                continue;
-            };
         }
     }
 
@@ -464,51 +416,6 @@ pub const Client = struct {
                 continue;
             };
         }
-    }
-
-    fn performResponseFetch(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8) !ApiResponse {
-        if (self.transport) |transport| {
-            const body = try transport.send(transport.context, self.allocator, req_json);
-            defer self.allocator.free(body);
-            if (self.http_error) |message| self.allocator.free(message);
-            self.http_error = null;
-            const parsed = try parseResponse(self.allocator, body);
-            self.addUsage(parsed.usage);
-            return parsed;
-        }
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-
-        self.retryable_http_error = false;
-        const fetch_result = self.http_client.fetch(.{
-            .location = .{ .url = response_url },
-            .method = .POST,
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = auth_header },
-            },
-            .payload = req_json,
-            .response_writer = &aw.writer,
-        }) catch |err| return err;
-
-        if (fetch_result.status != .ok) {
-            self.retryable_http_error = switch (@backingInt(fetch_result.status)) {
-                408, 429, 500, 502, 503, 504 => true,
-                else => false,
-            };
-            self.recordHttpError(fetch_result.status, aw.written());
-            return error.ApiError;
-        }
-
-        if (self.http_error) |message| self.allocator.free(message);
-        self.http_error = null;
-        const parsed = parseResponse(self.allocator, aw.written()) catch |err| {
-            if (err == error.ApiError) self.recordHttpError(fetch_result.status, aw.written());
-            return err;
-        };
-        self.addUsage(parsed.usage);
-        return parsed;
     }
 
     /// A streaming Responses request. The body is an SSE stream: every event
@@ -723,19 +630,6 @@ pub const Client = struct {
     }
 };
 
-/// Whether a request advertises the tools. The completion judge must not, or
-/// the model can answer it with a tool call instead of a verdict.
-pub const Tools = enum { included, omitted };
-
-/// Build a stateless Responses API request, replaying typed output items.
-pub fn buildRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools) ![]u8 {
-    return buildRequestWithTools(allocator, model, messages, max_tokens, tools, &.{}, false);
-}
-
-pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8, stream: bool) ![]u8 {
-    return buildRequestWithSearch(allocator, model, messages, max_tokens, tools, extra_tools, stream, .{});
-}
-
 /// The single source of truth for Responses history replay and size estimates.
 pub fn writeInput(allocator: std.mem.Allocator, w: *std.Io.Writer, messages: []const Message) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -747,10 +641,6 @@ pub fn writeInput(allocator: std.mem.Allocator, w: *std.Io.Writer, messages: []c
 const InputItem = union(enum) {
     replay: std.json.Value,
     output: struct { type: []const u8 = "function_call_output", call_id: []const u8, output: []const u8 },
-    reasoning: struct {
-        type: []const u8 = "reasoning",
-        content: [1]struct { type: []const u8 = "reasoning_text", text: []const u8 },
-    },
     message: struct { role: []const u8, content: []const u8 },
     call: struct { type: []const u8 = "function_call", call_id: []const u8, name: []const u8, arguments: []const u8 },
 
@@ -785,10 +675,6 @@ fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const Inpu
             try input.append(arena, .{ .output = .{ .call_id = call_id, .output = output } });
             continue;
         }
-        // Convert reasoning from older session snapshots into typed items.
-        if (message.reasoning_content) |reasoning| {
-            if (reasoning.len > 0) try input.append(arena, .{ .reasoning = .{ .content = .{.{ .text = reasoning }} } });
-        }
         if (message.content) |content| {
             try input.append(arena, .{ .message = .{ .role = message.role, .content = content } });
         }
@@ -808,10 +694,6 @@ const Request = struct {
     input: []const InputItem,
     tools: ?[]const tool_schema.Function,
 };
-
-pub fn buildRequestWithSearch(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8, stream: bool, search: search_tools.SearchBackends) ![]u8 {
-    return buildRequestWithToolSelection(allocator, model, messages, max_tokens, if (tools == .included) .{ .extra = extra_tools } else null, stream, search);
-}
 
 /// Built-in definitions can be any slice (including a runtime ArrayList's
 /// items). Extra entries retain the existing MCP JSON schema interface.
@@ -1131,7 +1013,7 @@ test "preflight estimate uses full wire request including schemas and Codex proj
     defer client.deinit();
     const messages = [_]Message{.{ .role = "user", .content = "中文\n\"quoted\"", .reasoning_content = null, .tool_calls = null, .tool_call_id = null }};
     const extra = [_][]const u8{"{\"type\":\"function\",\"name\":\"mcp__test\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}"};
-    const ordinary = try buildRequestWithSearch(a, client.model, &messages, client.max_tokens, .included, &extra, true, client.search);
+    const ordinary = try buildRequestWithToolSelection(a, client.model, &messages, client.max_tokens, .{ .extra = &extra }, true, client.search);
     defer a.free(ordinary);
     try std.testing.expectEqual(estimateTokens(ordinary), try client.estimateRequestTokens(&messages, &extra));
     try std.testing.expect(try client.estimateRequestTokens(&messages, &extra) > try client.estimateRequestTokens(&messages, &.{}));
@@ -1157,7 +1039,7 @@ test "Responses request uses typed items and flat non-strict function schemas" {
         .{ .role = "tool", .content = "result", .reasoning_content = null, .tool_calls = null, .tool_call_id = "call_1" },
     };
     const borrowed = [_][]const u8{"{\"type\":\"function\",\"function\":{\"name\":\"mcp__test__search\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}"};
-    const encoded = try buildRequestWithTools(a, "provider/model-name", &messages, 1234, .included, &borrowed, false);
+    const encoded = try buildRequestWithToolSelection(a, "provider/model-name", &messages, 1234, .{ .extra = &borrowed }, false, .{});
     defer a.free(encoded);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
     defer parsed.deinit();
@@ -1167,17 +1049,14 @@ test "Responses request uses typed items and flat non-strict function schemas" {
     try std.testing.expectEqual(@as(i64, 1234), root.get("max_output_tokens").?.integer);
     try std.testing.expect(!root.get("store").?.bool);
     const input = root.get("input").?.array.items;
-    try std.testing.expectEqual(@as(usize, 5), input.len);
-    // The legacy Chat Completions reasoning string is replayed as a typed
-    // reasoning item so thinking mode can receive it back.
-    try std.testing.expectEqualStrings("reasoning", input[1].object.get("type").?.string);
-    try std.testing.expectEqualStrings("legacy", input[1].object.get("content").?.array.items[0].object.get("text").?.string);
-    try std.testing.expectEqualStrings("assistant", input[2].object.get("role").?.string);
-    try std.testing.expect(input[2].object.get("reasoning_content") == null);
-    try std.testing.expectEqualStrings("function_call", input[3].object.get("type").?.string);
+    try std.testing.expectEqual(@as(usize, 4), input.len);
+    // Reasoning is replayed only through exact Responses output items.
+    try std.testing.expectEqualStrings("assistant", input[1].object.get("role").?.string);
+    try std.testing.expect(input[1].object.get("reasoning_content") == null);
+    try std.testing.expectEqualStrings("function_call", input[2].object.get("type").?.string);
+    try std.testing.expectEqualStrings("call_1", input[2].object.get("call_id").?.string);
+    try std.testing.expectEqualStrings("function_call_output", input[3].object.get("type").?.string);
     try std.testing.expectEqualStrings("call_1", input[3].object.get("call_id").?.string);
-    try std.testing.expectEqualStrings("function_call_output", input[4].object.get("type").?.string);
-    try std.testing.expectEqualStrings("call_1", input[4].object.get("call_id").?.string);
     const tools = root.get("tools").?.array.items;
     for (tools) |tool| {
         try std.testing.expect(tool.object.get("function") == null);
@@ -1196,7 +1075,7 @@ test "Responses request escapes strings and rejects malformed replay" {
         .{ .role = "assistant", .content = tricky, .reasoning_content = tricky, .tool_calls = &calls, .tool_call_id = null },
         .{ .role = "tool", .content = tricky, .reasoning_content = null, .tool_calls = null, .tool_call_id = tricky },
     };
-    const encoded = try buildRequestWithTools(a, tricky, &messages, 32, .omitted, &.{}, false);
+    const encoded = try buildRequestWithToolSelection(a, tricky, &messages, 32, null, false, .{});
     defer a.free(encoded);
     const parsed = try std.json.parseFromSlice(struct {
         model: []const u8,
@@ -1219,18 +1098,17 @@ test "Responses request escapes strings and rejects malformed replay" {
     try std.testing.expectEqual(@as(usize, 1), parsed.value.include.len);
     const items = parsed.value.input;
     try std.testing.expectEqualStrings(tricky, items[0].content.?.string);
-    try std.testing.expectEqualStrings(tricky, items[1].content.?.array.items[0].object.get("text").?.string);
-    try std.testing.expectEqualStrings(tricky, items[2].content.?.string);
-    try std.testing.expectEqualStrings(tricky, items[3].call_id.?);
-    try std.testing.expectEqualStrings(tricky, items[3].name.?);
-    try std.testing.expectEqualStrings(tricky, items[4].output.?);
+    try std.testing.expectEqualStrings(tricky, items[1].content.?.string);
+    try std.testing.expectEqualStrings(tricky, items[2].call_id.?);
+    try std.testing.expectEqualStrings(tricky, items[2].name.?);
+    try std.testing.expectEqualStrings(tricky, items[3].output.?);
     try std.testing.expect(std.mem.indexOfScalar(u8, encoded, '\n') == null);
 
     // Replayed items must be a JSON array of objects, never a splice point.
     const broken = [_]Message{.{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null, .response_items = "{\"type\":\"message\"}" }};
-    try std.testing.expectError(error.InvalidResponseItems, buildRequestWithTools(a, "m", &broken, 8, .omitted, &.{}, false));
+    try std.testing.expectError(error.InvalidResponseItems, buildRequestWithToolSelection(a, "m", &broken, 8, null, false, .{}));
     const garbage = [_]Message{.{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null, .response_items = "[] , \"injected\":true" }};
-    try std.testing.expectError(error.SyntaxError, buildRequestWithTools(a, "m", &garbage, 8, .omitted, &.{}, false));
+    try std.testing.expectError(error.SyntaxError, buildRequestWithToolSelection(a, "m", &garbage, 8, null, false, .{}));
 }
 
 test "Responses parsing keeps call_id separate from item IDs and replays all output" {
@@ -1249,7 +1127,7 @@ test "Responses parsing keeps call_id separate from item IDs and replays all out
     try std.testing.expectEqual(@as(usize, 2), response.tool_calls.?.len);
     try std.testing.expectEqualStrings("call_1", response.tool_calls.?[0].id);
     const messages = [_]Message{.{ .role = "assistant", .content = response.content, .reasoning_content = null, .tool_calls = response.tool_calls, .tool_call_id = null, .response_items = response.response_items }};
-    const request = try buildRequest(a, "model", &messages, 1000, .omitted);
+    const request = try buildRequestWithToolSelection(a, "model", &messages, 1000, null, false, .{});
     defer a.free(request);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
     defer parsed.deinit();
@@ -1334,11 +1212,9 @@ test "token estimates count cjk and ascii sensibly" {
     try std.testing.expectEqual(@as(u64, 2), estimateTokens("你好"));
 }
 
-fn discardText(_: *anyopaque, _: []const u8) void {}
-
 test "Codex request includes only configured options" {
     const a = std.testing.allocator;
-    const ordinary = try buildRequest(a, "test", &.{}, 100, .omitted);
+    const ordinary = try buildRequestWithToolSelection(a, "test", &.{}, 100, null, false, .{});
     defer a.free(ordinary);
     const cases = [_]CodexOptions{
         .{},

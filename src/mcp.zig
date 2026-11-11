@@ -6,12 +6,9 @@
 //! call them, and handed to the agent as extra function tools. `tools/call` on
 //! one of those names comes back through here and is forwarded as it is.
 //!
-//! Two things about the protocol shape everything below. It is *stateless*: a
-//! connection carries no session, every request declares the revision and the
-//! client's capabilities in `_meta` (a revision this client calls modern). And
-//! it is *new*: the servers in the wild were written for the revision before
-//! it, which opened with an `initialize` handshake — so a connection finds out
-//! which of the two it is talking to before it does anything else.
+//! Only the stateless revision is supported: every request declares the
+//! revision and the client's capabilities in `_meta`. Discovery verifies the
+//! server before tools are listed; older handshake revisions are rejected.
 
 const std = @import("std");
 const transport = @import("mcp_transport.zig");
@@ -25,10 +22,6 @@ const style = @import("style.zig");
 /// The revision this client speaks. It is the current one: no session, no
 /// handshake, everything a request needs carried in the request.
 pub const modern_protocol_version = "2026-07-28";
-
-/// The revision it falls back to. 2025-06-18 is what the servers in the wild
-/// were built against, and what the official SDKs have shipped for longest.
-const legacy_protocol_version = "2025-06-18";
 
 const client_name = "zagent";
 const client_version = "0.0.0";
@@ -450,26 +443,12 @@ pub fn aliasFor(allocator: std.mem.Allocator, server: []const u8, tool: []const 
 // The connection
 // ---------------------------------------------------------------------------
 
-pub const Era = enum {
-    /// Per-request `_meta`, no handshake: the revision this client prefers.
-    modern,
-    /// The `initialize` handshake and a stream that stays one conversation.
-    legacy,
-};
-
-/// Why a server is not usable, kept as a sentence for the user.
-const failure_max_bytes = 400;
-
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     /// Borrowed from the caller: the server's name, for messages.
     name: []const u8,
     transport: transport.Transport,
-    era: Era = .modern,
-    /// The revision the server named, when it named one. Null means the
-    /// revision this client asked for was taken as it is.
-    negotiated_version: ?[]u8 = null,
     server_info: ?[]u8 = null,
     /// What the server says about using it, for the system prompt.
     instructions: ?[]u8 = null,
@@ -508,7 +487,7 @@ pub const Connection = struct {
                 }, parent_env) };
             },
             .http => |http| {
-                connection.transport = .{ .http = transport.Http.init(io, allocator, .{
+                connection.transport = .{ .http = transport.Http.init(io, .{
                     .url = http.url,
                     .headers = http.headers,
                 }) };
@@ -525,11 +504,9 @@ pub const Connection = struct {
         self.transport.deinit();
         if (self.server_info) |info| self.allocator.free(info);
         if (self.instructions) |text| self.allocator.free(text);
-        if (self.negotiated_version) |version| self.allocator.free(version);
         if (self.failed) |reason| self.allocator.free(reason);
         self.server_info = null;
         self.instructions = null;
-        self.negotiated_version = null;
         self.failed = null;
     }
 
@@ -548,192 +525,45 @@ pub const Connection = struct {
         }
     }
 
-    /// The revision this connection ended up speaking.
-    pub fn negotiated(self: *const Connection) []const u8 {
-        return self.negotiated_version orelse modern_protocol_version;
-    }
-
-    /// Work out which revision the server speaks and get ready to use it.
-    ///
-    /// The probe goes both ways on purpose. A modern server that never
-    /// implemented `server/discover` answers a method-not-found error, which is
-    /// indistinguishable from a legacy server's answer to the same request; and
-    /// a modern server that is slow to start misses the probe's deadline. Both
-    /// are recovered by asking the other revision's question, which costs one
-    /// round trip and is harmless to either kind of server.
+    /// Discover the current stateless revision; never retry an old handshake.
     pub fn negotiate(self: *Connection) !void {
-        const params = try metaParams(self.allocator);
-        defer self.allocator.free(params);
-
-        const response = self.request(.{
+        const response = try self.request(.{
             .method = "server/discover",
-            .params_json = params,
-            .meta = .modern,
             .timeout_ms = @min(self.timeout_ms, probe_timeout_cap_ms),
-        }) catch |err| switch (err) {
-            // Nothing came back at all. Only a legacy server (or a busy one)
-            // behaves this way, so the handshake is tried before giving up.
-            error.McpTimeout, error.McpClosed => return self.handshake(),
-            else => return err,
-        };
+        });
         defer response.deinit(self.allocator);
-
         switch (response) {
-            .result => |text| switch (try self.readDiscover(self.allocator, text)) {
-                .settled => {},
-                .ask_for_handshake => try self.handshake(),
-            },
-            .err => |err| {
-                if (err.code == unsupported_protocol_version) {
-                    switch (try self.retryWith(self.allocator, err.data_json)) {
-                        .settled => {},
-                        .ask_for_handshake => try self.handshake(),
-                    }
-                    return;
-                }
-                // A method the server does not have, or anything else that is
-                // not a protocol error: ask the older question instead.
-                try self.handshake();
-            },
-            .http_error => |refusal| switch (try self.judgeRefusal(refusal.status, refusal.body)) {
-                .settled => {},
-                .ask_for_handshake => try self.handshake(),
-            },
+            .result => |text| try self.readDiscover(self.allocator, text),
+            .err => |err| return if (err.code == unsupported_protocol_version or err.code == -32601)
+                error.McpUnsupportedVersion
+            else
+                error.McpServerError,
+            .http_error => |refusal| try self.judgeRefusal(refusal.status, refusal.body),
             .accepted => return error.McpProtocol,
         }
     }
 
-    /// The legacy opening: `initialize`, then the notification that says the
-    /// client is ready. Nothing about it carries `_meta`, because the revision
-    /// it belongs to predates per-request metadata.
-    fn handshake(self: *Connection) !void {
-        const params = try initializeParams(self.allocator);
-        defer self.allocator.free(params);
-
-        // An error here — no answer, a closed stream — is the end of it: both
-        // questions have been asked, and there is no third one to try.
-        const response = try self.request(.{
-            .method = "initialize",
-            .params_json = params,
-            .meta = .none,
-            .timeout_ms = @min(self.timeout_ms, probe_timeout_cap_ms),
-        });
-        defer response.deinit(self.allocator);
-
-        switch (response) {
-            .result => |text| {
-                self.era = .legacy;
-                try self.readInitialize(self.allocator, text);
-
-                const notification = try transport.buildNotification(self.allocator, "notifications/initialized", null);
-                defer self.allocator.free(notification);
-                try self.transport.notify(self.allocator, .{
-                    .message = notification,
-                    .id = 0,
-                    .method = "notifications/initialized",
-                    .protocol_version = self.negotiated(),
-                    .timeout_ms = self.timeout_ms,
-                });
-            },
-            // A server that does not know `initialize` is one written for the
-            // modern revision, which rejects the handshake as an unknown
-            // method. The probe was wrong; it is not fatal.
-            .err => self.era = .modern,
-            // Over HTTP a modern server may refuse the handshake with a status
-            // rather than a JSON-RPC error; that also means modern.
-            .http_error => self.era = .modern,
-            .accepted => self.era = .modern,
-        }
-    }
-
-    /// Whether a question settled the connection, or whether the server turned
-    /// out to want the older question asked.
-    const Settlement = enum { settled, ask_for_handshake };
-
-    fn readDiscover(self: *Connection, allocator: std.mem.Allocator, result_json: []const u8) !Settlement {
+    fn readDiscover(self: *Connection, allocator: std.mem.Allocator, result_json: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, result_json, .{}) catch
             return error.McpProtocol;
         defer parsed.deinit();
         if (parsed.value != .object) return error.McpProtocol;
-
         const object = parsed.value.object;
         if (object.get("supportedVersions")) |versions| {
-            if (versions == .array and !versionOffered(versions.array.items, modern_protocol_version)) {
-                // The server speaks the current shape of the protocol but not
-                // this revision of it, so what it supports are the older
-                // revisions — which are opened with the handshake.
-                return .ask_for_handshake;
-            }
+            if (versions != .array) return error.McpProtocol;
+            if (!versionOffered(versions.array.items, modern_protocol_version)) return error.McpUnsupportedVersion;
         }
-
-        self.era = .modern;
         try self.readIdentity(allocator, object);
-        return .settled;
     }
 
-    /// The server refused the revision asked for and named the ones it has.
-    /// One of them may be this revision after all — a server that lists it has
-    /// it — and if none is, the list holds the older revisions, which the
-    /// handshake is how to ask for.
-    fn retryWith(self: *Connection, allocator: std.mem.Allocator, data_json: ?[]const u8) !Settlement {
-        const supported = data_json orelse return .ask_for_handshake;
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, supported, .{}) catch
-            return .ask_for_handshake;
-        defer parsed.deinit();
-        if (parsed.value != .object) return .ask_for_handshake;
-
-        const versions = parsed.value.object.get("supported") orelse return .ask_for_handshake;
-        if (versions != .array) return .ask_for_handshake;
-        if (!versionOffered(versions.array.items, modern_protocol_version)) return .ask_for_handshake;
-
-        self.era = .modern;
-        return .settled;
-    }
-
-    /// A refusal from the HTTP layer. This is where the era is decided on HTTP:
-    /// a modern server uses `400` for a version or header it will not take, and
-    /// says so with a JSON-RPC error this client recognizes. Anything else —
-    /// an empty body, an old server's plain `400` — means the request was not
-    /// understood, which is what a legacy server does to a modern one.
-    fn judgeRefusal(self: *Connection, status: u16, body: []const u8) !Settlement {
-        // rmcp may reject discovery with 422 because it expects initialize.
-        // This fallback is only for discovery, never ordinary tool calls.
-        if (status == 400 or status == 404 or status == 405 or status == 422) {
+    fn judgeRefusal(self: *Connection, status: u16, body: []const u8) !void {
+        if (status == 400) {
             if (try readError(self.allocator, body)) |err| {
                 defer err.deinit(self.allocator);
-                if (isModernErrorCode(err.code)) {
-                    if (err.code == unsupported_protocol_version) {
-                        return self.retryWith(self.allocator, err.data_json);
-                    }
-                    // A header or a capability the server insists on, and
-                    // which this client cannot supply.
-                    return error.McpUnsupportedVersion;
-                }
+                if (isModernErrorCode(err.code)) return error.McpUnsupportedVersion;
             }
-            return .ask_for_handshake;
         }
-
         return error.McpRefused;
-    }
-
-    fn readInitialize(self: *Connection, allocator: std.mem.Allocator, result_json: []const u8) !void {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, result_json, .{}) catch
-            return error.McpProtocol;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.McpProtocol;
-
-        const object = parsed.value.object;
-        if (object.get("protocolVersion")) |version| {
-            if (version == .string) {
-                if (self.negotiated_version) |previous| allocator.free(previous);
-                self.negotiated_version = try allocator.dupe(u8, version.string);
-            }
-        }
-        // 2024-11-05 and the HTTP+SSE transport that goes with it are not
-        // spoken here: a server that answers with them would have to be
-        // talked to over a transport this client does not implement.
-        if (std.mem.eql(u8, self.negotiated(), "2024-11-05")) return error.McpUnsupportedVersion;
-        try self.readIdentity(allocator, object);
     }
 
     fn readIdentity(self: *Connection, allocator: std.mem.Allocator, object: std.json.ObjectMap) !void {
@@ -745,11 +575,7 @@ pub const Connection = struct {
             }
         }
 
-        // `serverInfo` is `_meta`'s on a modern result and its own member on an
-        // older one, so both are looked for.
-        const info = if (object.get("serverInfo")) |info|
-            info
-        else if (object.get("_meta")) |meta|
+        const info = if (object.get("_meta")) |meta|
             (if (meta == .object) meta.object.get("io.modelcontextprotocol/serverInfo") else null)
         else
             null;
@@ -779,13 +605,12 @@ pub const Connection = struct {
 
         var page: usize = 0;
         while (page < max_pages) : (page += 1) {
-            const params = try listParams(allocator, cursor, self.era == .modern);
+            const params = try listParams(allocator, cursor);
             defer allocator.free(params);
 
             const response = try self.request(.{
                 .method = "tools/list",
                 .params_json = params,
-                .meta = if (self.era == .modern) .modern else .none,
                 .timeout_ms = self.timeout_ms,
             });
             defer response.deinit(allocator);
@@ -823,25 +648,21 @@ pub const Connection = struct {
         name: []const u8,
         arguments_json: []const u8,
     ) !transport.Response {
-        const params = try callParams(allocator, name, arguments_json, self.era == .modern);
+        const params = try callParams(allocator, name, arguments_json);
         defer allocator.free(params);
 
         return self.request(.{
             .method = "tools/call",
             .params_json = params,
             .name = name,
-            .meta = if (self.era == .modern) .modern else .none,
             .timeout_ms = self.timeout_ms,
         });
     }
-
-    const Meta = enum { modern, none };
 
     const Request = struct {
         method: []const u8,
         params_json: ?[]const u8 = null,
         name: ?[]const u8 = null,
-        meta: Meta = .modern,
         timeout_ms: i64,
     };
 
@@ -854,7 +675,7 @@ pub const Connection = struct {
         const id = self.next_id;
         self.next_id += 1;
 
-        const params = if (options.meta == .modern and options.params_json == null)
+        const params = if (options.params_json == null)
             try metaParams(self.allocator)
         else
             null;
@@ -873,13 +694,7 @@ pub const Connection = struct {
             .id = id,
             .method = options.method,
             .name = options.name,
-            // A legacy connection stops declaring a version once its opening
-            // has named one; before that, the modern revision is what is being
-            // attempted, and that is what the header says.
-            .protocol_version = switch (options.meta) {
-                .modern => modern_protocol_version,
-                .none => if (self.era == .legacy) self.negotiated() else null,
-            },
+            .protocol_version = modern_protocol_version,
             .timeout_ms = options.timeout_ms,
         }) catch |err| {
             switch (err) {
@@ -1034,11 +849,6 @@ const RequestMeta = struct {
     @"io.modelcontextprotocol/clientCapabilities": struct {} = .{},
 };
 
-/// The capabilities this client declares in the handshake. It declares none, and
-/// says so with an empty object: a server deserializes this member as a map, and
-/// an empty *array* — what an untyped `{}` literal becomes — is not one.
-const ClientCapabilities = struct {};
-
 const ClientInfo = struct {
     name: []const u8 = client_name,
     version: []const u8 = client_version,
@@ -1048,19 +858,10 @@ fn metaParams(allocator: std.mem.Allocator) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{ ._meta = RequestMeta{} }, .{});
 }
 
-/// The legacy revision has no per-request metadata.
-fn initializeParams(allocator: std.mem.Allocator) ![]u8 {
-    return std.json.Stringify.valueAlloc(allocator, .{
-        .protocolVersion = legacy_protocol_version,
-        .capabilities = ClientCapabilities{},
-        .clientInfo = ClientInfo{},
-    }, .{});
-}
-
-fn listParams(allocator: std.mem.Allocator, cursor: ?[]const u8, meta: bool) ![]u8 {
+fn listParams(allocator: std.mem.Allocator, cursor: ?[]const u8) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
         .cursor = cursor,
-        ._meta = if (meta) RequestMeta{} else @as(?RequestMeta, null),
+        ._meta = RequestMeta{},
     }, .{ .emit_null_optional_fields = false });
 }
 
@@ -1068,7 +869,6 @@ fn callParams(
     allocator: std.mem.Allocator,
     name: []const u8,
     arguments_json: []const u8,
-    meta: bool,
 ) ![]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
     defer parsed.deinit();
@@ -1076,7 +876,7 @@ fn callParams(
     return std.json.Stringify.valueAlloc(allocator, .{
         .name = name,
         .arguments = parsed.value,
-        ._meta = if (meta) RequestMeta{} else @as(?RequestMeta, null),
+        ._meta = RequestMeta{},
     }, .{ .emit_null_optional_fields = false });
 }
 
@@ -1644,10 +1444,10 @@ pub const Registry = struct {
             if (server.config.disabled) continue;
             if (server.failure) |failure| {
                 try w.print(style.YELLOW ++ "  ✗ mcp: {s} — {s}\n" ++ style.RESET, .{ server.config.name, failure });
-            } else if (server.connection) |connection| {
+            } else if (server.connection != null) {
                 try w.print(
                     style.DIM ++ "  ✓ mcp: {s} — {d} tools, {s}\n" ++ style.RESET,
-                    .{ server.config.name, server.tool_count, connection.negotiated() },
+                    .{ server.config.name, server.tool_count, modern_protocol_version },
                 );
             }
         }
@@ -1679,8 +1479,8 @@ pub const Registry = struct {
                 try w.writeAll("disabled\n");
             } else if (server.failure) |failure| {
                 try w.print("not connected: {s}\n", .{failure});
-            } else if (server.connection) |connection| {
-                try w.print("{d} tools  {s}\n", .{ server.tool_count, connection.negotiated() });
+            } else if (server.connection != null) {
+                try w.print("{d} tools  {s}\n", .{ server.tool_count, modern_protocol_version });
             } else {
                 try w.writeAll("no tools\n");
             }
@@ -1763,11 +1563,9 @@ fn describeError(err: anyerror) []const u8 {
 
 /// A server written in the shell.
 ///
-/// It is enough of a JSON-RPC peer to answer what this client asks — a probe,
-/// a handshake, a tool list, a call — and it needs no network, no package
-/// manager and no fixture file to do it. The mode picks how it behaves: a
-/// modern server, one from before the handshake was removed, one that prints a
-/// banner before it starts talking, and one that never answers at all.
+/// A JSON-RPC peer for discovery, tool listing and calls, requiring no network
+/// or package manager. Modes cover normal, noisy, environment-aware and silent
+/// servers.
 const fake_server_script =
     \\mode=$1
     \\if [ "$mode" = noisy ]; then printf 'npm warn using --force\n'; fi
@@ -1776,14 +1574,8 @@ const fake_server_script =
     \\  id=${id%%,*}
     \\  if [ "$mode" = silent ]; then continue; fi
     \\  case $line in
-    \\    *notifications/initialized*) ;;
     \\    *'"method":"server/discover"'*)
-    \\      case $mode in
-    \\        modern|noisy|env) printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Say it back."}}\n' "$id" ;;
-    \\        *) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id" ;;
-    \\      esac ;;
-    \\    *'"method":"initialize"'*)
-    \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"instructions":"Say it back."}}\n' "$id" ;;
     \\    *'"method":"tools/list"'*)
     \\      printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[{"name":"echo","description":"Say it back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]}}\n' "$id" ;;
     \\    *'"method":"tools/call"'*)
@@ -1877,22 +1669,22 @@ test "an alias fits what an endpoint accepts" {
 test "MCP params and schemas round trip escaped strings and optional fields" {
     const a = std.testing.allocator;
     const name = "echo\"\\\n测试";
-    for ([_]bool{ true, false }) |meta| {
-        const params = try callParams(a, name, "{\n\"nested\":{\"value\":null},\"text\":\"line\\nquote\\\"\"}", meta);
+    {
+        const params = try callParams(a, name, "{\n\"nested\":{\"value\":null},\"text\":\"line\\nquote\\\"\"}");
         defer a.free(params);
         const decoded = try std.json.parseFromSlice(std.json.Value, a, params, .{});
         defer decoded.deinit();
         const object = decoded.value.object;
         try std.testing.expectEqualStrings(name, object.get("name").?.string);
-        try std.testing.expectEqual(meta, object.contains("_meta"));
+        try std.testing.expect(object.contains("_meta"));
         try std.testing.expect(object.get("arguments").?.object.get("nested").?.object.get("value").? == .null);
         try std.testing.expect(std.mem.indexOfScalar(u8, params, '\n') == null);
-        const listing = try listParams(a, name, meta);
+        const listing = try listParams(a, name);
         defer a.free(listing);
         const page = try std.json.parseFromSlice(std.json.Value, a, listing, .{});
         defer page.deinit();
         try std.testing.expectEqualStrings(name, page.value.object.get("cursor").?.string);
-        try std.testing.expectEqual(meta, page.value.object.contains("_meta"));
+        try std.testing.expect(page.value.object.contains("_meta"));
     }
     const function = try buildFunction(a, name, "server\"", "description\n\\", "{\n\"type\":\"object\",\"x-custom\":null}");
     defer a.free(function);
@@ -1902,27 +1694,9 @@ test "MCP params and schemas round trip escaped strings and optional fields" {
     try std.testing.expectEqualStrings(name, object.get("name").?.string);
     try std.testing.expectEqualStrings("server\": description\n\\", object.get("description").?.string);
     try std.testing.expect(object.get("parameters").?.object.get("x-custom").? == .null);
-    try std.testing.expectError(error.McpInvalidArguments, callParams(a, name, "[]", false));
-    try std.testing.expectError(error.SyntaxError, callParams(a, name, "{} , \"injected\":true", false));
+    try std.testing.expectError(error.McpInvalidArguments, callParams(a, name, "[]"));
+    try std.testing.expectError(error.SyntaxError, callParams(a, name, "{} , \"injected\":true"));
     try std.testing.expectError(error.InvalidToolSchema, buildFunction(a, name, "s", "d", "[]"));
-}
-
-test "the handshake declares its capabilities as an object" {
-    const a = std.testing.allocator;
-    const params = try initializeParams(a);
-    defer a.free(params);
-
-    const decoded = try std.json.parseFromSlice(std.json.Value, a, params, .{});
-    defer decoded.deinit();
-    const object = decoded.value.object;
-    try std.testing.expectEqualStrings(legacy_protocol_version, object.get("protocolVersion").?.string);
-    // A server deserializes this member as a map. An untyped `{}` literal in
-    // Zig is an empty tuple, is written as `[]`, and is refused outright —
-    // rmcp answers it with `422 Unexpected message, expect initialize request`.
-    try std.testing.expect(object.get("capabilities").? == .object);
-    try std.testing.expectEqual(@as(usize, 0), object.get("capabilities").?.object.count());
-    // The rest of the handshake's members are objects for the same reason.
-    try std.testing.expect(object.get("clientInfo").? == .object);
 }
 
 test "arguments are written back as one line of JSON" {
@@ -2162,8 +1936,6 @@ test "a modern server is met without a handshake" {
 
     try connection.negotiate();
 
-    try std.testing.expectEqual(Era.modern, connection.era);
-    try std.testing.expectEqualStrings(modern_protocol_version, connection.negotiated());
     try std.testing.expectEqualStrings("fake", connection.server_info.?);
     try std.testing.expectEqual(@as(usize, 1), connection.transport.scripted.sent.items.len);
     // The request carries the per-request fields that make the revision
@@ -2172,86 +1944,38 @@ test "a modern server is met without a handshake" {
     try std.testing.expect(std.mem.indexOf(u8, connection.transport.scripted.sent.items[0], "\"io.modelcontextprotocol/clientCapabilities\":{}") != null);
 }
 
-test "a server from before the handshake was removed is opened the old way" {
+test "a server requiring the old handshake is rejected without retry" {
     const allocator = std.testing.allocator;
-
     var connection = scriptedConnection(allocator, &.{
-        // The probe is answered the way a server that has never heard of it
-        // answers: a method it does not have.
         .{ .err = .{ .code = -32601, .message = "Method not found" } },
-        .{ .result = "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}}}" },
     });
     defer connection.deinit();
-
-    try connection.negotiate();
-
-    try std.testing.expectEqual(Era.legacy, connection.era);
-    try std.testing.expectEqualStrings("2025-06-18", connection.negotiated());
-
+    try std.testing.expectError(error.McpUnsupportedVersion, connection.negotiate());
     const sent = connection.transport.scripted.sent.items;
-    try std.testing.expectEqual(@as(usize, 3), sent.len);
+    try std.testing.expectEqual(@as(usize, 1), sent.len);
     try std.testing.expect(std.mem.indexOf(u8, sent[0], "server/discover") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sent[1], "initialize") != null);
-    // The handshake belongs to a revision without per-request metadata, so it
-    // must not carry any.
-    try std.testing.expect(std.mem.indexOf(u8, sent[1], "_meta") == null);
-    // And the notification that follows has no id: nothing answers it.
-    try std.testing.expect(std.mem.indexOf(u8, sent[2], "notifications/initialized") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sent[2], "\"id\"") == null);
 }
 
-test "a server that is silent on the probe but knows the handshake is modern" {
+test "a silent discovery fails without a handshake retry" {
     const allocator = std.testing.allocator;
+    var connection = scriptedConnection(allocator, &.{.silence});
+    defer connection.deinit();
+    try std.testing.expectError(error.McpTimeout, connection.negotiate());
+    try std.testing.expectEqual(@as(usize, 1), connection.transport.scripted.sent.items.len);
+}
 
+test "an unsupported protocol version fails without downgrading" {
+    const allocator = std.testing.allocator;
     var connection = scriptedConnection(allocator, &.{
-        .silence,
-        .{ .err = .{ .code = -32601, .message = "Method not found" } },
+        .{ .err = .{
+            .code = unsupported_protocol_version,
+            .message = "Unsupported protocol version",
+            .data = "{\"supported\":[\"2025-11-25\",\"2025-06-18\"]}",
+        } },
     });
     defer connection.deinit();
-
-    try connection.negotiate();
-
-    // A server that does not know `initialize` cannot be an old one, however
-    // the probe went.
-    try std.testing.expectEqual(Era.modern, connection.era);
-}
-
-test "a version the server does not have is read from its refusal" {
-    const allocator = std.testing.allocator;
-
-    {
-        var connection = scriptedConnection(allocator, &.{
-            .{ .err = .{
-                .code = unsupported_protocol_version,
-                .message = "Unsupported protocol version",
-                .data = "{\"supported\":[\"2026-07-28\"],\"requested\":\"1900-01-01\"}",
-            } },
-        });
-        defer connection.deinit();
-
-        // A server that answers like this is modern, and this client knows the
-        // revision it lists.
-        try connection.negotiate();
-        try std.testing.expectEqual(Era.modern, connection.era);
-    }
-
-    {
-        var connection = scriptedConnection(allocator, &.{
-            .{ .err = .{
-                .code = unsupported_protocol_version,
-                .message = "Unsupported protocol version",
-                .data = "{\"supported\":[\"2025-11-25\",\"2025-06-18\"]}",
-            } },
-            .{ .result = "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{}}" },
-        });
-        defer connection.deinit();
-
-        // One whose list holds only the revisions from before the current one
-        // is opened the old way, which is what that list is for.
-        try connection.negotiate();
-        try std.testing.expectEqual(Era.legacy, connection.era);
-        try std.testing.expectEqualStrings("2025-06-18", connection.negotiated());
-    }
+    try std.testing.expectError(error.McpUnsupportedVersion, connection.negotiate());
+    try std.testing.expectEqual(@as(usize, 1), connection.transport.scripted.sent.items.len);
 }
 
 test "the shell server answers tools over stdio" {
@@ -2261,7 +1985,6 @@ test "the shell server answers tools over stdio" {
     var connection = try startFakeServer(allocator, "modern", 5_000);
     defer connection.deinit();
 
-    try std.testing.expectEqual(Era.modern, connection.era);
     try std.testing.expectEqualStrings("Say it back.", connection.instructions.?);
 
     const listed = try connection.listTools(allocator);
@@ -2282,26 +2005,6 @@ test "the shell server answers tools over stdio" {
     try std.testing.expect(!rendered.is_error);
 }
 
-test "the shell server is opened the old way when it needs the handshake" {
-    try skipUnlessPosix();
-    const allocator = std.testing.allocator;
-
-    var connection = try startFakeServer(allocator, "legacy", 5_000);
-    defer connection.deinit();
-
-    try std.testing.expectEqual(Era.legacy, connection.era);
-    try std.testing.expectEqualStrings("2025-06-18", connection.negotiated());
-
-    // The tool list still comes back: it is asked for in the revision the
-    // handshake settled on.
-    const listed = try connection.listTools(allocator);
-    defer {
-        for (listed) |tool| tool.deinit(allocator);
-        allocator.free(listed);
-    }
-    try std.testing.expectEqual(@as(usize, 1), listed.len);
-}
-
 test "a server that prints a banner before its first message still connects" {
     try skipUnlessPosix();
     const allocator = std.testing.allocator;
@@ -2309,16 +2012,13 @@ test "a server that prints a banner before its first message still connects" {
     // npm and friends write to stdout before the server has said anything.
     var connection = try startFakeServer(allocator, "noisy", 5_000);
     defer connection.deinit();
-
-    try std.testing.expectEqual(Era.modern, connection.era);
 }
 
 test "a server that never answers is given up on" {
     try skipUnlessPosix();
     const allocator = std.testing.allocator;
 
-    // Both questions go unanswered, so the second one's deadline is what ends
-    // this: the probe's, then the handshake's.
+    // Discovery has one deadline and no handshake retry.
     try std.testing.expectError(error.McpTimeout, startFakeServer(allocator, "silent", 150));
 }
 
@@ -2406,42 +2106,15 @@ test "the /mcp listing names the servers and what they brought" {
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "s3cret") == null);
 }
 
-test "over http the era is read from a refusal" {
+test "HTTP discovery refusals fail without a handshake" {
     const allocator = std.testing.allocator;
-
-    // A `400` whose body is a JSON-RPC error this client recognizes: the
-    // server speaks the current protocol and is refusing this revision of it.
-    {
-        var connection = scriptedConnection(allocator, &.{});
-        defer connection.deinit();
-
-        try std.testing.expectEqual(Connection.Settlement.settled, try connection.judgeRefusal(400,
-            \\{"jsonrpc":"2.0","error":{"code":-32022,"message":"Unsupported protocol version",
-            \\ "data":{"supported":["2026-07-28","2025-11-25"]}}}
-        ));
-        try std.testing.expectEqual(Era.modern, connection.era);
-    }
-
-    // The same status with a body that is not one: a server from before the
-    // current revision, which has never heard of the headers a modern request
-    // carries. That is the case the handshake exists for.
-    {
-        var connection = scriptedConnection(allocator, &.{});
-        defer connection.deinit();
-
-        try std.testing.expectEqual(Connection.Settlement.ask_for_handshake, try connection.judgeRefusal(400, "Bad Request"));
-        try std.testing.expectEqual(Connection.Settlement.ask_for_handshake, try connection.judgeRefusal(404, ""));
-        try std.testing.expectEqual(Connection.Settlement.ask_for_handshake, try connection.judgeRefusal(422, "Unexpected message, expect initialize request"));
-    }
-
-    // Any other status is not a question about the era at all.
-    {
-        var connection = scriptedConnection(allocator, &.{});
-        defer connection.deinit();
-
-        try std.testing.expectError(error.McpRefused, connection.judgeRefusal(401, "{}"));
-        try std.testing.expectError(error.McpRefused, connection.judgeRefusal(403, "{}"));
-        try std.testing.expectError(error.McpRefused, connection.judgeRefusal(500, "{}"));
+    var connection = scriptedConnection(allocator, &.{});
+    defer connection.deinit();
+    try std.testing.expectError(error.McpUnsupportedVersion, connection.judgeRefusal(400,
+        \\{"jsonrpc":"2.0","error":{"code":-32022,"message":"Unsupported protocol version"}}
+    ));
+    for ([_]u16{ 400, 404, 405, 422, 401, 403, 500 }) |status| {
+        try std.testing.expectError(error.McpRefused, connection.judgeRefusal(status, "Bad Request"));
     }
 }
 

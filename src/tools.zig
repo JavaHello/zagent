@@ -730,10 +730,6 @@ test "ls is sorted, capped by limit, and says when entries were left out" {
     try std.testing.expectEqualStrings("a\tf\nm\tf\nz\tf\n", all.content);
 }
 
-pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
-    return listDirPage(io, allocator, path, .{});
-}
-
 pub const Page = struct {
     limit: usize = 100,
 };

@@ -2,7 +2,17 @@
 const std = @import("std");
 const openai = @import("openai.zig");
 const Message = openai.Message;
-const Snapshot = struct { version: u32 = 1, workspace: []const u8, messages: []Message };
+// Persisted fields are required: old snapshot shapes are not migrated.
+const StoredMessage = struct {
+    role: []const u8,
+    content: ?[]const u8,
+    reasoning_content: ?[]const u8,
+    tool_calls: ?[]openai.ToolCallData,
+    tool_call_id: ?[]const u8,
+    response_items: ?[]const u8,
+    tool_status: ?@import("tools.zig").ToolStatus,
+};
+const Snapshot = struct { version: u32, workspace: []const u8, messages: []StoredMessage };
 
 pub fn newId(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
@@ -33,7 +43,7 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages
     const cwd = std.Io.Dir.cwd();
     const workspace = try cwd.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(workspace);
-    const data = try std.json.Stringify.valueAlloc(allocator, Snapshot{ .workspace = workspace, .messages = messages }, .{});
+    const data = try std.json.Stringify.valueAlloc(allocator, .{ .version = @as(u32, 1), .workspace = workspace, .messages = messages }, .{});
     defer allocator.free(data);
     const temporary = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(temporary);
@@ -54,9 +64,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.Arr
         else => return err,
     };
     defer allocator.free(data);
-    // Unknown keys are ignored on purpose: an older build also recorded its
-    // scratch directories in the snapshot, and those sessions must still load.
-    const parsed = try std.json.parseFromSlice(Snapshot, allocator, data, .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(Snapshot, allocator, data, .{});
     defer parsed.deinit();
     if (parsed.value.version != 1) return error.UnsupportedSessionVersion;
     const workspace = try cwd.realPathFileAlloc(io, ".", allocator);
@@ -140,10 +148,11 @@ test "session roundtrip retains tool calls and reasoning" {
     try std.testing.expectError(error.InvalidSessionToolSequence, load(io, allocator, path));
 }
 
-test "legacy messages without tool status remain readable" {
-    const parsed = try std.json.parseFromSlice(Message, std.testing.allocator, "{\"role\":\"tool\",\"content\":\"old\",\"reasoning_content\":null,\"tool_calls\":null,\"tool_call_id\":\"1\"}", .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(?@import("tools.zig").ToolStatus, null), parsed.value.tool_status);
+test "snapshots reject removed fields and require the current schema" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(StoredMessage, a, "{\"role\":\"tool\",\"content\":\"old\",\"reasoning_content\":null,\"tool_calls\":null,\"tool_call_id\":\"1\"}", .{}));
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Snapshot, a, "{\"version\":1,\"workspace\":\"\",\"messages\":[],\"scratch_dirs\":[]}", .{}));
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"workspace\":\"\",\"messages\":[]}", .{}));
 }
 
 test "a missing session starts empty but malformed JSON is rejected" {

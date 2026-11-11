@@ -82,14 +82,25 @@ fn parseResult(allocator: std.mem.Allocator, stdout: []const u8, stderr: []const
             else => null,
         },
     };
-    const parsed = std.json.parseFromSlice(tools.ToolResult, allocator, stdout, .{ .allocate = .alloc_always }) catch return .{
+    const WireResult = struct {
+        content: []const u8,
+        is_error: bool,
+        exit_code: ?u8,
+        timed_out: bool,
+        truncated: bool,
+    };
+    const parsed = std.json.parseFromSlice(WireResult, allocator, stdout, .{ .allocate = .alloc_always }) catch return .{
         .content = try allocator.dupe(u8, "Tool worker returned an invalid result."),
         .is_error = true,
     };
     defer parsed.deinit();
-    var result = parsed.value;
-    result.content = try allocator.dupe(u8, result.content);
-    return result;
+    return .{
+        .content = try allocator.dupe(u8, parsed.value.content),
+        .is_error = parsed.value.is_error,
+        .exit_code = parsed.value.exit_code,
+        .timed_out = parsed.value.timed_out,
+        .truncated = parsed.value.truncated,
+    };
 }
 
 /// Kill and reap the worker and any background processes left in its group.
@@ -109,16 +120,16 @@ fn shellTimeout(allocator: std.mem.Allocator, name: []const u8, arguments: []con
     return @intCast(value.integer);
 }
 
-test "worker JSON preserves status and legacy defaults" {
+test "worker JSON preserves status and rejects missing fields" {
     const a = std.testing.allocator;
     const result = try parseResult(a, "{\"content\":\"failed\",\"is_error\":true,\"exit_code\":7,\"timed_out\":true,\"truncated\":true}", "", .{ .exited = 0 });
     defer result.deinit(a);
     try std.testing.expect(result.is_error and result.timed_out and result.truncated);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
-    const legacy = try parseResult(a, "{\"content\":\"old\",\"is_error\":false}", "", .{ .exited = 0 });
-    defer legacy.deinit(a);
-    try std.testing.expect(!legacy.is_error and !legacy.timed_out and !legacy.truncated);
-    try std.testing.expectEqual(@as(?u8, null), legacy.exit_code);
+    const invalid = try parseResult(a, "{\"content\":\"old\",\"is_error\":false}", "", .{ .exited = 0 });
+    defer invalid.deinit(a);
+    try std.testing.expect(invalid.is_error);
+    try std.testing.expectEqualStrings("Tool worker returned an invalid result.", invalid.content);
     const failed = try parseResult(a, "", "worker crashed", .{ .exited = 137 });
     defer failed.deinit(a);
     try std.testing.expect(failed.is_error and !failed.timed_out);

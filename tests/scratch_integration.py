@@ -126,15 +126,20 @@ try:
         assert len(runs) == 2 and runs[1] != first, runs
         assert not Path(runs[1]).exists(), runs[1]
 
-        # Snapshots written by the old build kept a temp_dirs list; they still
-        # load, and their paths are not advertised again.
+        # Removed snapshot fields are rejected, never silently migrated.
         snapshot = state / 'sessions' / f'{sid}.json'
-        legacy = json.loads(snapshot.read_text())
+        current = snapshot.read_text()
+        legacy = json.loads(current)
         legacy['temp_dirs'] = runs[:2]
         snapshot.write_text(json.dumps(legacy))
-        run('--resume', sid, stdin='resume a legacy snapshot\n/quit\n')
-        assert len(runs) == 3 and runs[2] not in runs[:2], runs
-        assert not Path(runs[2]).exists(), runs[2]
+        rejected = subprocess.run(
+            [str(binary), '--resume', sid], cwd=directory, env=env,
+            input='/quit\n', text=True, capture_output=True, timeout=30)
+        assert rejected.returncode != 0, rejected.stdout
+        assert 'UnknownField' in rejected.stderr, rejected.stderr
+        assert len(runs) == 2, runs
+        assert json.loads(snapshot.read_text()) == legacy
+        snapshot.write_text(current)
 
         # Clearing history keeps the process's directory and its files.
         run('--resume', sid, stdin='/clear\n/quit\n')

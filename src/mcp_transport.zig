@@ -84,21 +84,6 @@ fn readParams(allocator: std.mem.Allocator, params_json: ?[]const u8) !?std.json
     return parsed;
 }
 
-/// Build a JSON-RPC notification: a request with no id, which nothing answers.
-pub fn buildNotification(
-    allocator: std.mem.Allocator,
-    method: []const u8,
-    params_json: ?[]const u8,
-) ![]u8 {
-    const params = try readParams(allocator, params_json);
-    defer if (params) |parsed| parsed.deinit();
-    return std.json.Stringify.valueAlloc(allocator, .{
-        .jsonrpc = "2.0",
-        .method = method,
-        .params = if (params) |parsed| parsed.value else null,
-    }, .{ .emit_null_optional_fields = false });
-}
-
 /// Build an error response, which is how a request *from* a server is refused.
 pub fn buildErrorResponse(
     allocator: std.mem.Allocator,
@@ -134,10 +119,8 @@ pub const Verdict = union(enum) {
     /// The answer: the JSON text of its `result`.
     result: []u8,
     err: RpcError,
-    /// A request *from* the server. The 2026 revision removed every one of them
-    /// (a server that needs input returns an `input_required` result instead),
-    /// but a legacy server may still send one, and a request that is never
-    /// answered hangs it: the caller refuses it politely.
+    /// An unsupported request from the server, explicitly refused rather than
+    /// dispatched. Input requests use `input_required` results in this revision.
     server_request: struct { id: i64 },
     /// Somebody else's traffic: a notification, or an answer to a request that
     /// is no longer in flight.
@@ -249,9 +232,8 @@ pub const Call = struct {
     method: []const u8,
     /// `params.name`, mirrored into `Mcp-Name` on Streamable HTTP.
     name: ?[]const u8 = null,
-    /// The revision to declare. Null leaves the header off, which a legacy
-    /// server's `initialize` wants: the header belongs to the versions after it.
-    protocol_version: ?[]const u8 = null,
+    /// The revision declared by this request.
+    protocol_version: []const u8,
     /// How long to wait for the answer. A subprocess is read with a deadline;
     /// `std.http` offers no such thing, so this is a stdio setting.
     timeout_ms: i64,
@@ -260,10 +242,7 @@ pub const Call = struct {
 pub const Transport = union(enum) {
     stdio: Stdio,
     http: Http,
-    /// Answers from a script instead of a server. It is a transport rather than
-    /// a test-only backdoor because the era negotiation is both the part of
-    /// this file most worth testing and the part hardest to reach through a
-    /// socket: a test needs a server that answers `-32601` to a modern request.
+    /// Scripted responses for deterministic discovery, refusal and timeout tests.
     scripted: Scripted,
 
     /// Send one request and return the message that answers it.
@@ -273,15 +252,6 @@ pub const Transport = union(enum) {
             .http => |*http| http.request(allocator, call),
             .scripted => |*scripted| scripted.request(allocator, call),
         };
-    }
-
-    /// Send a notification: a message nothing answers.
-    pub fn notify(self: *Transport, allocator: std.mem.Allocator, call: Call) !void {
-        switch (self.*) {
-            .stdio => |*stdio| try stdio.notify(call.message),
-            .http => |*http| try http.notify(allocator, call.message),
-            .scripted => |*scripted| try scripted.notify(call.message),
-        }
     }
 
     /// Shut the server down. Idempotent.
@@ -296,18 +266,9 @@ pub const Transport = union(enum) {
     pub fn deinit(self: *Transport) void {
         switch (self.*) {
             .stdio => |*stdio| stdio.deinit(),
-            .http => |*http| http.deinit(),
+            .http => {},
             .scripted => |*scripted| scripted.deinit(),
         }
-    }
-
-    /// Whether the server is a subprocess, which is what the request timeout
-    /// applies to.
-    pub fn isStdio(self: *const Transport) bool {
-        return switch (self.*) {
-            .stdio => true,
-            else => false,
-        };
     }
 };
 
@@ -425,10 +386,6 @@ pub const Stdio = struct {
         if (self.child.id != null) self.child.kill(self.io);
     }
 
-    fn notify(self: *Stdio, json: []const u8) !void {
-        try self.write(json);
-    }
-
     /// Write one message. Nothing is buffered in this process: a request sitting
     /// in a buffer is a request the server has not been given yet.
     fn write(self: *Stdio, message: []const u8) !void {
@@ -465,8 +422,7 @@ pub const Stdio = struct {
                 },
                 .server_request => |from_server| {
                     verdict.deinit(allocator);
-                    // Servers are not supposed to ask; refusing costs a line
-                    // and keeps a legacy one from waiting forever on an answer.
+                    // Explicitly refuse unsupported server-initiated requests.
                     const refusal = try buildErrorResponse(allocator, from_server.id, -32601, "Method not found");
                     defer allocator.free(refusal);
                     self.write(refusal) catch {};
@@ -556,41 +512,15 @@ pub const HttpSpec = struct {
 /// request and never answers holds the agent until it is interrupted.
 pub const Http = struct {
     io: std.Io,
-    allocator: std.mem.Allocator,
     url: []const u8,
     headers: []const [2][]const u8,
-    /// The session a legacy server handed out at `initialize`, echoed back on
-    /// every request after it. A modern server never sends one.
-    session_id: ?[]u8 = null,
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, spec: HttpSpec) Http {
+    pub fn init(io: std.Io, spec: HttpSpec) Http {
         return .{
             .io = io,
-            .allocator = allocator,
             .url = spec.url,
             .headers = spec.headers,
         };
-    }
-
-    pub fn deinit(self: *Http) void {
-        if (self.session_id) |id| self.allocator.free(id);
-        self.session_id = null;
-    }
-
-    /// Nothing is kept open between requests — every one is its own POST — so
-    /// there is nothing to shut down.
-    pub fn close(self: *Http) void {
-        _ = self;
-    }
-
-    fn notify(self: *Http, allocator: std.mem.Allocator, json: []const u8) !void {
-        var response = try self.post(allocator, .{
-            .message = json,
-            .id = 0,
-            .method = "",
-            .timeout_ms = 0,
-        });
-        defer response.deinit(allocator);
     }
 
     fn request(self: *Http, allocator: std.mem.Allocator, call: Call) !Response {
@@ -614,15 +544,8 @@ pub const Http = struct {
         defer headers.deinit(arena);
         // Either answer is acceptable, and a server picks per request.
         try headers.append(arena, .{ .name = "Accept", .value = "application/json, text/event-stream" });
-        if (call.protocol_version) |version| {
-            try headers.append(arena, .{ .name = "MCP-Protocol-Version", .value = version });
-        }
-        if (call.method.len > 0) {
-            try appendRoutingHeaders(arena, &headers, call.method, call.name);
-        }
-        if (self.session_id) |id| {
-            try headers.append(arena, .{ .name = "Mcp-Session-Id", .value = id });
-        }
+        try headers.append(arena, .{ .name = "MCP-Protocol-Version", .value = call.protocol_version });
+        try appendRoutingHeaders(arena, &headers, call.method, call.name);
         for (self.headers) |header| {
             try headers.append(arena, .{ .name = header[0], .value = header[1] });
         }
@@ -650,15 +573,9 @@ pub const Http = struct {
         // moment the body is read, so everything wanted from it is taken now.
         const status = response.head.status;
         var content_type: []const u8 = "";
-        var session: ?[]const u8 = null;
         var iterator = response.head.iterateHeaders();
         while (iterator.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "content-type")) content_type = header.value;
-            if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) session = header.value;
-        }
-        if (session) |id| {
-            if (self.session_id) |previous| self.allocator.free(previous);
-            self.session_id = try allocator.dupe(u8, id);
         }
 
         if (status == .accepted) {
@@ -964,10 +881,6 @@ pub const Scripted = struct {
             .result => |result| try frameResult(allocator, call.id, result),
         };
     }
-
-    fn notify(self: *Scripted, json: []const u8) !void {
-        try self.sent.append(self.allocator, try self.allocator.dupe(u8, json));
-    }
 };
 
 /// Wrap a scripted `result` in a response and read it back the way a real one
@@ -1013,12 +926,6 @@ test "RPC serialization escapes strings and normalizes embedded params" {
     try std.testing.expect(parsed.value.params.optional == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, message, '\n') == null);
 
-    const notification = try buildNotification(a, method, params);
-    defer a.free(notification);
-    const decoded = try std.json.parseFromSlice(std.json.Value, a, notification, .{});
-    defer decoded.deinit();
-    try std.testing.expect(decoded.value.object.get("id") == null);
-    try std.testing.expectEqualStrings(method, decoded.value.object.get("method").?.string);
     const absent = try buildRequest(a, 8, method, null);
     defer a.free(absent);
     const no_params = try std.json.parseFromSlice(std.json.Value, a, absent, .{});
@@ -1036,7 +943,6 @@ test "RPC envelopes reject invalid embedded JSON" {
     const a = std.testing.allocator;
     for ([_][]const u8{ "{", "{} , \"injected\":true", "{}\n{}", "[]", "\"text\"", "42" }) |params| {
         try std.testing.expectError(error.McpInvalidArguments, buildRequest(a, 1, "tools/list", params));
-        try std.testing.expectError(error.McpInvalidArguments, buildNotification(a, "notify", params));
     }
 }
 
@@ -1052,17 +958,6 @@ test "build request carries the id, the method and the params" {
     // The stdio binding is one message per line, so a message must not carry a
     // line ending of its own.
     try std.testing.expect(std.mem.indexOfScalar(u8, message, '\n') == null);
-}
-
-test "build notification has no id" {
-    const allocator = std.testing.allocator;
-    const message = try buildNotification(allocator, "notifications/initialized", null);
-    defer allocator.free(message);
-
-    try std.testing.expectEqualStrings(
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
-        message,
-    );
 }
 
 test "build error response names the code" {
@@ -1242,7 +1137,7 @@ test "a scripted transport answers in order and remembers what it was sent" {
 
     const call = struct {
         fn at(id: i64, method: []const u8) Call {
-            return .{ .message = "{\"jsonrpc\":\"2.0\"}", .id = id, .method = method, .timeout_ms = 50 };
+            return .{ .message = "{\"jsonrpc\":\"2.0\"}", .id = id, .method = method, .protocol_version = "2026-07-28", .timeout_ms = 50 };
         }
     };
 

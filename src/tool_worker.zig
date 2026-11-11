@@ -22,8 +22,7 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
             defer allocator.free(command);
             var shell_env = try env.clone(allocator);
             defer shell_env.deinit();
-            // Persist compilation caches even when an older controller is still
-            // running through an atomically upgraded worker binary.
+            // Keep compilation caches in the workspace, outside temporary scratch.
             try shell_env.put("ZIG_GLOBAL_CACHE_DIR", ".zig-cache/global");
             break :blk try tools.executeShellWithEnv(io, allocator, command, &shell_env);
         } else if (std.mem.eql(u8, name, "read")) {
