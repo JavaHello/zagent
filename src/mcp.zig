@@ -956,22 +956,18 @@ fn readTool(allocator: std.mem.Allocator, object: std.json.ObjectMap) !?RemoteTo
     const owned_description = try allocator.dupe(u8, description);
     errdefer allocator.free(owned_description);
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    if (object.get("inputSchema")) |schema| {
-        if (schema == .object) {
-            try std.json.Stringify.value(schema, .{}, &aw.writer);
-        } else {
-            try aw.writer.writeAll("{\"type\":\"object\"}");
-        }
-    } else {
-        try aw.writer.writeAll("{\"type\":\"object\"}");
-    }
+    const schema_json = if (object.get("inputSchema")) |schema|
+        (if (schema == .object)
+            try std.json.Stringify.valueAlloc(allocator, schema, .{})
+        else
+            try std.json.Stringify.valueAlloc(allocator, .{ .type = "object" }, .{}))
+    else
+        try std.json.Stringify.valueAlloc(allocator, .{ .type = "object" }, .{});
 
     return .{
         .name = owned_name,
         .description = owned_description,
-        .schema_json = try aw.toOwnedSlice(),
+        .schema_json = schema_json,
     };
 }
 
@@ -1031,64 +1027,36 @@ fn readError(allocator: std.mem.Allocator, body: []const u8) !?transport.RpcErro
 // Request params
 // ---------------------------------------------------------------------------
 
-/// The per-request protocol fields every request in the current revision
-/// carries. They are what makes the protocol stateless: the version, who is
-/// asking, and what the asker can do are all in the request.
-fn writeMeta(w: *std.Io.Writer) !void {
-    try w.writeAll("\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":");
-    try std.json.Stringify.encodeJsonString(modern_protocol_version, .{}, w);
-    try w.writeAll(",\"io.modelcontextprotocol/clientInfo\":{\"name\":");
-    try std.json.Stringify.encodeJsonString(client_name, .{}, w);
-    try w.writeAll(",\"version\":");
-    try std.json.Stringify.encodeJsonString(client_version, .{}, w);
-    try w.writeAll("},\"io.modelcontextprotocol/clientCapabilities\":{}}");
-}
+/// Typed metadata shared by requests in the stateless protocol revision.
+const RequestMeta = struct {
+    @"io.modelcontextprotocol/protocolVersion": []const u8 = modern_protocol_version,
+    @"io.modelcontextprotocol/clientInfo": ClientInfo = .{},
+    @"io.modelcontextprotocol/clientCapabilities": struct {} = .{},
+};
+
+const ClientInfo = struct {
+    name: []const u8 = client_name,
+    version: []const u8 = client_version,
+};
 
 fn metaParams(allocator: std.mem.Allocator) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    try aw.writer.writeByte('{');
-    try writeMeta(&aw.writer);
-    try aw.writer.writeByte('}');
-    return aw.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, .{ ._meta = RequestMeta{} }, .{});
 }
 
-/// The opening of the legacy revision. No `_meta`: that belongs to the revision
-/// this request is not.
+/// The legacy revision has no per-request metadata.
 fn initializeParams(allocator: std.mem.Allocator) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
-    try w.writeAll("{\"protocolVersion\":");
-    try std.json.Stringify.encodeJsonString(legacy_protocol_version, .{}, w);
-    try w.writeAll(",\"capabilities\":{},\"clientInfo\":{\"name\":");
-    try std.json.Stringify.encodeJsonString(client_name, .{}, w);
-    try w.writeAll(",\"version\":");
-    try std.json.Stringify.encodeJsonString(client_version, .{}, w);
-    try w.writeAll("}}");
-    return aw.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .protocolVersion = legacy_protocol_version,
+        .capabilities = .{},
+        .clientInfo = ClientInfo{},
+    }, .{});
 }
 
 fn listParams(allocator: std.mem.Allocator, cursor: ?[]const u8, meta: bool) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
-    try w.writeByte('{');
-    var first = true;
-    if (cursor) |value| {
-        try w.writeAll("\"cursor\":");
-        try std.json.Stringify.encodeJsonString(value, .{}, w);
-        first = false;
-    }
-    if (meta) {
-        if (!first) try w.writeByte(',');
-        try writeMeta(w);
-    }
-    try w.writeByte('}');
-
-    return aw.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .cursor = cursor,
+        ._meta = if (meta) RequestMeta{} else @as(?RequestMeta, null),
+    }, .{ .emit_null_optional_fields = false });
 }
 
 fn callParams(
@@ -1097,21 +1065,14 @@ fn callParams(
     arguments_json: []const u8,
     meta: bool,
 ) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
-    try w.writeAll("{\"name\":");
-    try std.json.Stringify.encodeJsonString(name, .{}, w);
-    try w.writeAll(",\"arguments\":");
-    try w.writeAll(arguments_json);
-    if (meta) {
-        try w.writeByte(',');
-        try writeMeta(w);
-    }
-    try w.writeByte('}');
-
-    return aw.toOwnedSlice();
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.McpInvalidArguments;
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .name = name,
+        .arguments = parsed.value,
+        ._meta = if (meta) RequestMeta{} else @as(?RequestMeta, null),
+    }, .{ .emit_null_optional_fields = false });
 }
 
 /// Re-render the arguments a model sent for a tool call.
@@ -1747,25 +1708,17 @@ fn buildFunction(
     description: []const u8,
     schema_json: []const u8,
 ) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
-    // The description is prefixed with the server it came from: with several
-    // connected, "Create an issue" on its own does not say where.
+    // Prefix descriptions with the server they came from.
     const capped = description[0..@min(description.len, max_description_bytes)];
     const prefixed = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ server, capped });
     defer allocator.free(prefixed);
-
-    try w.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-    try std.json.Stringify.encodeJsonString(alias, .{}, w);
-    try w.writeAll(",\"description\":");
-    try std.json.Stringify.encodeJsonString(prefixed, .{}, w);
-    try w.writeAll(",\"parameters\":");
-    try w.writeAll(schema_json);
-    try w.writeAll("}}");
-
-    return aw.toOwnedSlice();
+    const schema = try std.json.parseFromSlice(std.json.Value, allocator, schema_json, .{});
+    defer schema.deinit();
+    if (schema.value != .object) return error.InvalidToolSchema;
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .type = "function",
+        .function = .{ .name = alias, .description = prefixed, .parameters = schema.value },
+    }, .{});
 }
 
 /// The spinner's label for a tool call. Built once, here, so the animation is
@@ -1914,6 +1867,39 @@ test "an alias fits what an endpoint accepts" {
     try std.testing.expectEqual(@as(usize, max_tool_name), long_b.len);
     try std.testing.expect(!std.mem.eql(u8, long_a, long_b));
     for (long_a) |byte| try std.testing.expect(isNameByte(byte));
+}
+
+test "MCP params and schemas round trip escaped strings and optional fields" {
+    const a = std.testing.allocator;
+    const name = "echo\"\\\n测试";
+    for ([_]bool{ true, false }) |meta| {
+        const params = try callParams(a, name, "{\n\"nested\":{\"value\":null},\"text\":\"line\\nquote\\\"\"}", meta);
+        defer a.free(params);
+        const decoded = try std.json.parseFromSlice(std.json.Value, a, params, .{});
+        defer decoded.deinit();
+        const object = decoded.value.object;
+        try std.testing.expectEqualStrings(name, object.get("name").?.string);
+        try std.testing.expectEqual(meta, object.contains("_meta"));
+        try std.testing.expect(object.get("arguments").?.object.get("nested").?.object.get("value").? == .null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, params, '\n') == null);
+        const listing = try listParams(a, name, meta);
+        defer a.free(listing);
+        const page = try std.json.parseFromSlice(std.json.Value, a, listing, .{});
+        defer page.deinit();
+        try std.testing.expectEqualStrings(name, page.value.object.get("cursor").?.string);
+        try std.testing.expectEqual(meta, page.value.object.contains("_meta"));
+    }
+    const function = try buildFunction(a, name, "server\"", "description\n\\", "{\n\"type\":\"object\",\"x-custom\":null}");
+    defer a.free(function);
+    const decoded = try std.json.parseFromSlice(std.json.Value, a, function, .{});
+    defer decoded.deinit();
+    const object = decoded.value.object.get("function").?.object;
+    try std.testing.expectEqualStrings(name, object.get("name").?.string);
+    try std.testing.expectEqualStrings("server\": description\n\\", object.get("description").?.string);
+    try std.testing.expect(object.get("parameters").?.object.get("x-custom").? == .null);
+    try std.testing.expectError(error.McpInvalidArguments, callParams(a, name, "[]", false));
+    try std.testing.expectError(error.SyntaxError, callParams(a, name, "{} , \"injected\":true", false));
+    try std.testing.expectError(error.InvalidToolSchema, buildFunction(a, name, "s", "d", "[]"));
 }
 
 test "arguments are written back as one line of JSON" {
@@ -2447,21 +2433,16 @@ test "the registry connects what mcp.json names, end to end" {
 
     // The shell server is described in JSON rather than in a file, so nothing
     // has to be written for it but the configuration itself.
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try aw.writer.writeAll("{\"mcpServers\":{");
-    for ([_][]const u8{ "demo", "other" }, 0..) |name, server_index| {
-        if (server_index > 0) try aw.writer.writeByte(',');
-        try std.json.Stringify.encodeJsonString(name, .{}, &aw.writer);
-        try aw.writer.writeAll(":{\"description\":\"Echo service\",\"command\":\"sh\",\"args\":[");
-        for ([_][]const u8{ "-c", fake_server_script, "demo", "modern" }, 0..) |arg, index| {
-            if (index > 0) try aw.writer.writeByte(',');
-            try std.json.Stringify.encodeJsonString(arg, .{}, &aw.writer);
-        }
-        try aw.writer.writeAll("]}");
-    }
-    try aw.writer.writeAll("}}");
-    try tmp.dir.writeFile(io, .{ .sub_path = "zagent/mcp.json", .data = aw.written() });
+    const server = .{
+        .description = "Echo service",
+        .command = "sh",
+        .args = [_][]const u8{ "-c", fake_server_script, "demo", "modern" },
+    };
+    const contents = try std.json.Stringify.valueAlloc(allocator, .{
+        .mcpServers = .{ .demo = server, .other = server },
+    }, .{});
+    defer allocator.free(contents);
+    try tmp.dir.writeFile(io, .{ .sub_path = "zagent/mcp.json", .data = contents });
 
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const home = buf[0..try tmp.dir.realPath(io, &buf)];

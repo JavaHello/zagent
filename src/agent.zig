@@ -1770,14 +1770,20 @@ test "model compaction waits for the whole tool batch and coalesces requests" {
             try harness.agent.appendUserMessage("old question");
             try harness.agent.appendAssistantText("old answer");
         }
-        const batch =
-            "{\"status\":\"completed\",\"output\":[" ++
-            "{\"type\":\"function_call\",\"call_id\":\"compact1\",\"name\":\"compact_context\",\"arguments\":\"{\\\"summary\\\":\\\"Old questions answered.\\\",\\\"keep_messages\\\":";
-        const batch_end =
-            "}\"}," ++
-            "{\"type\":\"function_call\",\"call_id\":\"list\",\"name\":\"ls\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}," ++
-            "{\"type\":\"function_call\",\"call_id\":\"compact2\",\"name\":\"compact_context\",\"arguments\":\"{\\\"summary\\\":\\\"Second summary.\\\"}\"}]}";
-        const reply = try std.fmt.allocPrint(allocator, "{s}{d}{s}", .{ batch, @as(u32, if (usable_summary) 4 else 100), batch_end });
+        const arguments = try std.json.Stringify.valueAlloc(allocator, .{
+            .summary = "Old questions answered.",
+            .keep_messages = @as(u32, if (usable_summary) 4 else 100),
+        }, .{});
+        defer allocator.free(arguments);
+        const Call = struct { type: []const u8 = "function_call", call_id: []const u8, name: []const u8, arguments: []const u8 };
+        const reply = try std.json.Stringify.valueAlloc(allocator, .{
+            .status = "completed",
+            .output = [_]Call{
+                .{ .call_id = "compact1", .name = "compact_context", .arguments = arguments },
+                .{ .call_id = "list", .name = "ls", .arguments = "{\"path\":\".\"}" },
+                .{ .call_id = "compact2", .name = "compact_context", .arguments = "{\"summary\":\"Second summary.\"}" },
+            },
+        }, .{});
         defer allocator.free(reply);
         var mock: MockTransport = .{ .replies = &.{ reply, completed_answer } };
         defer mock.deinit(allocator);

@@ -738,71 +738,76 @@ pub fn buildRequestWithTools(allocator: std.mem.Allocator, model: []const u8, me
 
 /// The single source of truth for Responses history replay and size estimates.
 pub fn writeInput(allocator: std.mem.Allocator, w: *std.Io.Writer, messages: []const Message) !void {
-    try w.writeByte('[');
-    var first = true;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.json.Stringify.value(try buildInput(arena.allocator(), messages), .{}, w);
+}
+
+/// Heterogeneous Responses items serialize as their payload, not a union tag.
+const InputItem = union(enum) {
+    replay: std.json.Value,
+    output: struct { type: []const u8 = "function_call_output", call_id: []const u8, output: []const u8 },
+    reasoning: struct {
+        type: []const u8 = "reasoning",
+        content: [1]struct { type: []const u8 = "reasoning_text", text: []const u8 },
+    },
+    message: struct { role: []const u8, content: []const u8 },
+    call: struct { type: []const u8 = "function_call", call_id: []const u8, name: []const u8, arguments: []const u8 },
+
+    pub fn jsonStringify(self: InputItem, json: *std.json.Stringify) std.json.Stringify.Error!void {
+        switch (self) {
+            inline else => |item| try json.write(item),
+        }
+    }
+};
+
+/// All allocations belong to the caller's request-scoped arena.
+fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const InputItem {
+    var input: std.ArrayList(InputItem) = .empty;
     for (messages) |message| {
         if (message.response_items) |items| {
-            // Preserve every returned item, including encrypted reasoning and
-            // message/function IDs. Reconstructing only the text loses state.
-            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, items, .{});
-            defer parsed.deinit();
-            if (parsed.value != .array) return error.InvalidResponseItems;
-            for (parsed.value.array.items) |item| {
+            // Replay opaque items intact, including encrypted reasoning and IDs.
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, items, .{});
+            if (parsed != .array) return error.InvalidResponseItems;
+            for (parsed.array.items) |item| {
                 if (item != .object) return error.InvalidResponseItems;
-                try separator(w, &first);
-                try std.json.Stringify.value(item, .{}, w);
+                try input.append(arena, .{ .replay = item });
             }
             continue;
         }
         if (std.mem.eql(u8, message.role, "tool")) {
             const call_id = message.tool_call_id orelse return error.MissingCallId;
-            try separator(w, &first);
-            try w.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-            try std.json.Stringify.encodeJsonString(call_id, .{}, w);
-            try w.writeAll(",\"output\":");
-            if (message.tool_status) |status| {
-                const output = try search_tools.formatToolOutput(allocator, status, message.content orelse "");
-                defer allocator.free(output);
-                try std.json.Stringify.encodeJsonString(output, .{}, w);
-            } else {
-                try std.json.Stringify.encodeJsonString(message.content orelse "", .{}, w);
-            }
-            try w.writeByte('}');
+            const content = message.content orelse "";
+            const output = if (message.tool_status) |status|
+                try search_tools.formatToolOutput(arena, status, content)
+            else
+                content;
+            try input.append(arena, .{ .output = .{ .call_id = call_id, .output = output } });
             continue;
         }
-        // Older session snapshots carry unstructured Chat Completions
-        // reasoning strings. Convert them to a typed reasoning item so the
-        // chain-of-thought is passed back; thinking mode requires it when the
-        // request carries tools.
+        // Convert reasoning from older session snapshots into typed items.
         if (message.reasoning_content) |reasoning| {
-            if (reasoning.len > 0) {
-                try separator(w, &first);
-                try w.writeAll("{\"type\":\"reasoning\",\"content\":[{\"type\":\"reasoning_text\",\"text\":");
-                try std.json.Stringify.encodeJsonString(reasoning, .{}, w);
-                try w.writeAll("}]}");
-            }
+            if (reasoning.len > 0) try input.append(arena, .{ .reasoning = .{ .content = .{.{ .text = reasoning }} } });
         }
         if (message.content) |content| {
-            try separator(w, &first);
-            try w.writeAll("{\"role\":");
-            try std.json.Stringify.encodeJsonString(message.role, .{}, w);
-            try w.writeAll(",\"content\":");
-            try std.json.Stringify.encodeJsonString(content, .{}, w);
-            try w.writeByte('}');
+            try input.append(arena, .{ .message = .{ .role = message.role, .content = content } });
         }
         if (message.tool_calls) |calls| for (calls) |call| {
-            try separator(w, &first);
-            try w.writeAll("{\"type\":\"function_call\",\"call_id\":");
-            try std.json.Stringify.encodeJsonString(call.id, .{}, w);
-            try w.writeAll(",\"name\":");
-            try std.json.Stringify.encodeJsonString(call.name, .{}, w);
-            try w.writeAll(",\"arguments\":");
-            try std.json.Stringify.encodeJsonString(call.arguments, .{}, w);
-            try w.writeByte('}');
+            try input.append(arena, .{ .call = .{ .call_id = call.id, .name = call.name, .arguments = call.arguments } });
         };
     }
-    try w.writeByte(']');
+    return input.items;
 }
+
+const Request = struct {
+    model: []const u8,
+    max_output_tokens: u32,
+    store: bool = false,
+    stream: bool,
+    include: [1][]const u8 = .{"reasoning.encrypted_content"},
+    input: []const InputItem,
+    tools: ?[]const tool_schema.Function,
+};
 
 pub fn buildRequestWithSearch(allocator: std.mem.Allocator, model: []const u8, messages: []const Message, max_tokens: u32, tools: Tools, extra_tools: []const []const u8, stream: bool, search: search_tools.SearchBackends) ![]u8 {
     return buildRequestWithToolSelection(allocator, model, messages, max_tokens, if (tools == .included) .{ .extra = extra_tools } else null, stream, search);
@@ -827,16 +832,12 @@ pub fn buildRequestWithToolSelection(
     stream: bool,
     search: search_tools.SearchBackends,
 ) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-    try w.writeAll("{\"model\":");
-    try std.json.Stringify.encodeJsonString(model, .{}, w);
-    try w.print(",\"max_output_tokens\":{d},\"store\":false,\"stream\":{},\"include\":[\"reasoning.encrypted_content\"],\"input\":", .{ max_tokens, stream });
-    try writeInput(allocator, w, messages);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const input = try buildInput(arena, messages);
+    var functions: std.ArrayList(tool_schema.Function) = .empty;
     if (selection) |selected| {
-        try w.writeAll(",\"tools\":[");
-        var first = true;
         for (selected.builtin orelse &tool_schema.builtin) |tool| {
             if (selected.builtin == null) {
                 if (std.mem.eql(u8, tool.name, "rg") and !search.rg) continue;
@@ -844,24 +845,20 @@ pub fn buildRequestWithToolSelection(
                 if (std.mem.eql(u8, tool.name, "fd") and !search.fd) continue;
                 if (std.mem.eql(u8, tool.name, "find") and search.fd) continue;
             }
-            try separator(w, &first);
-            try tool.writeJson(w);
+            try functions.append(arena, try tool.function(arena));
         }
         for (selected.extra) |entry| {
-            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry, .{});
-            defer parsed.deinit();
-            try separator(w, &first);
-            try writeFunction(w, parsed.value);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, entry, .{});
+            try functions.append(arena, try readFunction(parsed));
         }
-        try w.writeByte(']');
     }
-    try w.writeByte('}');
-    return aw.toOwnedSlice();
-}
-
-fn separator(w: *std.Io.Writer, first: *bool) !void {
-    if (!first.*) try w.writeByte(',');
-    first.* = false;
+    return std.json.Stringify.valueAlloc(allocator, Request{
+        .model = model,
+        .max_output_tokens = max_tokens,
+        .stream = stream,
+        .input = input,
+        .tools = if (selection != null) functions.items else null,
+    }, .{ .emit_null_optional_fields = false });
 }
 
 fn stringField(value: std.json.Value, key: []const u8) ![]const u8 {
@@ -871,22 +868,18 @@ fn stringField(value: std.json.Value, key: []const u8) ![]const u8 {
     return item.string;
 }
 
-fn writeFunction(w: *std.Io.Writer, tool: std.json.Value) !void {
+fn readFunction(tool: std.json.Value) !tool_schema.Function {
     if (tool != .object) return error.InvalidToolSchema;
     const function = tool.object.get("function") orelse tool;
+    if (function != .object) return error.InvalidToolSchema;
     const name = try stringField(function, "name");
     const parameters = function.object.get("parameters") orelse return error.InvalidToolSchema;
     if (parameters != .object) return error.InvalidToolSchema;
-    try w.writeAll("{\"type\":\"function\",\"strict\":false,\"name\":");
-    try std.json.Stringify.encodeJsonString(name, .{}, w);
-    if (function.object.get("description")) |description| {
-        if (description != .string) return error.InvalidToolSchema;
-        try w.writeAll(",\"description\":");
-        try std.json.Stringify.value(description, .{}, w);
-    }
-    try w.writeAll(",\"parameters\":");
-    try std.json.Stringify.value(parameters, .{}, w);
-    try w.writeByte('}');
+    const description: ?[]const u8 = if (function.object.get("description")) |value| switch (value) {
+        .string => |text| text,
+        else => return error.InvalidToolSchema,
+    } else null;
+    return .{ .name = name, .description = description, .parameters = parameters };
 }
 
 /// The plain chain-of-thought text from a response's completed reasoning
@@ -1192,6 +1185,52 @@ test "Responses request uses typed items and flat non-strict function schemas" {
         try std.testing.expect(!tool.object.get("strict").?.bool);
     }
     try std.testing.expectEqualStrings("mcp__test__search", tools[tools.len - 1].object.get("name").?.string);
+}
+
+test "Responses request escapes strings and rejects malformed replay" {
+    const a = std.testing.allocator;
+    const tricky = "quote\" backslash\\ newline\n测试";
+    var calls = [_]ToolCallData{.{ .id = tricky, .name = tricky, .arguments = "{\"path\":\"a\\\"b\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = tricky, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = tricky, .reasoning_content = tricky, .tool_calls = &calls, .tool_call_id = null },
+        .{ .role = "tool", .content = tricky, .reasoning_content = null, .tool_calls = null, .tool_call_id = tricky },
+    };
+    const encoded = try buildRequestWithTools(a, tricky, &messages, 32, .omitted, &.{}, false);
+    defer a.free(encoded);
+    const parsed = try std.json.parseFromSlice(struct {
+        model: []const u8,
+        max_output_tokens: u32,
+        store: bool,
+        stream: bool,
+        include: []const []const u8,
+        input: []const struct {
+            type: ?[]const u8 = null,
+            role: ?[]const u8 = null,
+            content: ?std.json.Value = null,
+            call_id: ?[]const u8 = null,
+            name: ?[]const u8 = null,
+            arguments: ?[]const u8 = null,
+            output: ?[]const u8 = null,
+        },
+    }, a, encoded, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(tricky, parsed.value.model);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.include.len);
+    const items = parsed.value.input;
+    try std.testing.expectEqualStrings(tricky, items[0].content.?.string);
+    try std.testing.expectEqualStrings(tricky, items[1].content.?.array.items[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings(tricky, items[2].content.?.string);
+    try std.testing.expectEqualStrings(tricky, items[3].call_id.?);
+    try std.testing.expectEqualStrings(tricky, items[3].name.?);
+    try std.testing.expectEqualStrings(tricky, items[4].output.?);
+    try std.testing.expect(std.mem.indexOfScalar(u8, encoded, '\n') == null);
+
+    // Replayed items must be a JSON array of objects, never a splice point.
+    const broken = [_]Message{.{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null, .response_items = "{\"type\":\"message\"}" }};
+    try std.testing.expectError(error.InvalidResponseItems, buildRequestWithTools(a, "m", &broken, 8, .omitted, &.{}, false));
+    const garbage = [_]Message{.{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null, .response_items = "[] , \"injected\":true" }};
+    try std.testing.expectError(error.SyntaxError, buildRequestWithTools(a, "m", &garbage, 8, .omitted, &.{}, false));
 }
 
 test "Responses parsing keeps call_id separate from item IDs and replays all output" {

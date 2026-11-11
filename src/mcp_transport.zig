@@ -61,21 +61,27 @@ pub fn buildRequest(
     method: []const u8,
     params_json: ?[]const u8,
 ) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
+    const params = try readParams(allocator, params_json);
+    defer if (params) |parsed| parsed.deinit();
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = method,
+        .params = if (params) |parsed| parsed.value else null,
+    }, .{ .emit_null_optional_fields = false });
+}
 
-    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-    try w.print("{d}", .{id});
-    try w.writeAll(",\"method\":");
-    try std.json.Stringify.encodeJsonString(method, .{}, w);
-    if (params_json) |params| {
-        try w.writeAll(",\"params\":");
-        try w.writeAll(params);
+/// Parse the already-rendered params this layer carries. They must be an
+/// object, so a malformed splice can never become part of the envelope.
+fn readParams(allocator: std.mem.Allocator, params_json: ?[]const u8) !?std.json.Parsed(std.json.Value) {
+    const text = params_json orelse return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch
+        return error.McpInvalidArguments;
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return error.McpInvalidArguments;
     }
-    try w.writeByte('}');
-
-    return aw.toOwnedSlice();
+    return parsed;
 }
 
 /// Build a JSON-RPC notification: a request with no id, which nothing answers.
@@ -84,19 +90,13 @@ pub fn buildNotification(
     method: []const u8,
     params_json: ?[]const u8,
 ) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
-    try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
-    try std.json.Stringify.encodeJsonString(method, .{}, w);
-    if (params_json) |params| {
-        try w.writeAll(",\"params\":");
-        try w.writeAll(params);
-    }
-    try w.writeByte('}');
-
-    return aw.toOwnedSlice();
+    const params = try readParams(allocator, params_json);
+    defer if (params) |parsed| parsed.deinit();
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .method = method,
+        .params = if (params) |parsed| parsed.value else null,
+    }, .{ .emit_null_optional_fields = false });
 }
 
 /// Build an error response, which is how a request *from* a server is refused.
@@ -106,17 +106,11 @@ pub fn buildErrorResponse(
     code: i64,
     message: []const u8,
 ) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    const w = &aw.writer;
-
-    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-    try w.print("{d}", .{id});
-    try w.print(",\"error\":{{\"code\":{d},\"message\":", .{code});
-    try std.json.Stringify.encodeJsonString(message, .{}, w);
-    try w.writeAll("}}");
-
-    return aw.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .@"error" = .{ .code = code, .message = message },
+    }, .{});
 }
 
 /// A JSON-RPC error a server sent back. Owns its strings.
@@ -979,12 +973,13 @@ pub const Scripted = struct {
 /// Wrap a scripted `result` in a response and read it back the way a real one
 /// would be read, so a test exercises the same path a server's answer takes.
 fn frameResult(allocator: std.mem.Allocator, id: i64, result: []const u8) !Response {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    try aw.writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":", .{id});
-    try aw.writer.writeAll(result);
-    try aw.writer.writeByte('}');
-    const raw = try aw.toOwnedSlice();
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const raw = try std.json.Stringify.valueAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .result = parsed.value,
+    }, .{});
     defer allocator.free(raw);
 
     var verdict = try interpret(allocator, raw, id);
@@ -997,6 +992,51 @@ fn frameResult(allocator: std.mem.Allocator, id: i64, result: []const u8) !Respo
             verdict.deinit(allocator);
             return Error.McpProtocol;
         },
+    }
+}
+
+test "RPC serialization escapes strings and normalizes embedded params" {
+    const a = std.testing.allocator;
+    const method = "tools/\"echo\\\n测试";
+    const params = "{\n\"text\":\"quote\\\" slash\\\\ line\\n\",\"optional\":null}";
+    const message = try buildRequest(a, 7, method, params);
+    defer a.free(message);
+    const parsed = try std.json.parseFromSlice(struct {
+        jsonrpc: []const u8,
+        id: i64,
+        method: []const u8,
+        params: struct { text: []const u8, optional: ?bool },
+    }, a, message, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(method, parsed.value.method);
+    try std.testing.expectEqualStrings("quote\" slash\\ line\n", parsed.value.params.text);
+    try std.testing.expect(parsed.value.params.optional == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, message, '\n') == null);
+
+    const notification = try buildNotification(a, method, params);
+    defer a.free(notification);
+    const decoded = try std.json.parseFromSlice(std.json.Value, a, notification, .{});
+    defer decoded.deinit();
+    try std.testing.expect(decoded.value.object.get("id") == null);
+    try std.testing.expectEqualStrings(method, decoded.value.object.get("method").?.string);
+    const absent = try buildRequest(a, 8, method, null);
+    defer a.free(absent);
+    const no_params = try std.json.parseFromSlice(std.json.Value, a, absent, .{});
+    defer no_params.deinit();
+    try std.testing.expect(no_params.value.object.get("params") == null);
+
+    const refusal = try buildErrorResponse(a, 9, -32601, method);
+    defer a.free(refusal);
+    const error_response = try std.json.parseFromSlice(std.json.Value, a, refusal, .{});
+    defer error_response.deinit();
+    try std.testing.expectEqualStrings(method, error_response.value.object.get("error").?.object.get("message").?.string);
+}
+
+test "RPC envelopes reject invalid embedded JSON" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{", "{} , \"injected\":true", "{}\n{}", "[]", "\"text\"", "42" }) |params| {
+        try std.testing.expectError(error.McpInvalidArguments, buildRequest(a, 1, "tools/list", params));
+        try std.testing.expectError(error.McpInvalidArguments, buildNotification(a, "notify", params));
     }
 }
 

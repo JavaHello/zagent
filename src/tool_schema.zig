@@ -1,23 +1,55 @@
 const std = @import("std");
 
 /// A built-in tool definition, independent of any request or tool selection.
-/// parameters_json is a complete JSON Schema object, written without parsing
-/// or allocating on the request path. Tests validate every built-in schema.
+/// parameters_json is parsed before embedding, never spliced into JSON output.
+/// Tests validate every built-in schema.
 pub const ToolDefinition = struct {
     name: []const u8,
     description: []const u8,
     parameters_json: []const u8,
 
-    pub fn writeJson(self: ToolDefinition, writer: *std.Io.Writer) !void {
-        try writer.writeAll("{\"type\":\"function\",\"strict\":false,\"name\":");
-        try std.json.Stringify.encodeJsonString(self.name, .{}, writer);
-        try writer.writeAll(",\"description\":");
-        try std.json.Stringify.encodeJsonString(self.description, .{}, writer);
-        try writer.writeAll(",\"parameters\":");
-        try writer.writeAll(self.parameters_json);
-        try writer.writeByte('}');
+    /// Parse parameters_json into the typed wire shape. A request-scoped arena
+    /// allocator keeps the parsed schema alive until serialization finishes.
+    pub fn function(self: ToolDefinition, allocator: std.mem.Allocator) !Function {
+        const parameters = try std.json.parseFromSliceLeaky(std.json.Value, allocator, self.parameters_json, .{});
+        if (parameters != .object) return error.InvalidToolSchema;
+        return .{ .name = self.name, .description = self.description, .parameters = parameters };
     }
 };
+
+/// Responses API function schema; parameters may contain arbitrary JSON Schema.
+pub const Function = struct {
+    type: []const u8 = "function",
+    strict: bool = false,
+    name: []const u8,
+    description: ?[]const u8 = null,
+    parameters: std.json.Value,
+};
+
+test "tool definitions serialize strings and reject non-object schemas" {
+    const a = std.testing.allocator;
+    const tool: ToolDefinition = .{
+        .name = "echo\"\\\n测试",
+        .description = "quoted \"description\"\nnext line",
+        .parameters_json = "{\n\"type\":\"object\",\"default\":null}",
+    };
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const function = try tool.function(arena_state.allocator());
+    const output = try std.json.Stringify.valueAlloc(a, function, .{ .emit_null_optional_fields = false });
+    defer a.free(output);
+    const decoded = try std.json.parseFromSlice(Function, a, output, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(tool.name, decoded.value.name);
+    try std.testing.expectEqualStrings(tool.description, decoded.value.description.?);
+    try std.testing.expect(decoded.value.parameters.object.get("default").? == .null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, output, '\n') == null);
+    var invalid = tool;
+    invalid.parameters_json = "[]";
+    try std.testing.expectError(error.InvalidToolSchema, invalid.function(arena_state.allocator()));
+    invalid.parameters_json = "{} , \"injected\":true";
+    try std.testing.expectError(error.SyntaxError, invalid.function(arena_state.allocator()));
+}
 
 pub const memory_search = ToolDefinition{
     .name = "memory_search",
