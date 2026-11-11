@@ -919,7 +919,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
         } else if (!truncated and !std.mem.eql(u8, kind, "reasoning")) return error.UnsupportedOutputItem;
     }
     if (!truncated and calls.items.len == 0 and content.written().len == 0) return error.EmptyResponse;
-    const text = if (content.written().len > 0) try allocator.dupe(u8, content.written()) else null;
+    const text = if (content.written().len > 0) try content.toOwnedSlice() else null;
     errdefer if (text) |value| allocator.free(value);
     // Incomplete output items must not be replayed: a partial call or message
     // would be sent back to the model as if it had been completed.

@@ -69,20 +69,24 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages
     defer allocator.free(workspace);
     const steps = try plan.stored(allocator);
     defer allocator.free(steps);
-    const data = try std.json.Stringify.valueAlloc(allocator, .{
-        .version = schema_version,
-        .workspace = workspace,
-        .messages = messages,
-        .plan = steps,
-    }, .{});
-    defer allocator.free(data);
     const temporary = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(temporary);
     if (std.fs.path.dirname(path)) |parent| try cwd.createDirPath(io, parent);
     const file = try cwd.createFile(io, temporary, .{ .permissions = .fromMode(0o600) });
     defer file.close(io);
     errdefer cwd.deleteFile(io, temporary) catch {};
-    try file.writeStreamingAll(io, data);
+    // Written straight to the file: a checkpoint is as large as the whole
+    // conversation, and holding a serialized copy of it as well would double
+    // that peak on every save.
+    var buf: [64 * 1024]u8 = undefined;
+    var file_writer = file.writer(io, &buf);
+    try std.json.Stringify.value(.{
+        .version = schema_version,
+        .workspace = workspace,
+        .messages = messages,
+        .plan = steps,
+    }, .{}, &file_writer.interface);
+    try file_writer.interface.flush();
     try cwd.rename(temporary, cwd, path, io);
 }
 

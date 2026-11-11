@@ -85,21 +85,41 @@ fn search(allocator: Allocator, io: std.Io, root: std.Io.Dir, path: []const u8, 
         if (entry.kind == .directory) {
             if (depth < 12) try search(allocator, io, root, relative, items, before, query, depth + 1, budget);
         } else if (entry.kind == .file and containsIgnoreCase(relative, query)) {
-            const label = try std.fmt.allocPrint(allocator, "@{s}", .{relative});
-            defer allocator.free(label);
-            // Quote paths with spaces so the reference remains one readable token.
-            const value = if (std.mem.indexOfScalar(u8, relative, ' ') != null)
-                try std.fmt.allocPrint(allocator, "{s}@\"{s}\"", .{ before, relative })
-            else
-                try std.fmt.allocPrint(allocator, "{s}{s}", .{ before, label });
-            defer allocator.free(value);
-            try append(allocator, items, "", label, "File", true);
-            const item = &items.items[items.items.len - 1];
-            const owned_value = try allocator.dupe(u8, value);
-            allocator.free(item.value.?);
-            item.value = owned_value;
+            try appendFile(allocator, items, before, relative);
         }
     }
+}
+
+fn appendFile(allocator: Allocator, items: *std.ArrayList(Item), before: []const u8, relative: []const u8) !void {
+    const label = try std.fmt.allocPrint(allocator, "@{s}", .{relative});
+    errdefer allocator.free(label);
+    // Quote paths with spaces so the reference remains one readable token.
+    const value = if (std.mem.indexOfScalar(u8, relative, ' ') != null)
+        try std.fmt.allocPrint(allocator, "{s}@\"{s}\"", .{ before, relative })
+    else
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ before, label });
+    errdefer allocator.free(value);
+    const description = try allocator.dupe(u8, "File");
+    errdefer allocator.free(description);
+    try items.append(allocator, .{ .label = label, .value = value, .description = description });
+}
+
+test "file candidates transfer ownership and clean up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: Allocator) !void {
+            var items: std.ArrayList(Item) = .empty;
+            defer {
+                for (items.items) |item| item.deinit(allocator);
+                items.deinit(allocator);
+            }
+            try appendFile(allocator, &items, "read ", "src/a.zig");
+            try appendFile(allocator, &items, "read ", "a b.txt");
+            try std.testing.expectEqualStrings("@src/a.zig", items.items[0].label);
+            try std.testing.expectEqualStrings("read @src/a.zig", items.items[0].value.?);
+            try std.testing.expectEqualStrings("read @\"a b.txt\"", items.items[1].value.?);
+            try std.testing.expectEqualStrings("File", items.items[1].description);
+        }
+    }.run, .{});
 }
 
 test "triggers recognize commands and references at token boundaries" {

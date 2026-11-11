@@ -54,15 +54,20 @@ pub const Memory = struct {
             error.HomeNotSet => null,
             else => return err,
         };
-        defer if (path) |value| allocator.free(value);
-        return initWithPath(allocator, io, path);
+        return initWithOwnedPath(allocator, io, path);
     }
 
     pub fn initWithPath(allocator: std.mem.Allocator, io: std.Io, path: ?[]const u8) !Memory {
+        const owned = if (path) |value| try allocator.dupe(u8, value) else null;
+        return initWithOwnedPath(allocator, io, owned);
+    }
+
+    /// The path is already this memory's to free, so it is never copied twice.
+    fn initWithOwnedPath(allocator: std.mem.Allocator, io: std.Io, path: ?[]u8) !Memory {
         var memory = Memory{
             .allocator = allocator,
             .io = io,
-            .path = if (path) |value| try allocator.dupe(u8, value) else null,
+            .path = path,
             .enabled = path != null,
             .entries = .empty,
         };
