@@ -1782,9 +1782,11 @@ pub const Agent = struct {
             return;
         }
         // A sub-agent call carries a whole task as its argument, so the line
-        // says what is being done rather than pasting the JSON of it.
+        // says what is being done rather than pasting the JSON of it. It is
+        // marked with a glyph and a colour of its own: this line starts a
+        // second agent, and nothing else on the terminal looks like it.
         if (std.mem.eql(u8, call.name, "subagent")) {
-            try w.writeAll(YELLOW ++ "  ⚙ subagent" ++ RESET ++ " ");
+            try w.writeAll(CYAN ++ "  ⇢ subagent" ++ RESET ++ " ");
             const task = openai.extractStringArg(self.allocator, call.arguments, "task") catch {
                 try text.writeSanitized(w, call.arguments);
                 try w.writeByte('\n');
@@ -1844,9 +1846,16 @@ pub const Agent = struct {
             // A tool from an MCP server has a label too, built when the tool
             // was listed: it names the server the call is going to, and it is
             // this process's own string rather than one a server wrote.
-            const label = tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
+            var label_aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer label_aw.deinit();
+            const label = try self.callProgressLabel(call, &label_aw);
+            var options = self.progressOptions();
+            // A sub-agent works out of sight, so its line is coloured like
+            // its call: the user can tell a second agent at work from the
+            // main model thinking, without reading the words.
+            if (std.mem.eql(u8, call.name, "subagent")) options.style = CYAN;
             var spin = if (label) |caption|
-                spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, self.progressOptions())
+                spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options)
             else
                 spinner.Spinner.disabled(self.io);
             defer spin.stop();
@@ -1878,6 +1887,32 @@ pub const Agent = struct {
         const clipped = try tools.clipOversized(self.allocator, result);
         try self.previewToolResult(clipped.content, clipped.is_error);
         return clipped;
+    }
+
+    /// The progress line's label for a tool call, or null for a tool that must
+    /// not have one. Most tools name themselves; a sub-agent names the task it
+    /// was handed, because it works with no output of its own on screen and
+    /// this line is the only sign of what it is doing.
+    ///
+    /// `buf` is where a built label lives. It must outlive the animation, so
+    /// the caller owns it and frees it after the spinner has stopped.
+    fn callProgressLabel(self: *Agent, call: ToolCallData, buf: *std.Io.Writer.Allocating) !?[]const u8 {
+        if (!std.mem.eql(u8, call.name, "subagent"))
+            return tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
+
+        buf.clearRetainingCapacity();
+        const task = openai.extractStringArg(self.allocator, call.arguments, "task") catch null;
+        defer if (task) |t| self.allocator.free(t);
+        const trimmed = if (task) |t| std.mem.trim(u8, t, " \t\r\n") else "";
+        if (trimmed.len == 0) {
+            try buf.writer.writeAll("subagent…");
+            return buf.written();
+        }
+        try buf.writer.writeAll("subagent · ");
+        // The task is model output, so it is flattened and sanitised the same
+        // way the call's own line shows it.
+        try writeCallBrief(&buf.writer, trimmed);
+        return buf.written();
     }
 
     /// Use the same result preview for live execution and restored messages.
@@ -2428,6 +2463,38 @@ test "a subagent runs its own turn and reports back" {
     const parent = mock.requests.items[2];
     try std.testing.expect(std.mem.indexOf(u8, parent, "Sub-agent report") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent, "answer.") != null);
+}
+
+test "the sub-agent's progress line names its task and keeps to one line" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+
+    var label: std.Io.Writer.Allocating = .init(allocator);
+    defer label.deinit();
+
+    // The task is model output: its newlines are flattened and its escape
+    // sequences dropped, because the line is read on a terminal.
+    const call: ToolCallData = .{
+        .id = "sub",
+        .name = "subagent",
+        .arguments = "{\"task\":\"count \\u001b[31mthe tests\\u001b[0m\\nquietly\"}",
+    };
+    try std.testing.expectEqualStrings(
+        "subagent · count the tests…",
+        (try harness.agent.callProgressLabel(call, &label)).?,
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, label.written(), 0x1b) == null);
+
+    // A call with no task yet still says who is at work, and a tool that is
+    // not a sub-agent keeps its own label.
+    const nameless: ToolCallData = .{ .id = "sub", .name = "subagent", .arguments = "{}" };
+    try std.testing.expectEqualStrings("subagent…", (try harness.agent.callProgressLabel(nameless, &label)).?);
+    const bash: ToolCallData = .{ .id = "b", .name = "bash", .arguments = "{}" };
+    try std.testing.expectEqualStrings("bash…", (try harness.agent.callProgressLabel(bash, &label)).?);
+    // A tool whose wait asks the user a question gets no line at all.
+    const ask: ToolCallData = .{ .id = "a", .name = "ask_user", .arguments = "{}" };
+    try std.testing.expectEqual(@as(?[]const u8, null), try harness.agent.callProgressLabel(ask, &label));
 }
 
 test "a subagent cannot start another one" {

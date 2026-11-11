@@ -50,6 +50,11 @@ pub const Options = struct {
     /// decides, because only it knows whether something else — a pager, a
     /// redirected stdout — is using the terminal too.
     enabled: bool,
+    /// The SGR style the frame and its label are drawn in. Dim by default:
+    /// the line is an aside to the answer. A caller can give the wait a
+    /// colour of its own, so a job that is not the main model's — a
+    /// sub-agent's, say — is told apart from it at a glance.
+    style: []const u8 = sgr.DIM,
     /// How long to wait before drawing the first frame, so that a request
     /// answered at once never flashes a line.
     first_frame_delay_ms: i64 = 200,
@@ -139,6 +144,7 @@ fn animate(
         var buf: [256]u8 = undefined;
         const line = formatLine(
             &buf,
+            options.style,
             frames[index % frames.len],
             label,
             @divTrunc(elapsed_ms, std.time.ms_per_s),
@@ -174,6 +180,7 @@ fn animate(
 /// screen for good.
 fn formatLine(
     buf: []u8,
+    style: []const u8,
     frame: []const u8,
     label: []const u8,
     seconds: i64,
@@ -195,7 +202,7 @@ fn formatLine(
     const room = if (budget > taken) budget - taken else 1;
     const shown = label[0..term.takeFit(label, room)];
 
-    return std.fmt.bufPrint(buf, erase ++ sgr.DIM ++ "  {s} {s}{s}" ++ sgr.RESET, .{ frame, shown, tail });
+    return std.fmt.bufPrint(buf, erase ++ "{s}  {s} {s}{s}" ++ sgr.RESET, .{ style, frame, shown, tail });
 }
 
 const expect = std.testing.expect;
@@ -205,17 +212,25 @@ test "a frame clears its line and names what is being waited for" {
     var buf: [256]u8 = undefined;
     try expectEqualStrings(
         "\r\x1b[2K\x1b[2m  ⠋ thinking… 0s\x1b[0m",
-        try formatLine(&buf, "⠋", "thinking…", 0, 80, null, null),
+        try formatLine(&buf, sgr.DIM, "⠋", "thinking…", 0, 80, null, null),
     );
     try expectEqualStrings(
         "\r\x1b[2K\x1b[2m  ⠙ checking completion… 1s\x1b[0m",
-        try formatLine(&buf, "⠙", "checking completion…", 1, 80, null, null),
+        try formatLine(&buf, sgr.DIM, "⠙", "checking completion…", 1, 80, null, null),
+    );
+}
+
+test "a frame takes the style its caller chose" {
+    var buf: [256]u8 = undefined;
+    try expectEqualStrings(
+        "\r\x1b[2K\x1b[36m  ⠋ subagent · count the tests… 3s\x1b[0m",
+        try formatLine(&buf, sgr.CYAN, "⠋", "subagent · count the tests…", 3, 80, null, null),
     );
 }
 
 test "a frame is shortened to fit rather than allowed to wrap" {
     var buf: [256]u8 = undefined;
-    const line = try formatLine(&buf, "⠋", "checking completion…", 3600, 24, null, null);
+    const line = try formatLine(&buf, sgr.DIM, "⠋", "checking completion…", 3600, 24, null, null);
 
     // Everything after the erasure is what lands on the line. (`\r` counts as
     // a cell here: term.width measures bytes, so that nothing can hide width.)
