@@ -332,20 +332,15 @@ export OPENAI_API_KEY=sk-...
 
 ### Completion status
 
-The main model judges completion itself. No independent checker request or
-automatic repair round runs after its final answer. The final answer ends with
-one explicit status line: `[task_status: completed]`, `[task_status: blocked]`,
-`[task_status: failed]`, `[task_status: needs_user]`, or `[task_status: paused]`.
-Only a standalone last line is accepted. Missing or invalid status means paused,
-not success, even for a reply without tool calls.
+The main model judges completion itself. A final answer without tool calls ends
+the turn directly (exit code 0), without a status marker, independent checker
+request or automatic repair round. The CLI prints `Turn finished` to indicate
+that the turn ended, not that the requested work necessarily succeeded.
 
-The model may declare completion only after the requested work and necessary
-validation succeed. Failures, missing permissions/dependencies, partial work,
-and waiting for user confirmation must not be called completed. These settled
-non-success statuses end the turn normally (exit code 0), explain the situation
-and next step, and do not print `Task completed`. Transport errors, truncation
-and iteration limits still return errors. Completion is a model assertion, not
-a substitute for running real tests.
+The model must validate its work before claiming success and explain partial
+work, failures, missing permissions/dependencies or required user input in its
+answer. Answer text is not parsed as a completion protocol. Transport errors,
+truncation and iteration limits still return errors.
 
 ### Choices
 

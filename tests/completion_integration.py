@@ -21,6 +21,10 @@ class API(http.server.BaseHTTPRequestHandler):
         if not body.get('tools'):
             scenario['checks'] += 1
         assert self.path == '/v1/responses'
+        instructions = json.dumps([m for m in body['input']
+                                   if m.get('role') in ('system', 'developer')])
+        assert 'You are zagent' in instructions, instructions
+        assert '[task_status:' not in instructions, instructions
         calls = [m for m in body['input'] if m.get('type') == 'function_call_output']
         commands = []
         if scenario['work']:
@@ -43,31 +47,30 @@ try:
                'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '8'}
         trust_workspace(directory, env)
         cases = [
-            ('completed', 'Task completed'), ('blocked', 'Task blocked'),
-            ('failed', 'Task failed'), ('needs_user', 'Task awaiting user input'),
-            ('paused', 'Task paused'),
+            'The work is done and validated.',
+            'Blocked: credentials are missing. Please configure authentication.',
+            'The command failed; no changes were made.',
+            'Which deployment target should I use?',
+            'Partial work saved; resume after the dependency is available.',
+            # Legacy or quoted markers are ordinary answer text, not a protocol.
+            '[task_status: blocked]',
+            '[task_status: unknown]',
+            '[task_status: completed]\nStill working',
+            'Quoted [task_status: completed]',
         ]
         for work in (False, True):
-            for status, expected in cases:
-                scenario.update(work=work, checks=0, requests=0,
-                                answer=f'Candidate answer: {status}\n[task_status: {status}]')
+            for answer in cases:
+                scenario.update(work=work, checks=0, requests=0, answer=answer)
                 result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
                                         env=env, capture_output=True, text=True, timeout=30)
                 assert result.returncode == 0, result.stderr
                 assert scenario['checks'] == 0, result.stderr
                 assert scenario['requests'] == (2 if work else 1), scenario
-                assert expected in result.stderr, result.stderr
-                assert ('Task completed' in result.stderr) == (status == 'completed'), result.stderr
-        # Missing/malformed/non-final declarations are conservative, even without tools.
-        for answer in ('Candidate answer', '[task_status: unknown]',
-                       '[task_status: completed]\nStill working',
-                       'Quoted [task_status: completed]'):
-            scenario.update(work=False, checks=0, requests=0,
-                            answer=answer)
-            result = subprocess.run([str(binary), 'Perform the task'], cwd=directory,
-                                    env=env, capture_output=True, text=True, timeout=30)
-            assert result.returncode == 0 and scenario['checks'] == 0, result.stderr
-            assert 'Task paused' in result.stderr and 'Task completed' not in result.stderr
+                assert answer in result.stdout, result.stdout
+                assert 'Turn finished' in result.stderr, result.stderr
+                for obsolete in ('Task completed', 'Task blocked', 'Task failed',
+                                 'Task awaiting user input', 'Task paused'):
+                    assert obsolete not in result.stderr, result.stderr
 finally:
     server.shutdown()
 print('main-model completion integration passed')

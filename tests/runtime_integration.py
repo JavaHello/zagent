@@ -43,7 +43,7 @@ class API(http.server.BaseHTTPRequestHandler):
         else:
             answers.append(results[-1]['output'])
             output = [{'type': 'message', 'role': 'assistant', 'content': [
-                {'type': 'output_text', 'text': 'Background answer complete\n[task_status: completed]'}]}]
+                {'type': 'output_text', 'text': 'Background answer complete'}]}]
         send_response(self, body, {'status': 'completed', 'output': output})
 
 
@@ -124,8 +124,8 @@ try:
             until(b'Enter an option number or your own answer below')
             # Clear any command-menu input left by the preceding redraw.
             send(b'\x15' + b'1\r', b'Background answer complete')
-            until('✓ Task completed'.encode())
-            assert b'\x1b[1m\x1b[32m' + '  ✓ Task completed'.encode() + b'\x1b[0m' in transcript, transcript
+            until('✓ Turn finished'.encode())
+            assert b'\x1b[1m\x1b[32m' + '  ✓ Turn finished'.encode() + b'\x1b[0m' in transcript, transcript
             deadline = time.monotonic() + 8
             while not answers:
                 assert time.monotonic() < deadline

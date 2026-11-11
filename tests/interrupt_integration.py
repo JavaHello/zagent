@@ -28,7 +28,7 @@ class API(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         requests.append(body)
-        text = 'Recovery complete\n[task_status: completed]'
+        text = 'Recovery complete'
         output = None
         if not body.get('tools'):
             text = json.dumps({'complete': True, 'reason': 'done'})
@@ -101,7 +101,7 @@ try:
 
         def recover():
             send(b'\x15recovery question\r')
-            until('✓ Task completed'.encode())
+            until('✓ Turn finished'.encode())
             # Every recorded function call must have an output before replay.
             body = [r for r in requests if r.get('tools')][-1]
             ids = {m['call_id'] for m in body['input'] if m.get('type') == 'function_call_output'}

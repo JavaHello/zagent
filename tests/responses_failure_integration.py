@@ -113,7 +113,7 @@ try:
         replies.extend([
             {'status': 'completed', 'output': [{'type': 'function_call', 'call_id': 'read_evidence',
                 'name': 'read', 'arguments': json.dumps({'path': 'evidence.txt'})}]},
-            partial, partial, completed_text('Recovered answer\n[task_status: completed]'),
+            partial, partial, completed_text('Recovered answer'),
         ])
         requests.clear()
         # Growth is only possible from below the cap, so this case lowers the
