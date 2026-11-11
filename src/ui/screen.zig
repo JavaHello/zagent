@@ -31,6 +31,12 @@ const ALT_ON = ansi.ALT_ON;
 const ALT_OFF = ansi.ALT_OFF;
 const selection = @import("selection.zig");
 
+/// How much conversation history the screen keeps for redrawing. A terminal
+/// cannot be asked what it holds, so the bytes that drew the log are what a
+/// repaint works from; the oldest ones are dropped rather than kept for the
+/// whole life of a long-running session.
+pub const max_transcript_bytes: usize = 8 * 1024 * 1024;
+
 pub const Screen = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -173,6 +179,29 @@ pub const Screen = struct {
         self.progress_changed = true;
     }
 
+    /// Drop the oldest whole lines once the transcript outgrows its bound.
+    /// Everything that points into the transcript moves with it; a selection
+    /// or drag whose text was dropped collapses instead of pointing at bytes
+    /// that are gone. The screen is repainted from what is left.
+    fn trimTranscript(self: *Screen) void {
+        if (self.transcript.items.len <= max_transcript_bytes) return;
+        // Keep the newest part, and cut on a line boundary so a repaint never
+        // shows half a line as though it had been written that way.
+        const from = self.transcript.items.len - max_transcript_bytes / 2;
+        const newline = std.mem.indexOfScalarPos(u8, self.transcript.items, from, '\n') orelse self.transcript.items.len;
+        const dropped = @min(newline + 1, self.transcript.items.len);
+        if (dropped == 0) return;
+        const rest = self.transcript.items.len - dropped;
+        std.mem.copyForwards(u8, self.transcript.items[0..rest], self.transcript.items[dropped..]);
+        self.transcript.shrinkRetainingCapacity(rest);
+        self.rendered_len = self.rendered_len -| dropped;
+        self.selection_start = self.selection_start -| dropped;
+        self.selection_end = self.selection_end -| dropped;
+        if (self.anchor) |anchor| self.anchor = anchor -| dropped;
+        self.anchor_end = self.anchor_end -| dropped;
+        self.dirty = true;
+    }
+
     pub fn drain(self: *Screen) !bool {
         // Keep the viewport stable while the pointer is selecting streamed text.
         if (self.dragging) return false;
@@ -208,6 +237,7 @@ pub const Screen = struct {
             self.scroll_rows += rows.len -| old_rows;
         }
         self.queued.clearRetainingCapacity();
+        self.trimTranscript();
         // A scrolled/selected viewport must be reconstructed, not appended to.
         if (self.scroll_rows > 0 or self.selection_end > self.selection_start) {
             self.dirty = true;
@@ -345,6 +375,7 @@ pub const Screen = struct {
         }
         if (self.dirty or repaintPending()) try self.replay();
         try self.transcript.appendSlice(self.allocator, bytes);
+        self.trimTranscript();
         try self.out.writeStreamingAll(self.io, bytes);
         self.rendered_len = self.transcript.items.len;
     }
@@ -1215,4 +1246,48 @@ test "a taller input repaints the log in a shorter region" {
     try expectEqual(1, std.mem.count(u8, written, "answer\r\n"));
     try expectEqual(1, std.mem.count(u8, written, "answer\n"));
     try expect(std.mem.indexOf(u8, written, "\x1b[21;1H\x1b[0J") != null);
+}
+
+test "a transcript past its bound drops the oldest whole lines and moves its offsets" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, false);
+    defer s.deinit();
+
+    // Identical lines make a line boundary easy to check on both sides.
+    const line = "0123456789abcdef\n";
+    while (s.transcript.items.len <= max_transcript_bytes) try s.transcript.appendSlice(a, line);
+    const before = s.transcript.items.len;
+
+    // A selection that starts in the part about to go and ends in the part
+    // that stays, with a drag anchored near the front.
+    s.rendered_len = before;
+    s.selection_start = line.len;
+    s.selection_end = before - line.len;
+    s.anchor = line.len;
+    s.anchor_end = 2 * line.len;
+
+    s.trimTranscript();
+
+    const after = s.transcript.items.len;
+    const dropped = before - after;
+    try std.testing.expect(after <= max_transcript_bytes);
+    try std.testing.expectEqual(@as(usize, 0), after % line.len);
+    try std.testing.expectEqualStrings(line, s.transcript.items[0..line.len]);
+    try std.testing.expectEqualStrings(line, s.transcript.items[after - line.len ..]);
+
+    // Offsets into the transcript move with it, and the dropped selection
+    // collapses instead of pointing at bytes that are gone.
+    try std.testing.expectEqual(after, s.rendered_len);
+    try std.testing.expectEqual(@as(usize, 0), s.selection_start);
+    try std.testing.expectEqual(before - line.len - dropped, s.selection_end);
+    try std.testing.expectEqual(@as(usize, 0), s.anchor.?);
+    try std.testing.expectEqual(@as(usize, 0), s.anchor_end);
+    try std.testing.expect(s.dirty);
+
+    // Nothing is cut while it fits.
+    const kept = s.transcript.items.len;
+    s.dirty = false;
+    s.trimTranscript();
+    try std.testing.expectEqual(kept, s.transcript.items.len);
+    try std.testing.expect(!s.dirty);
 }
