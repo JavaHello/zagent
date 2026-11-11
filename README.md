@@ -139,23 +139,16 @@ bounded continuations, return an error instead of reporting completion.
 
 A long conversation eventually costs more context than the model has, and a
 turn that read half a repository keeps paying for that output long after it
-served its purpose. Nothing shrinks the history on its own: there is no
-compaction step, no summary request and no automatic token threshold, because
-the model cannot reliably judge how much of its own context is still needed.
-`/clear` starts over. Otherwise the model decides, result by result: when it no
-longer needs one of its own earlier outputs, it names the call id and calls
-`drop_context` with `call_ids` (at most 64 ids of 512 bytes each).
-Each named result is replaced by a one-line marker naming the tool and the call
-id, and the drop runs after the current tool batch finishes.
-
-Only the result text changes. The assistant call and the result stay paired,
-because a Responses request must answer every `function_call` with its
+served its purpose. Nothing shrinks the history: there is no compaction step,
+no summary request, no automatic token threshold and no way for the model to
+drop its own earlier results, because it cannot reliably judge how much of its
+context is still needed. `/clear` starts over. The one saving that does happen
+is free and mechanical: when the same file region is read again with identical
+output, the second result is replaced by a one-line marker that points at the
+earlier result instead of repeating it, while both calls and results stay
+paired — a Responses request must answer every `function_call` with its
 `function_call_output`, and the assistant message replays the exact output
-items it was given; deleting either side would break the next request. Ids that
-no live result answers — a typo, a call that never ran — are reported back, a
-second drop of the same call is a no-op, and a result a deduplicated read still points
-at is kept rather than replaced by an empty reference. Re-run the tool if the
-output turns out to be needed again.
+items it was given.
 
 ## Memory
 

@@ -161,14 +161,6 @@ pub const set_task = ToolDefinition{
     ,
 };
 
-pub const drop_context = ToolDefinition{
-    .name = "drop_context",
-    .description = "Drop the output of earlier tool calls you no longer need, so later requests stop paying for it. Each named result is replaced by a short marker naming the tool and call id; the call and its result stay paired, which is what keeps the next request valid. Runs after the whole tool batch finishes. A result already dropped is left alone, an id no live result answers is reported, and a result a deduplicated read points at is kept. Re-run the tool if you need the output again.",
-    .parameters_json =
-    \\{"type":"object","properties":{"call_ids":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string","minLength":1,"maxLength":512},"description":"Tool call ids whose output should be dropped, exactly as they appeared in the function_call items"}},"required":["call_ids"],"additionalProperties":false}
-    ,
-};
-
 pub const remember = ToolDefinition{
     .name = "remember",
     .description = "Save one durable note to memory so it survives this session. Use it when the user states a lasting preference, convention or constraint, when a project fact or build command is learned, or when a decision is made that future work must respect. Do not save transient status, one-off task details, secrets, or anything the user asked to forget.",
@@ -180,9 +172,9 @@ pub const remember = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,         read,     write,    apply_patch, ls,
-    rg,            fd,           grep,     find,     http,        ask_user,
-    remember,      drop_context, temp_dir, set_task,
+    memory_search, bash,     read,     write, apply_patch, ls,
+    rg,            fd,       grep,     find,  http,        ask_user,
+    remember,      temp_dir, set_task,
 };
 
 test "built-in definitions have valid schemas and unique names" {

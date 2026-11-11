@@ -48,17 +48,6 @@ const continue_prompt =
 const restart_prompt =
     "Your previous attempt was cut off by the model's output token limit before it delivered a usable reply. Try again in smaller steps: split large files into chunks and keep the response concise.";
 
-/// How many call ids one `drop_context` call may name, and how long each may
-/// be. Both are generous for real call ids; together they stop one call from
-/// turning into a rewrite of the whole history.
-const max_drop_ids: usize = 64;
-const max_drop_id_bytes: usize = 512;
-
-/// What the model is told when its drop request cannot be read. The schema
-/// already says this, so the text is repeated for a model that sent it anyway.
-const invalid_drop_message =
-    "Error: provide call_ids as a non-empty array of at most 64 UTF-8 tool call ids, each at most 512 bytes.";
-
 // Prompt for the choice menu. Colour codes are fine here because linenoize's
 // width() implementation correctly ignores ANSI SGR sequences.
 const CHOICE_PROMPT = BOLD ++ YELLOW ++ "choice" ++ RESET ++ " \xe2\x9d\xaf ";
@@ -74,7 +63,6 @@ const SYSTEM_PROMPT =
     \\- Do not read or expose sensitive information, including environment variable values, secrets or tokens in configuration files, passwords and private keys. Avoid commands or broad searches that could reveal them; use only non-sensitive fields needed for the task, and never include secrets in tool arguments, output, logs or memory.
     \\- Use ask_user with concrete options when ambiguity or a user-only decision blocks progress; recommend one option. Decide routine details yourself.
     \\- Save durable preferences, project facts and decisions with remember, not transient status or secrets. Correct obsolete notes rather than adding contradictions.
-    \\- Call drop_context with the call ids of tool output you no longer need: each named result becomes a short marker naming the tool and call id, and both stay paired. Use it when a large output has served its purpose, and re-run the tool if you need the output again.
     \\- Finish with a concise final answer after the work and necessary validation. Clearly explain partial work, failures or blockers rather than claiming success.
 ;
 
@@ -369,21 +357,6 @@ pub const Agent = struct {
         self.allocator.free(self.history.items[0].content.?);
         self.history.items[0].content = prompt;
         return .{ .content = content, .is_error = false };
-    }
-
-    /// Replace the content of the tool result answering `call_id`, taking
-    /// ownership of `content`. This is how a request that rewrites its own
-    /// result — a drop — answers itself.
-    fn replaceToolResult(self: *Agent, call_id: []const u8, content: []const u8) !void {
-        for (self.history.items) |*message| {
-            const id = message.tool_call_id orelse continue;
-            if (!std.mem.eql(u8, id, call_id)) continue;
-            if (message.content) |old| self.allocator.free(old);
-            message.content = content;
-            return;
-        }
-        // Nothing to answer. The content is still the caller's allocation.
-        self.allocator.free(content);
     }
 
     /// `/memory`: list what is saved, newest last.
@@ -811,23 +784,6 @@ pub const Agent = struct {
                         .tool_status = result.status(),
                     });
                 }
-                // Complete every call/result pair before rewriting results: a
-                // drop names a call, and its marker has to replace a result
-                // that is already in the history.
-                for (tool_calls) |call| {
-                    if (!std.mem.eql(u8, call.name, "drop_context")) continue;
-                    const ids = dropContextIds(self.allocator, call.arguments) catch {
-                        try self.replaceToolResult(call.id, try self.allocator.dupe(u8, invalid_drop_message));
-                        continue;
-                    };
-                    defer dropContextIdsDeinit(self.allocator, ids);
-                    const report = try compact.dropToolResults(self.allocator, self.history.items, ids);
-                    try self.replaceToolResult(call.id, try std.fmt.allocPrint(
-                        self.allocator,
-                        "Dropped {d} tool result(s), freeing ~{d} bytes of context. Already dropped: {d}. Unknown or not in context: {d}. Kept because a deduplicated read points at them: {d}.",
-                        .{ report.dropped, report.freed_bytes, report.repeated, report.unknown, report.referenced },
-                    ));
-                }
                 try self.checkpoint();
                 turn.tool_calls += tool_calls.len;
                 // Continue: call API again with tool results
@@ -1150,12 +1106,6 @@ pub const Agent = struct {
                 break :blk try self.createTempDir(call.arguments);
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "drop_context")) {
-                const ids = dropContextIds(self.allocator, call.arguments) catch {
-                    break :blk .{ .content = try self.allocator.dupe(u8, invalid_drop_message), .is_error = true };
-                };
-                dropContextIdsDeinit(self.allocator, ids);
-                break :blk .{ .content = try self.allocator.dupe(u8, "Context drop requested; it runs after this tool batch finishes."), .is_error = false };
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
                 break :blk try self.askUser(call.arguments);
             } else if (std.mem.eql(u8, call.name, mcp.Registry.loader_name)) {
@@ -1444,70 +1394,6 @@ fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptim
     try file.writeStreamingAll(io, message);
 }
 
-/// The call ids a `drop_context` call names, each copied so the caller owns
-/// the whole list. Unknown keys are rejected rather than ignored: a misspelt
-/// `call_ids` would otherwise drop nothing and look like it had worked.
-fn dropContextIds(allocator: std.mem.Allocator, arguments: []const u8) ![]const []const u8 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidDropIds;
-    for (parsed.value.object.keys()) |key| if (!std.mem.eql(u8, key, "call_ids")) return error.InvalidDropIds;
-    const value = parsed.value.object.get("call_ids") orelse return error.InvalidDropIds;
-    if (value != .array) return error.InvalidDropIds;
-    const items = value.array.items;
-    if (items.len == 0 or items.len > max_drop_ids) return error.InvalidDropIds;
-
-    const ids = try allocator.alloc([]const u8, items.len);
-    var copied: usize = 0;
-    errdefer {
-        for (ids[0..copied]) |id| allocator.free(id);
-        allocator.free(ids);
-    }
-    for (items, 0..) |item, index| {
-        if (item != .string) return error.InvalidDropIds;
-        if (item.string.len == 0 or item.string.len > max_drop_id_bytes) return error.InvalidDropIds;
-        if (!std.unicode.utf8ValidateSlice(item.string)) return error.InvalidDropIds;
-        ids[index] = try allocator.dupe(u8, item.string);
-        copied += 1;
-    }
-    return ids;
-}
-
-fn dropContextIdsDeinit(allocator: std.mem.Allocator, ids: []const []const u8) void {
-    for (ids) |id| allocator.free(id);
-    allocator.free(ids);
-}
-
-test "a drop request is a bounded list of call ids" {
-    const a = std.testing.allocator;
-    const ids = try dropContextIds(a, "{\"call_ids\":[\"call-1\",\"call-2\"]}");
-    defer dropContextIdsDeinit(a, ids);
-    try std.testing.expectEqual(@as(usize, 2), ids.len);
-    try std.testing.expectEqualStrings("call-2", ids[1]);
-
-    var many: [max_drop_ids + 1][]const u8 = undefined;
-    for (&many, 0..) |*id, index| id.* = try std.fmt.allocPrint(a, "c{d}", .{index});
-    defer for (many) |id| a.free(id);
-    const too_many = try std.json.Stringify.valueAlloc(a, .{ .call_ids = many }, .{});
-    defer a.free(too_many);
-
-    for ([_][]const u8{
-        "{}",
-        "{\"call_ids\":[]}",
-        "{\"call_ids\":\"call-1\"}",
-        "{\"call_ids\":[1]}",
-        "{\"call_ids\":[\"\"]}",
-        "{\"call_ids\":[\"a\"],\"keep_messages\":4}",
-        "not json",
-    }) |invalid| {
-        if (dropContextIds(a, invalid)) |parsed| {
-            dropContextIdsDeinit(a, parsed);
-            return error.ExpectedInvalidDropIds;
-        } else |_| {}
-    }
-    try std.testing.expectError(error.InvalidDropIds, dropContextIds(a, too_many));
-}
-
 /// A standalone agent with a hermetic environment for tests. The line editor
 /// and MCP registry live beside it because the agent only borrows them.
 const TestHarness = struct {
@@ -1686,77 +1572,6 @@ test "task metadata requires title and description and fewer than 80 Unicode cha
     defer allocator.free(invalid);
     try std.testing.expectError(error.InvalidTaskMetadata, harness.agent.setTask(invalid));
     try std.testing.expectEqualStrings(title.items[0 .. 79 * "题".len], harness.agent.current_task);
-}
-
-/// Append one assistant call and the result that answers it, owning every
-/// string the way the tool loop does, so a drop has real messages to work on.
-fn appendToolPair(
-    allocator: std.mem.Allocator,
-    agent: *Agent,
-    id: []const u8,
-    name: []const u8,
-    output: []const u8,
-) !void {
-    const calls = try allocator.alloc(ToolCallData, 1);
-    errdefer allocator.free(calls);
-    calls[0] = .{
-        .id = try allocator.dupe(u8, id),
-        .name = try allocator.dupe(u8, name),
-        .arguments = try allocator.dupe(u8, "{}"),
-    };
-    try agent.history.append(allocator, .{
-        .role = "assistant",
-        .content = null,
-        .reasoning_content = null,
-        .tool_calls = calls,
-        .tool_call_id = null,
-    });
-    try agent.history.append(allocator, .{
-        .role = "tool",
-        .content = try allocator.dupe(u8, output),
-        .reasoning_content = null,
-        .tool_calls = null,
-        .tool_call_id = try allocator.dupe(u8, id),
-        .tool_status = .{ .is_error = false },
-    });
-}
-
-test "dropping tool output happens after the batch and keeps the call paired" {
-    const allocator = std.testing.allocator;
-    const harness = try TestHarness.init(allocator, std.testing.io);
-    defer harness.deinit(allocator);
-    var quiet = try Silence.init(std.testing.io);
-    defer quiet.deinit(std.testing.io);
-
-    try harness.agent.appendUserMessage("run the tests");
-    const output = try allocator.alloc(u8, 5_000);
-    defer allocator.free(output);
-    @memset(output, 'y');
-    try appendToolPair(allocator, &harness.agent, "big", "bash", output);
-
-    const call = "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"drop\",\"name\":\"drop_context\",\"arguments\":\"{\\\"call_ids\\\":[\\\"big\\\",\\\"missing\\\"]}\"}]}";
-    var mock: MockTransport = .{ .replies = &.{ call, completed_answer } };
-    defer mock.deinit(allocator);
-    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
-
-    const turn = try harness.agent.runToolLoop();
-    try std.testing.expect(turn.completed);
-    try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
-
-    // The next request carries the marker instead of the output, and still
-    // answers the call it belongs to.
-    const next = mock.requests.items[1];
-    try std.testing.expect(std.mem.indexOf(u8, next, "Tool result dropped by the model: bash (call big)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, next, output) == null);
-    try std.testing.expect(std.mem.indexOf(u8, next, "function_call_output") != null);
-    const report = harness.agent.history.items[5].content.?;
-    try std.testing.expect(std.mem.indexOf(u8, report, "Dropped 1 tool result(s)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "Unknown or not in context: 1") != null);
-    // Nothing was rewritten: the dropped turn is still two messages, and the
-    // final answer is the only thing the batch appended besides the report.
-    try std.testing.expectEqual(@as(usize, 7), harness.agent.history.items.len);
-    try std.testing.expectEqualStrings("assistant", harness.agent.history.items[2].role);
-    try std.testing.expectEqualStrings("big", harness.agent.history.items[2].tool_calls.?[0].id);
 }
 
 test "a truncated reply is continued and kept as one message" {
