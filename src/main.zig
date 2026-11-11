@@ -35,8 +35,8 @@ const HELP =
     \\  /, @, $      Command / project file / reserved candidates
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
     \\  Wheel/PageUp/Down  Scroll output history
-    \\  While running: commands remain available; new questions are queued
-    \\  Esc          Stop current task and clear queued input (popup closes first)
+    \\  While running: commands remain available; typed text adjusts the task
+    \\  Esc          Stop current task and discard input typed while it ran
     \\  Ctrl+Z       Suspend; resume with fg
     \\  Ctrl+D       Exit zagent
     \\

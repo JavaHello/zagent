@@ -114,7 +114,7 @@ try:
             send(b'network wait\r')
             wait_for(blocked.is_set)
             send(b'queued question\r')
-            until(b'Input queued')
+            until(b'Input sent to the running task.')
             send(b'/')
             until(b'/help  Show this help')
             send(b'\x1b')
@@ -122,6 +122,9 @@ try:
             assert b'Task interrupted' not in ansi.sub(b'', transcript)
             send(b'\x15')
             stop()
+            # Esc cancels the line that was waiting for the running task, so
+            # no request may carry it.
+            assert not any('queued question' in json.dumps(body) for body in requests), requests
             release.set()
             recover()
             send(b'slow tool\r')

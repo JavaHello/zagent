@@ -20,6 +20,7 @@ started = threading.Event()
 release = threading.Event()
 answers = []
 turns = []
+requests = []
 
 
 class API(http.server.BaseHTTPRequestHandler):
@@ -28,6 +29,7 @@ class API(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        requests.append(body)
         results = [m for m in body['input'] if m.get('type') == 'function_call_output']
         if not body.get('tools'):
             text = json.dumps({'complete': True, 'reason': 'done'})
@@ -116,8 +118,8 @@ try:
             assert not release.is_set()
             send(b'/status\r\r', b'Account quota:')
             assert not release.is_set()
-            send(b'/help\r\r', b'While running: commands remain available; new questions are queued')
-            send(b'next question\r', b'Input queued for the next turn.')
+            send(b'/help\r\r', b'While running: commands remain available; typed text adjusts the task')
+            send(b'next question\r', b'Input sent to the running task.')
             # Page keys must leave the editor usable, even during a blocked request.
             send(b'\x1b[5~\x1b[6~/model\r\r', b'Model: runtime-mock')
             release.set()
@@ -131,10 +133,13 @@ try:
                 assert time.monotonic() < deadline
                 time.sleep(.05)
             assert 'User selected: Alpha' in answers[0], answers
+            # The typed line joined the running task: it was sent to the model
+            # with the request that followed, not held for a new turn.
+            assert any('next question' in json.dumps(body) for body in requests), requests
             send(b'/quit\r\r', b'Goodbye!')
             assert process.wait(timeout=5) == 0
             assert termios.tcgetattr(slave) == original
-            print('PASS: background requests, live commands, queued input, page keys, foreground choice and clean shutdown')
+            print('PASS: background requests, live commands, steering input, page keys, foreground choice and clean shutdown')
         finally:
             release.set()
             if process.poll() is None:

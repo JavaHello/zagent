@@ -198,7 +198,8 @@ python3 tests/responses_failure_integration.py
 
 The integration test uses a local mock model endpoint and the actual binary. It
 checks editing/search, host and credential isolation, symlink escapes, network
-isolation, API retries, session recovery and binary replacement during a run.
+isolation, API retries, session recovery, input typed into a running task, and
+binary replacement during a run.
 
 ## Configuration
 
@@ -628,9 +629,17 @@ Typing `/` at the start of the prompt opens system command candidates. Typing
 “Coming soon” entry. Candidates filter as you type. Use ↑/↓ to select, Tab or
 Enter to insert, and Esc to dismiss; press Enter again to submit the line.
 
-Press **Esc** to interrupt the current task, terminate its running tools, and clear
-queued questions while keeping your input draft. If a completion popup is open,
-Esc only closes the popup. Completed actions are not undone.
+The prompt stays live while a task runs. What you type there is not queued
+behind the task: it is handed to the running task and sent to the model with
+its next request, so you can redirect the work in progress instead of waiting
+for it to finish and asking again. A reply that is already streaming is not cut
+short — the guidance lands with the request after it. Read-only commands
+(`/help`, `/model`, `/status`, `/mcp`, `/session`) still run immediately; the
+ones that change session state wait for the task to end.
+
+Press **Esc** to interrupt the current task, terminate its running tools, and
+discard input typed while it ran, keeping your own draft. If a completion popup
+is open, Esc only closes the popup. Completed actions are not undone.
 File search skips `.git`, build caches and `node_modules`, and bounds traversal
 to keep large workspaces responsive. File selection inserts an `@path` reference
 (paths with spaces are quoted); it does not attach file contents automatically.

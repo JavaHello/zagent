@@ -49,6 +49,12 @@ const continue_prompt =
 const restart_prompt =
     "Your previous attempt was cut off by the model's output token limit before it delivered a usable reply. Try again in smaller steps: split large files into chunks and keep the response concise.";
 
+/// Framing for a line the user typed while the task was still running. It is
+/// guidance for the work in progress, not a new order to start over: the
+/// model must adjust what it is doing and carry on.
+const steering_note =
+    "The user typed this while you were working on the current task. Treat it as guidance for the work in progress: adjust what you are doing now and continue the same task.";
+
 // Prompt for the choice menu. Colour codes are fine here because linenoize's
 // width() implementation correctly ignores ANSI SGR sequences.
 const CHOICE_PROMPT = BOLD ++ YELLOW ++ "choice" ++ RESET ++ " \xe2\x9d\xaf ";
@@ -160,6 +166,13 @@ pub const Agent = struct {
     current_task: []const u8 = "",
     query_started: ?std.Io.Timestamp = null,
     progress_prompt: ?[]const u8 = null,
+    /// Lines the user typed while this task was running. They are not a new
+    /// task: the worker drains them at its next request boundary and sends
+    /// them to the model inside the work in progress. The terminal thread
+    /// appends and the worker swaps the whole list out, so the mutex only
+    /// ever guards that hand-over.
+    inbox: std.ArrayList([]u8) = .empty,
+    inbox_mutex: std.Io.Mutex = .init,
     /// Where the conversation is drawn when the interactive session owns the
     /// screen. Null for a single query: answers then go straight to stdout, so
     /// `zagent "q" > notes.md` stays clean.
@@ -231,6 +244,8 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         if (self.current_task.len > 0) self.allocator.free(self.current_task);
+        for (self.inbox.items) |line| self.allocator.free(line);
+        self.inbox.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
         self.allocator.free(self.workspace);
         self.terminal_title.deinit();
@@ -529,6 +544,78 @@ pub const Agent = struct {
         if (self.interrupted.load(.acquire)) return error.Canceled;
     }
 
+    /// Hand a line the user typed during a running task to that task. The
+    /// worker sends it with its next request, so the instruction reaches the
+    /// model now instead of queueing behind the answer it belongs to.
+    pub fn steer(self: *Agent, line: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, line);
+        errdefer self.allocator.free(owned);
+        // Appended under the lock so a drain cannot miss the allocation.
+        self.inbox_mutex.lockUncancelable(self.io);
+        defer self.inbox_mutex.unlock(self.io);
+        try self.inbox.append(self.allocator, owned);
+    }
+
+    /// Move the lines typed during the task into `into`, for a caller with no
+    /// request left to send them with. Ownership of the lines passes over.
+    pub fn takeSteering(self: *Agent, into: *std.ArrayList([]u8)) !void {
+        var lines = self.claimInbox();
+        defer lines.deinit(self.allocator);
+        var moved: usize = 0;
+        errdefer for (lines.items[moved..]) |line| self.allocator.free(line);
+        for (lines.items) |line| {
+            try into.append(self.allocator, line);
+            moved += 1;
+        }
+    }
+
+    /// Throw away guidance no request will carry: Esc drops it with the task.
+    pub fn clearSteering(self: *Agent) void {
+        var lines = self.claimInbox();
+        defer lines.deinit(self.allocator);
+        for (lines.items) |line| self.allocator.free(line);
+    }
+
+    /// Take the whole inbox, leaving an empty one behind. The list that comes
+    /// back is the caller's to free.
+    fn claimInbox(self: *Agent) std.ArrayList([]u8) {
+        self.inbox_mutex.lockUncancelable(self.io);
+        defer self.inbox_mutex.unlock(self.io);
+        const lines = self.inbox;
+        self.inbox = .empty;
+        return lines;
+    }
+
+    /// Put what the user typed during the task into the conversation, so the
+    /// next request carries it. Returns false when nothing arrived.
+    ///
+    /// Holding it back until a request boundary is the point: a request in
+    /// flight cannot take new input, and a line that cut it short would throw
+    /// away work the user asked for. The answer that is already streaming
+    /// finishes, and the guidance redirects the request after it.
+    fn injectSteering(self: *Agent) !bool {
+        var lines = self.claimInbox();
+        defer {
+            for (lines.items) |line| self.allocator.free(line);
+            lines.deinit(self.allocator);
+        }
+        if (lines.items.len == 0) return false;
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll(steering_note);
+        try aw.writer.writeAll("\n\n");
+        for (lines.items, 0..) |line, index| {
+            if (index > 0) try aw.writer.writeByte('\n');
+            try text.writeSanitized(&aw.writer, line);
+        }
+
+        try self.appendUserMessage(aw.written());
+        try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ guidance from the terminal added to this task\n" ++ RESET, .{});
+        try self.checkpoint();
+        return true;
+    }
+
     pub fn processQuery(self: *Agent, query: []const u8) !void {
         self.query_started = std.Io.Timestamp.now(self.io, .awake);
         defer self.query_started = null;
@@ -660,6 +747,15 @@ pub const Agent = struct {
 
         while (iteration < self.max_iterations) : (iteration += 1) {
             try self.checkInterrupted();
+            // A line typed while the last request was running goes out with
+            // this one: it belongs to the task in progress. A continuation
+            // chain is the exception — its fragments are folded or dropped
+            // when it settles, and the guidance would go with them, so it
+            // waits for the first boundary that is not part of a chain.
+            if (continuation_start == null) {
+                stream.flushPending() catch {};
+                _ = try self.injectSteering();
+            }
             const response = self.chatAnimated(self.history.items, stream) catch |err| {
                 // Do not leave a continuation prompt as the last message for
                 // the next request to answer.
@@ -818,6 +914,14 @@ pub const Agent = struct {
                     }
                 }
                 try self.checkpoint();
+                // A line typed while the answer was being written is part of
+                // this task too. Keep the turn open so the request after the
+                // answer acts on it, rather than handing it to a new task.
+                if (try self.injectSteering()) {
+                    turn.completed = false;
+                    stream.reopen();
+                    continue;
+                }
                 turn.completed = true;
                 break;
             }
@@ -1310,6 +1414,14 @@ const AnswerStream = struct {
         self.clearRetainedLines();
         if (self.started) try self.agent.answerTrailer();
     }
+
+    /// Reopen the stream for another reply in the same turn. The next text
+    /// paints its own header and trailer, because a task that took fresh
+    /// guidance is answering a different question than the one before it.
+    fn reopen(self: *AnswerStream) void {
+        self.finished = false;
+        self.started = false;
+    }
 };
 
 test "streamed table rows survive pending buffer compaction and reallocation" {
@@ -1437,6 +1549,11 @@ const TestHarness = struct {
 const MockTransport = struct {
     replies: []const []const u8,
     cursor: usize = 0,
+    /// Set to act like a user typing during the run: `steer_line` is handed to
+    /// the agent just before the reply to request `steer_at` is produced.
+    agent: ?*Agent = null,
+    steer_at: usize = 0,
+    steer_line: []const u8 = "",
     budgets: std.ArrayList(u32) = .empty,
     requests: std.ArrayList([]u8) = .empty,
 
@@ -1448,9 +1565,16 @@ const MockTransport = struct {
         try self.budgets.append(allocator, @intCast(budget.integer));
 
         const owned = try allocator.dupe(u8, request);
-        errdefer allocator.free(owned);
-        try self.requests.append(allocator, owned);
+        // Recorded before any later failure: the request did go out, and a
+        // caller that dies of `NoScriptedReply` still wants to read it.
+        self.requests.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
 
+        if (self.agent) |agent| {
+            if (self.steer_at == self.cursor) try agent.steer(self.steer_line);
+        }
         if (self.cursor >= self.replies.len) return error.NoScriptedReply;
         const reply = self.replies[self.cursor];
         self.cursor += 1;
@@ -1538,6 +1662,46 @@ test "main model announces the task through a built-in call without planning req
         try std.testing.expect(request.value.object.get("tools") != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "先定位标题逻辑") != null);
+}
+
+test "a line typed while the task runs joins the next request instead of a new turn" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+    // A tool call, then the answer. The user types while the call is answered,
+    // which is the window a long tool or a slow request opens.
+    const call =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"task\",\"name\":\"announce_task\",\"arguments\":\"{\\\"title\\\":\\\"调整任务\\\",\\\"description\\\":\\\"先看实现。\\\"}\"}]}";
+    var mock: MockTransport = .{
+        .replies = &.{ call, completed_split },
+        .agent = &harness.agent,
+        .steer_at = 0,
+        .steer_line = "also update the docs",
+    };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("Do the task");
+    const turn = try harness.agent.runToolLoop();
+
+    // One task, not two: the reply that follows the tool result is the only
+    // answer, and it was asked for with the line the user typed.
+    try std.testing.expect(turn.completed);
+    try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[0], "also update the docs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "function_call_output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "also update the docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "guidance for the work in progress") != null);
+
+    // The guidance is part of the conversation now, ahead of the answer.
+    try std.testing.expectEqual(@as(usize, 6), harness.agent.history.items.len);
+    const guidance = harness.agent.history.items[4];
+    try std.testing.expectEqualStrings("user", guidance.role);
+    try std.testing.expect(std.mem.indexOf(u8, guidance.content.?, "also update the docs") != null);
+    try std.testing.expectEqualStrings("assistant", harness.agent.history.items[5].role);
+    // Nothing is left waiting in the inbox once the turn settled.
+    try std.testing.expectEqual(@as(usize, 0), harness.agent.inbox.items.len);
 }
 
 test "task metadata requires title and description and fewer than 80 Unicode characters" {

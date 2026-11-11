@@ -42,9 +42,11 @@ pub const Runtime = struct {
         // Do not silently start another queued task after an explicit stop.
         for (self.queue.items) |line| self.agent.allocator.free(line);
         self.queue.clearRetainingCapacity();
+        // Neither should a line typed while the task ran outlive the stop.
+        self.agent.clearSteering();
         try self.agent.finishInterruption();
         _ = try self.screen.drain();
-        try self.screen.writeLog(sgr.YELLOW ++ "Task interrupted (Esc). Queued input cleared." ++ sgr.RESET ++ "\n");
+        try self.screen.writeLog(sgr.YELLOW ++ "Task interrupted (Esc). Input typed while it ran was discarded." ++ sgr.RESET ++ "\n");
         _ = try self.screen.drain();
     }
 
@@ -55,10 +57,18 @@ pub const Runtime = struct {
             self.answered.store(true, .release);
             return;
         }
+        // A running task takes the line itself: the worker sends it with its
+        // next request, so the instruction redirects the work in progress
+        // instead of waiting for it to end.
+        if (self.busy()) {
+            try self.agent.steer(line);
+            try self.screen.writeLog(sgr.DIM ++ "Input sent to the running task." ++ sgr.RESET ++ "\n");
+            _ = try self.tick();
+            return;
+        }
         const owned = try self.agent.allocator.dupe(u8, line);
         errdefer self.agent.allocator.free(owned);
         try self.queue.append(self.agent.allocator, owned);
-        if (self.busy()) try self.screen.writeLog(sgr.DIM ++ "Input queued for the next turn." ++ sgr.RESET ++ "\n");
         _ = try self.tick();
     }
 
@@ -67,6 +77,9 @@ pub const Runtime = struct {
             if (self.future) |*f| f.await(self.agent.io);
             self.future = null;
             self.done.store(false, .release);
+            // A line that arrived just as the task settled found no request
+            // left to join, so it runs as the next turn.
+            try self.agent.takeSteering(&self.queue);
         }
         if (!self.busy() and self.queue.items.len > 0) {
             const line = self.queue.orderedRemove(0);
