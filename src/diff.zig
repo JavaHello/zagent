@@ -1,4 +1,12 @@
-//! Unified diffs: reading one, applying one, and drawing one.
+//! Git Unified Diffs: reading one, applying one, and drawing one.
+//!
+//! The format is the one `git diff` and `diff -u` write, and what `git apply`
+//! reads: `diff --git a/old b/new` sections carrying `index`, `similarity
+//! index`, `old mode`/`new mode`, `new file mode`, `deleted file mode` and
+//! `rename from`/`rename to`; `--- a/path` / `+++ b/path` headers whose paths
+//! may be git-quoted (`"a/caf\303\251.txt"`, with the C escapes undoing back to
+//! bytes); and `@@ -l,c +l,c @@` hunks of space, `-` and `+` lines with their
+//! `\ No newline at end of file` markers.
 //!
 //! The agent edits files by writing these, so the parser is lenient about
 //! everything that does not change what a patch means — git's metadata headers,
@@ -6,14 +14,19 @@
 //! blank *context* line should be, the fence a patch arrives wrapped in — and
 //! strict about the one thing that does: the text a hunk says it replaces has
 //! to be the text the file holds. A hunk that does not match is reported, never
-//! guessed at, because a patch landing in the wrong place is worse than a patch
-//! that did not land at all.
+//! guessed at, and one that would fit in two places is reported rather than
+//! placed in the nearer of them, because a patch landing in the wrong place is
+//! worse than a patch that did not land at all.
 //!
 //! Nothing is written until every file of the patch has been rebuilt in memory,
 //! so a patch whose last hunk fails leaves the tree exactly as it was.
 //!
-//! What is deliberately not supported: binary hunks, mode changes, and the line
-//! shifting that lets `patch(1)` apply a hunk to text it does not quite match.
+//! The permissions git prints are carried out: a `new file mode 100755` creates
+//! an executable, `old mode`/`new mode` changes one, and a section that changes
+//! nothing but the mode is applied as that change on its own. What is
+//! deliberately not supported: binary patches (`GIT binary patch`, `Binary
+//! files … differ`), copies, symlinks and submodules (mode 120000/160000), and
+//! the fuzz that lets `patch(1)` apply a hunk to text it does not quite match.
 //!
 //! A rename is read the way git writes one — a `diff --git a/old b/new` section
 //! with `rename from`/`rename to`, and either no `---`/`+++` pair at all
@@ -40,7 +53,7 @@ const render_max_lines: usize = 400;
 /// Longest patch line drawn, for the same reason.
 const render_max_line_bytes: usize = 2000;
 
-pub const Action = enum { modified, created, deleted, renamed };
+pub const Action = enum { modified, created, deleted, renamed, mode_changed };
 
 /// One file the patch changed, as it was changed. Owns `path`.
 pub const FileStat = struct {
@@ -51,6 +64,9 @@ pub const FileStat = struct {
     action: Action,
     added: usize,
     removed: usize,
+    /// The mode the patch set on the file, as git prints one — `100755` — when
+    /// it said anything about it at all. Nothing owns it: it is a number.
+    mode: ?u32 = null,
 };
 
 /// What applying a patch came to.
@@ -134,6 +150,7 @@ pub fn apply(allocator: std.mem.Allocator, io: std.Io, patch_text: []const u8) !
             .action = plan.action,
             .added = plan.added,
             .removed = plan.removed,
+            .mode = plan.mode,
         };
         filled = i + 1;
     }
@@ -160,25 +177,32 @@ pub fn apply(allocator: std.mem.Allocator, io: std.Io, patch_text: []const u8) !
 
 /// Write one planned file: a new body for a modified or created file, the same
 /// bytes under a new name for a rename, nothing at all but a removal for a
-/// deletion.
+/// deletion, and nothing but the permissions for a patch that changes only
+/// those.
 fn writePlan(io: std.Io, plan: Plan) !void {
     const cwd = std.Io.Dir.cwd();
     switch (plan.action) {
         .deleted => try cwd.deleteFile(io, plan.path),
+        .mode_changed => try setMode(io, plan.path, plan.mode.?),
         .renamed => {
             const old = plan.old_path.?;
             const content = plan.content orelse {
                 // Nothing but the name changes, so nothing has to be rewritten:
-                // a plain rename keeps the bytes, the mode and the timestamps.
+                // a plain rename keeps the bytes, the mode and the timestamps —
+                // unless the patch named a mode of its own.
                 if (std.Io.Dir.path.dirname(plan.path)) |dir_path| {
                     cwd.createDirPath(io, dir_path) catch {};
                 }
-                return cwd.rename(old, cwd, plan.path, io);
+                try cwd.rename(old, cwd, plan.path, io);
+                if (plan.mode) |mode| try setMode(io, plan.path, mode);
+                return;
             };
             // The body is rewritten, so the mode has to be carried across by
             // hand: an executable script that is renamed stays executable.
             var permissions: ?std.Io.Dir.Permissions = null;
-            if (cwd.statFile(io, old, .{})) |stat| {
+            if (plan.mode) |mode| {
+                permissions = permissionsOf(mode);
+            } else if (cwd.statFile(io, old, .{})) |stat| {
                 permissions = stat.permissions;
             } else |_| {}
             try writeBytes(io, plan.path, content, permissions);
@@ -187,8 +211,21 @@ fn writePlan(io: std.Io, plan: Plan) !void {
             // when both names turn out to be the one file.
             if (!sameFile(io, old, plan.path)) try cwd.deleteFile(io, old);
         },
-        else => try writeBytes(io, plan.path, plan.content.?, null),
+        else => try writeBytes(io, plan.path, plan.content.?, if (plan.mode) |mode| permissionsOf(mode) else null),
     }
+}
+
+/// The permissions a git mode stands for. Git prints the whole `st_mode` as
+/// octal — `100644`, `100755` — so what a file gets is the low nine bits of it.
+fn permissionsOf(mode: u32) std.Io.File.Permissions {
+    return .fromMode(@intCast(mode & 0o777));
+}
+
+/// Change one file's permissions, for a patch whose whole change is the mode.
+fn setMode(io: std.Io, path: []const u8, mode: u32) !void {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    try file.setPermissions(io, permissionsOf(mode));
 }
 
 fn writeBytes(io: std.Io, path: []const u8, content: []const u8, permissions: ?std.Io.Dir.Permissions) !void {
@@ -220,10 +257,13 @@ const Plan = struct {
     old_path: ?[]const u8,
     action: Action,
     /// The file's new contents, or null for a deletion, and for a rename that
-    /// changes nothing but the name. Owned.
+    /// changes nothing but the name, and for a patch that changes only the
+    /// permissions. Owned.
     content: ?[]u8,
     added: usize,
     removed: usize,
+    /// The mode the patch named, as git prints one. Null when it named none.
+    mode: ?u32 = null,
 
     fn deinit(self: Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -275,6 +315,9 @@ fn planFile(
     // The name the file has after it.
     const path = file.new_path orelse file.old_path.?;
 
+    // The permissions the section asked for, if it asked for any.
+    const mode = file.mode;
+
     if (action == .created and pathExists(io, path)) {
         diag.say("'{s}' already exists, so it cannot be created: send it as a patch against the file it is now", .{path});
         return error.BadPatch;
@@ -296,7 +339,17 @@ fn planFile(
     // are the old file's, and moving them is cheaper and more exact than
     // rebuilding them from the lines they split into.
     if (action == .renamed and file.hunks.len == 0) {
-        return buildPlan(allocator, path, original_path, action, null, 0, 0);
+        return buildPlan(allocator, path, original_path, action, null, 0, 0, mode);
+    }
+
+    // A section that changes nothing but the permissions has no text to apply:
+    // git writes 'old mode' and 'new mode' and no headers at all for one.
+    if (action == .modified and file.hunks.len == 0 and mode != null) {
+        if (!pathExists(io, path)) {
+            diag.say("'{s}' cannot have its mode changed because it does not exist: a mode change names a file the tree has", .{path});
+            return error.BadPatch;
+        }
+        return buildPlan(allocator, path, null, .mode_changed, null, 0, 0, mode);
     }
 
     const original: []u8 = if (action == .created)
@@ -396,7 +449,7 @@ fn planFile(
         content = try joined.toOwnedSlice();
     }
 
-    return buildPlan(allocator, path, if (action == .renamed) original_path else null, action, content, added, removed);
+    return buildPlan(allocator, path, if (action == .renamed) original_path else null, action, content, added, removed, mode);
 }
 
 /// The plan for one file, taking its own copy of both names.
@@ -408,6 +461,7 @@ fn buildPlan(
     content: ?[]u8,
     added: usize,
     removed: usize,
+    mode: ?u32,
 ) error{OutOfMemory}!Plan {
     const owned_path = try allocator.dupe(u8, path);
     const owned_old = if (old_path) |old| try allocator.dupe(u8, old) else null;
@@ -418,6 +472,7 @@ fn buildPlan(
         .content = content,
         .added = added,
         .removed = removed,
+        .mode = mode,
     };
 }
 
@@ -677,6 +732,10 @@ const FilePatch = struct {
     /// Whether the patch says in git's own words that these two names are one
     /// rename, rather than two headers that happen to disagree.
     renamed: bool = false,
+    /// The mode the section named, as git prints one: `new file mode`, or the
+    /// `new mode` of an `old mode`/`new mode` pair. Null when it named none, in
+    /// which case the file keeps the permissions it has.
+    mode: ?u32 = null,
     hunks: []Hunk,
 
     fn deinit(self: FilePatch, allocator: std.mem.Allocator) void {
@@ -705,9 +764,17 @@ const Section = struct {
     subject: ?[]const u8 = null,
     /// The line the section began on, so a refusal can point at it.
     line: usize = 0,
-    /// A section whose mode changed, which this tool cannot carry out:
-    /// refusing beats applying half of a patch.
-    mode_changed: bool = false,
+    /// `new file mode`: the permissions a file this section creates is written
+    /// with, and — when the section has no hunks at all — what makes it the
+    /// creation of an empty file.
+    new_file_mode: ?u32 = null,
+    /// `deleted file mode`: a deletion of a file that had nothing in it, which
+    /// git writes with no hunks to remove.
+    deleted_file_mode: bool = false,
+    /// `old mode`/`new mode`: the permissions the file ends up with, applied
+    /// after whatever the hunks wrote.
+    old_mode: ?u32 = null,
+    new_mode: ?u32 = null,
     /// `copy from`/`copy to`. A copy leaves the original in place, so reading it
     /// as a rename would delete a file the patch never mentions again.
     copy: bool = false,
@@ -725,12 +792,28 @@ const Section = struct {
         self.to = null;
         self.subject = null;
         self.line = 0;
-        self.mode_changed = false;
+        self.new_file_mode = null;
+        self.deleted_file_mode = false;
+        self.old_mode = null;
+        self.new_mode = null;
         self.copy = false;
     }
 
     fn isRename(self: Section) bool {
         return self.from != null and self.to != null and !std.mem.eql(u8, self.from.?, self.to.?);
+    }
+
+    /// The mode this section gives the file it ends up with, if any. A pair of
+    /// mode lines that say the same thing is no change at all, and a `new file
+    /// mode` is the whole of a creation's mode.
+    fn givenMode(self: Section) ?u32 {
+        if (self.new_file_mode) |created| return created;
+        if (self.old_mode) |old| {
+            if (self.new_mode) |new| {
+                if (old != new) return new;
+            }
+        }
+        return null;
     }
 
     /// The file to name when explaining what this section cannot be applied as.
@@ -808,7 +891,7 @@ fn parse(allocator: std.mem.Allocator, patch_text: []const u8, diag: *Diagnostic
             // Whatever the section before this one announced and never got to
             // apply is finished here: a rename that changes nothing but the name
             // is the whole of its section.
-            if (try finishSection(&section, diag)) |file_patch| {
+            if (try finishSection(allocator, &section, diag)) |file_patch| {
                 try appendFile(allocator, &files, file_patch, diag);
             }
             section.clear(allocator);
@@ -828,9 +911,32 @@ fn parse(allocator: std.mem.Allocator, patch_text: []const u8, diag: *Diagnostic
                 .rename_from => try setSectionPath(allocator, &section.from, line["rename from ".len..]),
                 .rename_to => try setSectionPath(allocator, &section.to, line["rename to ".len..]),
                 .copy => section.copy = true,
-                .mode => section.mode_changed = true,
             }
             continue;
+        }
+        if (modeLine(line)) |meta| {
+            if (section.line == 0) section.line = cursor.i;
+            // Git prints a whole `st_mode`, so the type bits say whether this is
+            // a file this tool can write at all: a symlink's "contents" are a
+            // path, and a submodule's are a commit.
+            if (meta.mode & 0o170000 != 0o100000) {
+                diag.say("the section on line {d} gives '{s}' mode {o}, which is a symlink or a submodule rather than a regular file: this tool writes regular files only", .{ section.line, section.named(), meta.mode });
+                return error.BadPatch;
+            }
+            switch (meta.kind) {
+                .new_file => section.new_file_mode = meta.mode,
+                .deleted_file => section.deleted_file_mode = true,
+                .old => section.old_mode = meta.mode,
+                .new => section.new_mode = meta.mode,
+            }
+            continue;
+        }
+        // A binary change is a git patch nothing here can carry out: refusing at
+        // the line that says so beats reading base85 as though it were a diff.
+        if (std.mem.startsWith(u8, line, "Binary files ") or std.mem.startsWith(u8, line, "GIT binary patch")) {
+            if (section.line == 0) section.line = cursor.i;
+            diag.say("the section on line {d} changes '{s}' in binary, which this tool does not apply: change the file with 'write' instead", .{ section.line, section.named() });
+            return error.BadPatch;
         }
         if (isDecoration(line)) continue;
 
@@ -852,7 +958,7 @@ fn parse(allocator: std.mem.Allocator, patch_text: []const u8, diag: *Diagnostic
 
     // A rename with no hunks is the last thing in a patch as often as it is the
     // first, so the section is finished here too.
-    if (try finishSection(&section, diag)) |file_patch| {
+    if (try finishSection(allocator, &section, diag)) |file_patch| {
         try appendFile(allocator, &files, file_patch, diag);
     }
 
@@ -866,13 +972,37 @@ fn parse(allocator: std.mem.Allocator, patch_text: []const u8, diag: *Diagnostic
 
 /// The git metadata lines that decide what a section means, as opposed to the
 /// ones that only say what it came from and are skipped as decoration.
-const Meta = enum { rename_from, rename_to, copy, mode };
+const Meta = enum { rename_from, rename_to, copy };
 
 fn gitMeta(line: []const u8) ?Meta {
     if (std.mem.startsWith(u8, line, "rename from ")) return .rename_from;
     if (std.mem.startsWith(u8, line, "rename to ")) return .rename_to;
     if (std.mem.startsWith(u8, line, "copy from ") or std.mem.startsWith(u8, line, "copy to ")) return .copy;
-    if (std.mem.startsWith(u8, line, "old mode ") or std.mem.startsWith(u8, line, "new mode ")) return .mode;
+    return null;
+}
+
+const ModeKind = enum { new_file, deleted_file, old, new };
+
+/// One of git's four mode lines, with the mode it names.
+const ModeMeta = struct {
+    kind: ModeKind,
+    /// The whole `st_mode` as git prints it, in octal: `100755`.
+    mode: u32,
+};
+
+fn modeLine(line: []const u8) ?ModeMeta {
+    const kinds = [_]struct { prefix: []const u8, kind: ModeKind }{
+        .{ .prefix = "new file mode ", .kind = .new_file },
+        .{ .prefix = "deleted file mode ", .kind = .deleted_file },
+        .{ .prefix = "old mode ", .kind = .old },
+        .{ .prefix = "new mode ", .kind = .new },
+    };
+    for (kinds) |kind| {
+        if (!std.mem.startsWith(u8, line, kind.prefix)) continue;
+        const digits = std.mem.trimEnd(u8, line[kind.prefix.len..], " \t");
+        const mode = std.fmt.parseInt(u32, digits, 8) catch return null;
+        return .{ .kind = kind.kind, .mode = mode };
+    }
     return null;
 }
 
@@ -893,11 +1023,17 @@ fn appendFile(
 
 /// The `b/` side of a `diff --git` line: the file the section is about.
 ///
-/// Only ever used to name a file in a refusal, so a line this cannot read — a
-/// quoted name, say — is no loss: the rename lines are what an apply needs, and
-/// they are read on their own.
+/// A name git had to escape is written quoted on both sides — `diff --git
+/// "a/caf\303\251.txt" "b/caf\303\251.txt"` — so the quoted form is read first
+/// and the plain form, whose two names are separated by " b/", second.
 fn diffGitSubject(allocator: std.mem.Allocator, line: []const u8) error{OutOfMemory}!?[]const u8 {
     const rest = line["diff --git ".len..];
+    if (rest.len > 0 and rest[0] == '"') {
+        const end = quotedEnd(rest) orelse return null;
+        const second = std.mem.trimStart(u8, rest[end..], " ");
+        if (second.len == 0) return null;
+        return headerPath(allocator, second);
+    }
     const split = std.mem.indexOf(u8, rest, " b/") orelse return null;
     return headerPath(allocator, rest[split + 1 ..]);
 }
@@ -916,9 +1052,11 @@ fn rejectCopy(section: *Section, diag: *Diagnostic) error{BadPatch}!void {
     return error.BadPatch;
 }
 
-/// Finish a section that ended without hunks. A rename needs none — the two
-/// names are the whole change — and anything else has nothing this tool can do.
-fn finishSection(section: *Section, diag: *Diagnostic) error{ BadPatch, OutOfMemory }!?FilePatch {
+/// Finish a section that ended without hunks. Git writes three of those: a
+/// rename, whose two names are the whole change; a new or deleted empty file,
+/// which `new file mode`/`deleted file mode` announce with nothing to show; and
+/// a change to the permissions alone. Anything else has nothing to apply.
+fn finishSection(allocator: std.mem.Allocator, section: *Section, diag: *Diagnostic) error{ BadPatch, OutOfMemory }!?FilePatch {
     try rejectCopy(section, diag);
     if ((section.from == null) != (section.to == null)) {
         diag.say("the section on line {d} has only one of 'rename from' and 'rename to': a rename names the file it starts from and the file it becomes, and '{s}' cannot be moved on one of them", .{ section.line, section.named() });
@@ -927,18 +1065,48 @@ fn finishSection(section: *Section, diag: *Diagnostic) error{ BadPatch, OutOfMem
     if (section.isRename()) {
         const from = section.from.?;
         const to = section.to.?;
+        const mode = section.givenMode();
         section.from = null;
         section.to = null;
         return FilePatch{
             .old_path = from,
             .new_path = to,
             .renamed = true,
+            .mode = mode,
             .hunks = &.{},
         };
     }
-    if (section.mode_changed) {
-        diag.say("the section on line {d} changes only the mode of '{s}', and this tool does not change permissions: a patch here has to change text", .{ section.line, section.named() });
-        return error.BadPatch;
+    // An empty file is all that `new file mode` says on its own: git writes no
+    // headers and no hunks for one, because there are no lines to add.
+    if (section.new_file_mode) |mode| {
+        const path = (try headerPath(allocator, section.named())) orelse {
+            diag.say("the section on line {d} creates a file but names none", .{section.line});
+            return error.BadPatch;
+        };
+        return FilePatch{ .old_path = null, .new_path = path, .mode = mode, .hunks = &.{} };
+    }
+    if (section.deleted_file_mode) {
+        const path = (try headerPath(allocator, section.named())) orelse {
+            diag.say("the section on line {d} deletes a file but names none", .{section.line});
+            return error.BadPatch;
+        };
+        return FilePatch{ .old_path = path, .new_path = null, .hunks = &.{} };
+    }
+    // `old mode`/`new mode` with nothing else is a change of permissions and
+    // only of those. The file is named by the section's `diff --git` line, and
+    // the change is a pair of names that are the same, so it reads as a
+    // modification with no hunks.
+    if (section.givenMode()) |mode| {
+        const path = (try headerPath(allocator, section.named())) orelse {
+            diag.say("the section on line {d} changes a mode but names no file", .{section.line});
+            return error.BadPatch;
+        };
+        // Both sides are the same file, and each is freed from its own field.
+        const new_path = allocator.dupe(u8, path) catch |err| {
+            allocator.free(path);
+            return err;
+        };
+        return FilePatch{ .old_path = path, .new_path = new_path, .mode = mode, .hunks = &.{} };
     }
     return null;
 }
@@ -960,6 +1128,7 @@ fn parseFile(
         .old_path = try headerPath(allocator, old_line[4..]),
         .new_path = null,
         .renamed = section.isRename(),
+        .mode = section.givenMode(),
         .hunks = &.{},
     };
     errdefer {
@@ -1187,24 +1356,103 @@ fn isDecoration(line: []const u8) bool {
     return false;
 }
 
-/// The path out of a `---` or `+++` header, or null for `/dev/null`.
+/// The path out of a `---` or `+++` header, a `diff --git` name, or a `rename
+/// from`/`rename to` line, or null for `/dev/null`.
 ///
 /// A git patch writes `a/path` and `b/path`, and `-p1` is what strips those two
-/// off. Doing it here rather than asking the model to is what lets the output of
-/// `git diff` be pasted in as it comes.
+/// off. A name git had to escape is written the way git quotes one — as a C
+/// string whose octal escapes are the name's own bytes, `"a/caf\303\251.txt"`
+/// for `a/café.txt` — and is read back unquoted. Doing both here rather than
+/// asking the model to is what lets the output of `git diff` be pasted in as it
+/// comes.
 fn headerPath(allocator: std.mem.Allocator, rest: []const u8) !?[]const u8 {
-    // A timestamp may follow the path, separated by a tab.
-    const path = if (std.mem.indexOfScalar(u8, rest, '\t')) |tab| rest[0..tab] else rest;
-    const trimmed = std.mem.trim(u8, path, " ");
+    const trimmed = std.mem.trim(u8, rest, " \t");
     if (trimmed.len == 0) return null;
-    if (std.mem.eql(u8, trimmed, "/dev/null")) return null;
 
-    const stripped = if (std.mem.startsWith(u8, trimmed, "a/") or std.mem.startsWith(u8, trimmed, "b/"))
-        trimmed[2..]
-    else
-        trimmed;
+    // A quoted name ends where its quote closes, so nothing after it — a
+    // timestamp, say — can be mistaken for part of the name.
+    if (trimmed[0] == '"') {
+        const name = try unquotePath(allocator, trimmed);
+        defer allocator.free(name);
+        if (std.mem.eql(u8, name, "/dev/null")) return null;
+        return stripDiffPrefix(allocator, name);
+    }
+
+    // A timestamp may follow the path, separated by a tab.
+    const path = if (std.mem.indexOfScalar(u8, trimmed, '\t')) |tab| trimmed[0..tab] else trimmed;
+    const bare = std.mem.trim(u8, path, " ");
+    if (bare.len == 0) return null;
+    if (std.mem.eql(u8, bare, "/dev/null")) return null;
+    return stripDiffPrefix(allocator, bare);
+}
+
+/// `a/path` and `b/path` are git's two sides of one name; what the file is
+/// called is what is left of it.
+fn stripDiffPrefix(allocator: std.mem.Allocator, name: []const u8) error{OutOfMemory}!?[]const u8 {
+    const stripped = if (std.mem.startsWith(u8, name, "a/") or std.mem.startsWith(u8, name, "b/")) name[2..] else name;
     if (stripped.len == 0) return null;
     return try allocator.dupe(u8, stripped);
+}
+
+/// The end of a quoted name: just past the quote that closes it, or null when
+/// the patch has one that never closes.
+fn quotedEnd(name: []const u8) ?usize {
+    var i: usize = 1; // past the opening quote
+    while (i < name.len) : (i += 1) {
+        switch (name[i]) {
+            // The byte after a backslash is escaped, quote or not.
+            '\\' => i += 1,
+            '"' => return i + 1,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// One of git's quoted names, unquoted: the escapes are gone and the octal ones
+/// are the bytes they stand for. An unterminated quote is taken as the rest of
+/// the line rather than refused, since what follows it on a header line is a
+/// timestamp and not a name.
+fn unquotePath(allocator: std.mem.Allocator, quoted: []const u8) error{OutOfMemory}![]u8 {
+    const end = quotedEnd(quoted) orelse quoted.len;
+    const stop = if (end > 1 and end <= quoted.len and quoted[end - 1] == '"') end - 1 else end;
+
+    var name: std.ArrayList(u8) = .empty;
+    errdefer name.deinit(allocator);
+    var i: usize = 1;
+    while (i < stop) {
+        if (quoted[i] != '\\') {
+            try name.append(allocator, quoted[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if (i >= stop) break;
+        const escape = quoted[i];
+        i += 1;
+        switch (escape) {
+            'a' => try name.append(allocator, 0x07),
+            'b' => try name.append(allocator, 0x08),
+            'f' => try name.append(allocator, 0x0c),
+            'n' => try name.append(allocator, '\n'),
+            'r' => try name.append(allocator, '\r'),
+            't' => try name.append(allocator, '\t'),
+            'v' => try name.append(allocator, 0x0b),
+            '\\', '"' => try name.append(allocator, escape),
+            '0'...'7' => {
+                var value: u16 = escape - '0';
+                var digits: usize = 1;
+                while (digits < 3 and i < stop and quoted[i] >= '0' and quoted[i] <= '7') : (digits += 1) {
+                    value = value * 8 + (quoted[i] - '0');
+                    i += 1;
+                }
+                try name.append(allocator, @intCast(value & 0xff));
+            },
+            // Not an escape git writes; the byte speaks for itself.
+            else => try name.append(allocator, escape),
+        }
+    }
+    return name.toOwnedSlice(allocator);
 }
 
 /// Make one side of a file header agree with the name the git section gave it.
@@ -1699,8 +1947,6 @@ test "renames that cannot be carried out are refused without touching either nam
         // A copy keeps the original, which a rename cannot express.
         "diff --git a/{0s}/note.txt b/{0s}/copied.txt\ncopy from {0s}/note.txt\ncopy to {0s}/copied.txt\n",
         "diff --git a/{0s}/note.txt b/{0s}/copied.txt\ncopy from {0s}/note.txt\ncopy to {0s}/copied.txt\n--- {0s}/note.txt\n+++ {0s}/copied.txt\n@@ -1 +1 @@\n-original\n+new\n",
-        // Only the mode changes, and this tool has nothing to change it with.
-        "diff --git a/{0s}/note.txt b/{0s}/note.txt\nold mode 100644\nnew mode 100755\n",
     };
     inline for (cases) |body| {
         errdefer std.debug.print("rename refusal case did not refuse: {s}\n", .{body});
@@ -1709,6 +1955,8 @@ test "renames that cannot be carried out are refused without touching either nam
         const message = try applyRefused(allocator, patch);
         defer allocator.free(message);
         try testing.expect(message.len > 0);
+        // Nothing is half-done: whatever the section could not carry out, both
+        // names are as they were and no third one appeared.
         try expectFileContent(allocator, &tmp, "note.txt", "original\n");
         try expectFileContent(allocator, &tmp, "taken.txt", "kept\n");
         for ([_][]const u8{ "moved.txt", "elsewhere.txt", "copied.txt" }) |absent| {
@@ -2500,4 +2748,231 @@ test "a patch too long for the terminal is cut where it says it was" {
     try testing.expect(std.mem.endsWith(u8, drawn, "10 more line(s) of the diff are not shown" ++ sgr.RESET ++ "\n"));
     try testing.expect(std.mem.indexOf(u8, drawn, "+line 0" ++ sgr.RESET) != null);
     try testing.expect(std.mem.indexOf(u8, drawn, "+line 400" ++ sgr.RESET) == null);
+}
+
+test "a quoted name is unquoted to its bytes, and a header's timestamp is not part of it" {
+    const allocator = testing.allocator;
+
+    // What git writes for a name it had to escape: the octal escapes are the
+    // bytes of the UTF-8 name, and the a/ prefix is not part of it either.
+    const utf8 = (try headerPath(allocator, "\"a/caf\\303\\251.txt\"")).?;
+    defer allocator.free(utf8);
+    try testing.expectEqualStrings("café.txt", utf8);
+
+    // A quote or a backslash in the name is escaped rather than ended.
+    const escaped = (try headerPath(allocator, "\"b/say \\\"hi\\\" \\\\ there.txt\"")).?;
+    defer allocator.free(escaped);
+    try testing.expectEqualStrings("say \"hi\" \\ there.txt", escaped);
+
+    // The plain form shadows neither: a timestamp after a tab is not the name.
+    const plain = (try headerPath(allocator, "a/plain.txt\t2024-01-01 00:00:00")).?;
+    defer allocator.free(plain);
+    try testing.expectEqualStrings("plain.txt", plain);
+
+    try testing.expect(try headerPath(allocator, "/dev/null") == null);
+    try testing.expect(try headerPath(allocator, "\"/dev/null\"") == null);
+    // An unterminated quote is the rest of the line rather than a refusal.
+    const open = (try headerPath(allocator, "\"a/never ends.txt")).?;
+    defer allocator.free(open);
+    try testing.expectEqualStrings("never ends.txt", open);
+}
+
+test "a patch for a quoted name applies to that name" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "café.txt", .data = "one\ntwo\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    // The same patch `git diff` writes for this file: quoted on the `diff --git`
+    // line as one C string per side, and quoted in both headers.
+    const patch = try patchFor(allocator, dir,
+        \\diff --git "a/{0s}/caf\303\251.txt" "b/{0s}/caf\303\251.txt"
+        \\index 1111111..2222222 100644
+        \\--- "a/{0s}/caf\303\251.txt"
+        \\+++ "b/{0s}/caf\303\251.txt"
+        \\@@ -1,2 +1,2 @@
+        \\ one
+        \\-two
+        \\+TWO
+    );
+    defer allocator.free(patch);
+
+    const outcome = try applyOk(allocator, patch);
+    defer outcome.deinit(allocator);
+    try testing.expectEqual(Action.modified, outcome.applied[0].action);
+    try expectFileContent(allocator, &tmp, "café.txt", "one\nTWO\n");
+}
+
+test "a rename of a quoted name is read from git's rename lines" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "café.txt", .data = "kept as it is\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    const patch = try patchFor(allocator, dir,
+        \\diff --git "a/{0s}/caf\303\251.txt" "b/{0s}/th\303\251.txt"
+        \\similarity index 100%
+        \\rename from "{0s}/caf\303\251.txt"
+        \\rename to "{0s}/th\303\251.txt"
+    );
+    defer allocator.free(patch);
+
+    const outcome = try applyOk(allocator, patch);
+    defer outcome.deinit(allocator);
+    try testing.expectEqual(Action.renamed, outcome.applied[0].action);
+    try expectFileContent(allocator, &tmp, "thé.txt", "kept as it is\n");
+    try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "café.txt", allocator, .limited(1024)));
+}
+
+/// The permission bits of a fixture file, as the file system has them.
+fn fixtureMode(tmp: *testing.TmpDir, sub_path: []const u8) !std.posix.mode_t {
+    const stat = try tmp.dir.statFile(testing.io, sub_path, .{});
+    return stat.permissions.toMode() & 0o777;
+}
+
+test "the modes git states are applied, alone and alongside text" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "script.sh", .data = "echo one\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    // A section that changes nothing but the permissions: no headers, no hunks.
+    const alone = try patchFor(allocator, dir,
+        \\diff --git a/{0s}/script.sh b/{0s}/script.sh
+        \\old mode 100644
+        \\new mode 100755
+    );
+    defer allocator.free(alone);
+    const mode_change = try applyOk(allocator, alone);
+    defer mode_change.deinit(allocator);
+    try testing.expectEqual(Action.mode_changed, mode_change.applied[0].action);
+    try testing.expectEqual(@as(?u32, 0o100755), mode_change.applied[0].mode);
+    try testing.expectEqual(@as(std.posix.mode_t, 0o755), try fixtureMode(&tmp, "script.sh"));
+    try expectFileContent(allocator, &tmp, "script.sh", "echo one\n");
+
+    // The same pair of lines above hunks: the text lands and so does the mode.
+    const with_text = try patchFor(allocator, dir,
+        \\diff --git a/{0s}/script.sh b/{0s}/script.sh
+        \\old mode 100755
+        \\new mode 100700
+        \\index 1111111..2222222
+        \\--- a/{0s}/script.sh
+        \\+++ b/{0s}/script.sh
+        \\@@ -1 +1 @@
+        \\-echo one
+        \\+echo two
+    );
+    defer allocator.free(with_text);
+    const changed = try applyOk(allocator, with_text);
+    defer changed.deinit(allocator);
+    try testing.expectEqual(Action.modified, changed.applied[0].action);
+    try testing.expectEqual(@as(?u32, 0o100700), changed.applied[0].mode);
+    try testing.expectEqual(@as(std.posix.mode_t, 0o700), try fixtureMode(&tmp, "script.sh"));
+    try expectFileContent(allocator, &tmp, "script.sh", "echo two\n");
+
+    // `new file mode` is what a file the patch creates is written with.
+    const created = try patchFor(allocator, dir,
+        \\diff --git a/{0s}/run.sh b/{0s}/run.sh
+        \\new file mode 100755
+        \\index 0000000..e69de29
+        \\--- /dev/null
+        \\+++ b/{0s}/run.sh
+        \\@@ -0,0 +1 @@
+        \\+#!/bin/sh
+    );
+    defer allocator.free(created);
+    const made = try applyOk(allocator, created);
+    defer made.deinit(allocator);
+    try testing.expectEqual(Action.created, made.applied[0].action);
+    try testing.expectEqual(@as(std.posix.mode_t, 0o755), try fixtureMode(&tmp, "run.sh"));
+    try expectFileContent(allocator, &tmp, "run.sh", "#!/bin/sh\n");
+}
+
+test "an empty file is created and deleted by git's mode lines alone" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    // Git writes no headers and no hunks for an empty file: there are no lines
+    // to show, and the mode line is the whole of the change.
+    const created = try patchFor(allocator, dir,
+        \\diff --git a/{0s}/empty.txt b/{0s}/empty.txt
+        \\new file mode 100644
+        \\index 0000000..e69de29
+    );
+    defer allocator.free(created);
+    const made = try applyOk(allocator, created);
+    defer made.deinit(allocator);
+    try testing.expectEqual(Action.created, made.applied[0].action);
+    try testing.expectEqual(@as(?u32, 0o100644), made.applied[0].mode);
+    try expectFileContent(allocator, &tmp, "empty.txt", "");
+
+    const deleted = try patchFor(allocator, dir,
+        \\diff --git a/{0s}/empty.txt b/{0s}/empty.txt
+        \\deleted file mode 100644
+        \\index e69de29..0000000
+    );
+    defer allocator.free(deleted);
+    const gone = try applyOk(allocator, deleted);
+    defer gone.deinit(allocator);
+    try testing.expectEqual(Action.deleted, gone.applied[0].action);
+    try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, "empty.txt", allocator, .limited(1024)));
+}
+
+test "changes that are not text this tool can write are refused with the reason" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "note.txt", .data = "original\n" });
+
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try fixturePath(&tmp, &buf);
+
+    const Case = struct { body: []const u8, reason: []const u8 };
+    const cases = [_]Case{
+        // A symlink's "contents" are a path, and writing them as text would
+        // make it a file that happens to read like one.
+        .{
+            .body = "diff --git a/{0s}/link b/{0s}/link\nnew file mode 120000\nindex 0000000..1111111\n--- /dev/null\n+++ b/{0s}/link\n@@ -0,0 +1 @@\n+{0s}/note.txt\n",
+            .reason = "symlink",
+        },
+        // A binary change has no lines to apply.
+        .{
+            .body = "diff --git a/{0s}/blob b/{0s}/blob\nindex 0000000..1111111 100644\nGIT binary patch\nliteral 4\nLcmZQzU|?VY0RR91\n",
+            .reason = "binary",
+        },
+        .{
+            .body = "diff --git a/{0s}/blob b/{0s}/blob\nindex 0000000..1111111 100644\nBinary files a/{0s}/blob and b/{0s}/blob differ\n",
+            .reason = "binary",
+        },
+        // A mode change names a file the tree has to hold.
+        .{
+            .body = "diff --git a/{0s}/missing.txt b/{0s}/missing.txt\nold mode 100644\nnew mode 100755\n",
+            .reason = "does not exist",
+        },
+    };
+    inline for (cases) |case| {
+        errdefer std.debug.print("the patch was not refused for its {s}: {s}\n", .{ case.reason, case.body });
+        const patch = try patchFor(allocator, dir, case.body);
+        defer allocator.free(patch);
+        const message = try applyRefused(allocator, patch);
+        defer allocator.free(message);
+        try testing.expect(std.mem.indexOf(u8, message, case.reason) != null);
+        try expectFileContent(allocator, &tmp, "note.txt", "original\n");
+        for ([_][]const u8{ "link", "blob", "missing.txt" }) |absent| {
+            try testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(testing.io, absent, allocator, .limited(1024)));
+        }
+    }
 }

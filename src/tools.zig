@@ -677,6 +677,12 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
                         try aw.writer.print("renamed from {s}", .{stat.from orelse stat.path});
                         if (stat.added != 0 or stat.removed != 0) try aw.writer.print(", +{d} -{d}", .{ stat.added, stat.removed });
                     },
+                    .mode_changed => try aw.writer.print("mode {o}", .{stat.mode.?}),
+                }
+                // A mode the patch set alongside the text is worth naming:
+                // it is the one part of a change the diff itself cannot show.
+                if (stat.action != .mode_changed) {
+                    if (stat.mode) |mode| try aw.writer.print(", mode {o}", .{mode});
                 }
                 try aw.writer.writeByte(')');
             }

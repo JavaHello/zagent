@@ -12,7 +12,7 @@ A command-line AI agent built with [Zig](https://ziglang.org/) that can help you
   - `bash` — run Bash commands
   - `read` — read a file page by page: `offset` (1-based first line) and `limit` (line count); every returned line is prefixed `<number>:` so a line reference can be read straight off it
   - `write` — create/overwrite with `content`, or replace one exact, unique block with `old_text`/`new_text` (atomic, preserving permissions)
-  - `apply_patch` — change a file by applying a unified diff, which is then shown to you as a coloured diff
+  - `apply_patch` — change files by applying a Git Unified Diff (what `git diff` writes and `git apply` reads), which is then shown to you as a coloured diff
   - `ls` — list directory contents
   - `rg` / `grep` — search file contents; dynamically advertise `rg` if installed on PATH, otherwise `grep`
   - `fd` / `find` — find files by name; dynamically advertise `fd` if installed on PATH, otherwise `find`; prompt guidance follows the selected tools
@@ -493,9 +493,10 @@ Four behaviours are worth knowing:
 
 ### Patching code
 
-`apply_patch` is how the agent changes a file. It takes a unified diff — the
-format `git diff` and `diff -u` produce — applies it to the working tree, and
-prints the change as it goes, in the terminal's own red and green:
+`apply_patch` is how the agent changes a file. It takes a Git Unified Diff —
+the format `git diff` and `diff -u` write, and the format `git apply` reads —
+applies it to the working tree, and prints the change as it goes, in the
+terminal's own red and green:
 
 ```
 ❯ rename the greeting in greet.txt to hello
@@ -512,7 +513,7 @@ prints the change as it goes, in the terminal's own red and green:
 
 | Argument | Required | Description                                        |
 |----------|----------|----------------------------------------------------|
-| `patch`  | yes      | The unified diff to apply, with its newlines        |
+| `patch`  | yes      | The Git Unified Diff to apply, with its newlines    |
 
 Added lines are green, removed lines are red held back to a faint shade, hunk
 headers are cyan and file headers bold. Context lines are left alone, so what
@@ -522,8 +523,15 @@ A patch is a header pair (`--- a/path`, `+++ b/path`) and one or more hunks
 (`@@ -1,3 +1,3 @@`, then lines marked with a leading space, `-` or `+`). A new
 file is sent with `--- /dev/null` and a hunk that adds every line; a deletion
 with `+++ /dev/null` and a hunk that removes them. Git's `a/` and `b/` prefixes
-are stripped, and everything else `git diff` writes around a diff is ignored, so
-its output applies as it comes.
+are stripped, a name git had to escape is unquoted (`"a/caf\303\251.txt"` is
+`café.txt`), hunk counts are recomputed from the lines, and everything else
+`git diff` writes around a diff is ignored, so its output applies as it comes.
+
+The permissions git prints are applied too. `new file mode 100755` creates an
+executable, `old mode 100644` with `new mode 100755` above a hunk changes the
+permissions as well as the text, and a section that carries those two lines and
+nothing else changes only the mode. Git writes no headers at all for an empty
+file that is created or deleted, and those sections apply as well.
 
 A rename is one of those things `git diff` writes around a diff, and it is
 applied as a rename rather than as the pair of headers it looks like:
@@ -536,12 +544,12 @@ rename to hello.txt
 ```
 
 That section is the whole change — nothing is read or rewritten, the file
-simply has another name, mode and timestamps included. A rename that changes
-text as well carries the usual `---`/`+++` hunks, which are matched against the
-old file and written under the new one. The `rename from`/`rename to` lines are
-the only place a rename is read from: a patch whose `---` and `+++` name two
-different files and has them is refused, because that is also what a mistyped
-path looks like.
+simply has another name, mode and timestamps included (unless the section names
+a mode of its own). A rename that changes text as well carries the usual
+`---`/`+++` hunks, which are matched against the old file and written under the
+new one. The `rename from`/`rename to` lines are the only place a rename is read
+from: a patch whose `---` and `+++` name two different files and has them is
+refused, because that is also what a mistyped path looks like.
 
 Six behaviours are worth knowing:
 
@@ -564,9 +572,9 @@ Six behaviours are worth knowing:
   from`/`rename to` in sight — are an error, and so is a rename onto a file that
   is already there or from one that is not; delete and create in two steps
   instead.
-- **Mode changes and copies are refused.** A section that changes only a file's
-  permissions, or that copies one to a second name, is not something a text
-  patch can carry out, so the whole patch comes back with that said rather than
+- **What is refused is said to be.** A copy leaves its source in place, which a
+  text patch cannot express, and a binary hunk, a symlink or a submodule has no
+  lines to apply; each comes back with the section and the reason rather than
   half applied.
 
 ### MCP servers
