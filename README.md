@@ -696,7 +696,7 @@ src/
   diff.zig    — Unified diffs: reading one, applying one, drawing one
   agent.zig   — Agent loop: call API → execute tools → repeat → check completion
   compact.zig — Dropping tool results, and deduplicating repeated reads
-  memory.zig  — Durable notes: file format, prompt section, extraction
+  memory.zig  — Durable notes: file format, local retrieval, edits
   banner.zig  — The startup wordmark: letterforms, terminal palette, plain-text fallback
   menu.zig    — Option parsing, choice menus, and reading the user's answer
 build.zig     — Zig build script
