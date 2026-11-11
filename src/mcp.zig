@@ -1034,6 +1034,11 @@ const RequestMeta = struct {
     @"io.modelcontextprotocol/clientCapabilities": struct {} = .{},
 };
 
+/// The capabilities this client declares in the handshake. It declares none, and
+/// says so with an empty object: a server deserializes this member as a map, and
+/// an empty *array* — what an untyped `{}` literal becomes — is not one.
+const ClientCapabilities = struct {};
+
 const ClientInfo = struct {
     name: []const u8 = client_name,
     version: []const u8 = client_version,
@@ -1047,7 +1052,7 @@ fn metaParams(allocator: std.mem.Allocator) ![]u8 {
 fn initializeParams(allocator: std.mem.Allocator) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
         .protocolVersion = legacy_protocol_version,
-        .capabilities = .{},
+        .capabilities = ClientCapabilities{},
         .clientInfo = ClientInfo{},
     }, .{});
 }
@@ -1900,6 +1905,24 @@ test "MCP params and schemas round trip escaped strings and optional fields" {
     try std.testing.expectError(error.McpInvalidArguments, callParams(a, name, "[]", false));
     try std.testing.expectError(error.SyntaxError, callParams(a, name, "{} , \"injected\":true", false));
     try std.testing.expectError(error.InvalidToolSchema, buildFunction(a, name, "s", "d", "[]"));
+}
+
+test "the handshake declares its capabilities as an object" {
+    const a = std.testing.allocator;
+    const params = try initializeParams(a);
+    defer a.free(params);
+
+    const decoded = try std.json.parseFromSlice(std.json.Value, a, params, .{});
+    defer decoded.deinit();
+    const object = decoded.value.object;
+    try std.testing.expectEqualStrings(legacy_protocol_version, object.get("protocolVersion").?.string);
+    // A server deserializes this member as a map. An untyped `{}` literal in
+    // Zig is an empty tuple, is written as `[]`, and is refused outright —
+    // rmcp answers it with `422 Unexpected message, expect initialize request`.
+    try std.testing.expect(object.get("capabilities").? == .object);
+    try std.testing.expectEqual(@as(usize, 0), object.get("capabilities").?.object.count());
+    // The rest of the handshake's members are objects for the same reason.
+    try std.testing.expect(object.get("clientInfo").? == .object);
 }
 
 test "arguments are written back as one line of JSON" {
