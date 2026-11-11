@@ -38,9 +38,9 @@ pub const ToolResult = struct {
     }
 };
 
-/// The one limit on a tool result. A tool that pages its output (`read`, `ls`,
-/// the searches) shapes each page to fit under it, and `clipOversized` holds
-/// the line for whatever gets past them, an MCP server's answer among it.
+/// The one limit on a tool result. A tool that shapes its own output (`read`,
+/// `ls`, the searches) keeps a page under it, and `clipOversized` holds the
+/// line for whatever gets past them, an MCP server's answer among it.
 ///
 /// No tool description quotes this number. The model is not asked to budget a
 /// call against a size, and a result that still lands over the limit comes back
@@ -48,10 +48,11 @@ pub const ToolResult = struct {
 /// model reading a silently cut answer.
 pub const max_output_bytes: usize = 40 * 1024;
 
-/// Room one page of a paged tool (`read`, `ls`, the searches) may fill. A
-/// little under `max_output_bytes`, so the line each page appends — where the
-/// next one starts, or which single row was too long — still fits under the
-/// limit the finished result is held to.
+/// Room one page of a tool that shapes its own output (`read`, `ls`, the
+/// searches) may fill. A little under `max_output_bytes`, so the line a page
+/// appends — where the next one starts, that results were left out, or which
+/// single row was too long — still fits under the limit the finished result is
+/// held to.
 pub const page_room_bytes: usize = max_output_bytes - 256;
 
 /// Cut a result down to `max_output_bytes` when a tool let more through, and
@@ -347,30 +348,25 @@ test "read cuts a line longer than a page without splitting a character" {
     try std.testing.expectEqual(@as(usize, 0), room % 3);
 }
 
-test "search pages sort names, preserve status, and expose continuation" {
+test "search pages sort names, preserve status, and mark a page that was cut" {
     const a = std.testing.allocator;
-    const sorted = try searchPage(a, "z\na\nm\n", 1, true, .{ .is_error = false, .exit_code = 0 });
+    const sorted = try searchPage(a, "z\na\nm\n", true, .{ .is_error = false, .exit_code = 0 });
     defer sorted.deinit(a);
-    try std.testing.expectEqualStrings("m\nz\n", sorted.content);
+    try std.testing.expectEqualStrings("a\nm\nz\n", sorted.content);
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(a);
     const page_lines = page_room_bytes / "one matching line\n".len;
     while (buffer.items.len < (page_lines + 100) * "one matching line\n".len)
         try buffer.appendSlice(a, "one matching line\n");
     const data = buffer.items;
-    const first = try searchPage(a, data, 0, false, .{ .is_error = true, .exit_code = 2 });
-    defer first.deinit(a);
-    try std.testing.expect(first.is_error);
-    try std.testing.expectEqual(@as(?u8, 2), first.exit_code);
-    try std.testing.expect(first.truncated);
-    const cursor = page_room_bytes / "one matching line\n".len;
-    const marker = try std.fmt.allocPrint(a, "offset={d}", .{cursor});
-    defer a.free(marker);
-    try std.testing.expect(std.mem.indexOf(u8, first.content, marker) != null);
-    const second = try searchPage(a, data, cursor, false, .{ .is_error = false });
-    defer second.deinit(a);
-    try std.testing.expect(!second.truncated);
-    try std.testing.expectEqualStrings(data[cursor * "one matching line\n".len ..], second.content);
+    const page = try searchPage(a, data, false, .{ .is_error = true, .exit_code = 2 });
+    defer page.deinit(a);
+    try std.testing.expect(page.is_error);
+    try std.testing.expectEqual(@as(?u8, 2), page.exit_code);
+    try std.testing.expect(page.truncated);
+    // The cut is reported and the call is narrowed; there is no cursor to resume.
+    try std.testing.expect(std.mem.indexOf(u8, page.content, "offset=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, page.content, "[More results than shown") != null);
 }
 
 test "search limits parse and reach both backends" {
@@ -706,7 +702,7 @@ test "patch envelopes do not change hunk content" {
     try std.testing.expectEqualStrings("+*** End Patch", normalizePatchEnvelope("+*** End Patch"));
 }
 
-test "ls pages are sorted and expose a resumable entry offset" {
+test "ls is sorted, capped by limit, and says when entries were left out" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -715,15 +711,17 @@ test "ls pages are sorted and expose a resumable entry offset" {
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(path);
-    const first = try listDirPage(io, a, path, .{ .limit = 2 });
-    defer first.deinit(a);
-    try std.testing.expect(first.truncated);
-    try std.testing.expect(std.mem.startsWith(u8, first.content, "a\tf\nm\tf\n"));
-    try std.testing.expect(std.mem.indexOf(u8, first.content, "offset=2") != null);
-    const second = try listDirPage(io, a, path, .{ .offset = 2, .limit = 2 });
-    defer second.deinit(a);
-    try std.testing.expect(!second.truncated);
-    try std.testing.expectEqualStrings("z\tf\n", second.content);
+    const capped = try listDirPage(io, a, path, .{ .limit = 2 });
+    defer capped.deinit(a);
+    try std.testing.expect(capped.truncated);
+    try std.testing.expect(std.mem.startsWith(u8, capped.content, "a\tf\nm\tf\n"));
+    // There is no cursor to continue from: the call is narrowed instead.
+    try std.testing.expect(std.mem.indexOf(u8, capped.content, "offset") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capped.content, "More entries") != null);
+    const all = try listDirPage(io, a, path, .{ .limit = 1000 });
+    defer all.deinit(a);
+    try std.testing.expect(!all.truncated);
+    try std.testing.expectEqualStrings("a\tf\nm\tf\nz\tf\n", all.content);
 }
 
 pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
@@ -731,7 +729,6 @@ pub fn listDir(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Tool
 }
 
 pub const Page = struct {
-    offset: usize = 0,
     limit: usize = 100,
 };
 
@@ -769,14 +766,14 @@ pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, p
     std.mem.sort([]const u8, entries.items, {}, lessString);
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    var index = @min(page.offset, entries.items.len);
-    while (index < entries.items.len and index - page.offset < page.limit) : (index += 1) {
+    var index: usize = 0;
+    while (index < entries.items.len and index < page.limit) : (index += 1) {
         const entry = entries.items[index];
         if (aw.written().len + entry.len > page_room_bytes) break;
         try aw.writer.writeAll(entry);
     }
     const truncated = index < entries.items.len;
-    if (truncated) try aw.writer.print("[More entries; continue with offset={d}, limit={d}.]\n", .{ index, page.limit });
+    if (truncated) try aw.writer.writeAll("[More entries than listed; narrow 'path' or raise 'limit' to see the rest.]\n");
     if (aw.written().len == 0) try aw.writer.writeAll("(no entries)");
     return .{ .content = try aw.toOwnedSlice(), .is_error = false, .truncated = truncated };
 }
@@ -843,7 +840,6 @@ pub const GrepArgs = struct {
     max_matches: ?usize = null,
     hidden: bool = false,
     no_ignore: bool = false,
-    offset: usize = 0,
 
     pub fn deinit(self: GrepArgs, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
@@ -881,7 +877,6 @@ pub fn parseGrepArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !
         .max_matches = try optionalUnsigned(arguments.get("max_matches"), 1),
         .hidden = try optionalBool(arguments.get("hidden")),
         .no_ignore = try optionalBool(arguments.get("no_ignore")),
-        .offset = (try optionalUnsigned(arguments.get("offset"), 0)) orelse 0,
     };
 }
 
@@ -892,7 +887,6 @@ pub const FindArgs = struct {
     path: []const u8,
     hidden: bool = false,
     no_ignore: bool = false,
-    offset: usize = 0,
 
     pub fn deinit(self: FindArgs, allocator: std.mem.Allocator) void {
         allocator.free(self.pattern);
@@ -920,7 +914,6 @@ pub fn parseFindArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !
         .path = path,
         .hidden = try optionalBool(arguments.get("hidden")),
         .no_ignore = try optionalBool(arguments.get("no_ignore")),
-        .offset = (try optionalUnsigned(arguments.get("offset"), 0)) orelse 0,
     };
 }
 
@@ -1068,7 +1061,6 @@ fn runSearch(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     exit_one_is_no_match: bool,
-    offset: usize,
 ) !ToolResult {
     const result = std.process.run(allocator, io, .{
         .argv = argv,
@@ -1119,14 +1111,14 @@ fn runSearch(
         try aw.writer.writeAll(if (is_error) "(no output)" else "(no matches)");
     }
 
-    return searchPage(allocator, aw.written(), offset, !exit_one_is_no_match, .{
+    return searchPage(allocator, aw.written(), !exit_one_is_no_match, .{
         .is_error = is_error,
         .exit_code = exit_code,
     });
 }
 
-fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, sort: bool, status: ToolStatus) !ToolResult {
-    if (offset == 0 and std.mem.eql(u8, output, "(no matches)"))
+fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, status: ToolStatus) !ToolResult {
+    if (std.mem.eql(u8, output, "(no matches)"))
         return finalizeResultLimited(allocator, output, status, max_output_bytes);
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(allocator);
@@ -1135,7 +1127,7 @@ fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, s
     if (sort) std.mem.sort([]const u8, lines.items, {}, lessString);
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var index = @min(offset, lines.items.len);
+    var index: usize = 0;
     var oversized = false;
     while (index < lines.items.len) : (index += 1) {
         const line = lines.items[index];
@@ -1150,7 +1142,7 @@ fn searchPage(allocator: std.mem.Allocator, output: []const u8, offset: usize, s
         try aw.writer.print("{s}\n", .{line});
     }
     const truncated = index < lines.items.len;
-    if (truncated) try aw.writer.print("[More results; continue with offset={d}.]\n", .{index});
+    if (truncated) try aw.writer.writeAll("[More results than shown; narrow the pattern, path or glob to see the rest.]\n");
     return finalizeResultLimited(allocator, aw.written(), .{ .is_error = status.is_error, .exit_code = status.exit_code, .truncated = truncated or oversized }, max_output_bytes);
 }
 
@@ -1182,23 +1174,23 @@ fn runContentSearch(io: std.Io, allocator: std.mem.Allocator, argv: []const []co
             "sh", "-c", "path=$1; shift; IFS=; exec \"$@\" $path", "zagent-search", args.path,
         });
         try expanded.appendSlice(allocator, argv[0 .. argv.len - 1]);
-        return runSearch(io, allocator, expanded.items, true, args.offset);
+        return runSearch(io, allocator, expanded.items, true);
     }
-    return runSearch(io, allocator, argv, true, args.offset);
+    return runSearch(io, allocator, argv, true);
 }
 
 /// The find tool: find files and directories by name.
 pub fn find(io: std.Io, allocator: std.mem.Allocator, args: FindArgs) !ToolResult {
     const argv = try findArgv(allocator, args);
     defer allocator.free(argv);
-    return runSearch(io, allocator, argv, false, args.offset);
+    return runSearch(io, allocator, argv, false);
 }
 
 /// The fd tool always runs fd, independent of startup detection.
 pub fn fd(io: std.Io, allocator: std.mem.Allocator, args: FindArgs) !ToolResult {
     const argv = try fdArgv(allocator, args);
     defer allocator.free(argv);
-    return runSearch(io, allocator, argv, false, args.offset);
+    return runSearch(io, allocator, argv, false);
 }
 
 /// How many redirects a request without a body is followed through.
@@ -2002,7 +1994,7 @@ test "a search that outruns the limit is refused with advice" {
     // `yes` writes without end, which is the shape of output this tool cannot
     // read at all: std refuses the whole result once the cap is passed rather
     // than handing back the beginning of it.
-    const result = try runSearch(io, allocator, &.{"yes"}, true, 0);
+    const result = try runSearch(io, allocator, &.{"yes"}, true);
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);

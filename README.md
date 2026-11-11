@@ -67,14 +67,14 @@ Tool calls retain a 180-second default limit
 (`bash.timeout_seconds` accepts 1–3600), output bounds and process-group cleanup.
 Commands use `bash --noprofile --norc -c`, not `/bin/sh`.
 
-One tool result is held to 40 KiB. A tool that can page its output — `read`,
-`ls`, `rg`, `grep`, `fd`, `find` — stops a page short of that and names the
-`offset` the next page starts at; a `bash` command or `http` response that runs
-past it is cut at the limit and marked `... (truncated)`; anything else that
-still lands over it, an MCP server's answer included, comes back cut at the
-limit and reported as an error naming it, so the model narrows the call instead
-of reading a cut answer as a complete one. No tool description quotes the
-number: the limit lives in the code, not in the prompt.
+One tool result is held to 40 KiB. `read` pages a file and names the `offset`
+the next page starts at; `ls` and the searches stop short of the limit and say
+so, so the model narrows the call rather than reading a cut answer as a
+complete one; a `bash` command or `http` response that runs past it is cut at
+the limit and marked `... (truncated)`; anything else that still lands over it,
+an MCP server's answer included, comes back cut at the limit and reported as an
+error naming it. No tool description quotes the number: the limit lives in the
+code, not in the prompt.
 
 Every run creates one private scratch directory at startup (mode `0700`, a
 random name under `$TMPDIR`, or `/tmp` if unset) and names it, together with the
@@ -482,9 +482,11 @@ Four behaviours are worth knowing:
   paths by default; `hidden` and `no_ignore` can override those defaults.
   `grep` and `find` include hidden and ignored paths, but prune `.git`.
 - **Limits.** A search that returns more than 256 KB is refused rather than cut
-  short, and the message says how to narrow it. What does come back arrives one
-  page at a time: the page names the `offset` the next one starts at, and a
-  single result longer than the page is reported instead of being cut.
+  short, and the message says how to narrow it. What does come back arrives in
+  one page that stops short of the result limit and says it did, so a narrower
+  pattern, path or glob is what reaches the rest; a single result longer than
+  the page is reported instead of being cut. `ls` caps its listing the same way,
+  honouring `limit`.
 - **Regex flavour.** `grep`'s pattern is an extended regular expression —
   `+`, `?`, `|` and `()` are operators, as they are in `rg`. More advanced
   regex syntax can differ between the two programs.

@@ -3,6 +3,14 @@ const tools = @import("tools.zig");
 const openai = @import("openai.zig");
 
 pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8, arguments: []const u8) !tools.ToolResult {
+    if (refusesOffset(name) and carriesOffset(allocator, arguments)) return .{
+        .content = try std.fmt.allocPrint(
+            allocator,
+            "Error: {s} has no 'offset' argument. It answers with one page of output; narrow the call instead of asking for a later page.",
+            .{name},
+        ),
+        .is_error = true,
+    };
     return blk: {
         if (std.mem.eql(u8, name, "bash")) {
             const command = openai.extractStringArg(allocator, arguments, "command") catch {
@@ -77,16 +85,15 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
         } else if (std.mem.eql(u8, name, "ls")) {
             const parsed = std.json.parseFromSlice(struct {
                 path: []const u8 = ".",
-                offset: usize = 0,
                 limit: usize = 100,
             }, allocator, arguments, .{ .ignore_unknown_fields = true }) catch {
                 break :blk .{
-                    .content = try allocator.dupe(u8, "Error: ls expects an optional 'path' string (defaults to the current directory)"),
+                    .content = try allocator.dupe(u8, "Error: ls expects an optional 'path' string (defaults to the current directory) and a 'limit' integer"),
                     .is_error = true,
                 };
             };
             defer parsed.deinit();
-            break :blk try tools.listDirPage(io, allocator, parsed.value.path, .{ .offset = parsed.value.offset, .limit = parsed.value.limit });
+            break :blk try tools.listDirPage(io, allocator, parsed.value.path, .{ .limit = parsed.value.limit });
         } else if (std.mem.eql(u8, name, "rg") or std.mem.eql(u8, name, "grep")) {
             const args = tools.parseGrepArgs(allocator, arguments) catch |err| {
                 break :blk .{
@@ -138,6 +145,24 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
     };
 }
 
+/// The tools that used to page their output with an `offset`. They answer with
+/// one page now, so a call that still carries the argument is told that rather
+/// than handed page one again as though it were the page it asked for.
+fn refusesOffset(name: []const u8) bool {
+    for ([_][]const u8{ "ls", "rg", "grep", "fd", "find" }) |tool|
+        if (std.mem.eql(u8, name, tool)) return true;
+    return false;
+}
+
+/// Whether the arguments name an `offset` field. Arguments that do not parse
+/// are not this check's business: the tool itself reports them.
+fn carriesOffset(allocator: std.mem.Allocator, arguments: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get("offset") != null;
+}
+
 test "read dispatch forwards the page the caller asked for" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -173,6 +198,23 @@ test "read dispatch forwards the page the caller asked for" {
         try std.testing.expect(invalid_search.is_error);
         try std.testing.expect(std.mem.indexOf(u8, invalid_search.content, "max_matches") != null);
     }
+}
+
+test "ls and the searches refuse the offset paging they no longer take" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    for ([_][]const u8{ "ls", "rg", "grep", "fd", "find" }) |name| {
+        const result = try execute(io, a, &env, name, "{\"pattern\":\"x\",\"offset\":2}");
+        defer result.deinit(a);
+        try std.testing.expect(result.is_error);
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "has no 'offset'") != null);
+    }
+    // The same call without it is dispatched as usual.
+    const listed = try execute(io, a, &env, "ls", "{\"limit\":1}");
+    defer listed.deinit(a);
+    try std.testing.expect(!listed.is_error);
 }
 
 test "write creates overwrites and rejects mixed modes; legacy names are removed" {
