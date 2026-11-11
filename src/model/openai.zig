@@ -5,11 +5,6 @@ const Config = @import("config.zig").Config;
 pub const tool_schema = @import("../tools/schema.zig");
 pub const ToolDefinition = tool_schema.ToolDefinition;
 
-/// Largest output budget a truncated response may be retried with. DeepSeek
-/// rejects anything above 8192 output tokens for its chat models, so asking for
-/// more would turn a recoverable truncation into a hard error.
-const growth_cap: u32 = @import("config.zig").max_output_tokens_ceiling;
-
 test "search registration follows installed backends and advertises renamed filesystem tools" {
     const allocator = std.testing.allocator;
     for ([_]search_tools.SearchBackends{ .{}, .{ .rg = true }, .{ .fd = true }, .{ .rg = true, .fd = true } }) |search| {
@@ -262,7 +257,6 @@ pub const Client = struct {
     /// a message written from in here would be glued onto a frame and then
     /// erased by the next one. Whoever stops the animation reports it instead.
     http_error: ?[]u8,
-    retryable_http_error: bool = false,
     search: search_tools.SearchBackends = .{},
     /// Borrowed definitions; callers may replace this slice between requests.
     /// The slice and its strings must remain valid for each request's duration.
@@ -508,12 +502,7 @@ pub const Client = struct {
         var decompress: std.http.Decompress = undefined;
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
-        self.retryable_http_error = false;
         if (response.head.status != .ok) {
-            self.retryable_http_error = switch (@backingInt(response.head.status)) {
-                408, 429, 500, 502, 503, 504 => true,
-                else => false,
-            };
             var aw: std.Io.Writer.Allocating = .init(self.allocator);
             defer aw.deinit();
             _ = reader.streamRemaining(&aw.writer) catch {};
@@ -972,15 +961,6 @@ fn tryParseApiErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]co
     return allocator.dupe(u8, msg_val.string) catch null;
 }
 
-fn isRecoverableFetchError(err: anyerror) bool {
-    return switch (err) {
-        error.HttpConnectionClosing,
-        error.ConnectionResetByPeer,
-        => true,
-        else => false,
-    };
-}
-
 /// Rough token count for the live status line, before the server reports the
 /// real usage. It approximates OpenAI's tokenizer well enough to watch a reply
 /// stream: ASCII text is about four bytes per token, and each non-ASCII
@@ -1021,12 +1001,6 @@ test "extract string arg" {
     const result = try extractStringArg(allocator, "{\"command\":\"ls -la\"}", "command");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("ls -la", result);
-}
-
-test "recoverable fetch errors are retried" {
-    try std.testing.expect(isRecoverableFetchError(error.HttpConnectionClosing));
-    try std.testing.expect(isRecoverableFetchError(error.ConnectionResetByPeer));
-    try std.testing.expect(!isRecoverableFetchError(error.ApiError));
 }
 
 test "an http failure is kept until the caller asks for it" {
