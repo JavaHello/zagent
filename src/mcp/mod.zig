@@ -180,6 +180,7 @@ pub fn loadServers(
             continue;
         }
         if (try parseServer(allocator, name, entry.value_ptr.*, problems)) |server| {
+            errdefer server.deinit(allocator);
             try servers.append(allocator, server);
         }
     }
@@ -230,7 +231,9 @@ fn addProblem(
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
-    try problems.append(allocator, try std.fmt.allocPrint(allocator, fmt, args));
+    const problem = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(problem);
+    try problems.append(allocator, problem);
 }
 
 fn isUsableServerName(name: []const u8) bool {
@@ -336,7 +339,9 @@ fn stringList(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const []c
         if (field == .array) {
             for (field.array.items) |item| {
                 if (item != .string) continue;
-                try list.append(allocator, try allocator.dupe(u8, item.string));
+                const owned = try allocator.dupe(u8, item.string);
+                errdefer allocator.free(owned);
+                try list.append(allocator, owned);
             }
         }
     }
@@ -613,7 +618,7 @@ pub const Connection = struct {
                 .params_json = params,
                 .timeout_ms = self.timeout_ms,
             });
-            defer response.deinit(allocator);
+            defer response.deinit(self.allocator);
 
             const result_json = switch (response) {
                 .result => |text| text,
@@ -630,11 +635,9 @@ pub const Connection = struct {
                 cursor = null;
             }
 
-            const next = try readToolPage(allocator, result_json, &listed);
+            cursor = try readToolPage(allocator, result_json, &listed);
             if (listed.items.len >= max_tools_per_server) break;
-            if (next) |value| {
-                cursor = value;
-            } else break;
+            if (cursor == null) break;
         }
 
         return listed.toOwnedSlice(allocator);
@@ -642,6 +645,7 @@ pub const Connection = struct {
 
     /// Call one tool. The result is the JSON text of the `result` member, for
     /// the caller to shape into something the model can read.
+    /// The response is owned by `self.allocator`, not the params allocator.
     pub fn callTool(
         self: *Connection,
         allocator: std.mem.Allocator,
@@ -731,8 +735,10 @@ fn readToolPage(
     result_json: []const u8,
     listed: *std.ArrayList(RemoteTool),
 ) !?[]u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result_json, .{}) catch
-        return error.McpProtocol;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.McpProtocol,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.McpProtocol;
     const object = parsed.value.object;
@@ -740,8 +746,10 @@ fn readToolPage(
     if (object.get("tools")) |tools_value| {
         if (tools_value == .array) {
             for (tools_value.array.items) |item| {
+                if (listed.items.len >= max_tools_per_server) break;
                 if (item != .object) continue;
                 const tool = try readTool(allocator, item.object) orelse continue;
+                errdefer tool.deinit(allocator);
                 try listed.append(allocator, tool);
             }
         }
@@ -1255,10 +1263,7 @@ pub const Registry = struct {
         }
 
         self.tools = try listed.toOwnedSlice(self.allocator);
-        errdefer {
-            for (self.tools) |tool| self.freeTool(tool);
-            self.allocator.free(self.tools);
-        }
+        // Ownership has moved to the registry, including on later errors.
 
         try self.refreshFunctions();
 
@@ -1389,7 +1394,7 @@ pub const Registry = struct {
             result.timed_out = err == error.McpTimeout;
             return result;
         };
-        defer response.deinit(allocator);
+        defer response.deinit(connection.allocator);
 
         return switch (response) {
             .result => |text| renderCallResult(allocator, text),
@@ -1921,6 +1926,109 @@ test "mcp.json is optional and a broken one costs only itself" {
         try std.testing.expectEqualStrings("good", servers[1].name);
         try std.testing.expectEqual(before + 1, problems.items.len);
     }
+}
+
+fn checkToolPageAllocationFailures(allocator: std.mem.Allocator) !void {
+    var listed: std.ArrayList(RemoteTool) = .empty;
+    defer {
+        for (listed.items) |tool| tool.deinit(allocator);
+        listed.deinit(allocator);
+    }
+    const cursor = try readToolPage(allocator,
+        \\{"tools":[{"name":"one"},{"name":"two","description":"second"}],"nextCursor":"more"}
+    , &listed);
+    defer if (cursor) |value| allocator.free(value);
+    try std.testing.expectEqual(@as(usize, 2), listed.items.len);
+}
+
+fn checkProblemAllocationFailures(allocator: std.mem.Allocator) !void {
+    var problems: std.ArrayList([]u8) = .empty;
+    defer {
+        for (problems.items) |problem| allocator.free(problem);
+        problems.deinit(allocator);
+    }
+    try addProblem(allocator, &problems, "problem {d}", .{42});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "[\"one\",\"two\"]", .{});
+    defer parsed.deinit();
+    const strings = try stringList(allocator, parsed.value);
+    defer {
+        for (strings) |item| allocator.free(item);
+        allocator.free(strings);
+    }
+}
+
+test "MCP page and diagnostic allocation failures release partial results" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkToolPageAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkProblemAllocationFailures, .{});
+}
+
+test "MCP pagination caps each page and frees cursor at the tool limit" {
+    const a = std.testing.allocator;
+    const page = "{\"tools\":[" ++ sanitize.repeat("{\"name\":\"tool\"},", 256) ++ "{\"name\":\"extra\"}],\"nextCursor\":\"more\"}";
+    var connection = scriptedConnection(a, &.{.{ .result = page }});
+    defer connection.deinit();
+    // A separate arena catches accidental response destruction via this allocator.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const listed = try connection.listTools(arena.allocator());
+    defer {
+        for (listed) |tool| tool.deinit(arena.allocator());
+        arena.allocator().free(listed);
+    }
+    try std.testing.expectEqual(max_tools_per_server, listed.len);
+    try std.testing.expectEqual(@as(usize, 1), connection.transport.scripted.sent.items.len);
+
+    var paged = scriptedConnection(a, &.{
+        .{ .result = "{\"tools\":[{\"name\":\"first\"}],\"nextCursor\":\"page2\"}" },
+        .{ .result = "{\"tools\":[{\"name\":\"second\"}]}" },
+    });
+    defer paged.deinit();
+    const both = try paged.listTools(a);
+    defer {
+        for (both) |tool| tool.deinit(a);
+        a.free(both);
+    }
+    try std.testing.expectEqual(@as(usize, 2), both.len);
+    try std.testing.expectEqualStrings("second", both[1].name);
+    try std.testing.expect(std.mem.indexOf(u8, paged.transport.scripted.sent.items[1], "page2") != null);
+}
+
+test "MCP collectTools errors leave transferred tools owned by registry" {
+    const a = std.testing.allocator;
+    var reached_success = false;
+    for (0..200) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const f = failing.allocator();
+        const servers = try a.alloc(Server, 1);
+        servers[0] = .{
+            .config = .{
+                .name = try a.dupe(u8, "fake"),
+                .transport = .{ .http = .{ .url = try a.dupe(u8, "http://unused"), .headers = &.{} } },
+            },
+            .summary = try a.dupe(u8, "scripted"),
+            .connection = scriptedConnection(f, &.{.{ .result = "{\"tools\":[{\"name\":\"one\"},{\"name\":\"two\"}]}" }}),
+        };
+        var registry: Registry = .{
+            .allocator = f,
+            .io = std.testing.io,
+            .servers = servers,
+            .tools = &.{},
+            .tool_json = &.{},
+        };
+        defer registry.deinit();
+        var problems: std.ArrayList([]u8) = .empty;
+        defer {
+            for (problems.items) |problem| f.free(problem);
+            problems.deinit(f);
+        }
+        registry.collectTools(&problems) catch continue;
+        if (!failing.has_induced_failure) {
+            try std.testing.expectEqual(@as(usize, 2), registry.tools.len);
+            reached_success = true;
+            break;
+        }
+    }
+    try std.testing.expect(reached_success);
 }
 
 test "a modern server is met without a handshake" {

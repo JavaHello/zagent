@@ -692,6 +692,10 @@ const Sse = struct {
     allocator: std.mem.Allocator,
     lines: LineBuffer,
     data: std.ArrayList(u8) = .empty,
+    /// Whether `data` holds any `data:` line of the current event. It tells a
+    /// keep-alive (no data at all) from an event whose payload is empty, and
+    /// it decides whether the next line needs a separating newline.
+    has_data: bool = false,
     /// Whether `data` is still the payload last handed out. It is cleared on
     /// the next ask, so a caller may read what it was given until then.
     delivered: bool = false,
@@ -714,14 +718,19 @@ const Sse = struct {
     fn next(self: *Sse) !?[]const u8 {
         if (self.delivered) {
             self.data.clearRetainingCapacity();
+            self.has_data = false;
             self.delivered = false;
         }
 
         while (try self.lines.next(max_message_bytes)) |line| {
             if (line.len == 0) {
                 // A blank line ends an event. One carrying no data at all is a
-                // keep-alive, and is not an event.
-                if (self.data.items.len == 0) continue;
+                // keep-alive, and is not an event: the lines it held are
+                // dropped, and its payload is not what the next one continues.
+                if (self.data.items.len == 0) {
+                    self.has_data = false;
+                    continue;
+                }
                 self.delivered = true;
                 return self.data.items;
             }
@@ -730,8 +739,13 @@ const Sse = struct {
 
             var value: []const u8 = line["data:".len..];
             if (value.len > 0 and value[0] == ' ') value = value[1..];
-            if (self.data.items.len > 0) try self.data.append(self.allocator, '\n');
+            const separator: usize = @intFromBool(self.has_data);
+            const remaining = max_message_bytes - self.data.items.len;
+            if (separator > remaining or value.len > remaining - separator)
+                return Error.McpMessageTooLong;
+            if (self.has_data) try self.data.append(self.allocator, '\n');
             try self.data.appendSlice(self.allocator, value);
+            self.has_data = true;
         }
 
         self.lines.compact();
@@ -787,7 +801,9 @@ pub fn appendRoutingHeaders(
 ) !void {
     try out.append(allocator, .{ .name = "Mcp-Method", .value = method });
     if (name) |tool| {
-        try out.append(allocator, .{ .name = "Mcp-Name", .value = try encodeHeaderValue(allocator, tool) });
+        const value = try encodeHeaderValue(allocator, tool);
+        errdefer allocator.free(value);
+        try out.append(allocator, .{ .name = "Mcp-Name", .value = value });
     }
 }
 
@@ -865,7 +881,11 @@ pub const Scripted = struct {
     }
 
     fn request(self: *Scripted, allocator: std.mem.Allocator, call: Call) !Response {
-        try self.sent.append(self.allocator, try self.allocator.dupe(u8, call.message));
+        {
+            const message = try self.allocator.dupe(u8, call.message);
+            errdefer self.allocator.free(message);
+            try self.sent.append(self.allocator, message);
+        }
 
         if (self.index >= self.script.len) return Error.McpTimeout;
         const answer = self.script[self.index];
@@ -873,11 +893,15 @@ pub const Scripted = struct {
 
         return switch (answer) {
             .silence => Error.McpTimeout,
-            .err => |err| .{ .err = .{
-                .code = err.code,
-                .message = try allocator.dupe(u8, err.message),
-                .data_json = if (err.data) |data| try allocator.dupe(u8, data) else null,
-            } },
+            .err => |err| result: {
+                const message = try allocator.dupe(u8, err.message);
+                errdefer allocator.free(message);
+                break :result .{ .err = .{
+                    .code = err.code,
+                    .message = message,
+                    .data_json = if (err.data) |data| try allocator.dupe(u8, data) else null,
+                } };
+            },
             .result => |result| try frameResult(allocator, call.id, result),
         };
     }
@@ -906,6 +930,57 @@ fn frameResult(allocator: std.mem.Allocator, id: i64, result: []const u8) !Respo
             return Error.McpProtocol;
         },
     }
+}
+
+test "SSE cumulative data limit includes inserted newlines and resets per event" {
+    var events = Sse.init(std.testing.allocator);
+    defer events.deinit();
+    // Each line is small; only their combined payload reaches the limit.
+    const block = @import("../util/text.zig").repeat("x", 1023);
+    for (0..4096) |_| {
+        try events.push("data: " ++ block ++ "\n");
+        try std.testing.expectEqual(@as(?[]const u8, null), try events.next());
+    }
+    try std.testing.expectEqual(max_message_bytes - 1, events.data.items.len);
+    try events.push("data:\n\n");
+    try std.testing.expectEqual(max_message_bytes, (try events.next()).?.len);
+    try events.push("data: ok\n\n");
+    try std.testing.expectEqualStrings("ok", (try events.next()).?);
+
+    // Fill again, then exceed by the separator alone.
+    for (0..4096) |_| {
+        try events.push("data: " ++ block ++ "\n");
+        try std.testing.expectEqual(@as(?[]const u8, null), try events.next());
+    }
+    try events.push("data:\n");
+    _ = try events.next();
+    try events.push("data:\n");
+    try std.testing.expectError(error.McpMessageTooLong, events.next());
+    try std.testing.expectEqual(max_message_bytes, events.data.items.len);
+}
+
+fn checkSseAllocationFailures(allocator: std.mem.Allocator) !void {
+    var events = Sse.init(allocator);
+    defer events.deinit();
+    try events.push("data:\ndata: x\ndata:\n\n");
+    try std.testing.expectEqualStrings("\nx\n", (try events.next()).?);
+}
+
+test "SSE allocation failures clean up partial framing and payload" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSseAllocationFailures, .{});
+}
+
+test "SSE rejects an oversized completed data line before growing payload" {
+    var events = Sse.init(std.testing.allocator);
+    defer events.deinit();
+    const value = try std.testing.allocator.alloc(u8, max_message_bytes + 1);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'x');
+    try events.push("data:");
+    try events.push(value);
+    try events.push("\n\n");
+    try std.testing.expectError(error.McpMessageTooLong, events.next());
+    try std.testing.expectEqual(@as(usize, 0), events.data.items.len);
 }
 
 test "RPC serialization escapes strings and normalizes embedded params" {
