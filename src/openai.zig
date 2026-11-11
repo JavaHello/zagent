@@ -311,6 +311,14 @@ pub const Client = struct {
         };
     }
 
+    /// Add another client's totals to this one. A sub-agent's requests are part
+    /// of what the query that started it cost, so they are counted where the
+    /// user reads the totals instead of being hidden from them.
+    pub fn absorbUsage(self: *Client, other: *const Client) void {
+        _ = self.input_tokens.fetchAdd(other.input_tokens.load(.monotonic), .monotonic);
+        _ = self.output_tokens.fetchAdd(other.output_tokens.load(.monotonic), .monotonic);
+    }
+
     fn addUsage(self: *Client, usage: ?Usage) void {
         const u = usage orelse return;
         _ = self.input_tokens.fetchAdd(u.input_tokens, .monotonic);

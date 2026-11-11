@@ -171,12 +171,20 @@ pub const plan = ToolDefinition{
     ,
 };
 
+pub const subagent = ToolDefinition{
+    .name = "subagent",
+    .description = "Hand one self-contained task to a sub-agent that works on its own and returns a short report. The sub-agent does not read this conversation, cannot ask the user and cannot change the plan, so the task must carry everything it needs. Use it for a step whose tool output would flood this conversation; verify its work yourself before marking a plan step done.",
+    .parameters_json =
+    \\{"type":"object","properties":{"task":{"type":"string","description":"One self-contained task: what to do and how it is verified, in full, since the sub-agent does not read this conversation"},"context":{"type":"string","description":"Optional facts the sub-agent needs: file paths, decisions already made, the shape of the expected change. Keep it short."},"timeout_seconds":{"type":"integer","minimum":30,"maximum":1800,"description":"Wall-clock limit for the sub-agent's whole run, default 600. A tool already running is not interrupted."}},"required":["task"]}
+    ,
+};
+
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,          read, write, apply_patch, ls,
-    rg,            fd,            grep, find,  http,        ask_user,
-    remember,      announce_task, plan,
+    memory_search, bash,          read, write,    apply_patch, ls,
+    rg,            fd,            grep, find,     http,        ask_user,
+    remember,      announce_task, plan, subagent,
 };
 
 test "built-in definitions have valid schemas and unique names" {

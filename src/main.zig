@@ -289,7 +289,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try registry.writeStartup(&report.writer);
 
-    var agent = try Agent.init(allocator, io, config, &ln, env, &registry);
+    var agent = try Agent.init(allocator, io, &config, &ln, env, &registry);
     defer agent.deinit();
 
     agent.startSession(resume_id) catch |err| {
