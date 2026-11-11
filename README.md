@@ -67,15 +67,20 @@ Tool calls retain a 180-second default limit
 (`bash.timeout_seconds` accepts 1–3600), output bounds and process-group cleanup.
 Commands use `bash --noprofile --norc -c`, not `/bin/sh`.
 
-The `temp_dir` tool takes `{}` and returns `{"path":"/absolute/path"}` for a
-new, unique private directory (mode `0700`) under `$TMPDIR`, or `/tmp` if unset.
-Use existing tools such as `write`, `read`, `apply_patch` and `bash` to store,
-inspect and execute files there; no separate workspace or file API is needed.
-Paths are tracked in runtime state and saved with the session. Resuming restores
-still-existing directories without recreating deleted ones; clearing history
-keeps the paths, while a new session starts with an empty list. Directories and
-files are **not deleted on exit**. Remove them explicitly when no longer needed.
-These are ordinary host directories, not sandboxes or an extra authorization boundary.
+Every run creates one private scratch directory at startup (mode `0700`, a
+random name under `$TMPDIR`, or `/tmp` if unset) and names it, together with the
+working directory, in the system prompt. The agent is told to use it for complex
+or multi-step work and for anything that would change the user's system,
+settings or configuration, so the workspace and the host stay untouched; only
+the finished deliverable is copied back. Existing tools such as `write`, `read`,
+`apply_patch` and `bash` work there, so no separate file API is needed. Because
+the directory belongs to the process, agents started at the same time never
+share a path, and a resumed session gets a fresh one instead of adopting an old
+one. The directory is not saved with the session, and nothing is removed at
+exit while it still holds files: an empty one is deleted, a used one is left as
+it is, so remove it explicitly when no longer needed (`/status` shows the
+current path). These are ordinary host directories, not sandboxes or an extra
+authorization boundary.
 
 ```sh
 cd /path/to/project

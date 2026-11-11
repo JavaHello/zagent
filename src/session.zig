@@ -2,8 +2,7 @@
 const std = @import("std");
 const openai = @import("openai.zig");
 const Message = openai.Message;
-const TempDirs = @import("temp_dirs.zig").State;
-const Snapshot = struct { version: u32 = 1, workspace: []const u8, messages: []Message, temp_dirs: []const []const u8 = &.{} };
+const Snapshot = struct { version: u32 = 1, workspace: []const u8, messages: []Message };
 
 pub fn newId(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
@@ -31,14 +30,10 @@ test "session IDs are unique and cannot escape the session directory" {
 }
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages: []Message) !void {
-    return saveWithTempDirs(io, allocator, path, messages, &.{});
-}
-
-pub fn saveWithTempDirs(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages: []Message, temp_dirs: []const []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     const workspace = try cwd.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(workspace);
-    const data = try std.json.Stringify.valueAlloc(allocator, Snapshot{ .workspace = workspace, .messages = messages, .temp_dirs = temp_dirs }, .{});
+    const data = try std.json.Stringify.valueAlloc(allocator, Snapshot{ .workspace = workspace, .messages = messages }, .{});
     defer allocator.free(data);
     const temporary = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(temporary);
@@ -53,17 +48,15 @@ pub fn saveWithTempDirs(io: std.Io, allocator: std.mem.Allocator, path: []const 
 /// Returns an owned list with canonical static role strings, ready for Agent.
 /// A missing session is a new conversation. A corrupt/wrong-workspace one fails.
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(Message) {
-    return loadWithTempDirs(io, allocator, path, null);
-}
-
-pub fn loadWithTempDirs(io: std.Io, allocator: std.mem.Allocator, path: []const u8, temp_dirs: ?*TempDirs) !std.ArrayList(Message) {
     const cwd = std.Io.Dir.cwd();
     const data = cwd.readFileAlloc(io, path, allocator, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .empty,
         else => return err,
     };
     defer allocator.free(data);
-    const parsed = try std.json.parseFromSlice(Snapshot, allocator, data, .{});
+    // Unknown keys are ignored on purpose: an older build also recorded its
+    // scratch directories in the snapshot, and those sessions must still load.
+    const parsed = try std.json.parseFromSlice(Snapshot, allocator, data, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (parsed.value.version != 1) return error.UnsupportedSessionVersion;
     const workspace = try cwd.realPathFileAlloc(io, ".", allocator);
@@ -114,7 +107,6 @@ pub fn loadWithTempDirs(io: std.Io, allocator: std.mem.Allocator, path: []const 
         try messages.append(allocator, message);
     }
     if (pending != null) return error.InvalidSessionToolSequence;
-    if (temp_dirs) |state| try state.restore(io, allocator, parsed.value.temp_dirs);
     return messages;
 }
 

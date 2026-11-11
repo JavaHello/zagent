@@ -48,7 +48,6 @@ pub const ToolResult = struct {
 /// the line to itself.
 pub fn progressLabel(name: []const u8) ?[]const u8 {
     const labels = [_]struct { name: []const u8, label: []const u8 }{
-        .{ .name = "temp_dir", .label = "temp_dir…" },
         .{ .name = "bash", .label = "bash…" },
         .{ .name = "read", .label = "read…" },
         .{ .name = "write", .label = "write…" },

@@ -59,12 +59,6 @@ pub const memory_search = ToolDefinition{
     ,
 };
 
-pub const temp_dir = ToolDefinition{
-    .name = "temp_dir",
-    .description = "Create a unique private temporary directory and return its absolute path. Reuse existing read/write/apply_patch/bash tools inside it. Paths are recorded in global runtime state and the session; surviving directories are reusable after resume. Every call creates a new directory. No automatic cleanup or sandbox isolation.",
-    .parameters_json = "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
-};
-
 pub const bash = ToolDefinition{
     .name = "bash",
     .description = "Execute a Bash command and return its output. Use this to run programs, inspect the system, manage files, and more.",
@@ -172,9 +166,9 @@ pub const remember = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,     read,     write, apply_patch, ls,
-    rg,            fd,       grep,     find,  http,        ask_user,
-    remember,      temp_dir, set_task,
+    memory_search, bash,     read, write, apply_patch, ls,
+    rg,            fd,       grep, find,  http,        ask_user,
+    remember,      set_task,
 };
 
 test "built-in definitions have valid schemas and unique names" {

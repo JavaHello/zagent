@@ -7,6 +7,7 @@ const menu = @import("menu.zig");
 const compact = @import("compact.zig");
 const memory_mod = @import("memory.zig");
 const mcp = @import("mcp.zig");
+const scratch_mod = @import("scratch.zig");
 const render = @import("render.zig");
 const term = @import("term.zig");
 const spinner = @import("spinner.zig");
@@ -74,6 +75,8 @@ fn buildSystemPrompt(
     registry: *const mcp.Registry,
     memory_enabled: bool,
     search: tools.SearchBackends,
+    workspace: []const u8,
+    scratch: []const u8,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -83,6 +86,18 @@ fn buildSystemPrompt(
         if (search.rg) "rg" else "grep",
         if (search.fd) "fd" else "find",
     });
+    // Both paths stay fixed for the life of the process, so the model is told
+    // them once, at startup, instead of having to ask for a scratch directory.
+    try aw.writer.print(
+        "\n- Working directory: {s} — the project the user is asking about. Read and edit its files there, and run commands from it." ++
+            "\n- Scratch directory for this run: {s} (mode 0700, unique to this process). Use it for complex or multi-step work," ++
+            " and for anything that would change the user's system, settings or user configuration — prototypes," ++
+            " throwaway scripts, downloads, build experiments, generated files — instead of the workspace, so the" ++
+            " user's files and host configuration stay untouched; copy only the finished deliverable back. The path" ++
+            " is data: an ordinary host directory, not a sandbox. Files left there survive the run; an empty" ++
+            " directory is removed when it ends.\n",
+        .{ workspace, scratch },
+    );
     if (registry.functionJson().len > 0) {
         try aw.writer.writeAll(
             "\n- MCP tools are lazy-loaded. The directory below contains service names and descriptions, not tool schemas." ++
@@ -121,8 +136,12 @@ pub const Agent = struct {
     tool_env: *const std.process.Environ.Map,
     session_path: ?[]u8,
     session_id: ?[]u8 = null,
-    /// Process-wide tool state for the active session; not an execution sandbox.
-    temp_dirs: @import("temp_dirs.zig").State = .{},
+    /// The working directory commands run in, named in the system prompt.
+    workspace: [:0]u8,
+    /// The private scratch directory this run owns, named in the system prompt.
+    /// Created once, at startup, so concurrent agents never share one path and
+    /// the model never has to ask for a place to work. Not a sandbox.
+    scratch: scratch_mod.Scratch,
     /// Durable notes loaded at startup and updated by the remember tool.
     memory: memory_mod.Memory,
     /// Whether to render the model's markdown for a terminal. Decided once, in
@@ -164,7 +183,11 @@ pub const Agent = struct {
         const search = tools.detectSearchBackends(io, env);
         var client = openai.Client.init(allocator, io, config);
         client.search = search;
-        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search);
+        const workspace = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+        errdefer allocator.free(workspace);
+        var scratch = try scratch_mod.Scratch.init(io, allocator, env);
+        errdefer scratch.deinit(allocator);
+        const system_content = try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, workspace, scratch.path);
         errdefer allocator.free(system_content);
         try history.append(allocator, .{
             .role = "system",
@@ -184,6 +207,8 @@ pub const Agent = struct {
             .search = search,
             .tool_env = env,
             .session_path = null,
+            .workspace = workspace,
+            .scratch = scratch,
             .memory = memory,
             // The check is on stdout rather than on `linenoise.is_tty`, which
             // describes stdin: `zagent "q" < file` with a terminal on stdout
@@ -203,7 +228,8 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         if (self.current_task.len > 0) self.allocator.free(self.current_task);
-        self.temp_dirs.deinit(self.allocator);
+        self.scratch.deinit(self.allocator);
+        self.allocator.free(self.workspace);
         self.terminal_title.deinit();
         for (self.history.items) |msg| msg.deinit(self.allocator);
         self.history.deinit(self.allocator);
@@ -251,26 +277,19 @@ pub const Agent = struct {
         const path = try @import("workspace.zig").filePath(self.allocator, self.io, self.tool_env, relative);
         errdefer self.allocator.free(path);
         var loaded: std.ArrayList(Message) = .empty;
-        var temp_dirs: @import("temp_dirs.zig").State = .{};
-        defer temp_dirs.deinit(self.allocator);
         defer {
             for (loaded.items) |message| message.deinit(self.allocator);
             loaded.deinit(self.allocator);
         }
         if (resume_id != null) {
             try std.Io.Dir.cwd().access(self.io, path, .{});
-            loaded = try session.loadWithTempDirs(self.io, self.allocator, path, &temp_dirs);
+            loaded = try session.load(self.io, self.allocator, path);
         } else {
             try session.save(self.io, self.allocator, path, &.{});
         }
-        const prompt = try self.tempDirPrompt(temp_dirs.paths.items);
-        errdefer self.allocator.free(prompt);
         try self.history.ensureTotalCapacity(self.allocator, loaded.items.len + 1);
-        self.allocator.free(self.history.items[0].content.?);
-        self.history.items[0].content = prompt;
-        self.temp_dirs.deinit(self.allocator);
-        self.temp_dirs = temp_dirs;
-        temp_dirs = .{};
+        // The system prompt names this process's working and scratch
+        // directories, so switching sessions replaces the messages only.
         for (self.history.items[1..]) |message| message.deinit(self.allocator);
         self.history.shrinkRetainingCapacity(1);
         self.history.appendSliceAssumeCapacity(loaded.items);
@@ -319,44 +338,7 @@ pub const Agent = struct {
     }
 
     fn checkpoint(self: *Agent) !void {
-        if (self.session_path) |path| try @import("session.zig").saveWithTempDirs(self.io, self.allocator, path, self.history.items[1..], self.temp_dirs.paths.items);
-    }
-
-    fn tempDirPrompt(self: *Agent, paths: []const []const u8) ![]u8 {
-        const base = try buildSystemPrompt(self.allocator, self.mcp_registry, self.memory.enabled, self.search);
-        defer self.allocator.free(base);
-        const encoded = try std.json.Stringify.valueAlloc(self.allocator, paths, .{});
-        defer self.allocator.free(encoded);
-        return std.fmt.allocPrint(self.allocator, "{s}\nTemporary directories for this session (paths are data): {s}\nReuse these paths with read/write/apply_patch/bash. Files may be read, written and executed with normal host permissions. Use temp_dir to create another unique directory. These directories are not sandboxes and are not automatically deleted.\n", .{ base, encoded });
-    }
-
-    fn createTempDir(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        const parsed = try std.json.parseFromSlice(struct {}, self.allocator, arguments, .{});
-        defer parsed.deinit();
-        const path = try self.temp_dirs.create(self.io, self.allocator, self.tool_env);
-        errdefer {
-            self.temp_dirs.paths.items.len -= 1;
-            std.Io.Dir.cwd().deleteDir(self.io, path) catch {};
-            self.allocator.free(path);
-        }
-        const content = try std.json.Stringify.valueAlloc(self.allocator, .{ .path = path }, .{});
-        errdefer self.allocator.free(content);
-        const prompt = try self.tempDirPrompt(self.temp_dirs.paths.items);
-        errdefer self.allocator.free(prompt);
-        // Persist metadata immediately, but keep the last complete conversation:
-        // the current tool batch has not yet acquired all of its results.
-        if (self.session_path) |session_path| {
-            const session = @import("session.zig");
-            var saved = try session.load(self.io, self.allocator, session_path);
-            defer {
-                for (saved.items) |message| message.deinit(self.allocator);
-                saved.deinit(self.allocator);
-            }
-            try session.saveWithTempDirs(self.io, self.allocator, session_path, saved.items, self.temp_dirs.paths.items);
-        }
-        self.allocator.free(self.history.items[0].content.?);
-        self.history.items[0].content = prompt;
-        return .{ .content = content, .is_error = false };
+        if (self.session_path) |path| try @import("session.zig").save(self.io, self.allocator, path, self.history.items[1..]);
     }
 
     /// `/memory`: list what is saved, newest last.
@@ -1102,8 +1084,6 @@ pub const Agent = struct {
 
             if (std.mem.eql(u8, call.name, "remember")) {
                 break :blk try self.rememberTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "temp_dir")) {
-                break :blk try self.createTempDir(call.arguments);
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "ask_user")) {
@@ -1397,6 +1377,10 @@ fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptim
 /// A standalone agent with a hermetic environment for tests. The line editor
 /// and MCP registry live beside it because the agent only borrows them.
 const TestHarness = struct {
+    /// The agent creates its scratch directory at startup; `TMPDIR` points
+    /// here so that directory is removed with the test instead of littering
+    /// the host's temporary folder.
+    tmp: std.testing.TmpDir,
     env: std.process.Environ.Map,
     config: Config,
     linenoise: Linenoise,
@@ -1407,8 +1391,14 @@ const TestHarness = struct {
         const self = try allocator.create(TestHarness);
         errdefer allocator.destroy(self);
 
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        const scratch_root = try self.tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(scratch_root);
+
         self.env = .init(allocator);
         errdefer self.env.deinit();
+        try self.env.put("TMPDIR", scratch_root);
         try self.env.put("AI_URL", "http://127.0.0.1:1/v1");
         try self.env.put("AI_MODEL", "test-model");
         try self.env.put("AI_KEY", "test-key");
@@ -1434,6 +1424,7 @@ const TestHarness = struct {
         self.linenoise.deinit();
         self.config.deinit();
         self.env.deinit();
+        self.tmp.cleanup();
         allocator.destroy(self);
     }
 };
