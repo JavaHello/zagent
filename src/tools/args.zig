@@ -1,5 +1,26 @@
 const std = @import("std");
 
+/// A required string argument, owned by the caller. Absent, null or a
+/// non-string value is refused rather than guessed at; the tool that asked for
+/// it turns the error into the message it gives the model.
+pub fn requiredString(allocator: std.mem.Allocator, arguments: []const u8, field: []const u8) ![]const u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+    const value = parsed.value.object.get(field) orelse return error.MissingField;
+    if (value != .string) return error.InvalidFieldType;
+    return allocator.dupe(u8, value.string);
+}
+
+/// Whether the call names `field` at all. Arguments that do not parse are not
+/// this check's business: the tool's own parser reports them.
+pub fn hasField(allocator: std.mem.Allocator, arguments: []const u8, field: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get(field) != null;
+}
+
 pub fn optionalUnsigned(value: ?std.json.Value, minimum: usize) !?usize {
     const field = value orelse return null;
     if (field != .integer) return error.InvalidArguments;

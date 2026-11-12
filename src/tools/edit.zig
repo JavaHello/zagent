@@ -1,7 +1,35 @@
 const std = @import("std");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
+
+/// The edit tool: one exact, unique block replaced in an existing file.
+pub const spec: tool.Tool = .{
+    .name = "edit",
+    .description = "Replace one exact, unique text block in an existing file. Missing or ambiguous matches change nothing. Use write to create or overwrite a whole file.",
+    .parameters_json =
+    \\{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","minLength":1,"description":"Exact non-empty text to replace"},"new_text":{"type":"string","description":"Replacement text; may be empty"}},"required":["path","old_text","new_text"],"additionalProperties":false}
+    ,
+    .label = "edit…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    // All three fields are required and no other field is read: a call carrying
+    // `content` is a `write` call, and is told so rather than editing anything.
+    const parsed = std.json.parseFromSlice(Arguments, ctx.allocator, arguments, .{}) catch
+        return ctx.refuse("Error: edit requires 'path', 'old_text' and 'new_text' strings; do not pass 'content'");
+    defer parsed.deinit();
+    return editFile(ctx.io, ctx.allocator, parsed.value.path, parsed.value.old_text, parsed.value.new_text);
+}
+
+/// The arguments of one edit call, as the model sent them.
+const Arguments = struct {
+    path: []const u8,
+    old_text: []const u8,
+    new_text: []const u8,
+};
 
 /// Replace one exact, unique text block without requiring hunk line counts.
 pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_text: []const u8, new_text: []const u8) !ToolResult {

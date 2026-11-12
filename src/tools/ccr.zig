@@ -11,6 +11,7 @@
 const std = @import("std");
 const args_mod = @import("args.zig");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
 const read = @import("read.zig");
 const util = @import("util.zig");
 
@@ -218,6 +219,24 @@ pub fn parseArgs(allocator: std.mem.Allocator, arguments: []const u8) !RetrieveA
         .limit = try optionalUnsigned(fields.get("limit"), 1),
         .query = query,
     };
+}
+
+/// The ccr_retrieve tool: read back what a long `bash` output was cached as.
+pub const spec: tool.Tool = .{
+    .name = "ccr_retrieve",
+    .description = "Read back the cached output of a long command. A bash result that was too long for one result names an id and how many lines and bytes it holds; call this with that id to page through it, or with a query to find the lines that contain text (ignoring case). Without a query, offset is a 1-based line number and limit a count of lines, and the page names the offset the next one starts at; with a query, offset counts matching lines.",
+    .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string","description":"The hex id a cached result named"},"offset":{"type":"integer","minimum":1,"description":"1-based first line, or first matching line when query is given; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to return; defaults to as many as the page holds"},"query":{"type":"string","description":"Only the lines containing this text, matched without regard to case"}},"required":["id"],"additionalProperties":false}
+    ,
+    .label = "ccr_retrieve…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    const dir = ctx.cache_dir orelse return ctx.refuse(
+        "Error: no cached output is available here: ccr_retrieve reads this run's scratch directory, and this call was given none. Run the command again with its output going to a file, and read that file in pages.",
+    );
+    return retrieve(ctx.io, ctx.allocator, dir, arguments);
 }
 
 /// Read back what a `bash` result cached: one page of it, or the lines that

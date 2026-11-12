@@ -1,12 +1,33 @@
 const std = @import("std");
 const args_mod = @import("args.zig");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
 
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
 const finalizeResultLimited = result_mod.finalizeResultLimited;
 const max_output_bytes = result_mod.max_output_bytes;
 const optionalString = args_mod.optionalString;
+
+/// The http tool: one request, its answer, or the file its body was saved to.
+pub const spec: tool.Tool = .{
+    .name = "http",
+    .description = "Make an HTTP request and return its status line, headers and body, or save the body to a file.",
+    .parameters_json =
+    \\{"type":"object","properties":{"url":{"type":"string","description":"The full URL, including the scheme"},"method":{"type":"string","description":"HTTP method: GET, HEAD, POST, PUT, PATCH, DELETE, or OPTIONS. Defaults to GET"},"headers":{"type":"object","description":"Request headers as name/value pairs","additionalProperties":{"type":"string"}},"body":{"type":"string","description":"Request body, for a method that takes one"},"save_to":{"type":"string","description":"Write the response body to this file path instead of returning it"}},"required":["url"]}
+    ,
+    .label = "http…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    const request = parseHttpRequest(ctx.allocator, arguments) catch |err| return ctx.refuseFmt(
+        "Error: http arguments are unusable ({s}); it needs a 'url', and a 'method', 'headers', 'body', and 'save_to' it can use",
+        .{@errorName(err)},
+    );
+    defer request.deinit(ctx.allocator);
+    return httpRequest(ctx.io, ctx.allocator, request);
+}
 
 /// How many redirects a request without a body is followed through.
 const http_max_redirects: u16 = 5;

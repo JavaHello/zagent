@@ -1,6 +1,7 @@
 const std = @import("std");
 const args_mod = @import("args.zig");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -94,6 +95,27 @@ pub fn appendNumberedLine(body: *std.ArrayList(u8), allocator: std.mem.Allocator
     try body.append(allocator, ':');
     try body.appendSlice(allocator, line_text);
     try body.append(allocator, '\n');
+}
+
+/// The read tool: one numbered page of one file.
+pub const spec: tool.Tool = .{
+    .name = "read",
+    .description = "Read a file page, numbered by line. Follow the next offset for more; use limit to request fewer lines.",
+    .parameters_json =
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"integer","minimum":1,"description":"1-based number of the first line to read; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to read; defaults to as many as the output page holds"}},"required":["path"]}
+    ,
+    .label = "read…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    const path = args_mod.requiredString(ctx.allocator, arguments, "path") catch
+        return ctx.refuse("Error: missing 'path' argument");
+    defer ctx.allocator.free(path);
+    const page = parseReadPage(ctx.allocator, arguments) catch return ctx.refuse(
+        "Error: read takes a path plus an optional 'offset' (1-based first line) and 'limit' (line count), both integers of at least 1",
+    );
+    return readFilePage(ctx.io, ctx.allocator, path, page);
 }
 
 /// Read a page of a file, each line carrying the number it has in the file.

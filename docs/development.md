@@ -65,6 +65,7 @@ src/
     status.zig   — Status and quota formatting
   tools/         — The built-in tools, one file per tool
     mod.zig      — Re-exports the tool API the rest of the program uses
+    tool.zig     — What a built-in tool is: name, description, schema, label, run
     bash.zig     — bash
     read.zig     — read: one numbered page of a file
     write.zig    — write: whole-file writes
@@ -78,11 +79,11 @@ src/
     http.zig     — http
     search.zig   — What the four search tools share: backends, arguments, paging
     result.zig   — ToolResult, the output limit, sanitising and truncation
-    dispatch.zig — Sending one call to the tool that answers it, in this process
+    dispatch.zig — Sending one call to the tool that answers it, statically, in this process
     args.zig     — Reading a call's JSON arguments
     progress.zig — The label shown while a tool runs
     util.zig     — Helpers several tools share
-    schema.zig   — The JSON schema of every built-in tool
+    schema.zig   — The JSON schema of every built-in tool, from the tools' specs
   host/          — Running a program on the host
     exec.zig     — Deadline, bounded output, process-group cleanup
     sysinfo.zig  — What machine this is: OS, kernel, architecture, CPUs, memory
@@ -125,6 +126,32 @@ build.zig     — Zig build script
 
 The line editor lives in `src/editor` and the character-width implementation in
 `src/unicode_width`; neither needs a local package dependency.
+
+## Adding a built-in tool
+
+A built-in host tool is one file under `src/tools/`. It declares a
+`pub const spec: tool.Tool` — the name the model calls, the description and JSON
+schema it is offered, the label the terminal shows while it runs, and the `run`
+function that answers a call — and that one declaration is what every other user
+of the tool reads:
+
+- `dispatch.zig` lists the spec, and `inline for` over the specs resolves a call
+  to its `run` when the program is built, with no lookup at run time;
+- `schema.zig` derives the definition the model is offered from the same spec,
+  so a tool cannot be advertised without being runnable, or the reverse;
+- `progress.zig` takes the label from the same spec.
+
+The tool's `run(ctx, arguments)` parses and validates its own JSON arguments: a
+call it cannot use comes back as a `ToolResult` with `is_error` set and a
+sentence saying what to fix, rather than as an error. `ctx` carries the `std.Io`,
+the allocator, and — for a tool that starts a program or reads cached output —
+the environment to hand it and this run's `cache_dir`.
+
+The tools the agent answers itself — memory, the plan, sub-agents, questions to
+the user, the MCP loader and `announce_task` — are listed the same way beside
+their methods in `src/agent/mod.zig` (`session_tools`). Only a tool of a
+connected MCP server is matched by its prefix rather than by name, because its
+name is the server's.
 
 ## Documentation
 

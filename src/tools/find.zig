@@ -1,6 +1,8 @@
 const std = @import("std");
 const grep_mod = @import("grep.zig");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
+const args_mod = @import("args.zig");
 const search = @import("search.zig");
 const util = @import("util.zig");
 
@@ -10,6 +12,27 @@ const runSearch = search.runSearch;
 const grep = grep_mod.grep;
 const expectArgv = util.expectArgv;
 const fixturePath = util.fixturePath;
+
+/// The find tool: find files and directories by name glob.
+pub const spec: tool.Tool = .{
+    .name = "find",
+    .description = "Find files and directories by name glob using find. Prunes .git; includes hidden entries; does not read ignore files.",
+    .parameters_json =
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Name glob, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search; defaults to ."}},"required":["pattern"]}
+    ,
+    .label = "find…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    if (args_mod.hasField(ctx.allocator, arguments, "offset")) return ctx.refuseOffset("find");
+    const args = search.parseFindArgs(ctx.allocator, arguments) catch |err| return ctx.refuseFmt(
+        "Error: find arguments are unusable ({s}); it needs a non-empty 'pattern' holding a glob, and a 'path' it can use",
+        .{@errorName(err)},
+    );
+    defer args.deinit(ctx.allocator);
+    return find(ctx.io, ctx.allocator, args);
+}
 
 pub fn findArgv(allocator: std.mem.Allocator, args: FindArgs) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;

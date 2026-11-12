@@ -1,30 +1,27 @@
 const std = @import("std");
+const dispatch = @import("dispatch.zig");
 
 /// A label for the animation shown while `name` runs, or null for a tool that
 /// must not have one.
 ///
-/// The names are written out rather than taken from the call: a tool name is
+/// A host tool's label is the one its own spec declares, so a tool is named
+/// once whether the terminal is showing it, the model is being told about it,
+/// or a call is being dispatched to it. The tools the agent answers itself are
+/// not in that list, so their labels are written here.
+///
+/// The labels are written down rather than taken from the call: a tool name is
 /// model output, and a name carrying escape sequences would be written straight
 /// into the terminal (see `text.zig`). `ask_user` is deliberately absent — it
 /// asks a question on the terminal and reads the answer from it, so it needs
 /// the line to itself.
 pub fn progressLabel(name: []const u8) ?[]const u8 {
+    inline for (dispatch.all) |spec| {
+        if (std.mem.eql(u8, name, spec.name)) return spec.label;
+    }
     const labels = [_]struct { name: []const u8, label: []const u8 }{
-        .{ .name = "bash", .label = "bash…" },
-        .{ .name = "read", .label = "read…" },
-        .{ .name = "write", .label = "write…" },
-        .{ .name = "edit", .label = "edit…" },
-        .{ .name = "ls", .label = "ls…" },
-        .{ .name = "rg", .label = "rg…" },
-        .{ .name = "fd", .label = "fd…" },
-        .{ .name = "apply_patch", .label = "apply_patch…" },
-        .{ .name = "grep", .label = "grep…" },
-        .{ .name = "find", .label = "find…" },
-        .{ .name = "http", .label = "http…" },
         .{ .name = "memory_save", .label = "saving memory…" },
         .{ .name = "memory_search", .label = "searching memory…" },
         .{ .name = "plan", .label = "plan…" },
-        .{ .name = "ccr_retrieve", .label = "ccr_retrieve…" },
     };
     for (labels) |entry| {
         if (std.mem.eql(u8, name, entry.name)) return entry.label;

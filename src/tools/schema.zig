@@ -1,4 +1,6 @@
 const std = @import("std");
+const dispatch = @import("dispatch.zig");
+const tool_mod = @import("tool.zig");
 
 /// A built-in tool definition, independent of any request or tool selection.
 /// parameters_json is parsed before embedding, never spliced into JSON output.
@@ -51,125 +53,42 @@ test "tool definitions serialize strings and reject non-object schemas" {
     try std.testing.expectError(error.SyntaxError, invalid.function(arena_state.allocator()));
 }
 
+/// The definition the model is given of a host tool, taken from the spec the
+/// tool's own file declares. The list the model is offered is built from the
+/// same specs a call is dispatched through, so a tool cannot be advertised
+/// without being runnable, or run without being advertised.
+fn hostDefinition(comptime spec: tool_mod.Tool) ToolDefinition {
+    return .{
+        .name = spec.name,
+        .description = spec.description,
+        .parameters_json = spec.parameters_json,
+    };
+}
+
+// The host tools: the ones `tools/dispatch.zig` runs, each described in the
+// file that implements it.
+pub const bash = hostDefinition(dispatch.specOf("bash"));
+pub const ccr_retrieve = hostDefinition(dispatch.specOf("ccr_retrieve"));
+pub const read = hostDefinition(dispatch.specOf("read"));
+pub const write = hostDefinition(dispatch.specOf("write"));
+pub const edit = hostDefinition(dispatch.specOf("edit"));
+pub const apply_patch = hostDefinition(dispatch.specOf("apply_patch"));
+pub const ls = hostDefinition(dispatch.specOf("ls"));
+pub const rg = hostDefinition(dispatch.specOf("rg"));
+pub const fd = hostDefinition(dispatch.specOf("fd"));
+pub const grep = hostDefinition(dispatch.specOf("grep"));
+pub const find = hostDefinition(dispatch.specOf("find"));
+pub const http = hostDefinition(dispatch.specOf("http"));
+
+// The tools the agent itself answers. They work on the session's own state —
+// its memory, its plan, its second agents, its questions to the user — so they
+// are methods of the agent rather than files under `tools/`, and their
+// definitions are written here.
 pub const memory_search = ToolDefinition{
     .name = "memory_search",
     .description = "Search durable workspace notes by keyword and return the ranked matches. Lexical matching for Chinese and English, not semantic.",
     .parameters_json =
     \\{"type":"object","properties":{"query":{"type":"string","description":"Short keywords, non-empty UTF-8, at most 512 bytes"},"limit":{"type":"integer","minimum":1,"maximum":10,"description":"Maximum notes to return, default 5"}},"required":["query"]}
-    ,
-};
-
-pub const bash = ToolDefinition{
-    .name = "bash",
-    .description = "Execute a Bash command once. Output larger than 8 KiB is cached: the call returns its last lines, the cache id, its line count and its size, and ccr_retrieve reads the rest by id.",
-    .parameters_json =
-    \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}
-    ,
-};
-
-pub const ccr_retrieve = ToolDefinition{
-    .name = "ccr_retrieve",
-    .description = "Read back the cached output of a long command. A bash result that was too long for one result names an id and how many lines and bytes it holds; call this with that id to page through it, or with a query to find the lines that contain text (ignoring case). Without a query, offset is a 1-based line number and limit a count of lines, and the page names the offset the next one starts at; with a query, offset counts matching lines.",
-    .parameters_json =
-    \\{"type":"object","properties":{"id":{"type":"string","description":"The hex id a cached result named"},"offset":{"type":"integer","minimum":1,"description":"1-based first line, or first matching line when query is given; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to return; defaults to as many as the page holds"},"query":{"type":"string","description":"Only the lines containing this text, matched without regard to case"}},"required":["id"],"additionalProperties":false}
-    ,
-};
-
-pub const read = ToolDefinition{
-    .name = "read",
-    .description = "Read a file page, numbered by line. Follow the next offset for more; use limit to request fewer lines.",
-    .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"integer","minimum":1,"description":"1-based number of the first line to read; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to read; defaults to as many as the output page holds"}},"required":["path"]}
-    ,
-};
-
-pub const write = ToolDefinition{
-    .name = "write",
-    .description = "Create or overwrite an entire file with content. Use edit for exact text replacements.",
-    .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Entire file contents for creation or full replacement"}},"required":["path","content"],"additionalProperties":false}
-    ,
-};
-
-pub const edit = ToolDefinition{
-    .name = "edit",
-    .description = "Replace one exact, unique text block in an existing file. Missing or ambiguous matches change nothing. Use write to create or overwrite a whole file.",
-    .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","minLength":1,"description":"Exact non-empty text to replace"},"new_text":{"type":"string","description":"Replacement text; may be empty"}},"required":["path","old_text","new_text"],"additionalProperties":false}
-    ,
-};
-
-test "write and edit have separate required arguments" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const w = try write.function(arena.allocator());
-    const e = try edit.function(arena.allocator());
-    const wr = w.parameters.object.get("required").?.array.items;
-    const er = e.parameters.object.get("required").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), wr.len);
-    try std.testing.expectEqualStrings("path", wr[0].string);
-    try std.testing.expectEqualStrings("content", wr[1].string);
-    try std.testing.expectEqual(@as(usize, 3), er.len);
-    try std.testing.expectEqualStrings("path", er[0].string);
-    try std.testing.expectEqualStrings("old_text", er[1].string);
-    try std.testing.expectEqualStrings("new_text", er[2].string);
-    try std.testing.expect(!w.parameters.object.get("properties").?.object.contains("old_text"));
-    try std.testing.expect(!e.parameters.object.get("properties").?.object.contains("content"));
-}
-
-pub const apply_patch = ToolDefinition{
-    .name = "apply_patch",
-    .description = "Apply a Git unified diff patch.",
-    .parameters_json =
-    \\{"type":"object","properties":{"patch":{"type":"string","description":"The Git Unified Diff to apply, with its newlines"}},"required":["patch"]}
-    ,
-};
-
-pub const ls = ToolDefinition{
-    .name = "ls",
-    .description = "List directory entries in sorted order, at most 'limit' of them, each with its kind.",
-    .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Directory path, defaults to the current directory","default":"."},"limit":{"type":"integer","minimum":1,"maximum":1000,"description":"Most entries to list, default 100"}},"required":[]}
-    ,
-};
-
-pub const rg = ToolDefinition{
-    .name = "rg",
-    .description = "Search file contents with a regular expression and return matching lines with file and line number. Skips binary files. Results are paged; narrow pattern, path or glob when more remain.",
-    .parameters_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob to search (e.g. README* or src/*.zig); defaults to the current directory. Path globs expand before searching, unlike the recursive glob filter."},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"},"context_lines":{"type":"integer","minimum":0,"description":"Number of surrounding lines before and after each match; defaults to 0"},"max_matches":{"type":"integer","minimum":1,"description":"Stop after this many matching lines per file (not a global limit); defaults to unlimited."},"hidden":{"type":"boolean","description":"Include hidden files (default false)"},"no_ignore":{"type":"boolean","description":"Disable ignore files (default false)"}},"required":["pattern"]}
-    ,
-};
-
-pub const fd = ToolDefinition{
-    .name = "fd",
-    .description = "Find files and directories whose names match a glob and return their paths.",
-    .parameters_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob the name must match, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search in, defaults to the current directory"},"hidden":{"type":"boolean","description":"Include hidden entries (default false)"},"no_ignore":{"type":"boolean","description":"Disable ignore files (default false)"}},"required":["pattern"]}
-    ,
-};
-
-pub const grep = ToolDefinition{
-    .name = "grep",
-    .description = "Search file contents with grep extended regular expressions and return matching lines with file and line numbers. Skips binary files and .git; includes hidden files; does not read ignore files.",
-    .parameters_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Extended regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob (e.g. README*); defaults to ."},"glob":{"type":"string","description":"Only search files whose names match this glob"},"ignore_case":{"type":"boolean"},"context_lines":{"type":"integer","minimum":0},"max_matches":{"type":"integer","minimum":1}},"required":["pattern"]}
-    ,
-};
-
-pub const find = ToolDefinition{
-    .name = "find",
-    .description = "Find files and directories by name glob using find. Prunes .git; includes hidden entries; does not read ignore files.",
-    .parameters_json =
-    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Name glob, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search; defaults to ."}},"required":["pattern"]}
-    ,
-};
-
-pub const http = ToolDefinition{
-    .name = "http",
-    .description = "Make an HTTP request and return its status line, headers and body, or save the body to a file.",
-    .parameters_json =
-    \\{"type":"object","properties":{"url":{"type":"string","description":"The full URL, including the scheme"},"method":{"type":"string","description":"HTTP method: GET, HEAD, POST, PUT, PATCH, DELETE, or OPTIONS. Defaults to GET"},"headers":{"type":"object","description":"Request headers as name/value pairs","additionalProperties":{"type":"string"}},"body":{"type":"string","description":"Request body, for a method that takes one"},"save_to":{"type":"string","description":"Write the response body to this file path instead of returning it"}},"required":["url"]}
     ,
 };
 
@@ -237,6 +156,24 @@ pub const builtin = [_]ToolDefinition{
     announce_task, plan, subagent, subagent_stop, report, ccr_retrieve,
 };
 
+test "write and edit have separate required arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const w = try write.function(arena.allocator());
+    const e = try edit.function(arena.allocator());
+    const wr = w.parameters.object.get("required").?.array.items;
+    const er = e.parameters.object.get("required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), wr.len);
+    try std.testing.expectEqualStrings("path", wr[0].string);
+    try std.testing.expectEqualStrings("content", wr[1].string);
+    try std.testing.expectEqual(@as(usize, 3), er.len);
+    try std.testing.expectEqualStrings("path", er[0].string);
+    try std.testing.expectEqualStrings("old_text", er[1].string);
+    try std.testing.expectEqualStrings("new_text", er[2].string);
+    try std.testing.expect(!w.parameters.object.get("properties").?.object.contains("old_text"));
+    try std.testing.expect(!e.parameters.object.get("properties").?.object.contains("content"));
+}
+
 test "built-in definitions have valid schemas and unique names" {
     const allocator = std.testing.allocator;
     var names: std.StringHashMap(void) = .init(allocator);
@@ -253,5 +190,15 @@ test "built-in definitions have valid schemas and unique names" {
         for (parsed.value.object.get("required").?.array.items) |required| {
             try std.testing.expect(properties.contains(required.string));
         }
+    }
+}
+
+test "every host tool the model is offered is one dispatch runs" {
+    for (dispatch.all) |spec| {
+        var listed = false;
+        for (builtin) |definition| {
+            if (std.mem.eql(u8, definition.name, spec.name)) listed = true;
+        }
+        try std.testing.expect(listed);
     }
 }

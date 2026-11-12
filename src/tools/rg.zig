@@ -1,5 +1,7 @@
 const std = @import("std");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
+const args_mod = @import("args.zig");
 const search = @import("search.zig");
 const util = @import("util.zig");
 
@@ -10,6 +12,27 @@ const freeGrepFlags = search.freeGrepFlags;
 const appendGrepLimits = search.appendGrepLimits;
 const runContentSearch = search.runContentSearch;
 const expectArgv = util.expectArgv;
+
+/// The rg tool: search file contents with ripgrep.
+pub const spec: tool.Tool = .{
+    .name = "rg",
+    .description = "Search file contents with a regular expression and return matching lines with file and line number. Skips binary files. Results are paged; narrow pattern, path or glob when more remain.",
+    .parameters_json =
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob to search (e.g. README* or src/*.zig); defaults to the current directory. Path globs expand before searching, unlike the recursive glob filter."},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"},"context_lines":{"type":"integer","minimum":0,"description":"Number of surrounding lines before and after each match; defaults to 0"},"max_matches":{"type":"integer","minimum":1,"description":"Stop after this many matching lines per file (not a global limit); defaults to unlimited."},"hidden":{"type":"boolean","description":"Include hidden files (default false)"},"no_ignore":{"type":"boolean","description":"Disable ignore files (default false)"}},"required":["pattern"]}
+    ,
+    .label = "rg…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    if (args_mod.hasField(ctx.allocator, arguments, "offset")) return ctx.refuseOffset("rg");
+    const args = search.parseGrepArgs(ctx.allocator, arguments) catch |err| return ctx.refuseFmt(
+        "Error: rg arguments are unusable ({s}); expected a non-empty pattern, optional path/glob strings, ignore_case boolean, context_lines integer >= 0, and max_matches integer >= 1",
+        .{@errorName(err)},
+    );
+    defer args.deinit(ctx.allocator);
+    return rg(ctx.io, ctx.allocator, args);
+}
 
 pub fn rgArgv(allocator: std.mem.Allocator, args: GrepArgs) ![]const []const u8 {
     var argv: std.ArrayList([]const u8) = .empty;

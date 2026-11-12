@@ -1,6 +1,8 @@
 const std = @import("std");
 const diff = @import("../diff/mod.zig");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
+const args_mod = @import("args.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -9,6 +11,24 @@ const max_output_bytes = result_mod.max_output_bytes;
 const fixturePath = util.fixturePath;
 
 /// The apply_patch tool: change files by applying a unified diff to them.
+pub const spec: tool.Tool = .{
+    .name = "apply_patch",
+    .description = "Apply a Git unified diff patch.",
+    .parameters_json =
+    \\{"type":"object","properties":{"patch":{"type":"string","description":"The Git Unified Diff to apply, with its newlines"}},"required":["patch"]}
+    ,
+    .label = "apply_patch…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    const patch_text = args_mod.requiredString(ctx.allocator, arguments, "patch") catch
+        return ctx.refuse("Error: missing 'patch' argument; it has to hold a unified diff");
+    defer ctx.allocator.free(patch_text);
+    return applyPatch(ctx.io, ctx.allocator, patch_text);
+}
+
+/// Apply a unified diff to the files it names.
 ///
 /// The result is a summary rather than the patch back again: the model wrote
 /// the patch, so what it does not already have is what became of it — which

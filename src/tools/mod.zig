@@ -1,7 +1,7 @@
 //! The built-in host tools, one file per tool.
 //!
-//! Each tool keeps its implementation and its tests together — `bash.zig`,
-//! `read.zig`, `write.zig`, `edit.zig`, `apply_patch.zig`, `ls.zig`, `rg.zig`, `grep.zig`,
+//! Each tool keeps its implementation, its arguments and its tests together —
+//! `bash.zig`, `read.zig`, `write.zig`, `edit.zig`, `apply_patch.zig`, `ls.zig`, `rg.zig`, `grep.zig`,
 //! `fd.zig`, `find.zig`, `http.zig` — over a small shared floor: `result.zig`
 //! for the shape and size of a result, `progress.zig` for the progress labels,
 //! `args.zig` for reading a call's JSON arguments, `search.zig` for what the
@@ -9,13 +9,19 @@
 //! `ccr.zig` is the cache a command's output is kept in when it is too long for
 //! one result, and the `ccr_retrieve` tool that reads it back.
 //!
-//! This file only re-exports them, so the rest of the program goes on speaking
-//! of `tools.readFilePage` or `tools.parseGrepArgs`. Re-exporting a file is also
-//! what puts its tests in the build: nothing else imports these modules.
+//! `tool.zig` says what a built-in tool is — its name, description, argument
+//! schema, progress label and the `run` that parses its arguments and does the
+//! work — and `dispatch.zig` lists the specs to send a call to one of them.
+//!
+//! This file re-exports them, so the rest of the program goes on speaking of
+//! `tools.readFilePage` or `tools.execute`. Re-exporting a file is also what
+//! puts its tests in the build: nothing else imports these modules.
 const std = @import("std");
 
 const result_mod = @import("result.zig");
+const tool_mod = @import("tool.zig");
 const progress = @import("progress.zig");
+const dispatch = @import("dispatch.zig");
 const bash = @import("bash.zig");
 const read = @import("read.zig");
 const write = @import("write.zig");
@@ -28,6 +34,13 @@ const find_mod = @import("find.zig");
 const fd_mod = @import("fd.zig");
 const http = @import("http.zig");
 const ccr = @import("ccr.zig");
+
+/// What a built-in tool is, and what one is given besides its arguments.
+pub const Tool = tool_mod.Tool;
+pub const Context = tool_mod.Context;
+
+/// Send one call to the built-in tool that answers it.
+pub const execute = dispatch.execute;
 
 // The shape of a tool result and the one size limit it is held to.
 pub const ToolStatus = result_mod.ToolStatus;
@@ -65,7 +78,6 @@ pub const listDirPage = ls.listDirPage;
 
 // ccr: the cached output of a command that printed more than one result holds.
 pub const ccrDirPath = ccr.dirPath;
-pub const ccrRetrieve = ccr.retrieve;
 pub const ccrSaved = ccr.Saved;
 
 // The two search families: their arguments, the backends this machine has, and

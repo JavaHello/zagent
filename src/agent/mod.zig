@@ -2085,17 +2085,86 @@ pub const Agent = struct {
         try diff.render(w, patch_text);
     }
 
+    /// What a tool this session answers itself is handed besides the call's
+    /// arguments: the agent that holds the state it works on, and — for
+    /// `ask_user` — the answers to questions this message already put to the
+    /// user.
+    const CallSite = struct {
+        agent: *Agent,
+        answers: ?*QuestionAnswers = null,
+        index: usize = 0,
+    };
+
+    /// One tool answered with this session's own state rather than the host's:
+    /// the name the model calls, the function that answers it, and whether it
+    /// is answered before its call is announced on the terminal.
+    const Answer = struct {
+        name: []const u8,
+        run: *const fn (CallSite, []const u8) anyerror!tools.ToolResult,
+        /// Answered before the call is announced, because the tool writes the
+        /// line for what it does itself and an announcement of the call above
+        /// it would say the same thing twice.
+        quiet: bool = false,
+
+        /// An entry for a tool that reads nothing of the call site but the
+        /// agent it answers for.
+        fn of(comptime name: []const u8, comptime method: anytype) Answer {
+            return .{ .name = name, .run = struct {
+                fn run(site: CallSite, arguments: []const u8) anyerror!tools.ToolResult {
+                    return method(site.agent, arguments);
+                }
+            }.run };
+        }
+    };
+
+    /// The tools this session answers itself, listed once: the name a call is
+    /// matched against sits beside the method that answers it, and dispatch
+    /// walks the list at compile time. A tool of a connected MCP server has a
+    /// name that server chose, so it is not here — see `executeTool`.
+    const session_tools = [_]Answer{
+        Answer.of("memory_save", memorySaveTool),
+        Answer.of("memory_search", memorySearchTool),
+        Answer.of("plan", planTool),
+        Answer.of("subagent", subagentTool),
+        Answer.of("subagent_stop", subagentStopTool),
+        Answer.of("report", reportTool),
+        .{ .name = "ask_user", .run = askUserTool },
+        .{ .name = mcp.Registry.loader_name, .run = loadMcpToolsTool },
+        .{ .name = "announce_task", .run = announceTaskTool, .quiet = true },
+    };
+
+    /// `ask_user` as a call answers it: the question's answer was collected
+    /// with the other questions of this message, if there was one.
+    fn askUserTool(site: CallSite, arguments: []const u8) anyerror!tools.ToolResult {
+        return site.agent.askUser(arguments, site.answers, site.index);
+    }
+
+    /// `load_mcp_tools`: list a service's tools so they can be called.
+    fn loadMcpToolsTool(site: CallSite, arguments: []const u8) anyerror!tools.ToolResult {
+        return site.agent.mcp_registry.loadTools(site.agent.allocator, arguments);
+    }
+
+    /// `announce_task` writes the terminal's task line, so it belongs to the
+    /// agent that owns the terminal: a sub-agent reports instead.
+    fn announceTaskTool(site: CallSite, arguments: []const u8) anyerror!tools.ToolResult {
+        if (site.agent.role == .subagent) return .{
+            .content = try site.agent.allocator.dupe(u8, "A sub-agent does not announce tasks: the agent that called you owns the terminal and the plan. Report back instead."),
+            .is_error = true,
+        };
+        return site.agent.announceTask(arguments);
+    }
+
     /// Run one tool call. `index` and `answers` locate the result of a question
     /// the form of this message has already put to the user, if there was one.
     fn executeTool(self: *Agent, call: ToolCallData, index: usize, answers: ?*QuestionAnswers) !tools.ToolResult {
-        if (std.mem.eql(u8, call.name, "announce_task")) {
-            if (self.role == .subagent) {
-                return .{
-                    .content = try self.allocator.dupe(u8, "A sub-agent does not announce tasks: the agent that called you owns the terminal and the plan. Report back instead."),
-                    .is_error = true,
-                };
+        const site: CallSite = .{ .agent = self, .answers = answers, .index = index };
+        // A tool that answers quietly writes the terminal's line for what it
+        // does itself, so it is answered before the call is announced rather
+        // than under an announcement of itself.
+        inline for (session_tools) |entry| {
+            if (entry.quiet) {
+                if (std.mem.eql(u8, call.name, entry.name)) return entry.run(site, call.arguments);
             }
-            return self.announceTask(call.arguments);
         }
         self.terminal_title.update(call.name, self.current_task);
         try self.announceToolCall(call);
@@ -2123,36 +2192,33 @@ pub const Agent = struct {
                 spinner.Spinner.disabled(self.io);
             defer spin.stop();
 
-            if (std.mem.eql(u8, call.name, "memory_save")) {
-                break :blk try self.memorySaveTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "memory_search")) {
-                break :blk try self.memorySearchTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "plan")) {
-                break :blk try self.planTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "subagent")) {
-                break :blk try self.subagentTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "subagent_stop")) {
-                break :blk try self.subagentStopTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "report")) {
-                break :blk try self.reportTool(call.arguments);
-            } else if (std.mem.eql(u8, call.name, "ask_user")) {
-                break :blk try self.askUser(call.arguments, answers, index);
-            } else if (std.mem.eql(u8, call.name, mcp.Registry.loader_name)) {
-                break :blk try self.mcp_registry.loadTools(self.allocator, call.arguments);
-            } else if (std.mem.startsWith(u8, call.name, mcp.tool_prefix)) {
-                // A tool of a connected MCP server: the registry knows which
-                // server it belongs to and what the server calls it.
-                break :blk try self.mcp_registry.call(self.allocator, call.name, call.arguments);
-            } else {
-                // Each agent owns a scratch tree, including sub-agents. Derive
-                // the cache path from that tree so /new's scratch reset also
-                // invalidates cached output, without carrying it in sessions.
-                const cache_dir = try tools.ccrDirPath(self.allocator, self.scratch.path);
-                defer self.allocator.free(cache_dir);
-                if (std.mem.eql(u8, call.name, "ccr_retrieve"))
-                    break :blk try tools.ccrRetrieve(self.io, self.allocator, cache_dir, call.arguments);
-                break :blk try @import("../tools/dispatch.zig").execute(self.io, self.allocator, self.tool_env, cache_dir, call.name, call.arguments);
+            // The tools this session answers itself, listed once beside the
+            // methods that answer them: the walk happens at compile time, so
+            // each call below is a direct one.
+            inline for (session_tools) |entry| {
+                if (!entry.quiet) {
+                    if (std.mem.eql(u8, call.name, entry.name))
+                        break :blk try entry.run(site, call.arguments);
+                }
             }
+            // A tool of a connected MCP server: its name is the server's, so
+            // no list here holds it; the registry knows which server it
+            // belongs to and what the server calls it.
+            if (std.mem.startsWith(u8, call.name, mcp.tool_prefix))
+                break :blk try self.mcp_registry.call(self.allocator, call.name, call.arguments);
+
+            // The host tools. Each agent owns a scratch tree, including
+            // sub-agents. Derive the cache path from that tree so /new's
+            // scratch reset also invalidates cached output, without carrying
+            // it in sessions.
+            const cache_dir = try tools.ccrDirPath(self.allocator, self.scratch.path);
+            defer self.allocator.free(cache_dir);
+            break :blk try tools.execute(.{
+                .io = self.io,
+                .allocator = self.allocator,
+                .env = self.tool_env,
+                .cache_dir = cache_dir,
+            }, call.name, call.arguments);
         };
 
         // The one place the size limit is applied, whatever the tool was: the
@@ -3256,6 +3322,28 @@ test "every tool a sub-agent is denied exists in the default set" {
             if (std.mem.eql(u8, tool.name, name)) found = true;
         }
         try std.testing.expect(found);
+    }
+}
+
+test "every session tool the model is offered is one dispatch answers" {
+    // The agent's own tools are listed twice: as definitions the model is
+    // offered, and as the table a call is answered from. A rename in either
+    // place would otherwise be found by the model's next call rather than
+    // here. Every advertised tool is therefore either a host tool or one of
+    // the agent's own.
+    const tool_schema = @import("../tools/schema.zig");
+    const dispatch = @import("../tools/dispatch.zig");
+    for (tool_schema.builtin) |definition| {
+        var host = false;
+        for (dispatch.all) |spec| {
+            if (std.mem.eql(u8, definition.name, spec.name)) host = true;
+        }
+        if (host) continue;
+        var answered = false;
+        for (Agent.session_tools) |entry| {
+            if (std.mem.eql(u8, definition.name, entry.name)) answered = true;
+        }
+        try std.testing.expect(answered);
     }
 }
 

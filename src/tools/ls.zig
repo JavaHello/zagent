@@ -1,17 +1,64 @@
 const std = @import("std");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
+const args_mod = @import("args.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
 const page_room_bytes = result_mod.page_room_bytes;
 const lessString = util.lessString;
 
+/// The most entries one call may ask for.
+const max_limit: usize = 1000;
+
+/// The ls tool: one directory, sorted, at most `limit` entries.
+pub const spec: tool.Tool = .{
+    .name = "ls",
+    .description = "List directory entries in sorted order, at most 'limit' of them, each with its kind.",
+    .parameters_json =
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Directory path, defaults to the current directory","default":"."},"limit":{"type":"integer","minimum":1,"maximum":1000,"description":"Most entries to list, default 100"}},"required":[]}
+    ,
+    .label = "ls…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    if (args_mod.hasField(ctx.allocator, arguments, "offset")) return ctx.refuseOffset("ls");
+    const args = parseArgs(ctx.allocator, arguments) catch
+        return ctx.refuse("Error: ls expects an optional 'path' string (defaults to the current directory) and a 'limit' integer");
+    defer args.deinit(ctx.allocator);
+    return listDirPage(ctx.io, ctx.allocator, args.path, .{ .limit = args.limit });
+}
+
+/// The arguments of one ls call, owned.
+const Arguments = struct {
+    path: []const u8,
+    limit: usize,
+
+    fn deinit(self: Arguments, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+    }
+};
+
+fn parseArgs(allocator: std.mem.Allocator, arguments: []const u8) !Arguments {
+    const Parsed = struct {
+        path: []const u8 = ".",
+        limit: usize = 100,
+    };
+    // Unknown fields are not read, so a call carrying something this tool does
+    // not take is answered rather than refused for it.
+    const parsed = try std.json.parseFromSlice(Parsed, allocator, arguments, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value.limit == 0 or parsed.value.limit > max_limit) return error.InvalidArguments;
+    return .{ .path = try allocator.dupe(u8, parsed.value.path), .limit = parsed.value.limit };
+}
+
 pub const Page = struct {
     limit: usize = 100,
 };
 
 pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, page: Page) !ToolResult {
-    if (page.limit == 0 or page.limit > 1000) return error.InvalidArguments;
+    if (page.limit == 0 or page.limit > max_limit) return error.InvalidArguments;
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
         return .{
             .content = try std.fmt.allocPrint(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) }),

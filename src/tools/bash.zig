@@ -1,5 +1,7 @@
 const std = @import("std");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
+const args_mod = @import("args.zig");
 const ccr = @import("ccr.zig");
 const sanitize = @import("../util/text.zig");
 const host_exec = @import("../host/exec.zig");
@@ -139,7 +141,7 @@ const Collector = struct {
         self.scratch.clearRetainingCapacity();
         var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.scratch);
         defer self.scratch = aw.toArrayList();
-        try self.sanitizers[@intFromEnum(stream)].feed(&aw.writer, raw);
+        try self.sanitizers[@backingInt(stream)].feed(&aw.writer, raw);
         try self.append(io, aw.written());
     }
 
@@ -228,7 +230,6 @@ const Collector = struct {
     }
 };
 
-
 pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
     return executeShellTimed(io, allocator, command, null, null, default_timeout_seconds);
 }
@@ -256,7 +257,7 @@ pub fn executeShellTimed(
     var collector: Collector = .{ .allocator = allocator, .cache_dir = cache_dir };
     defer collector.deinit(io);
 
-    const run = host_exec.run(io, allocator, .{
+    const shell = host_exec.run(io, allocator, .{
         .argv = &.{ "bash", "--noprofile", "--norc", "-c", command },
         .env = env,
         .timeout_seconds = timeout_seconds,
@@ -265,7 +266,7 @@ pub fn executeShellTimed(
         .is_error = true,
     };
 
-    if (run.timed_out) {
+    if (shell.timed_out) {
         // Nothing of what the command said is worth keeping: the call failed
         // for taking too long, and a half-written entry would outlive the
         // answer that would have named it.
@@ -278,7 +279,7 @@ pub fn executeShellTimed(
     }
 
     const saved = try collector.finish(io);
-    const exit_code = run.exitCode();
+    const exit_code = shell.exitCode();
     const failed = exit_code == null or exit_code.? != 0;
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -288,7 +289,7 @@ pub fn executeShellTimed(
     if (exit_code) |code| {
         try aw.writer.print("Exit code: {d}\n", .{code});
     } else {
-        try aw.writer.print("Exit code: unavailable (termination: {any})\n", .{run.term});
+        try aw.writer.print("Exit code: unavailable (termination: {any})\n", .{shell.term});
     }
 
     if (!collector.overflowed) {
@@ -353,6 +354,39 @@ pub fn executeShellTimed(
         .exit_code = exit_code,
         .truncated = true,
     }, max_output_bytes);
+}
+
+/// The bash tool: one command, one deadline, and the cache a long output is
+/// kept in.
+pub const spec: tool.Tool = .{
+    .name = "bash",
+    .description = "Execute a Bash command once. Output larger than 8 KiB is cached: the call returns its last lines, the cache id, its line count and its size, and ccr_retrieve reads the rest by id.",
+    .parameters_json =
+    \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}
+    ,
+    .label = "bash…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    const command = args_mod.requiredString(ctx.allocator, arguments, "command") catch
+        return ctx.refuse("Error: missing 'command' argument");
+    defer ctx.allocator.free(command);
+    const timeout_seconds = parseTimeout(ctx.allocator, arguments) catch
+        return ctx.refuse("Invalid timeout_seconds: use an integer from 1 to 3600.");
+    return executeShellTimed(ctx.io, ctx.allocator, command, ctx.env, ctx.cache_dir, timeout_seconds);
+}
+
+/// The deadline a call asked for, in seconds. Arguments that do not parse, or a
+/// number outside 1..3600, are refused rather than defaulted: a command that
+/// runs longer than the caller meant is worse than a failed call.
+fn parseTimeout(allocator: std.mem.Allocator, arguments: []const u8) !u32 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+    const value = parsed.value.object.get("timeout_seconds") orelse return default_timeout_seconds;
+    if (value != .integer or value.integer < 1 or value.integer > max_timeout_seconds) return error.InvalidTimeout;
+    return @intCast(value.integer);
 }
 
 /// The line count of a body counted as it was written: a trailing terminator

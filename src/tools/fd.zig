@@ -1,5 +1,7 @@
 const std = @import("std");
 const result_mod = @import("result.zig");
+const tool = @import("tool.zig");
+const args_mod = @import("args.zig");
 const search = @import("search.zig");
 const util = @import("util.zig");
 
@@ -7,6 +9,27 @@ const ToolResult = result_mod.ToolResult;
 const FindArgs = search.FindArgs;
 const runSearch = search.runSearch;
 const expectArgv = util.expectArgv;
+
+/// The fd tool: find files and directories by name glob.
+pub const spec: tool.Tool = .{
+    .name = "fd",
+    .description = "Find files and directories whose names match a glob and return their paths.",
+    .parameters_json =
+    \\{"type":"object","properties":{"pattern":{"type":"string","description":"Glob the name must match, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search in, defaults to the current directory"},"hidden":{"type":"boolean","description":"Include hidden entries (default false)"},"no_ignore":{"type":"boolean","description":"Disable ignore files (default false)"}},"required":["pattern"]}
+    ,
+    .label = "fd…",
+    .run = run,
+};
+
+fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
+    if (args_mod.hasField(ctx.allocator, arguments, "offset")) return ctx.refuseOffset("fd");
+    const args = search.parseFindArgs(ctx.allocator, arguments) catch |err| return ctx.refuseFmt(
+        "Error: fd arguments are unusable ({s}); it needs a non-empty 'pattern' holding a glob, and a 'path' it can use",
+        .{@errorName(err)},
+    );
+    defer args.deinit(ctx.allocator);
+    return fd(ctx.io, ctx.allocator, args);
+}
 
 /// Build argv for one find call. Borrows args and literals; free only the slice.
 pub fn fdArgv(allocator: std.mem.Allocator, args: FindArgs) ![]const []const u8 {
