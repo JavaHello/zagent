@@ -6,6 +6,8 @@
 //! for the shape and size of a result, `progress.zig` for the progress labels,
 //! `args.zig` for reading a call's JSON arguments, `search.zig` for what the
 //! four search tools have in common, and `util.zig` for a handful of helpers.
+//! `ccr.zig` is the cache a command's output is kept in when it is too long for
+//! one result, and the `ccr_retrieve` tool that reads it back.
 //!
 //! This file only re-exports them, so the rest of the program goes on speaking
 //! of `tools.readFilePage` or `tools.parseGrepArgs`. Re-exporting a file is also
@@ -25,6 +27,7 @@ const rg_mod = @import("rg.zig");
 const find_mod = @import("find.zig");
 const fd_mod = @import("fd.zig");
 const http = @import("http.zig");
+const ccr = @import("ccr.zig");
 
 // The shape of a tool result and the one size limit it is held to.
 pub const ToolStatus = result_mod.ToolStatus;
@@ -59,6 +62,11 @@ pub const applyPatch = apply_patch.applyPatch;
 // ls
 pub const Page = ls.Page;
 pub const listDirPage = ls.listDirPage;
+
+// ccr: the cached output of a command that printed more than one result holds.
+pub const ccrDirPath = ccr.dirPath;
+pub const ccrRetrieve = ccr.retrieve;
+pub const ccrSaved = ccr.Saved;
 
 // The two search families: their arguments, the backends this machine has, and
 // the tool files that build one program's argv and run it.

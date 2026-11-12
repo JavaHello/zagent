@@ -44,6 +44,29 @@ The call returns the merged output and the exit status. A command that runs past
 the deadline is terminated with its process group, so a background child does
 not outlive the call. Background processes are not kept across calls.
 
+Output larger than 8 KiB (8192 bytes) is cached in the current run's scratch
+folder. The result keeps the exit status and up to the last 40 lines / 4 KiB,
+then names a unique cache ID, the total line count and the size in bytes.
+Stdout is followed by stderr under a `stderr:` label. Counts refer to this
+normalized, combined text, not the exit-status or cache-notice lines.
+
+## `ccr_retrieve`
+
+Read cached command output without rerunning the command.
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `id` | yes | Cache ID returned by `bash` |
+| `query` | no | Literal substring filter, ignoring ASCII case |
+| `offset` | no | 1-based first line, or first matching line with `query`; default 1 |
+| `limit` | no | Positive number of lines; defaults to the page capacity |
+
+For example, `{"id":"012345abcdef","query":"error","offset":1,"limit":20}`
+returns matching lines with their original line numbers. A partial page tells
+you the next offset. Cache entries are private to each agent's scratch folder;
+`/new` and process exit remove them, and resuming a conversation does not
+restore old cache entries.
+
 ## `read`
 
 Reads one page of a file: `offset` is the 1-based first line and `limit` the
@@ -101,13 +124,13 @@ rather than cutting a name in half, and honours `limit`.
 
 ## Output limit
 
-One tool result is held to 40 KiB.
+One tool result is held to 12 KiB.
 
 - `read` pages a file and names the `offset` the next page starts at.
 - `ls` and the searches stop short of the limit and say so, so the model
   narrows the call rather than reading a cut answer as a complete one.
-- A `bash` command or `http` response that runs past it is cut at the limit and
-  marked `... (truncated)`.
+- `bash` caches output above 8 KiB and returns a tail preview plus a cache ID.
+- An `http` response that runs past the result limit is cut and marked truncated.
 - Anything else that still lands over it, an MCP server's answer included, comes
   back cut at the limit and reported as an error naming it.
 

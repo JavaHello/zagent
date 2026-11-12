@@ -61,9 +61,17 @@ pub const memory_search = ToolDefinition{
 
 pub const bash = ToolDefinition{
     .name = "bash",
-    .description = "Execute a Bash command once. Long output keeps each stream's head and tail; redirect verbose output to a file and read it in pages.",
+    .description = "Execute a Bash command once. Output larger than 8 KiB is cached: the call returns its last lines, the cache id, its line count and its size, and ccr_retrieve reads the rest by id.",
     .parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}
+    ,
+};
+
+pub const ccr_retrieve = ToolDefinition{
+    .name = "ccr_retrieve",
+    .description = "Read back the cached output of a long command. A bash result that was too long for one result names an id and how many lines and bytes it holds; call this with that id to page through it, or with a query to find the lines that contain text (ignoring case). Without a query, offset is a 1-based line number and limit a count of lines, and the page names the offset the next one starts at; with a query, offset counts matching lines.",
+    .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string","description":"The hex id a cached result named"},"offset":{"type":"integer","minimum":1,"description":"1-based first line, or first matching line when query is given; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to return; defaults to as many as the page holds"},"query":{"type":"string","description":"Only the lines containing this text, matched without regard to case"}},"required":["id"],"additionalProperties":false}
     ,
 };
 
@@ -224,9 +232,9 @@ pub const subagent_stop = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash, read,     write,         edit,   apply_patch, ls,
-    rg,            fd,   grep,     find,          http,   ask_user,    memory_save,
-    announce_task, plan, subagent, subagent_stop, report,
+    memory_search, bash, read,     write,         edit,   apply_patch,  ls,
+    rg,            fd,   grep,     find,          http,   ask_user,     memory_save,
+    announce_task, plan, subagent, subagent_stop, report, ccr_retrieve,
 };
 
 test "built-in definitions have valid schemas and unique names" {

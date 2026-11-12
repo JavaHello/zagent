@@ -24,6 +24,7 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
         .{ .name = "memory_save", .label = "saving memory…" },
         .{ .name = "memory_search", .label = "searching memory…" },
         .{ .name = "plan", .label = "plan…" },
+        .{ .name = "ccr_retrieve", .label = "ccr_retrieve…" },
     };
     for (labels) |entry| {
         if (std.mem.eql(u8, name, entry.name)) return entry.label;
@@ -34,7 +35,7 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
 test "every tool that waits has a progress label, ask_user does not" {
     try std.testing.expect(progressLabel("shell") == null);
     try std.testing.expect(progressLabel("http_request") == null);
-    const labelled = [_][]const u8{ "bash", "read", "write", "edit", "ls", "rg", "fd", "apply_patch", "grep", "find", "http" };
+    const labelled = [_][]const u8{ "bash", "read", "write", "edit", "ls", "rg", "fd", "apply_patch", "grep", "find", "http", "ccr_retrieve" };
     for (labelled) |name| {
         const label = progressLabel(name) orelse return error.TestUnexpectedResult;
         // The label names the tool, so a user watching the line knows what is

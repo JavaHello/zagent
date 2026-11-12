@@ -35,7 +35,7 @@ pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Too
 }
 
 /// How one attempt to read a line ended.
-const LineEnd = enum {
+pub const LineEnd = enum {
     /// A whole line is in the buffer, without its terminator.
     line,
     /// The file ended before the buffer held anything.
@@ -46,7 +46,7 @@ const LineEnd = enum {
 
 /// Read the next line into `out`, holding at most `cap` bytes of it. A CRLF
 /// terminator is normalised away, so a page is one line per row either way.
-fn readLine(reader: *std.Io.Reader, allocator: std.mem.Allocator, out: *std.ArrayList(u8), cap: usize) !LineEnd {
+pub fn readLine(reader: *std.Io.Reader, allocator: std.mem.Allocator, out: *std.ArrayList(u8), cap: usize) !LineEnd {
     out.clearRetainingCapacity();
     while (true) {
         const byte = reader.takeByte() catch |err| switch (err) {
@@ -64,7 +64,7 @@ fn readLine(reader: *std.Io.Reader, allocator: std.mem.Allocator, out: *std.Arra
 
 /// Consume one line without holding any of it. False means the file ended
 /// before a line was there.
-fn skipLine(reader: *std.Io.Reader) !bool {
+pub fn skipLine(reader: *std.Io.Reader) !bool {
     var consumed = false;
     while (true) {
         const byte = reader.takeByte() catch |err| switch (err) {
@@ -78,7 +78,7 @@ fn skipLine(reader: *std.Io.Reader) !bool {
 
 /// Bytes a numbered line spends before its text: the digits and a `:`. The
 /// digits are not padded, so the cost is measured per line.
-fn linePrefixWidth(number: usize) usize {
+pub fn linePrefixWidth(number: usize) usize {
     var digits: usize = 1;
     var rest = number;
     while (rest >= 10) : (rest /= 10) digits += 1;
@@ -87,7 +87,7 @@ fn linePrefixWidth(number: usize) usize {
 
 /// Number a line as `42:`, so a model reading the page can copy a reference
 /// that reads as one, rather than a bare figure in a column it has to count.
-fn appendNumberedLine(body: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, line_text: []const u8) !void {
+pub fn appendNumberedLine(body: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, line_text: []const u8) !void {
     var digits_buf: [20]u8 = undefined;
     const digits = std.fmt.bufPrint(&digits_buf, "{d}", .{number}) catch unreachable;
     try body.appendSlice(allocator, digits);

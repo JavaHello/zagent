@@ -128,8 +128,17 @@ pub fn main(init: std.process.Init) !void {
         args.deinit(allocator);
     }
 
-    if (args.items.len == 4 and std.mem.eql(u8, args.items[1], "--tool-worker")) {
-        const result = @import("host/tool_worker.zig").execute(io, allocator, env, args.items[2], args.items[3]) catch |err| tools_error: {
+    if (args.items.len >= 2 and std.mem.eql(u8, args.items[1], "--tool-worker")) {
+        // Worker mode is private to host dispatch. Keep the legacy four-argument
+        // form for tools that do not need a cache, and reject malformed options
+        // rather than accidentally treating them as an interactive query.
+        const cache_dir: ?[]const u8 = if (args.items.len == 4)
+            null
+        else if (args.items.len == 6 and std.mem.eql(u8, args.items[4], "--cache-dir"))
+            args.items[5]
+        else
+            return error.InvalidArguments;
+        const result = @import("host/tool_worker.zig").executeWithCache(io, allocator, env, args.items[2], args.items[3], cache_dir) catch |err| tools_error: {
             break :tools_error @import("tools/mod.zig").ToolResult{
                 .content = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}),
                 .is_error = true,

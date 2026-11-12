@@ -2,7 +2,21 @@ const std = @import("std");
 const tools = @import("../tools/mod.zig");
 const openai = @import("../model/openai.zig");
 
+/// `cache_dir` is where a command's output is kept when it is too long for one
+/// result. Null when this worker was started without one, in which case a long
+/// output is cut and reported as a failure rather than cached.
 pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8, arguments: []const u8) !tools.ToolResult {
+    return executeWithCache(io, allocator, env, name, arguments, null);
+}
+
+pub fn executeWithCache(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    name: []const u8,
+    arguments: []const u8,
+    cache_dir: ?[]const u8,
+) !tools.ToolResult {
     if (refusesOffset(name) and carriesOffset(allocator, arguments)) return .{
         .content = try std.fmt.allocPrint(
             allocator,
@@ -20,7 +34,7 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
                 };
             };
             defer allocator.free(command);
-            break :blk try tools.executeShellWithEnv(io, allocator, command, env);
+            break :blk try tools.executeShellWithEnv(io, allocator, command, env, cache_dir);
         } else if (std.mem.eql(u8, name, "read")) {
             const path = openai.extractStringArg(allocator, arguments, "path") catch {
                 break :blk .{

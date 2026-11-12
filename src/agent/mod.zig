@@ -2144,7 +2144,14 @@ pub const Agent = struct {
                 // server it belongs to and what the server calls it.
                 break :blk try self.mcp_registry.call(self.allocator, call.name, call.arguments);
             } else {
-                break :blk try @import("../host/execution.zig").execute(self.io, self.allocator, self.tool_env, call.name, call.arguments);
+                // Each agent owns a scratch tree, including sub-agents. Derive
+                // the cache path from that tree so /new's scratch reset also
+                // invalidates cached output, without carrying it in sessions.
+                const cache_dir = try tools.ccrDirPath(self.allocator, self.scratch.path);
+                defer self.allocator.free(cache_dir);
+                if (std.mem.eql(u8, call.name, "ccr_retrieve"))
+                    break :blk try tools.ccrRetrieve(self.io, self.allocator, cache_dir, call.arguments);
+                break :blk try @import("../host/execution.zig").execute(self.io, self.allocator, self.tool_env, cache_dir, call.name, call.arguments);
             }
         };
 

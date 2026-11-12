@@ -2,7 +2,17 @@
 const std = @import("std");
 const tools = @import("../tools/mod.zig");
 
-pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, name: []const u8, arguments: []const u8) !tools.ToolResult {
+/// Run one host tool in a worker process. `cache_dir` is handed to the worker so
+/// a command whose output is too long for one result can keep the whole of it
+/// where `ccr_retrieve` reads it back; null leaves it uncached.
+pub fn execute(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    cache_dir: ?[]const u8,
+    name: []const u8,
+    arguments: []const u8,
+) !tools.ToolResult {
     if (arguments.len > 120 * 1024) return .{ .content = try allocator.dupe(u8, "Tool arguments exceed 120 KiB; split the operation into smaller patches."), .is_error = true };
     const timeout = shellTimeout(allocator, name, arguments) catch return .{
         .content = try allocator.dupe(u8, "Invalid timeout_seconds: use an integer from 1 to 3600."),
@@ -14,8 +24,22 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
     defer allocator.free(exe);
     const deleted = " (deleted)";
     const worker = if (std.mem.endsWith(u8, exe, deleted)) exe[0 .. exe.len - deleted.len] else exe;
+    // The worker is told where cached output belongs as one more argument: it
+    // is the worker that holds the whole output, and writing it there keeps it
+    // off this process's memory and off the pipe between them.
+    var argv: [6][]const u8 = undefined;
+    var arg_count: usize = 4;
+    argv[0] = worker;
+    argv[1] = "--tool-worker";
+    argv[2] = name;
+    argv[3] = arguments;
+    if (cache_dir) |dir| {
+        argv[4] = "--cache-dir";
+        argv[5] = dir;
+        arg_count = 6;
+    }
     var child = std.process.spawn(io, .{
-        .argv = &.{ worker, "--tool-worker", name, arguments },
+        .argv = argv[0..arg_count],
         .cwd = .{ .path = workspace },
         .environ_map = env,
         .stdin = .ignore,
