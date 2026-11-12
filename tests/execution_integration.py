@@ -34,12 +34,6 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     outside = root / 'private'
     outside.write_text('SECRET_OUTSIDE_WORKSPACE_9c18')
     (workspace / 'escape').symlink_to(outside)
-    worker = subprocess.run([str(live_binary), '--tool-worker', 'bash',
-                             json.dumps({'command': '/bin/echo HOST_WORKER'})],
-                            cwd=workspace, env={'PATH': '/usr/bin:/bin'}, capture_output=True,
-                            text=True, timeout=10)
-    assert worker.returncode == 0, worker.stderr
-    assert 'HOST_WORKER' in json.loads(worker.stdout)['content'], worker.stdout
     calls = [
         ('bash', {'command': 'test -n "$DEEPSEEK_API_KEY" && test -n "$OPENAI_API_KEY" && test -n "$PRIVATE_SENTINEL" && echo ENV_INHERITED'}),
         ('write', {'path': 'notes.md', 'content': '# Report\nAnalysis complete.\n'}),

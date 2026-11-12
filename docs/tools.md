@@ -48,7 +48,10 @@ Output larger than 8 KiB (8192 bytes) is cached in the current run's scratch
 folder. The result keeps the exit status and up to the last 40 lines / 4 KiB,
 then names a unique cache ID, the total line count and the size in bytes.
 Stdout is followed by stderr under a `stderr:` label. Counts refer to this
-normalized, combined text, not the exit-status or cache-notice lines.
+normalized, combined text, not the exit-status or cache-notice lines. The entry
+is written as the output arrives and holds at most 64 MiB, so a command that
+prints without end is bounded by the deadline and by that size; past it the rest
+is read and counted but not kept, and the result says so.
 
 ## `ccr_retrieve`
 

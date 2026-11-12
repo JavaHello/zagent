@@ -11,6 +11,76 @@ const optionalString = args_mod.optionalString;
 /// How many redirects a request without a body is followed through.
 const http_max_redirects: u16 = 5;
 
+/// How long one request may take, in all. Every other host tool is bounded by
+/// the deadline it gives the program it runs; this one has to carry its own,
+/// because `std.http` reads a socket with no timeout and a server that takes a
+/// request and says nothing would hold the session for ever.
+pub const timeout_seconds: u32 = 180;
+
+/// An `Io` that gives every socket operation a deadline, so a client built on
+/// it cannot wait on a server past one.
+///
+/// `std.http` reads through whatever `Io` it is given, and the interface hands
+/// the deadline down to the poll it waits in — which is the one way to bound a
+/// client that has none of its own. The table is the process's own with the one
+/// entry that performs socket operations replaced, so everything else behaves
+/// as it did. The deadline itself is reached through a thread-local: every
+/// other entry of that table expects this process's `Io` state and cannot carry
+/// one of ours, and the thread that made the request is the only one that reads
+/// it.
+const Deadline = struct {
+    inner: std.Io,
+    vtable: std.Io.VTable,
+    expires: std.Io.Clock.Timestamp,
+
+    threadlocal var running: ?*Deadline = null;
+
+    fn init(inner: std.Io, seconds: u32) Deadline {
+        var deadline: Deadline = .{
+            .inner = inner,
+            .vtable = inner.vtable.*,
+            .expires = .{
+                .raw = std.Io.Timestamp.addDuration(.now(inner, .awake), std.Io.Duration.fromSeconds(seconds)),
+                .clock = .awake,
+            },
+        };
+        deadline.vtable.operate = &operate;
+        return deadline;
+    }
+
+    /// The `Io` a client is built with: this process's own, with a deadline on
+    /// the operations that wait for a network.
+    fn io(self: *Deadline) std.Io {
+        return .{ .userdata = self.inner.userdata, .vtable = &self.vtable };
+    }
+
+    /// Whether the request has run out of time. An operation that ends with
+    /// `error.Canceled` says only that it stopped, and this is what says why.
+    fn passed(self: *const Deadline) bool {
+        return self.expires.untilNow(self.inner).raw.nanoseconds > 0;
+    }
+
+    fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        _ = userdata;
+        const self = running orelse return error.Canceled;
+        return switch (operation) {
+            .net_read, .net_write, .net_receive, .net_send => self.inner.operateTimeout(
+                operation,
+                .{ .deadline = self.expires },
+            ) catch |err| switch (err) {
+                // The interface has no way to say "too slow" through one
+                // operation, and the deadline above says it for the request.
+                error.Timeout => error.Canceled,
+                error.Canceled => error.Canceled,
+                // A platform whose waits cannot be polled is left to block, as
+                // it did before: a request that cannot be bounded still works.
+                error.ConcurrencyUnavailable => self.inner.operate(operation),
+            },
+            else => self.inner.operate(operation),
+        };
+    }
+};
+
 /// An HTTP request as the model described it. Owns its strings.
 pub const HttpRequest = struct {
     method: []const u8,
@@ -133,6 +203,31 @@ fn parseHttpHeaders(allocator: std.mem.Allocator, value: ?std.json.Value) ![]std
 /// Delivery failures and HTTP 4xx/5xx statuses are error results. Failed
 /// downloads leave the destination unchanged.
 pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpRequest) !ToolResult {
+    return httpRequestWithin(io, allocator, request, timeout_seconds);
+}
+
+pub fn httpRequestWithin(io: std.Io, allocator: std.mem.Allocator, request: HttpRequest, seconds: u32) !ToolResult {
+    var deadline: Deadline = .init(io, seconds);
+    const outer = Deadline.running;
+    Deadline.running = &deadline;
+    defer Deadline.running = outer;
+
+    const result = try perform(allocator, &deadline, request);
+    // A request that ran out of time is reported as one: what the deadline
+    // leaves behind is a read that failed or a connection that closed, and
+    // neither says what the wait was really about.
+    if (!result.is_error or !deadline.passed()) return result;
+    allocator.free(result.content);
+    return .{
+        .content = try std.fmt.allocPrint(allocator, "Error: '{s}' did not answer within {d}s; the request was stopped.", .{ request.url, seconds }),
+        .is_error = true,
+        .timed_out = true,
+    };
+}
+
+/// The request itself, on a client whose every socket waits no longer than the
+/// deadline it is given.
+fn perform(allocator: std.mem.Allocator, deadline: *Deadline, request: HttpRequest) !ToolResult {
     const method = parseHttpMethod(request.method) orelse return toolError(
         allocator,
         "Error: unsupported HTTP method '{s}'. Use GET, HEAD, POST, PUT, PATCH, DELETE, or OPTIONS.",
@@ -145,7 +240,7 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
         .{ request.url, @errorName(err) },
     );
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    var client: std.http.Client = .{ .allocator = allocator, .io = deadline.io() };
     defer client.deinit();
 
     // Every method that takes a body always goes through the body path, even
@@ -238,7 +333,7 @@ pub fn httpRequest(io: std.Io, allocator: std.mem.Allocator, request: HttpReques
             .content = try std.fmt.allocPrint(allocator, "{s}\nHTTP error: destination '{s}' was not changed.", .{ head_aw.written(), path }),
             .is_error = true,
         };
-        const written = saveResponseBody(io, allocator, &response, path) catch |err| return toolError(
+        const written = saveResponseBody(deadline.inner, allocator, &response, path) catch |err| return toolError(
             allocator,
             "Error: could not save the response from '{s}' to '{s}': {s}",
             .{ request.url, path, @errorName(err) },
@@ -557,4 +652,103 @@ test "http request reports a url it cannot use" {
 
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "valid URL") != null);
+}
+
+/// A server on the loopback interface that answers the one connection a test
+/// makes, or, when `response` is null, takes it and says nothing at all.
+const Server = struct {
+    listener: std.Io.net.Server,
+    port: u16,
+    response: ?[]const u8,
+    /// Set to let the thread holding a silent connection go.
+    released: std.atomic.Value(u32) = .init(0),
+    thread: ?std.Thread = null,
+
+    fn init(io: std.Io, response: ?[]const u8) !Server {
+        // Port 0 asks the kernel for a free one; `listen` fills in the one it
+        // took, which is the port the request is made to.
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        const listener = try address.listen(io, .{});
+        return .{ .listener = listener, .port = listener.socket.address.getPort(), .response = response };
+    }
+
+    fn start(self: *Server, io: std.Io) !void {
+        self.thread = try std.Thread.spawn(.{}, serve, .{ self, io });
+    }
+
+    fn serve(self: *Server, io: std.Io) void {
+        const stream = self.listener.accept(io) catch return;
+        defer stream.close(io);
+        const response = self.response orelse {
+            // Hold the connection open without answering it: this is the server
+            // the deadline exists for.
+            io.futexWaitTimeout(u32, &self.released.raw, 0, .{ .duration = .{
+                .raw = .fromSeconds(30),
+                .clock = .awake,
+            } }) catch {};
+            return;
+        };
+        var buffer: [256]u8 = undefined;
+        var writer = stream.writer(io, &buffer);
+        writer.interface.writeAll(response) catch {};
+        writer.interface.flush() catch {};
+    }
+
+    fn deinit(self: *Server, io: std.Io) void {
+        _ = self.released.swap(1, .release);
+        io.futexWake(u32, &self.released.raw, 1);
+        if (self.thread) |thread| thread.join();
+        self.listener.deinit(io);
+    }
+
+    fn url(self: Server, buffer: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "http://127.0.0.1:{d}/", .{self.port});
+    }
+};
+
+test "an answered request comes back with its status and body" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var server = try Server.init(io, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+    try server.start(io);
+    defer server.deinit(io);
+
+    var url_buffer: [64]u8 = undefined;
+    const result = try httpRequestWithin(std.testing.io, allocator, .{
+        .method = "GET",
+        .url = try server.url(&url_buffer),
+        .headers = &.{},
+        .body = null,
+        .save_to = null,
+    }, 30);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "hi") != null);
+}
+
+test "a server that never answers is stopped by the deadline" {
+    const allocator = std.testing.allocator;
+    // No answer at all: without a deadline this call would wait for ever.
+    const io = std.testing.io;
+    var server = try Server.init(io, null);
+    try server.start(io);
+    defer server.deinit(io);
+
+    var url_buffer: [64]u8 = undefined;
+    const started = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    const result = try httpRequestWithin(std.testing.io, allocator, .{
+        .method = "GET",
+        .url = try server.url(&url_buffer),
+        .headers = &.{},
+        .body = null,
+        .save_to = null,
+    }, 1);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.is_error and result.timed_out);
+    try std.testing.expect(std.mem.indexOf(u8, result.content, "did not answer within 1s") != null);
+    try std.testing.expect(started.untilNow(std.testing.io).raw.toSeconds() < 30);
 }

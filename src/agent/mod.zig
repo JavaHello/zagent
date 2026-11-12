@@ -2151,7 +2151,7 @@ pub const Agent = struct {
                 defer self.allocator.free(cache_dir);
                 if (std.mem.eql(u8, call.name, "ccr_retrieve"))
                     break :blk try tools.ccrRetrieve(self.io, self.allocator, cache_dir, call.arguments);
-                break :blk try @import("../host/execution.zig").execute(self.io, self.allocator, self.tool_env, cache_dir, call.name, call.arguments);
+                break :blk try @import("../tools/dispatch.zig").execute(self.io, self.allocator, self.tool_env, cache_dir, call.name, call.arguments);
             }
         };
 

@@ -8,9 +8,10 @@ and, when the work has more than a few steps, a [plan](plan.md).
 `AI_MAX_ITERATIONS` (default 200) bounds the loop. Reaching it returns an error
 instead of reporting completion.
 
-Tools run on the host through a worker process, with the deadline, output bound
-and process-group cleanup described in [Tools](tools.md) and
-[Security and state](security.md). Esc stops the loop and its running tools,
+Tools run on the host in this process; the ones that start a program (`bash`,
+the searches) carry the deadline, output bound and process-group cleanup
+described in [Tools](tools.md) and [Security and state](security.md). Esc stops
+the loop and its running tools,
 see [Interface](ui.md#steering-a-running-task).
 
 ## Completion status

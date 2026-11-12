@@ -1,10 +1,10 @@
 const std = @import("std");
 const result_mod = @import("result.zig");
 const ccr = @import("ccr.zig");
+const sanitize = @import("../util/text.zig");
+const host_exec = @import("../host/exec.zig");
 
 const ToolResult = result_mod.ToolResult;
-const toolError = result_mod.toolError;
-const normalizeToolText = result_mod.normalizeToolText;
 const finalizeNormalizedResultOwnedLimited = result_mod.finalizeNormalizedResultOwnedLimited;
 const max_output_bytes = result_mod.default_output_bytes;
 
@@ -19,55 +19,218 @@ const preview_bytes = 4 * 1024;
 /// Cache command output strictly larger than 8 KiB.
 pub const cache_threshold_bytes = 8 * 1024;
 
-/// The whole text one call would show if a result had no size limit: the
-/// normalized stdout, then stderr under a label of its own, so a line read back
-/// later is never two streams run together. One body is built for both the
-/// cache file and the preview, so `offset` counts the lines the model was told
-/// about.
-fn buildBody(allocator: std.mem.Allocator, stdout_text: ?[]const u8, stderr_text: ?[]const u8) ![]u8 {
-    const out = stdout_text orelse "";
-    const err = stderr_text orelse "";
-    if (out.len == 0 and err.len == 0) return allocator.dupe(u8, "(no output)");
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    try aw.writer.writeAll(out);
-    if (err.len > 0) {
-        if (out.len > 0 and out[out.len - 1] != '\n') try aw.writer.writeByte('\n');
-        try aw.writer.writeAll("stderr:\n");
-        try aw.writer.writeAll(err);
-    }
-    return aw.toOwnedSlice();
-}
-
 /// Where the last `lines` lines of `text` start, walking back no further than
 /// `budget` bytes and never cutting a line in half: whole lines are dropped
 /// from the beginning instead. A single line longer than the budget is the one
 /// exception, and it is cut on a UTF-8 boundary.
-fn tailStart(text: []const u8, lines: usize, budget: usize) usize {
+fn tailStart(raw: []const u8, lines: usize, budget: usize) usize {
     var start: usize = 0;
     var remaining = lines;
-    var index = text.len;
+    var index = raw.len;
     while (index > 0 and remaining > 0) {
         index -= 1;
-        if (text[index] == '\n' and index + 1 < text.len) {
+        if (raw[index] == '\n' and index + 1 < raw.len) {
             remaining -= 1;
             start = index + 1;
         }
     }
     if (remaining > 0) start = 0;
-    while (start < text.len and text.len - start > budget) {
-        const next = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse break;
-        if (next + 1 == text.len) break;
+    while (start < raw.len and raw.len - start > budget) {
+        const next = std.mem.indexOfScalarPos(u8, raw, start, '\n') orelse break;
+        if (next + 1 == raw.len) break;
         start = next + 1;
     }
-    if (text.len - start <= budget) return start;
-    var cut = text.len - budget;
-    while (cut < text.len and (text[cut] & 0xc0) == 0x80) cut += 1;
+    if (raw.len - start <= budget) return start;
+    var cut = raw.len - budget;
+    while (cut < raw.len and (raw[cut] & 0xc0) == 0x80) cut += 1;
     return cut;
 }
 
+/// How long a shell call may run when it names no limit of its own: long
+/// enough for a build or a test run, short enough that a command which hangs is
+/// not the session.
+pub const default_timeout_seconds: u32 = 180;
+
+/// The most a call may ask for. A shell that runs for an hour is a choice the
+/// model makes on purpose, not a default anyone waits out by accident.
+pub const max_timeout_seconds: u32 = 3600;
+
+/// Most bytes of one command's output kept in the cache. A command that prints
+/// without end — `yes`, a runaway loop — is bounded by the deadline and by this:
+/// past it the output is still read and counted, but no more of it is written,
+/// so the cache cannot fill the disk before the deadline passes.
+pub const cache_max_bytes: usize = 64 * 1024 * 1024;
+
+/// The last `preview_bytes` of the body, kept as it is written so that the
+/// preview of a long output costs a fixed amount of memory rather than a copy
+/// of the whole of it.
+const Tail = struct {
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn push(self: *Tail, allocator: std.mem.Allocator, data: []const u8) !void {
+        if (data.len >= preview_bytes) {
+            self.bytes.clearRetainingCapacity();
+            try self.bytes.appendSlice(allocator, data[data.len - preview_bytes ..]);
+            return;
+        }
+        try self.bytes.appendSlice(allocator, data);
+        const excess = self.bytes.items.len -| preview_bytes;
+        if (excess == 0) return;
+        const kept = self.bytes.items.len - excess;
+        std.mem.copyForwards(u8, self.bytes.items[0..kept], self.bytes.items[excess..]);
+        self.bytes.shrinkRetainingCapacity(kept);
+    }
+
+    fn slice(self: Tail) []const u8 {
+        return self.bytes.items;
+    }
+
+    fn deinit(self: *Tail, allocator: std.mem.Allocator) void {
+        self.bytes.deinit(allocator);
+    }
+};
+
+/// What a command's two streams are collected into while it runs.
+///
+/// The body is the text one result would show if it had no size limit: the
+/// sanitised stdout, then stderr under a label of its own, so a line read back
+/// later is never two streams run together. It is built as the output arrives
+/// rather than after the command ends — up to `cache_threshold_bytes` it is
+/// held as text, and past that the whole of it is streamed into the cache file,
+/// so a command that prints without end costs this process a fixed amount of
+/// memory instead of all of it.
+const Collector = struct {
+    allocator: std.mem.Allocator,
+    cache_dir: ?[]const u8,
+    /// The body, while it still fits in one result.
+    head: std.ArrayList(u8) = .empty,
+    /// The end of the body, for the preview that stands in for a long one.
+    tail: Tail = .{},
+    /// The cache entry, once the body has outgrown one result.
+    stream: ?ccr.Stream = null,
+    /// An entry that could not be written. The command still ran; only the copy
+    /// of its output was lost, so this is reported rather than raised.
+    cache_error: ?anyerror = null,
+    /// Output past `max_bytes`, which is read and counted but not cached.
+    capped: bool = false,
+    /// How much of the output may be written. A test asks for less than a
+    /// command would print; a real run takes the whole allowance.
+    max_bytes: usize = cache_max_bytes,
+    /// Whether the body has outgrown one result, whatever became of its cache.
+    overflowed: bool = false,
+    /// Bytes and lines of the whole body, cached or not.
+    bytes: usize = 0,
+    newlines: usize = 0,
+    last_byte: u8 = 0,
+    labelled: bool = false,
+    /// Sanitising state of each stream: text arrives in pieces, and a sequence
+    /// or a character cut in half by a chunk boundary is finished by the next.
+    sanitizers: [2]sanitize.Chunked = .{ .{}, .{} },
+    scratch: std.ArrayList(u8) = .empty,
+
+    pub fn feed(self: *Collector, io: std.Io, stream: host_exec.Stream, raw: []const u8) !void {
+        if (stream == .stderr and !self.labelled) {
+            self.labelled = true;
+            // The body's own shape: stdout, a newline if it did not end with
+            // one, then the label stderr is read under.
+            if (self.bytes > 0 and self.last_byte != '\n') try self.append(io, "\n");
+            try self.append(io, "stderr:\n");
+        }
+        self.scratch.clearRetainingCapacity();
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.scratch);
+        defer self.scratch = aw.toArrayList();
+        try self.sanitizers[@intFromEnum(stream)].feed(&aw.writer, raw);
+        try self.append(io, aw.written());
+    }
+
+    /// Take one piece of the body: count it, keep its end for the preview, and
+    /// put it where the body is being kept.
+    fn append(self: *Collector, io: std.Io, data: []const u8) !void {
+        if (data.len == 0) return;
+        for (data) |byte| {
+            if (byte == '\n') self.newlines += 1;
+        }
+        self.bytes += data.len;
+        self.last_byte = data[data.len - 1];
+        try self.tail.push(self.allocator, data);
+
+        if (self.stream) |*stream| {
+            self.cache(io, stream, data) catch |err| {
+                self.cache_error = err;
+                stream.abandon(io, self.allocator);
+                self.stream = null;
+            };
+            return;
+        }
+
+        if (!self.overflowed and self.head.items.len + data.len <= cache_threshold_bytes) {
+            try self.head.appendSlice(self.allocator, data);
+            return;
+        }
+        self.overflowed = true;
+        // Every byte before this point is in the head, and the body is about to
+        // grow past what one result holds: from here it belongs in the cache.
+        var head = self.head;
+        self.head = .empty;
+        defer head.deinit(self.allocator);
+
+        const dir = self.cache_dir orelse return;
+        var stream = ccr.createStream(io, self.allocator, dir) catch |err| {
+            self.cache_error = err;
+            return;
+        };
+        for ([_][]const u8{ head.items, data }) |piece| {
+            self.cache(io, &stream, piece) catch |err| {
+                self.cache_error = err;
+                stream.abandon(io, self.allocator);
+                return;
+            };
+        }
+        self.stream = stream;
+    }
+
+    /// Put one piece into the cache entry, stopping at the cap: past it the
+    /// output is still counted, but writing it would only fill the disk before
+    /// the deadline ends the command.
+    fn cache(self: *Collector, io: std.Io, stream: *ccr.Stream, data: []const u8) !void {
+        if (self.capped) return;
+        const room = self.max_bytes -| stream.bytes;
+        try stream.write(io, data[0..@min(data.len, room)]);
+        if (data.len > room) self.capped = true;
+    }
+
+    /// Finish the body: whatever a sanitizer still holds is written out, and
+    /// the cache entry is closed. Answers what the whole output held, for the
+    /// notice a long one names it in.
+    pub fn finish(self: *Collector, io: std.Io) !?ccr.Saved {
+        for (&self.sanitizers) |*sanitizer| {
+            var aw: std.Io.Writer.Allocating = .init(self.allocator);
+            defer aw.deinit();
+            try sanitizer.finish(&aw.writer);
+            try self.append(io, aw.written());
+        }
+        if (self.stream) |*stream| return stream.finish(io);
+        return null;
+    }
+
+    /// Give up on the body: the run was cut short, so there is no result to
+    /// name a cache entry in.
+    pub fn abandon(self: *Collector, io: std.Io) void {
+        if (self.stream) |*stream| stream.abandon(io, self.allocator);
+        self.stream = null;
+    }
+
+    pub fn deinit(self: *Collector, io: std.Io) void {
+        if (self.stream) |*stream| stream.deinit(io, self.allocator);
+        self.head.deinit(self.allocator);
+        self.tail.deinit(self.allocator);
+        self.scratch.deinit(self.allocator);
+    }
+};
+
+
 pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
-    return executeShellWithEnv(io, allocator, command, null, null);
+    return executeShellTimed(io, allocator, command, null, null, default_timeout_seconds);
 }
 
 pub fn executeShellWithEnv(
@@ -77,28 +240,46 @@ pub fn executeShellWithEnv(
     env: ?*const std.process.Environ.Map,
     cache_dir: ?[]const u8,
 ) !ToolResult {
-    // Capture once without dropping output at an arbitrary stream limit.
-    const result = try std.process.run(allocator, io, .{
-        .argv = &[_][]const u8{ "bash", "--noprofile", "--norc", "-c", command },
-        .environ_map = env,
-        .stdout_limit = .unlimited,
-        .stderr_limit = .unlimited,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    return executeShellTimed(io, allocator, command, env, cache_dir, default_timeout_seconds);
+}
 
-    const exit_code: ?u8 = switch (result.term) {
-        .exited => |code| code,
-        else => null,
+/// Run one shell command with a deadline, keeping its output to what one result
+/// can show and streaming the rest into the cache.
+pub fn executeShellTimed(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    command: []const u8,
+    env: ?*const std.process.Environ.Map,
+    cache_dir: ?[]const u8,
+    timeout_seconds: u32,
+) !ToolResult {
+    var collector: Collector = .{ .allocator = allocator, .cache_dir = cache_dir };
+    defer collector.deinit(io);
+
+    const run = host_exec.run(io, allocator, .{
+        .argv = &.{ "bash", "--noprofile", "--norc", "-c", command },
+        .env = env,
+        .timeout_seconds = timeout_seconds,
+    }, &collector) catch |err| return .{
+        .content = try std.fmt.allocPrint(allocator, "Error: the shell could not be run ({s}).", .{@errorName(err)}),
+        .is_error = true,
     };
 
-    const stdout_text: ?[]u8 = if (result.stdout.len > 0) try normalizeToolText(allocator, result.stdout) else null;
-    defer if (stdout_text) |text| allocator.free(text);
-    const stderr_text: ?[]u8 = if (result.stderr.len > 0) try normalizeToolText(allocator, result.stderr) else null;
-    defer if (stderr_text) |text| allocator.free(text);
+    if (run.timed_out) {
+        // Nothing of what the command said is worth keeping: the call failed
+        // for taking too long, and a half-written entry would outlive the
+        // answer that would have named it.
+        collector.abandon(io);
+        return .{
+            .content = try std.fmt.allocPrint(allocator, "Tool timed out after {d}s.", .{timeout_seconds}),
+            .is_error = true,
+            .timed_out = true,
+        };
+    }
 
-    const body = try buildBody(allocator, stdout_text, stderr_text);
-    defer allocator.free(body);
+    const saved = try collector.finish(io);
+    const exit_code = run.exitCode();
+    const failed = exit_code == null or exit_code.? != 0;
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -107,12 +288,15 @@ pub fn executeShellWithEnv(
     if (exit_code) |code| {
         try aw.writer.print("Exit code: {d}\n", .{code});
     } else {
-        try aw.writer.print("Exit code: unavailable (termination: {any})\n", .{result.term});
+        try aw.writer.print("Exit code: unavailable (termination: {any})\n", .{run.term});
     }
-    const failed = exit_code == null or exit_code.? != 0;
 
-    if (body.len <= cache_threshold_bytes) {
-        try aw.writer.writeAll(body);
+    if (!collector.overflowed) {
+        if (collector.bytes == 0) {
+            try aw.writer.writeAll("(no output)");
+        } else {
+            try aw.writer.writeAll(collector.head.items);
+        }
         return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
@@ -121,29 +305,35 @@ pub fn executeShellWithEnv(
     }
 
     // Too long for one result. The tail is what the model needs first — the end
-    // of a build, the last error of a test run — and the whole text is kept so
-    // the rest is one `ccr_retrieve` call away rather than a lost answer.
-    const preview = body[tailStart(body, preview_lines, preview_bytes)..];
+    // of a build, the last error of a test run — and the whole of it is kept
+    // where `ccr_retrieve` reads it back, rather than lost.
+    const tail = collector.tail.slice();
+    const preview = tail[tailStart(tail, preview_lines, preview_bytes)..];
     try aw.writer.writeAll(preview);
     if (preview.len == 0 or preview[preview.len - 1] != '\n') try aw.writer.writeByte('\n');
 
-    if (cache_dir) |dir| {
-        const saved = ccr.save(io, allocator, dir, body) catch |err| {
-            // The command ran; only the copy of its output was lost. Saying so
-            // keeps the failure where it belongs instead of failing the call.
-            try aw.writer.print(
-                "[Output cut here: {d} lines, {d} bytes of output, and this run could not cache the rest ({s}). Redirect long output to a file and read it in pages.]",
-                .{ ccr.countLines(body), body.len, @errorName(err) },
-            );
-            return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
-                .is_error = failed,
-                .exit_code = exit_code,
-                .truncated = true,
-            }, max_output_bytes);
-        };
+    if (saved) |entry| {
         try aw.writer.print(
             "[ccr {s}: {d} lines, {d} bytes, the last lines shown here. Call ccr_retrieve with id \"{s}\" to page through it with offset and limit, or query=\"text\" to find lines.]",
-            .{ saved.id, saved.lines, saved.bytes, saved.id },
+            .{ entry.id, entry.lines, entry.bytes, entry.id },
+        );
+        if (collector.capped) try aw.writer.print(
+            "[This command printed more than {d} MiB; the rest is not cached and was not kept.]",
+            .{cache_max_bytes / (1024 * 1024)},
+        );
+        return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
+            .is_error = failed,
+            .exit_code = exit_code,
+            .truncated = true,
+        }, max_output_bytes);
+    }
+
+    if (collector.cache_error) |err| {
+        // The command ran; only the copy of its output was lost. Saying so
+        // keeps the failure where it belongs instead of failing the call.
+        try aw.writer.print(
+            "[Output cut here: {d} lines, {d} bytes of output, and this run could not cache the rest ({s}). Redirect long output to a file and read it in pages.]",
+            .{ countedLines(collector.bytes, collector.newlines, collector.last_byte), collector.bytes, @errorName(err) },
         );
         return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
             .is_error = failed,
@@ -156,13 +346,19 @@ pub fn executeShellWithEnv(
     // call reports what it could not show rather than reading as complete.
     try aw.writer.print(
         "[Output cut: {d} lines, {d} bytes, only the last lines shown. Redirect long output to a file and read it in pages.]",
-        .{ ccr.countLines(body), body.len },
+        .{ countedLines(collector.bytes, collector.newlines, collector.last_byte), collector.bytes },
     );
     return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
         .is_error = true,
         .exit_code = exit_code,
         .truncated = true,
     }, max_output_bytes);
+}
+
+/// The line count of a body counted as it was written: a trailing terminator
+/// ends the last line rather than starting an empty one.
+fn countedLines(bytes: usize, newlines: usize, last_byte: u8) usize {
+    return newlines + @intFromBool(bytes > 0 and last_byte != '\n');
 }
 
 test "preview keeps all short tails and bounds a single long terminated line" {
@@ -269,4 +465,51 @@ test "long output is cached and the result names the id it is read back with" {
     const head = try @import("ccr.zig").retrieve(io, a, dir, arguments);
     defer head.deinit(a);
     try std.testing.expectEqualStrings("1:START你好", head.content[0.."1:START你好".len]);
+}
+
+test "a command that prints without end is cut by its deadline and leaves no entry" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const dir = try @import("ccr.zig").dirPath(a, base);
+    defer a.free(dir);
+
+    // `yes` never stops on its own: only the deadline does, and the cache entry
+    // it was streaming into must not outlive the call that would name it.
+    const result = try executeShellTimed(io, a, "yes", null, dir, 1);
+    defer result.deinit(a);
+    try std.testing.expect(result.is_error and result.timed_out);
+    try std.testing.expectEqualStrings("Tool timed out after 1s.", result.content);
+    // The directory the entry was reserved in stays; nothing in it does.
+    var entries = try tmp.dir.openDir(io, "ccr", .{ .iterate = true });
+    defer entries.close(io);
+    var iterator = entries.iterate();
+    try std.testing.expect(try iterator.next(io) == null);
+}
+
+test "output past the cache cap is counted but not written" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(base);
+    const dir = try @import("ccr.zig").dirPath(a, base);
+    defer a.free(dir);
+
+    var collector: Collector = .{ .allocator = a, .cache_dir = dir, .max_bytes = 64 };
+    defer collector.deinit(io);
+    const big = try a.alloc(u8, 9000);
+    defer a.free(big);
+    @memset(big, 'x');
+    try collector.feed(io, .stdout, big);
+    try collector.feed(io, .stdout, big[0..1000]);
+    const saved = (try collector.finish(io)).?;
+
+    try std.testing.expect(collector.capped);
+    try std.testing.expectEqual(@as(usize, 10000), collector.bytes);
+    try std.testing.expectEqual(@as(usize, 64), saved.bytes);
 }

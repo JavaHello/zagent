@@ -120,16 +120,6 @@ try:
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1',
                'AI_MODEL': 'mock', 'AI_KEY': 'test', 'AI_MAX_ITERATIONS': '12'}
         trust_workspace(directory, env)
-        # Worker mode accepts both the original invocation and the cache option.
-        for options in ([], ['--cache-dir', str(root / 'worker-cache')]):
-            worker = subprocess.run([str(BINARY), '--tool-worker', 'bash',
-                                     json.dumps({'command': 'printf worker-ok'}), *options],
-                                    cwd=directory, env=env, text=True, capture_output=True, timeout=20)
-            assert worker.returncode == 0, worker.stderr
-            assert 'worker-ok' in json.loads(worker.stdout)['content'], worker.stdout
-        malformed = subprocess.run([str(BINARY), '--tool-worker', 'bash', '{}', '--bogus', 'x'],
-                                   cwd=directory, env=env, text=True, capture_output=True, timeout=20)
-        assert malformed.returncode != 0 and 'InvalidArguments' in malformed.stderr, malformed
         result = subprocess.run([str(BINARY)], cwd=directory, env=env,
                                 input='cache output\n/new\nafter reset\n/quit\n',
                                 text=True, capture_output=True, timeout=90)

@@ -78,13 +78,13 @@ src/
     http.zig     — http
     search.zig   — What the four search tools share: backends, arguments, paging
     result.zig   — ToolResult, the output limit, sanitising and truncation
+    dispatch.zig — Sending one call to the tool that answers it, in this process
     args.zig     — Reading a call's JSON arguments
     progress.zig — The label shown while a tool runs
     util.zig     — Helpers several tools share
     schema.zig   — The JSON schema of every built-in tool
-  host/          — Running a tool on the host
-    execution.zig — Worker process, deadline, bounded output, process-group cleanup
-    tool_worker.zig — The worker: parse one call, run the tool, print the result
+  host/          — Running a program on the host
+    exec.zig     — Deadline, bounded output, process-group cleanup
     sysinfo.zig  — What machine this is: OS, kernel, architecture, CPUs, memory
   mcp/           — Model Context Protocol
     mod.zig      — Registry, tool aliases, loading a service's tools on demand

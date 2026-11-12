@@ -67,38 +67,103 @@ pub fn countLines(text: []const u8) usize {
     return lines;
 }
 
-/// Keep `text` under `dir` and report the id it can be read back with. The
-/// directory is created on first use, so a run that never prints that much
-/// never leaves one behind.
-pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []const u8) !Saved {
+/// An entry written while the output that fills it is still arriving.
+///
+/// A command's output is streamed into the cache as it comes off the pipe, so
+/// the copy on disk costs this process nothing to hold. The line and byte
+/// counts are kept as it is written, which is what a result naming the entry
+/// reports.
+pub const Stream = struct {
+    file: std.Io.File,
+    /// Owned; freed by `deinit`.
+    path: []u8,
+    id: [id_len]u8,
+    bytes: usize = 0,
+    newlines: usize = 0,
+    last_byte: u8 = 0,
+    closed: bool = false,
+
+    /// Append what the program just said.
+    pub fn write(self: *Stream, io: std.Io, data: []const u8) !void {
+        if (data.len == 0) return;
+        try self.file.writeStreamingAll(io, data);
+        for (data) |byte| {
+            if (byte == '\n') self.newlines += 1;
+        }
+        self.bytes += data.len;
+        self.last_byte = data[data.len - 1];
+    }
+
+    /// Close the entry and answer what it holds. A line count is the one
+    /// `countLines` would give for the same text: a trailing terminator ends
+    /// the last line rather than starting an empty one.
+    pub fn finish(self: *Stream, io: std.Io) Saved {
+        self.close(io);
+        const lines = self.newlines + @intFromBool(self.bytes > 0 and self.last_byte != '\n');
+        return .{ .id = self.id, .lines = lines, .bytes = self.bytes };
+    }
+
+    /// Give up on the entry: the output it holds is not worth reading back —
+    /// the run passed its deadline, so there is no result to name it in.
+    pub fn abandon(self: *Stream, io: std.Io, allocator: std.mem.Allocator) void {
+        self.close(io);
+        if (self.path.len > 0) std.Io.Dir.deleteFileAbsolute(io, self.path) catch {};
+        self.deinit(io, allocator);
+    }
+
+    /// Release the entry's file and name. Safe after `finish`, and called
+    /// unconditionally by way of `defer`.
+    pub fn deinit(self: *Stream, io: std.Io, allocator: std.mem.Allocator) void {
+        self.close(io);
+        if (self.path.len > 0) {
+            allocator.free(self.path);
+            self.path = &.{};
+        }
+    }
+
+    fn close(self: *Stream, io: std.Io) void {
+        if (self.closed) return;
+        self.file.close(io);
+        self.closed = true;
+    }
+};
+
+/// Start an entry under `dir`, whose name is reserved before anything is
+/// written so two runs cannot take the same id. The directory is created on
+/// first use, so a run that never prints that much never leaves one behind.
+pub fn createStream(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) !Stream {
     std.Io.Dir.createDirAbsolute(io, dir, .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
-    // Reserve the name atomically, including across concurrent workers.
     for (0..16) |_| {
         var random: [id_bytes]u8 = undefined;
         std.Io.random(io, &random);
-        const saved: Saved = .{
-            .id = std.fmt.bytesToHex(random, .lower),
-            .lines = countLines(text),
-            .bytes = text.len,
-        };
-        const path = try filePath(allocator, dir, &saved.id);
-        defer allocator.free(path);
+        const id: [id_len]u8 = std.fmt.bytesToHex(random, .lower);
+        const path = try filePath(allocator, dir, &id);
+        errdefer allocator.free(path);
         const file = std.Io.Dir.createFileAbsolute(io, path, .{
             .exclusive = true,
             .permissions = .fromMode(0o600),
         }) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
             else => return err,
         };
-        defer file.close(io);
-        errdefer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
-        try file.writeStreamingAll(io, text);
-        return saved;
+        return .{ .file = file, .path = path, .id = id };
     }
     return error.CacheIdCollision;
+}
+
+/// Keep `text` under `dir` and report the id it can be read back with.
+pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []const u8) !Saved {
+    var stream = try createStream(io, allocator, dir);
+    defer stream.deinit(io, allocator);
+    errdefer std.Io.Dir.deleteFileAbsolute(io, stream.path) catch {};
+    try stream.write(io, text);
+    return stream.finish(io);
 }
 
 /// What one `ccr_retrieve` call asks for. `offset` counts lines, or matching
@@ -448,4 +513,51 @@ test "line counting ends with the last line, not after it" {
     try std.testing.expectEqual(@as(usize, 1), countLines("one\n"));
     try std.testing.expectEqual(@as(usize, 2), countLines("one\ntwo\n"));
     try std.testing.expectEqual(@as(usize, 3), countLines("\n\n\n"));
+}
+
+test "an entry written as the output arrives counts what a whole text would" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+
+    const pieces = [_][]const u8{ "first\n", "second", "\nthird\n", "", "fourth" };
+    var stream = try createStream(io, a, dir);
+    defer stream.deinit(io, a);
+    for (pieces) |piece| try stream.write(io, piece);
+    const written = stream.finish(io);
+
+    var whole: std.ArrayList(u8) = .empty;
+    defer whole.deinit(a);
+    for (pieces) |piece| try whole.appendSlice(a, piece);
+    try std.testing.expectEqual(countLines(whole.items), written.lines);
+    try std.testing.expectEqual(whole.items.len, written.bytes);
+
+    const path = try filePath(a, dir, &written.id);
+    defer a.free(path);
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var read_buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buffer);
+    const kept = try file_reader.interface.allocRemaining(a, .limited(4096));
+    defer a.free(kept);
+    try std.testing.expectEqualStrings(whole.items, kept);
+}
+
+test "an abandoned entry leaves nothing behind" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+
+    var stream = try createStream(io, a, dir);
+    const path = try filePath(a, dir, &stream.id);
+    defer a.free(path);
+    try stream.write(io, "half an answer");
+    stream.abandon(io, a);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, path, .{}));
 }

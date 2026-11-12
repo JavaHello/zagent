@@ -128,30 +128,6 @@ pub fn main(init: std.process.Init) !void {
         args.deinit(allocator);
     }
 
-    if (args.items.len >= 2 and std.mem.eql(u8, args.items[1], "--tool-worker")) {
-        // Worker mode is private to host dispatch. Keep the legacy four-argument
-        // form for tools that do not need a cache, and reject malformed options
-        // rather than accidentally treating them as an interactive query.
-        const cache_dir: ?[]const u8 = if (args.items.len == 4)
-            null
-        else if (args.items.len == 6 and std.mem.eql(u8, args.items[4], "--cache-dir"))
-            args.items[5]
-        else
-            return error.InvalidArguments;
-        const result = @import("host/tool_worker.zig").executeWithCache(io, allocator, env, args.items[2], args.items[3], cache_dir) catch |err| tools_error: {
-            break :tools_error @import("tools/mod.zig").ToolResult{
-                .content = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}),
-                .is_error = true,
-                .timed_out = err == error.Timeout,
-            };
-        };
-        defer result.deinit(allocator);
-        const encoded = try std.json.Stringify.valueAlloc(allocator, result, .{});
-        defer allocator.free(encoded);
-        try std.Io.File.stdout().writeStreamingAll(io, encoded);
-        return;
-    }
-
     if (args.items.len == 2 and (std.mem.eql(u8, args.items[1], "--help") or std.mem.eql(u8, args.items[1], "-h"))) {
         try std.Io.File.stdout().writeStreamingAll(io, "Usage: zagent [query ...]\n" ++
             "With no query, start an interactive conversation.\n\n" ++
@@ -879,10 +855,10 @@ test {
     _ = @import("unicode_width/wcwidth.zig");
     _ = @import("agent/mod.zig");
     _ = @import("model/status.zig");
-    _ = @import("host/execution.zig");
+    _ = @import("host/exec.zig");
     _ = @import("host/sysinfo.zig");
     _ = @import("state/session.zig");
-    _ = @import("host/tool_worker.zig");
+    _ = @import("tools/dispatch.zig");
     _ = @import("cli/history.zig");
     _ = @import("tools/mod.zig");
     _ = @import("diff/mod.zig");

@@ -96,6 +96,192 @@ pub fn writeSanitized(w: *std.Io.Writer, raw: []const u8) !void {
     }
 }
 
+/// `writeSanitized` for text that arrives in pieces.
+///
+/// A whole text is sanitised in one pass: an escape sequence or a character cut
+/// off by the end of the buffer is dropped or escaped there. A caller reading a
+/// program's output as it arrives would get that cut at every chunk boundary —
+/// the end of a CSI sequence would be printed as text, a multi-byte character
+/// split in two would be escaped byte by byte — so the bytes that may still be
+/// completed are held back until the rest of them arrives.
+pub const Chunked = struct {
+    state: State = .text,
+    /// The beginning of a character whose remaining bytes have not arrived.
+    carry: [4]u8 = undefined,
+    carry_len: usize = 0,
+
+    const State = enum {
+        /// Between sequences: the text itself.
+        text,
+        /// Just past an ESC, before the byte that says what kind of sequence it is.
+        escape,
+        /// Inside a CSI, which ends on a byte in 0x40..0x7e.
+        csi,
+        /// Inside an OSC, which ends on BEL or on ESC \.
+        osc,
+        /// Inside an OSC, just past an ESC that may be the start of its terminator.
+        osc_escape,
+    };
+
+    pub fn feed(self: *Chunked, w: *std.Io.Writer, raw: []const u8) !void {
+        var i: usize = try self.completeCarry(w, raw);
+
+        while (i < raw.len) {
+            const byte = raw[i];
+            switch (self.state) {
+                .escape => {
+                    // Only the kind of sequence the introducer names matters;
+                    // a sequence this program does not know is dropped whole,
+                    // the way `skipAnsiEscape` drops it.
+                    self.state = switch (byte) {
+                        '[' => .csi,
+                        ']' => .osc,
+                        else => .text,
+                    };
+                    i += 1;
+                },
+                .csi => {
+                    if (byte >= 0x40 and byte <= 0x7e) self.state = .text;
+                    i += 1;
+                },
+                .osc => {
+                    switch (byte) {
+                        0x07 => self.state = .text,
+                        0x1b => self.state = .osc_escape,
+                        else => {},
+                    }
+                    i += 1;
+                },
+                .osc_escape => {
+                    self.state = if (byte == '\\') .text else .osc;
+                    i += 1;
+                },
+                .text => {
+                    if (byte == 0x1b) {
+                        self.state = .escape;
+                        i += 1;
+                        continue;
+                    }
+                    if (byte < 0x80) {
+                        const printable = byte == '\n' or byte == '\r' or byte == '\t' or byte >= 0x20;
+                        try w.writeByte(if (printable) byte else ' ');
+                        i += 1;
+                        continue;
+                    }
+                    const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+                        var escape_buf: [4]u8 = undefined;
+                        try w.writeAll(escapeByte(&escape_buf, byte));
+                        i += 1;
+                        continue;
+                    };
+                    // The rest of the character may be in the next chunk, and
+                    // it is not a broken character until the stream ends.
+                    if (i + seq_len > raw.len) {
+                        @memcpy(self.carry[0 .. raw.len - i], raw[i..]);
+                        self.carry_len = raw.len - i;
+                        return;
+                    }
+                    if (!std.unicode.utf8ValidateSlice(raw[i .. i + seq_len])) {
+                        var escape_buf: [4]u8 = undefined;
+                        try w.writeAll(escapeByte(&escape_buf, byte));
+                        i += 1;
+                        continue;
+                    }
+                    try w.writeAll(raw[i .. i + seq_len]);
+                    i += seq_len;
+                },
+            }
+        }
+    }
+
+    /// Finish the character held back from the previous chunk, if this chunk
+    /// holds the rest of it. Answers how much of `raw` that took.
+    fn completeCarry(self: *Chunked, w: *std.Io.Writer, raw: []const u8) !usize {
+        if (self.carry_len == 0) return 0;
+        const held = self.carry_len;
+        // A character is at most four bytes, so what is held plus what this
+        // chunk starts with is always enough to tell.
+        const seq_len = std.unicode.utf8ByteSequenceLength(self.carry[0]) catch held;
+        const filled = @min(seq_len, held + raw.len);
+        var scratch: [4]u8 = undefined;
+        @memcpy(scratch[0..held], self.carry[0..held]);
+        @memcpy(scratch[held..filled], raw[0 .. filled - held]);
+        self.carry_len = 0;
+
+        if (filled < seq_len) {
+            // Still not the whole character: hold all of it again.
+            @memcpy(self.carry[0..filled], scratch[0..filled]);
+            self.carry_len = filled;
+            return filled - held;
+        }
+        if (std.unicode.utf8ValidateSlice(scratch[0..filled])) {
+            try w.writeAll(scratch[0..filled]);
+            return filled - held;
+        }
+        // It was never a character: each byte is escaped on its own, which is
+        // what a whole-text pass does with bytes that are not UTF-8.
+        for (scratch[0..held]) |byte| {
+            var escape_buf: [4]u8 = undefined;
+            try w.writeAll(escapeByte(&escape_buf, byte));
+        }
+        return 0;
+    }
+
+    /// Whatever was held back never became a character or an entire sequence.
+    /// A half character is escaped the way a whole-text pass escapes it, and an
+    /// unfinished escape is dropped, which is also what that pass does at the
+    /// end of its buffer.
+    pub fn finish(self: *Chunked, w: *std.Io.Writer) !void {
+        for (self.carry[0..self.carry_len]) |byte| {
+            var escape_buf: [4]u8 = undefined;
+            try w.writeAll(escapeByte(&escape_buf, byte));
+        }
+        self.carry_len = 0;
+        self.state = .text;
+    }
+};
+
+test "chunked sanitising matches a whole-text pass at every split" {
+    const fixture = "plain \x1b[32mgreen\x1b[0m 你好 ok\xff \x1b]52;c;aGk=\x07end\r\n";
+    const a = std.testing.allocator;
+
+    var whole: std.Io.Writer.Allocating = .init(a);
+    defer whole.deinit();
+    try writeSanitized(&whole.writer, fixture);
+    const expected = whole.written();
+
+    // Every chunk size, so every place a sequence or a character can be cut.
+    var size: usize = 1;
+    while (size <= fixture.len) : (size += 1) {
+        var aw: std.Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        var chunked: Chunked = .{};
+        var i: usize = 0;
+        while (i < fixture.len) : (i += size) try chunked.feed(&aw.writer, fixture[i..@min(i + size, fixture.len)]);
+        try chunked.finish(&aw.writer);
+        try std.testing.expectEqualStrings(expected, aw.written());
+    }
+}
+
+test "a character cut in half is finished by the next chunk" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var chunked: Chunked = .{};
+    try chunked.feed(&aw.writer, "a\xe4\xbd");
+    try chunked.feed(&aw.writer, "\xa0b");
+    try chunked.finish(&aw.writer);
+    try expectEqualStrings("a\u{4f60}b", aw.written());
+}
+
+test "an unfinished character at the end of the stream is escaped" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var chunked: Chunked = .{};
+    try chunked.feed(&aw.writer, "ab\xe4");
+    try chunked.finish(&aw.writer);
+    try expectEqualStrings("ab\\xE4", aw.written());
+}
+
 test "writeSanitized strips escapes and keeps the text around them" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();

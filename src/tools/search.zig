@@ -2,6 +2,7 @@ const std = @import("std");
 const args_mod = @import("args.zig");
 const result_mod = @import("result.zig");
 const util = @import("util.zig");
+const host_exec = @import("../host/exec.zig");
 
 const ToolResult = result_mod.ToolResult;
 const ToolStatus = result_mod.ToolStatus;
@@ -194,6 +195,37 @@ pub fn appendGrepLimits(allocator: std.mem.Allocator, argv: *std.ArrayList([]con
 /// over a large repository comes back truncated rather than refused.
 const search_max_output: usize = 256 * 1024;
 
+/// Longest error output read back from a search program.
+const search_stderr_max: usize = 64 * 1024;
+
+/// How long a search program may run. A search that has not answered in three
+/// minutes is one the call has to narrow and try again.
+pub const search_timeout_seconds: u32 = 180;
+
+/// Collects a search program's output, refusing to hold more of it than a
+/// result could use: a pattern that matches everything must not be able to fill
+/// this process's memory before the page is shaped.
+const Capture = struct {
+    allocator: std.mem.Allocator,
+    stdout: std.ArrayList(u8) = .empty,
+    stderr: std.ArrayList(u8) = .empty,
+
+    pub fn feed(self: *Capture, io: std.Io, stream: host_exec.Stream, data: []const u8) !void {
+        _ = io;
+        const list, const limit = switch (stream) {
+            .stdout => .{ &self.stdout, search_max_output },
+            .stderr => .{ &self.stderr, search_stderr_max },
+        };
+        if (list.items.len + data.len > limit) return error.StreamTooLong;
+        try list.appendSlice(self.allocator, data);
+    }
+
+    fn deinit(self: *Capture) void {
+        self.stdout.deinit(self.allocator);
+        self.stderr.deinit(self.allocator);
+    }
+};
+
 /// Run a search program and shape its output into a tool result.
 ///
 /// `exit_one_is_no_match` is the one way the two search tools differ. grep and
@@ -208,13 +240,24 @@ pub fn runSearch(
     argv: []const []const u8,
     exit_one_is_no_match: bool,
 ) !ToolResult {
-    const result = std.process.run(allocator, io, .{
+    return runSearchTimed(io, allocator, argv, exit_one_is_no_match, search_timeout_seconds);
+}
+
+pub fn runSearchTimed(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    exit_one_is_no_match: bool,
+    timeout_seconds: u32,
+) !ToolResult {
+    var captured: Capture = .{ .allocator = allocator };
+    defer captured.deinit();
+    const run = host_exec.run(io, allocator, .{
         .argv = argv,
-        .stdout_limit = .limited(search_max_output),
-        .stderr_limit = .limited(64 * 1024),
-    }) catch |err| switch (err) {
-        // std refuses the whole result once the limit is passed, so there is
-        // nothing of it worth showing; the model is told what to do instead.
+        .timeout_seconds = timeout_seconds,
+    }, &captured) catch |err| switch (err) {
+        // The sink refuses the whole result once the limit is passed, so there
+        // is nothing of it worth showing; the model is told what to do instead.
         error.StreamTooLong => return toolError(
             allocator,
             "Error: the search matched more output than the tool reads. Narrow it with a 'glob' or a more specific 'pattern'.",
@@ -224,30 +267,31 @@ pub fn runSearch(
         // failing the turn over, so the model can fall back to the shell.
         else => return toolError(allocator, "Error: could not run '{s}': {s}", .{ argv[0], @errorName(err) }),
     };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+
+    if (run.timed_out) return toolError(
+        allocator,
+        "Error: '{s}' ran for more than {d}s and was stopped. Narrow the 'path', 'glob' or 'pattern'.",
+        .{ argv[0], timeout_seconds },
+    );
 
     // A program that died from a signal is not an answer, whatever the code it
     // would have carried means: `null` marks it as a failure below.
-    const exit_code: ?u8 = switch (result.term) {
-        .exited => |code| code,
-        else => null,
-    };
+    const exit_code = run.exitCode();
     const no_matches = exit_one_is_no_match and exit_code != null and exit_code.? == 1;
     const is_error = exit_code == null or (exit_code.? != 0 and !no_matches);
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    if (result.stdout.len > 0) {
-        const normalized = try normalizeToolText(allocator, result.stdout);
+    if (captured.stdout.items.len > 0) {
+        const normalized = try normalizeToolText(allocator, captured.stdout.items);
         defer allocator.free(normalized);
         try aw.writer.writeAll(normalized);
     }
-    if (result.stderr.len > 0) {
+    if (captured.stderr.items.len > 0) {
         if (aw.written().len > 0) try aw.writer.writeAll("\n");
         try aw.writer.writeAll("stderr: ");
-        const normalized = try normalizeToolText(allocator, result.stderr);
+        const normalized = try normalizeToolText(allocator, captured.stderr.items);
         defer allocator.free(normalized);
         try aw.writer.writeAll(normalized);
     }
