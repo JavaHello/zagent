@@ -2,7 +2,6 @@ const std = @import("std");
 const openai = @import("../model/openai.zig");
 const trace_mod = @import("../debug/trace.zig");
 const tools = @import("../tools/mod.zig");
-const diff = @import("../diff/mod.zig");
 const text = @import("../util/text.zig");
 const menu = @import("../ui/menu.zig");
 const compact = @import("../util/compact.zig");
@@ -43,18 +42,9 @@ const continue_prompt = agent_prompt.continue_prompt;
 const restart_prompt = agent_prompt.restart_prompt;
 const steering_note = agent_prompt.steering_note;
 const CHOICE_PROMPT = agent_prompt.CHOICE_PROMPT;
-const dismissed_question_message = agent_prompt.dismissed_question_message;
 const error_preview_max = agent_prompt.error_preview_max;
-const max_subagent_task_bytes = agent_prompt.max_subagent_task_bytes;
-const max_subagent_context_bytes = agent_prompt.max_subagent_context_bytes;
-const max_subagent_title_chars = agent_prompt.max_subagent_title_chars;
-const default_subagent_checkin_seconds = agent_prompt.default_subagent_checkin_seconds;
-const max_subagent_checkin_seconds = agent_prompt.max_subagent_checkin_seconds;
-const max_subagent_report_bytes = agent_prompt.max_subagent_report_bytes;
 const report_request_prompt = agent_prompt.report_request_prompt;
 const stop_prompt = agent_prompt.stop_prompt;
-const continue_verdict = agent_prompt.continue_verdict;
-const stop_verdict = agent_prompt.stop_verdict;
 const main_omitted = agent_prompt.main_omitted;
 const buildSystemPrompt = agent_prompt.buildSystemPrompt;
 const buildSubagentPrompt = agent_prompt.buildSubagentPrompt;
@@ -564,81 +554,15 @@ pub const Agent = struct {
         try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ forgot memory {d}\n" ++ RESET, .{number});
     }
 
+    /// Compatibility entry point; tool behavior lives with its schema.
     pub fn memorySearchTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        const parsed = std.json.parseFromSlice(struct {
-            query: []const u8,
-            limit: usize = 5,
-        }, self.allocator, arguments, .{}) catch {
-            return .{ .content = try self.allocator.dupe(u8, "Error: memory_search requires a query string and an optional integer limit (1-10)."), .is_error = true };
-        };
-        defer parsed.deinit();
-        const args = parsed.value;
-        if (std.mem.trim(u8, args.query, " \t\r\n").len == 0 or args.query.len > 512 or
-            !std.unicode.utf8ValidateSlice(args.query) or args.limit < 1 or args.limit > 10)
-        {
-            return .{ .content = try self.allocator.dupe(u8, "Error: query must be non-empty UTF-8 (at most 512 bytes); limit must be 1-10."), .is_error = true };
-        }
-        return .{
-            .content = try self.memory.search(self.allocator, args.query, args.limit, memory_mod.search_budget),
-            .is_error = !self.memory.enabled,
-        };
+        return @import("../tools/memory_search.zig").execute(self, arguments);
     }
 
     /// The memory_save tool: save one durable note and tell the model whether it
     /// was new.
     pub fn memorySaveTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        if (!self.memory.enabled) {
-            return .{
-                .content = try self.allocator.dupe(u8, "Memory is unavailable: no storage path could be resolved."),
-                .is_error = true,
-            };
-        }
-        const note = openai.extractStringArg(self.allocator, arguments, "text") catch {
-            return .{
-                .content = try self.allocator.dupe(u8, "Error: memory_save needs a non-empty 'text' string"),
-                .is_error = true,
-            };
-        };
-        defer self.allocator.free(note);
-
-        const parsed = try std.json.parseFromSlice(struct {
-            text: []const u8,
-            action: []const u8 = "add",
-            old_text: ?[]const u8 = null,
-        }, self.allocator, arguments, .{});
-        defer parsed.deinit();
-        // Stage edits so failed persistence cannot leave an unsaved note in
-        // the prompt while the tool reports success.
-        var staged = try memory_mod.Memory.initWithPath(self.allocator, self.io, null);
-        defer staged.deinit();
-        staged.enabled = true;
-        if (self.memory.path) |path| staged.path = try self.allocator.dupe(u8, path);
-        for (self.memory.entries.items) |entry| _ = try staged.add(entry);
-        const added = staged.edit(parsed.value.action, note, parsed.value.old_text) catch |err| switch (err) {
-            error.EmptyMemory => return .{
-                .content = try self.allocator.dupe(u8, "Error: memory_save needs a non-empty 'text' string"),
-                .is_error = true,
-            },
-            else => return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Memory edit failed: {s}", .{@errorName(err)}),
-                .is_error = true,
-            },
-        };
-        if (!added) {
-            return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Already in memory: {s}", .{note}),
-                .is_error = false,
-            };
-        }
-
-        staged.save() catch |err| {
-            return .{ .content = try std.fmt.allocPrint(self.allocator, "Memory save failed: {s}", .{@errorName(err)}), .is_error = true };
-        };
-        std.mem.swap(memory_mod.Memory, &self.memory, &staged);
-        return .{
-            .content = try std.fmt.allocPrint(self.allocator, "Memory {s}: {s}", .{ parsed.value.action, note }),
-            .is_error = false,
-        };
+        return @import("../tools/memory_save.zig").execute(self, arguments);
     }
 
     /// The plan tool: read the checklist, replace it, or move one step. The
@@ -647,75 +571,7 @@ pub const Agent = struct {
     /// from here: a snapshot taken mid-batch would hold a call without its
     /// result, and the next resume would refuse it.
     pub fn planTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        const parsed = std.json.parseFromSlice(plan_mod.Arguments, self.allocator, arguments, .{}) catch {
-            return .{
-                .content = try self.allocator.dupe(u8, "Error: expected an object with an optional 'steps' array, or 'index' with 'status' or 'note'."),
-                .is_error = true,
-            };
-        };
-        defer parsed.deinit();
-        const args = parsed.value;
-
-        if (args.steps == null and args.index == null) {
-            // A read: the cheapest way for the model to get the plan back
-            // after a long stretch of unrelated tool results.
-            if (args.status != null or args.note != null) {
-                return .{
-                    .content = try self.allocator.dupe(u8, "Error: 'status' and 'note' change the step named by 'index'; add the index, or send 'steps' to replace the plan."),
-                    .is_error = true,
-                };
-            }
-            return .{ .content = try self.plan.describe(self.allocator), .is_error = false };
-        }
-        if (args.steps != null and args.index != null) {
-            return .{
-                .content = try self.allocator.dupe(u8, "Error: send either 'steps' or 'index', not both."),
-                .is_error = true,
-            };
-        }
-
-        var previous_status: ?plan_mod.Status = null;
-        if (args.steps) |raw_steps| {
-            var converted: std.ArrayList(plan_mod.NewStep) = .empty;
-            defer converted.deinit(self.allocator);
-            try converted.ensureTotalCapacity(self.allocator, raw_steps.len);
-            for (raw_steps) |step| {
-                const status = if (step.status) |label| plan_mod.Status.parse(label) orelse return .{
-                    .content = try std.fmt.allocPrint(self.allocator, "Error: step status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
-                    .is_error = true,
-                } else null;
-                converted.appendAssumeCapacity(.{ .title = step.title, .status = status, .note = step.note });
-            }
-            self.plan.setSteps(converted.items) catch |err| return .{
-                .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
-                .is_error = true,
-            };
-        } else {
-            const status = if (args.status) |label| plan_mod.Status.parse(label) orelse return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
-                .is_error = true,
-            } else null;
-            if (status == null and args.note == null) {
-                return .{
-                    .content = try self.allocator.dupe(u8, "Error: 'index' needs a 'status' or a 'note' to change."),
-                    .is_error = true,
-                };
-            }
-            if (args.index.? > 0 and args.index.? <= self.plan.steps.items.len)
-                previous_status = self.plan.steps.items[args.index.? - 1].status;
-            self.plan.update(args.index.?, status, args.note) catch |err| switch (err) {
-                error.NoSuchStep => return .{
-                    .content = try std.fmt.allocPrint(self.allocator, "Error: there is no step {d}; the plan has {d}.", .{ args.index.?, self.plan.steps.items.len }),
-                    .is_error = true,
-                },
-                else => return .{
-                    .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
-                    .is_error = true,
-                },
-            };
-        }
-
-        return .{ .content = try self.plan.describeChange(self.allocator, args.index, previous_status, args.note != null), .is_error = false };
+        return @import("../tools/plan.zig").execute(self, arguments);
     }
 
     /// `/plan`: show the checklist, or `/plan clear` to drop it.
@@ -908,22 +764,6 @@ pub const Agent = struct {
         };
     }
 
-    /// The task announcement comes from the main model's normal tool loop.
-    fn announceTask(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        const parsed = try std.json.parseFromSlice(struct { title: []const u8, description: []const u8 }, self.allocator, arguments, .{});
-        defer parsed.deinit();
-        const title = std.mem.trim(u8, parsed.value.title, " \t\r\n");
-        const description = std.mem.trim(u8, parsed.value.description, " \t\r\n");
-        const count = std.unicode.utf8CountCodepoints(title) catch return error.InvalidTaskTitle;
-        if (count == 0 or count >= 80 or description.len == 0 or !std.unicode.utf8ValidateSlice(description)) return error.InvalidTaskMetadata;
-        const owned = try self.allocator.dupe(u8, title);
-        if (self.current_task.len > 0) self.allocator.free(self.current_task);
-        self.current_task = owned;
-        self.terminal_title.update("thinking…", self.current_task);
-        try self.writeAnswer(description);
-        return .{ .content = try self.allocator.dupe(u8, "Task announced; the description is shown to the user."), .is_error = false };
-    }
-
     /// The `subagent` tool: hand one self-contained task to an agent of its own
     /// and read back what it has done so far.
     ///
@@ -945,85 +785,7 @@ pub const Agent = struct {
     /// an agent that runs the tool loop that calls this function, and an
     /// inferred set would have to be known before it can be.
     pub fn subagentTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
-        if (self.role == .subagent) {
-            return .{
-                .content = try self.allocator.dupe(u8, "A sub-agent cannot start another sub-agent: do this task yourself and report back."),
-                .is_error = true,
-            };
-        }
-        const Arguments = struct {
-            task: ?[]const u8 = null,
-            title: ?[]const u8 = null,
-            context: ?[]const u8 = null,
-            id: ?[]const u8 = null,
-            checkin_seconds: ?u32 = null,
-        };
-        const parsed = std.json.parseFromSlice(Arguments, self.allocator, arguments, .{}) catch {
-            return .{
-                .content = try self.allocator.dupe(u8, "Error: subagent takes a 'task' string to start a run, or the 'id' of a paused run to let it carry on; it may also take 'title', 'context' and 'checkin_seconds' (0-3600)."),
-                .is_error = true,
-            };
-        };
-        defer parsed.deinit();
-
-        const checkin = parsed.value.checkin_seconds orelse default_subagent_checkin_seconds;
-        if (checkin > max_subagent_checkin_seconds) {
-            return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: checkin_seconds must be between 0 and {d}. It is how long the sub-agent works before it is asked for a progress report, not a limit on the work.", .{max_subagent_checkin_seconds}),
-                .is_error = true,
-            };
-        }
-
-        // A run that reported back is paused at that report: this call is the
-        // caller's answer to it, and the next wait starts from here.
-        if (parsed.value.id) |id| {
-            const run = self.findRun(id) orelse (self.restoreRun(id, checkin) catch |err| return .{
-                .content = if (err == error.FileNotFound)
-                    try std.fmt.allocPrint(self.allocator, "Error: no saved sub-agent has the id \"{s}\".", .{id})
-                else
-                    try std.fmt.allocPrint(self.allocator, "Error: could not restore sub-agent \"{s}\": {s}.", .{ id, @errorName(err) }),
-                .is_error = true,
-            });
-            run.supervisor.carryOn(checkin == 0);
-            return self.waitRun(run, checkin);
-        }
-
-        const task = std.mem.trim(u8, parsed.value.task orelse "", " \t\r\n");
-        if (task.len == 0 or task.len > max_subagent_task_bytes or !std.unicode.utf8ValidateSlice(task)) {
-            return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's task must be non-empty UTF-8 of at most {d} bytes: say what to do, and leave documents in files it can read. Pass the 'id' of a paused run instead to let it carry on.", .{max_subagent_task_bytes}),
-                .is_error = true,
-            };
-        }
-        const context: []const u8 = if (parsed.value.context) |value| std.mem.trim(u8, value, " \t\r\n") else "";
-        if (context.len > max_subagent_context_bytes) {
-            return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's context must be at most {d} bytes; put longer material in a file and name the path.", .{max_subagent_context_bytes}),
-                .is_error = true,
-            };
-        }
-        // The title is what the terminal calls this run while it works, so it
-        // is held to one readable line. Leaving it out is allowed — the call's
-        // line falls back to the opening of the task — but a title that would
-        // break that line is refused before a run starts on it.
-        const title = std.mem.trim(u8, parsed.value.title orelse "", " \t\r\n");
-        if (!validRunTitle(title)) {
-            return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: the title must be one line of at most {d} Unicode characters: it is the summary the terminal shows while the run works, and the task itself says the rest. Leave it out to fall back to the task.", .{max_subagent_title_chars}),
-                .is_error = true,
-            };
-        }
-
-        // Starting the sub-agent is the one failure that is about this call
-        // rather than about the task: it is reported as an error result, so
-        // the model sees why its delegation went nowhere.
-        const run = self.startRun(task, context, title, checkin) catch |err| {
-            return .{
-                .content = try std.fmt.allocPrint(self.allocator, "The sub-agent could not start: {s}.", .{@errorName(err)}),
-                .is_error = true,
-            };
-        };
-        return self.waitRun(run, checkin);
+        return @import("../tools/subagent.zig").execute(self, arguments);
     }
 
     /// Start one sub-agent and the task that runs it. The run owns the child,
@@ -1033,11 +795,11 @@ pub const Agent = struct {
     /// `title` is the summary the terminal names the run with, and may be
     /// empty: a run without one is named by its task on the lines that would
     /// have shown it.
-    fn startRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, checkin_seconds: u32) !*Run {
+    pub fn startRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, checkin_seconds: u32) !*Run {
         return self.createRun(task, context, title, checkin_seconds, null);
     }
 
-    fn restoreRun(self: *Agent, id: []const u8, checkin: u32) !*Run {
+    pub fn restoreRun(self: *Agent, id: []const u8, checkin: u32) !*Run {
         if (id.len < 2 or id[0] != 's') return error.InvalidSessionId;
         _ = try std.fmt.parseInt(usize, id[1..], 10);
         return self.createRun("", "", "", checkin, id);
@@ -1152,7 +914,7 @@ pub const Agent = struct {
     /// waiting for it. A command that is already running is never cut short,
     /// because a report that claims a check it did not finish is worse than a
     /// report that arrives late.
-    fn waitRun(self: *Agent, run: *Run, checkin_seconds: u32) anyerror!tools.ToolResult {
+    pub fn waitRun(self: *Agent, run: *Run, checkin_seconds: u32) anyerror!tools.ToolResult {
         const checkin_at = std.Io.Timestamp.addDuration(
             std.Io.Timestamp.now(self.io, .awake),
             .fromSeconds(@intCast(checkin_seconds)),
@@ -1220,24 +982,11 @@ pub const Agent = struct {
     /// does not want to continue. The child gets one last turn to write its
     /// final report and does no new work; that reply is the tool result.
     pub fn subagentStopTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
-        if (self.role == .subagent) {
-            return .{
-                .content = try self.allocator.dupe(u8, "A sub-agent cannot stop a run: its own task ends when its caller says so."),
-                .is_error = true,
-            };
-        }
-        const parsed = std.json.parseFromSlice(struct { id: []const u8 }, self.allocator, arguments, .{}) catch {
-            return .{
-                .content = try self.allocator.dupe(u8, "Error: subagent_stop takes the 'id' the run's progress report named."),
-                .is_error = true,
-            };
-        };
-        defer parsed.deinit();
-        const run = self.findRun(parsed.value.id) orelse return .{
-            .content = try std.fmt.allocPrint(self.allocator, "Error: no sub-agent has the id \"{s}\"; one that has finished is gone.", .{parsed.value.id}),
-            .is_error = true,
-        };
+        return @import("../tools/subagent_stop.zig").execute(self, arguments);
+    }
 
+    /// Stop and join a supervised run, retaining ownership until its final reply.
+    pub fn stopRun(self: *Agent, run: *Run) anyerror!tools.ToolResult {
         run.supervisor.stop();
         // The stop is the verdict on the report the child is paused at. If it
         // is not paused there, its next request boundary says the same thing.
@@ -1265,7 +1014,7 @@ pub const Agent = struct {
         while (self.runs.items.len > 0) self.abortRun(self.runs.items[self.runs.items.len - 1]);
     }
 
-    fn findRun(self: *Agent, id: []const u8) ?*Run {
+    pub fn findRun(self: *Agent, id: []const u8) ?*Run {
         for (self.runs.items) |run| {
             if (std.mem.eql(u8, run.id, id)) return run;
         }
@@ -1315,38 +1064,7 @@ pub const Agent = struct {
     /// the same call, which is what makes the check-in a pause rather than a
     /// race: the child does nothing more until the caller has read it.
     pub fn reportTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
-        const supervisor = self.supervisor orelse return .{
-            .content = try self.allocator.dupe(u8, "The report tool belongs to a sub-agent. On the terminal, answer the user instead."),
-            .is_error = true,
-        };
-        const parsed = std.json.parseFromSlice(struct { summary: []const u8 }, self.allocator, arguments, .{}) catch {
-            return .{
-                .content = try self.allocator.dupe(u8, "Error: report takes a 'summary' string: what is done, what you ran, what is left."),
-                .is_error = true,
-            };
-        };
-        defer parsed.deinit();
-        const summary = std.mem.trim(u8, parsed.value.summary, " \t\r\n");
-        if (summary.len == 0 or !std.unicode.utf8ValidateSlice(summary)) {
-            return .{
-                .content = try self.allocator.dupe(u8, "Error: the report's summary must be non-empty UTF-8: say what is done, what you ran, and what is left."),
-                .is_error = true,
-            };
-        }
-        const report = if (summary.len > max_subagent_report_bytes)
-            try std.fmt.allocPrint(self.allocator, "{s}…", .{cutUtf8(summary, max_subagent_report_bytes)})
-        else
-            try self.allocator.dupe(u8, summary);
-        const verdict = supervisor.handOver(report) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-        };
-        return .{
-            .content = try self.allocator.dupe(u8, switch (verdict) {
-                .continue_task => continue_verdict,
-                .stop => stop_verdict,
-            }),
-            .is_error = false,
-        };
+        return @import("../tools/report.zig").execute(self, arguments);
     }
 
     /// Take what the caller asked for at a request boundary: the progress
@@ -1678,7 +1396,7 @@ pub const Agent = struct {
     /// Returns one reply per question, in the order they were asked. A question
     /// the user dismissed comes back dismissed, and the model decides for
     /// itself what to do next.
-    fn askForm(self: *Agent, slots: []menu.Slot) !menu.Replies {
+    pub fn askForm(self: *Agent, slots: []menu.Slot) !menu.Replies {
         self.terminal_title.update("waiting for input", self.current_task);
         if (self.form_callback) |present| return present(self.form_context, slots);
 
@@ -1729,13 +1447,7 @@ pub const Agent = struct {
     /// Turn one answer into the tool result the model reads. A dismissed
     /// question is an error result: the model is told to decide by itself.
     fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option) !tools.ToolResult {
-        if (try menu.describeReply(self.allocator, reply, options)) |line| {
-            return .{ .content = line, .is_error = false };
-        }
-        return .{
-            .content = try self.allocator.dupe(u8, dismissed_question_message),
-            .is_error = true,
-        };
+        return @import("../tools/ask_user.zig").questionResult(self, reply, options);
     }
 
     /// Read the free text the "type your own answer" row asks for. Owned by the
@@ -1802,126 +1514,13 @@ pub const Agent = struct {
     /// answer back as the tool result. `answers` holds what the form drawn for
     /// this message already produced, when it covered this call.
     pub fn askUser(self: *Agent, arguments: []const u8, answers: ?*QuestionAnswers, index: usize) !tools.ToolResult {
-        // Nobody is watching a sub-agent's run: its caller reads a report when
-        // it is over, and it has no keyboard to put a question on.
-        if (self.role == .subagent) {
-            return .{
-                .content = try self.allocator.dupe(u8, "No user is available to a sub-agent. Decide from what the task gives you, or report what blocks it."),
-                .is_error = true,
-            };
-        }
-        if (answers) |prepared| {
-            if (prepared.take(index)) |content| {
-                return .{ .content = content.text, .is_error = content.is_error };
-            }
-        }
-        const question = menu.parseAskUser(self.allocator, arguments) catch {
-            return .{
-                .content = try self.allocator.dupe(u8, "Error: ask_user needs a 'question' and a non-empty 'options' array"),
-                .is_error = true,
-            };
-        };
-        defer question.deinit(self.allocator);
-
-        var slots = [_]menu.Slot{menu.Slot.init(question.text, question.options.items)};
-        const replies = try self.askForm(&slots);
-        defer replies.deinit(self.allocator);
-        return self.questionResult(replies.items[0], question.options.items);
+        return @import("../tools/ask_user.zig").execute(self, arguments, answers, index);
     }
 
-    /// The answers to the ask_user calls of one message, aligned with the calls
-    /// themselves so the dispatch can find the one it needs.
-    pub const QuestionAnswers = struct {
-        items: []Slot,
+    pub const QuestionAnswers = @import("../tools/ask_user.zig").QuestionAnswers;
 
-        /// What one tool result will say, once the call is dispatched.
-        const Content = struct { text: []const u8, is_error: bool };
-
-        const Slot = union(enum) {
-            /// Not a question of this form: the call is dispatched as usual.
-            none,
-            /// The prepared result. Owned here until it is taken.
-            content: Content,
-        };
-
-        fn deinit(self: QuestionAnswers, allocator: std.mem.Allocator) void {
-            for (self.items) |item| {
-                switch (item) {
-                    .content => |content| allocator.free(content.text),
-                    .none => {},
-                }
-            }
-            allocator.free(self.items);
-        }
-
-        /// Hand the prepared result to the dispatch, which then owns its text.
-        fn take(self: *QuestionAnswers, index: usize) ?Content {
-            if (index >= self.items.len) return null;
-            switch (self.items[index]) {
-                .none => return null,
-                .content => |content| {
-                    self.items[index] = .none;
-                    return content;
-                },
-            }
-        }
-    };
-
-    /// Put every question of this message to the user as one form, so an answer
-    /// can be revised with Tab before the form is submitted. A call whose
-    /// arguments do not parse is left out: `askUser` reports that as it always
-    /// has.
     fn askQuestions(self: *Agent, calls: []const ToolCallData) !?QuestionAnswers {
-        // A sub-agent has no user to put a form to. Its questions reach the
-        // dispatcher unanswered, which reports them as an error result instead
-        // of drawing a menu on a terminal the sub-agent does not own.
-        if (self.role == .subagent) return null;
-        var questions_in_message: usize = 0;
-        for (calls) |call| {
-            if (std.mem.eql(u8, call.name, "ask_user")) questions_in_message += 1;
-        }
-        // One ask_user call is still a form, but there is nothing to Tab
-        // between; drawing it costs nothing and keeps one code path.
-        if (questions_in_message == 0) return null;
-
-        const items = try self.allocator.alloc(QuestionAnswers.Slot, calls.len);
-        @memset(items, .none);
-        var answers = QuestionAnswers{ .items = items };
-        errdefer answers.deinit(self.allocator);
-
-        var questions: std.ArrayList(menu.Question) = .empty;
-        defer {
-            for (questions.items) |question| question.deinit(self.allocator);
-            questions.deinit(self.allocator);
-        }
-        var slots: std.ArrayList(menu.Slot) = .empty;
-        defer slots.deinit(self.allocator);
-        var indexes: std.ArrayList(usize) = .empty;
-        defer indexes.deinit(self.allocator);
-
-        for (calls, 0..) |call, i| {
-            if (!std.mem.eql(u8, call.name, "ask_user")) continue;
-            const question = menu.parseAskUser(self.allocator, call.arguments) catch continue;
-            // The array does not own it until the append succeeds.
-            questions.append(self.allocator, question) catch |err| {
-                question.deinit(self.allocator);
-                return err;
-            };
-            try slots.append(self.allocator, menu.Slot.init(question.text, question.options.items));
-            try indexes.append(self.allocator, i);
-        }
-        if (slots.items.len == 0) return answers;
-
-        const replies = try self.askForm(slots.items);
-        defer replies.deinit(self.allocator);
-
-        // Replies and slots are both in the order the questions were asked, and
-        // each slot knows which call asked it.
-        for (replies.items, slots.items, indexes.items) |reply, slot, index| {
-            const result = try self.questionResult(reply, slot.options);
-            answers.items[index] = .{ .content = .{ .text = result.content, .is_error = result.is_error } };
-        }
-        return answers;
+        return @import("../tools/ask_user.zig").askQuestions(self, calls);
     }
 
     /// Give the history a message whose fields are already owned. The history
@@ -2036,63 +1635,33 @@ pub const Agent = struct {
     }
 
     fn writeToolCall(self: *Agent, w: *std.Io.Writer, call: ToolCallData) !void {
-        // A plan call carries a whole checklist as its arguments. Its JSON is
-        // unreadable on one terminal line, so the summary says what it does;
-        // the result below shows the checklist itself.
-        if (std.mem.eql(u8, call.name, "plan")) {
-            try w.writeAll(YELLOW ++ "  ⚙ plan" ++ RESET ++ " ");
-            if (!try plan_mod.writeCallSummary(w, self.allocator, call.arguments)) {
-                try text.writeSanitized(w, call.arguments);
-            }
-            try w.writeByte('\n');
-            return;
-        }
-        // A sub-agent call carries a whole task as its argument, so the line
-        // says what is being done rather than pasting the JSON of it: the title
-        // the caller named the run with, the run a resume names, or the opening
-        // of the task. It is marked with a glyph and a colour of its own: this
-        // line starts a second agent, and nothing else on the terminal looks
-        // like it.
-        if (std.mem.eql(u8, call.name, "subagent")) {
-            try w.writeAll(CYAN ++ "  ⇢ subagent" ++ RESET ++ " ");
-            if (!try self.writeRunName(w, call.arguments)) try text.writeSanitized(w, call.arguments);
-            try w.writeByte('\n');
-            return;
-        }
-        if (!std.mem.eql(u8, call.name, "apply_patch")) {
-            try w.writeAll(YELLOW ++ "  ⚙ ");
-            // A tool name and its arguments are model output like any other, so
-            // they are sanitised like any other: a call carrying an escape
-            // sequence gets to be read, not to repaint the line it is on.
-            try text.writeSanitized(w, call.name);
+        const spec = @import("../tools/dispatch.zig").presentation(call.name);
+        var preview: std.Io.Writer.Allocating = .init(self.allocator);
+        defer preview.deinit();
+        const ctx: tools.Context = .{ .io = self.io, .allocator = self.allocator, .agent = self };
+        const summarized = if (spec) |s| if (s.summary) |write| try write(ctx, &preview.writer, call.arguments) else false else false;
+        const block = summarized and spec.?.summary_block;
+        try w.writeAll(if (spec != null and spec.?.delegated) CYAN ++ "  ⇢ " else YELLOW ++ "  ⚙ ");
+        try text.writeSanitized(w, call.name);
+        if (block) {
+            try w.writeAll("\n" ++ RESET);
+            try w.writeAll(preview.written());
+        } else {
             try w.writeAll(RESET ++ " ");
-            try text.writeSanitized(w, call.arguments);
+            try text.writeSanitized(w, if (summarized) preview.written() else call.arguments);
             try w.writeByte('\n');
-            return;
         }
+    }
 
-        const patch_text = openai.extractStringArg(self.allocator, call.arguments, "patch") catch {
-            // Nothing to draw. What the model actually sent still goes up, so
-            // the call is visible; the dispatch reports what was wrong with it.
-            try w.writeAll(YELLOW ++ "  ⚙ apply_patch" ++ RESET ++ " ");
-            try text.writeSanitized(w, call.arguments);
-            try w.writeByte('\n');
-            return;
-        };
-        defer self.allocator.free(patch_text);
-
-        try w.writeAll(YELLOW ++ "  ⚙ apply_patch\n" ++ RESET);
-        try diff.render(w, patch_text);
+    // Retained for existing tests of task metadata and title ownership.
+    fn announceTask(self: *Agent, arguments: []const u8) !tools.ToolResult {
+        return @import("../tools/announce_task.zig").execute(self, arguments);
     }
 
     /// `announce_task` writes the terminal's task line, so it belongs to the
     /// agent that owns the terminal: a sub-agent reports instead.
     pub fn announceTaskTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
-        if (self.role == .subagent) return .{
-            .content = try self.allocator.dupe(u8, "A sub-agent does not announce tasks: the agent that called you owns the terminal and the plan. Report back instead."),
-            .is_error = true,
-        };
-        return self.announceTask(arguments);
+        return @import("../tools/announce_task.zig").execute(self, arguments);
     }
 
     /// Run one tool call. `index` and `answers` locate the result of a question
@@ -2105,6 +1674,7 @@ pub const Agent = struct {
             .allocator = self.allocator,
             .env = self.tool_env,
             .cache_dir = cache_dir,
+            .hooks = .{ .after = @import("../tools/ccr.zig").afterExecute },
             .agent = self,
             .answers = answers,
             .index = index,
@@ -2131,8 +1701,9 @@ pub const Agent = struct {
             // A sub-agent works out of sight, so its line is coloured like
             // its call: the user can tell a second agent at work from the
             // main model thinking, without reading the words.
-            if (std.mem.eql(u8, call.name, "subagent") or std.mem.eql(u8, call.name, "subagent_stop"))
-                options.style = CYAN;
+            if (@import("../tools/dispatch.zig").presentation(call.name)) |spec| {
+                if (spec.delegated) options.style = CYAN;
+            }
             var spin = if (label) |caption|
                 spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options)
             else
@@ -2142,54 +1713,11 @@ pub const Agent = struct {
             break :blk try tools.execute(ctx, call.name, call.arguments);
         };
 
-        // The one place the size limit is applied, whatever the tool was: the
-        // tools page and clip what they can, and this holds the line for the
-        // rest, an MCP server's answer included.
-        const clipped = try tools.clipOversized(self.allocator, result);
-        errdefer clipped.deinit(self.allocator);
-        try self.previewToolResult(clipped.content, clipped.is_error);
-        return clipped;
-    }
-
-    /// What a `subagent` call is called on this terminal: the title the caller
-    /// named the run with, else the run a resume or a stop names — which knows
-    /// the title it was started with — else the opening of the task.
-    ///
-    /// Writes nothing and answers false when the arguments name none of them,
-    /// so the caller can fall back to whatever it has. All three are model
-    /// output, so they are flattened and sanitised the way any other line of
-    /// it is.
-    fn writeRunName(self: *Agent, w: *std.Io.Writer, arguments: []const u8) !bool {
-        const title = openai.extractStringArg(self.allocator, arguments, "title") catch null;
-        defer if (title) |value| self.allocator.free(value);
-        const named = if (title) |value| std.mem.trim(u8, value, " \t\r\n") else "";
-        if (named.len > 0) {
-            try writeCallBrief(w, named);
-            return true;
-        }
-
-        const id = openai.extractStringArg(self.allocator, arguments, "id") catch null;
-        defer if (id) |value| self.allocator.free(value);
-        if (id) |value| {
-            const run_id = std.mem.trim(u8, value, " \t\r\n");
-            if (run_id.len > 0) {
-                if (self.findRun(run_id)) |run| {
-                    if (run.title.len > 0) {
-                        try writeCallBrief(w, run.title);
-                        return true;
-                    }
-                }
-                try writeCallBrief(w, run_id);
-                return true;
-            }
-        }
-
-        const task = openai.extractStringArg(self.allocator, arguments, "task") catch return false;
-        defer self.allocator.free(task);
-        const trimmed = std.mem.trim(u8, task, " \t\r\n");
-        if (trimmed.len == 0) return false;
-        try writeCallBrief(w, trimmed);
-        return true;
+        // Dispatch applies the shared size limit after execution hooks, including
+        // quiet calls and MCP results. The UI only previews the finalized result.
+        errdefer result.deinit(self.allocator);
+        try self.previewToolResult(result.content, result.is_error);
+        return result;
     }
 
     /// The progress line's label for a tool call, or null for a tool that must
@@ -2201,34 +1729,17 @@ pub const Agent = struct {
     /// `buf` is where a built label lives. It must outlive the animation, so
     /// the caller owns it and frees it after the spinner has stopped.
     fn callProgressLabel(self: *Agent, call: ToolCallData, buf: *std.Io.Writer.Allocating) !?[]const u8 {
-        // Stopping a run waits for its last reply, the way a resume waits for
-        // its next report, so both get the same kind of line.
-        if (std.mem.eql(u8, call.name, "subagent_stop")) {
-            buf.clearRetainingCapacity();
-            try buf.writer.writeAll("subagent · ");
-            const id = openai.extractStringArg(self.allocator, call.arguments, "id") catch null;
-            defer if (id) |value| self.allocator.free(value);
-            // The run being stopped is still here, so it can name itself.
-            const stopped = if (id) |value| self.findRun(std.mem.trim(u8, value, " \t\r\n")) else null;
-            if (stopped) |run| {
-                if (run.title.len > 0) {
-                    try writeCallBrief(&buf.writer, run.title);
-                    try buf.writer.writeAll(" · ");
-                }
+        if (@import("../tools/dispatch.zig").presentation(call.name)) |spec| {
+            if (spec.progress) |write| {
+                var raw: std.Io.Writer.Allocating = .init(self.allocator);
+                defer raw.deinit();
+                const label = try write(.{ .io = self.io, .allocator = self.allocator, .agent = self }, &raw, call.arguments) orelse return null;
+                buf.clearRetainingCapacity();
+                try text.writeSanitized(&buf.writer, label);
+                return buf.written();
             }
-            try buf.writer.writeAll("stopping…");
-            return buf.written();
         }
-        if (!std.mem.eql(u8, call.name, "subagent"))
-            return tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
-
-        buf.clearRetainingCapacity();
-        try buf.writer.writeAll("subagent · ");
-        if (try self.writeRunName(&buf.writer, call.arguments)) return buf.written();
-        // A call that names nothing yet still says who is at work.
-        buf.clearRetainingCapacity();
-        try buf.writer.writeAll("subagent…");
-        return buf.written();
+        return tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
     }
 
     /// Use the same result preview for live execution and restored messages.
@@ -2256,7 +1767,7 @@ pub const Agent = struct {
     /// or a file the consumer is another program, and markdown is both the most
     /// faithful representation and the one that loses nothing — stripping
     /// markers would quietly cost a `| tee answer.md` user their structure.
-    fn writeAnswer(self: *Agent, content: []const u8) !void {
+    pub fn writeAnswer(self: *Agent, content: []const u8) !void {
         const stdout = std.Io.File.stdout();
         if (!self.render_markdown) return self.writeLogOrStdout(content);
 
@@ -2360,16 +1871,6 @@ fn childTurn(child: *Agent, supervisor: *subagent.Supervisor, prompt: []u8) void
         return;
     };
     supervisor.finish(null);
-}
-
-/// The longest prefix of `bytes` that is at most `max` bytes and does not end
-/// inside a character. A report is model text, and half a codepoint is not
-/// text: it would come back as an invalid string in the caller's history.
-fn cutUtf8(bytes: []const u8, max: usize) []const u8 {
-    if (bytes.len <= max) return bytes;
-    var end = max;
-    while (end > 0 and (bytes[end] & 0xc0) == 0x80) end -= 1;
-    return bytes[0..end];
 }
 
 /// Paints the answer as it streams from the model. The markdown renderer is
@@ -2609,20 +2110,6 @@ fn subagentFailure(err: anyerror) []const u8 {
     return @errorName(err);
 }
 
-/// The opening of a piece of model text, cut to one terminal line: a task is
-/// worth naming on the line that announces the call, and its newlines and its
-/// length are not. The cut never falls inside a character.
-fn writeCallBrief(w: *std.Io.Writer, raw: []const u8) !void {
-    const limit: usize = 120;
-    var used: usize = 0;
-    while (used < raw.len and used < limit) : (used += 1) {
-        if (raw[used] == '\n' or raw[used] == '\r') break;
-    }
-    while (used > 0 and used < raw.len and (raw[used] & 0xC0) == 0x80) used -= 1;
-    try text.writeSanitized(w, raw[0..used]);
-    if (used < raw.len) try w.writeAll("…");
-}
-
 /// The id of a run, and the title it was started with when it has one: how a
 /// line about a run names it, so a caller reading one of two reports can tell
 /// which run it is reading.
@@ -2634,20 +2121,6 @@ fn writeRunTag(w: *std.Io.Writer, run: *const Run) !void {
     // is one line already.
     try w.writeAll(run.title);
     try w.writeByte('"');
-}
-
-/// Whether a caller's title can name a run on the terminal: UTF-8, at most
-/// `max_subagent_title_chars` characters, and one line — no control characters,
-/// so the line it lands on keeps its shape. An empty title is allowed: the run
-/// is then named by its task instead.
-fn validRunTitle(title: []const u8) bool {
-    if (title.len == 0) return true;
-    if (!std.unicode.utf8ValidateSlice(title)) return false;
-    for (title) |byte| {
-        if (byte < 0x20 or byte == 0x7f) return false;
-    }
-    const count = std.unicode.utf8CountCodepoints(title) catch return false;
-    return count <= max_subagent_title_chars;
 }
 
 /// A standalone agent with a hermetic environment for tests. The line editor

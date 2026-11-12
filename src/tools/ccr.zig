@@ -167,6 +167,23 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []c
     return stream.finish(io);
 }
 
+/// Optional execution-after hook for any tool (including MCP). Unlike bash's
+/// streaming cache this handles already-materialized results. Install as
+/// Context.hooks.after or Tool.hooks.after; dispatch clips only after it runs.
+/// Consumes outcome's content on success and failure.
+pub fn afterExecute(ctx: tool.Context, _: []const u8, _: []const u8, outcome: anyerror!ToolResult) !ToolResult {
+    var result = try outcome;
+    if (result.content.len <= result_mod.max_output_bytes) return result;
+    const dir = ctx.cache_dir orelse return result;
+    const saved = save(ctx.io, ctx.allocator, dir, result.content) catch return result;
+    const original = result.content;
+    defer ctx.allocator.free(original);
+    const preview = truncateUtf8(original, page_room_bytes);
+    result.content = try std.fmt.allocPrint(ctx.allocator, "{s}\n[ccr {s}: {d} lines, {d} bytes. Call ccr_retrieve with id \"{s}\" to read the full output.]", .{ preview, saved.id, saved.lines, saved.bytes, saved.id });
+    result.truncated = true;
+    return result;
+}
+
 /// What one `ccr_retrieve` call asks for. `offset` counts lines, or matching
 /// lines when `query` is given; a null `limit` reads as many as a page holds.
 pub const RetrieveArgs = struct {
@@ -373,6 +390,62 @@ fn queryPage(
         .is_error = false,
         .truncated = resumes_at != null,
     };
+}
+
+test "afterExecute caches materialized output, preserves status and retrieves the tail" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const ctx: tool.Context = .{ .io = io, .allocator = a, .cache_dir = dir };
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    for (0..6000) |_| try text.writer.writeAll("payload\n");
+    try text.writer.writeAll("uncut tail\n");
+    const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = true, .exit_code = 7, .timed_out = true });
+    defer result.deinit(a);
+    try std.testing.expect(result.is_error and result.timed_out and result.truncated);
+    try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
+    try std.testing.expect(result.content.len < result_mod.max_output_bytes);
+    const start = (std.mem.indexOf(u8, result.content, "[ccr ") orelse return error.MissingCacheId) + "[ccr ".len;
+    const id = result.content[start..][0..id_len];
+    const path = try filePath(a, dir, id);
+    defer a.free(path);
+    const cached = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(100 * 1024));
+    defer a.free(cached);
+    try std.testing.expectEqualStrings(text.written(), cached);
+    const args = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"offset\":6001}}", .{id});
+    defer a.free(args);
+    const retrieved = try spec.execute(ctx, args);
+    defer retrieved.deinit(a);
+    try std.testing.expect(!retrieved.is_error);
+    try std.testing.expectEqualStrings("6001:uncut tail\n", retrieved.content);
+}
+
+test "afterExecute leaves short results and uncached fallbacks untouched and propagates errors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "not-a-directory", .data = "occupied" });
+    const invalid_dir = try tmp.dir.realPathFileAlloc(io, "not-a-directory", a);
+    defer a.free(invalid_dir);
+    // A regular file is a deterministic save failure even when running as root.
+    for ([_]?[]const u8{ null, invalid_dir }) |dir| {
+        for ([_]usize{ 5, result_mod.max_output_bytes, result_mod.max_output_bytes + 1 }) |len| {
+            const content = try a.alloc(u8, len);
+            @memset(content, 'x');
+            const original: ToolResult = .{ .content = content, .is_error = true, .exit_code = 9, .timed_out = true, .truncated = true };
+            const result = try afterExecute(.{ .io = io, .allocator = a, .cache_dir = dir }, "test", "{}", original);
+            defer result.deinit(a);
+            try std.testing.expect(result.content.ptr == original.content.ptr);
+            try std.testing.expectEqualStrings(original.content, result.content);
+            try std.testing.expectEqualDeep(original.status(), result.status());
+        }
+    }
+    try std.testing.expectError(error.RunFailed, afterExecute(.{ .io = io, .allocator = a }, "test", "{}", error.RunFailed));
 }
 
 test "cached output is read back in pages and by query" {

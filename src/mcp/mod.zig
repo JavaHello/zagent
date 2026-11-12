@@ -1299,7 +1299,7 @@ pub const Registry = struct {
         return self.tool_json;
     }
 
-    fn refreshFunctions(self: *Registry) !void {
+    pub fn refreshFunctions(self: *Registry) !void {
         var views: std.ArrayList([]const u8) = .empty;
         errdefer views.deinit(self.allocator);
         if (self.tools.len > 0) try views.append(self.allocator, loader_json);
@@ -1313,31 +1313,7 @@ pub const Registry = struct {
 
     /// Activate one service, without copying its schemas into conversation history.
     pub fn loadTools(self: *Registry, allocator: std.mem.Allocator, arguments_json: []const u8) !tools.ToolResult {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch {
-            return errorResult(allocator, "Expected an object with a server name.", .{});
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) return errorResult(allocator, "Expected an object with a server name.", .{});
-        const name = parsed.value.object.get("server") orelse return errorResult(allocator, "Missing server name.", .{});
-        if (name != .string) return errorResult(allocator, "Server name must be a string.", .{});
-        for (self.servers) |*server| {
-            if (!std.mem.eql(u8, server.config.name, name.string)) continue;
-            if (server.failure != null or server.connection == null or server.tool_count == 0)
-                return errorResult(allocator, "MCP server '{s}' has no available tools.", .{name.string});
-            const was_loaded = server.loaded;
-            server.loaded = true;
-            self.refreshFunctions() catch |err| {
-                server.loaded = was_loaded;
-                return err;
-            };
-            const note = server.connection.?.instructions orelse "";
-            return .{ .is_error = false, .content = try std.fmt.allocPrint(
-                allocator,
-                "Loaded {d} tools from MCP server '{s}'. They are now available.\nService instructions:\n{s}",
-                .{ server.tool_count, name.string, note },
-            ) };
-        }
-        return errorResult(allocator, "Unknown MCP server '{s}'. Use an exact name from the service directory.", .{name.string});
+        return @import("../tools/load_mcp_tools.zig").execute(self, allocator, arguments_json);
     }
 
     /// The progress line for a call, or null for anything that is not one of

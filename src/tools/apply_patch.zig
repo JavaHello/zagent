@@ -18,8 +18,17 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"patch":{"type":"string","description":"The Git Unified Diff to apply, with its newlines"}},"required":["patch"]}
     ,
     .label = "apply_patch…",
+    .summary = writeSummary,
+    .summary_block = true,
     .run = run,
 };
+
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    const patch = args_mod.requiredString(ctx.allocator, arguments, "patch") catch return false;
+    defer ctx.allocator.free(patch);
+    try diff.render(w, patch);
+    return true;
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     const patch_text = args_mod.requiredString(ctx.allocator, arguments, "patch") catch

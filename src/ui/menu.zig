@@ -36,16 +36,8 @@ pub const Options = struct {
     }
 };
 
-/// The parsed arguments of one ask_user call.
-pub const Question = struct {
-    text: []const u8,
-    options: Options,
-
-    pub fn deinit(self: Question, allocator: std.mem.Allocator) void {
-        allocator.free(self.text);
-        self.options.deinit(allocator);
-    }
-};
+/// Compatibility alias; the tool owns its JSON protocol, not the UI.
+pub const Question = @import("../tools/ask_user.zig").Question;
 
 /// What the user did at a menu.
 pub const Answer = union(enum) {
@@ -57,88 +49,9 @@ pub const Answer = union(enum) {
     skip,
 };
 
-/// Parse the `arguments` string of an ask_user tool call. Everything the model
-/// can get wrong — unparseable JSON, a missing question, no usable options —
-/// comes back as `InvalidQuestion`, so callers have one case to report.
-pub fn parseAskUser(allocator: std.mem.Allocator, arguments_json: []const u8) !Question {
-    return parseAskUserInner(allocator, arguments_json) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidQuestion,
-    };
-}
-
-fn parseAskUserInner(allocator: std.mem.Allocator, arguments_json: []const u8) !Question {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
-    defer parsed.deinit();
-
-    if (parsed.value != .object) return error.InvalidQuestion;
-    const question_val = parsed.value.object.get("question") orelse return error.InvalidQuestion;
-    if (question_val != .string) return error.InvalidQuestion;
-    const options_val = parsed.value.object.get("options") orelse return error.InvalidQuestion;
-
-    const options = try parseOptions(allocator, options_val);
-    errdefer options.deinit(allocator);
-
-    return .{
-        .text = try allocator.dupe(u8, question_val.string),
-        .options = options,
-    };
-}
-
-/// Parse an `options` array. A bare string counts as a label with no
-/// description, because models drift into `["a","b"]` often enough that
-/// rejecting it would cost a whole extra round trip.
-pub fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !Options {
-    if (value != .array) return error.InvalidOptions;
-
-    var items: std.ArrayList(Option) = .empty;
-    errdefer {
-        for (items.items) |option| option.deinit(allocator);
-        items.deinit(allocator);
-    }
-
-    for (value.array.items) |entry| {
-        // A malformed element is skipped rather than failing the whole call,
-        // the way the response parser skips unreadable tool calls.
-        const option = (try buildOption(allocator, entry)) orelse continue;
-        errdefer option.deinit(allocator);
-        try items.append(allocator, option);
-    }
-
-    if (items.items.len == 0) return error.InvalidOptions;
-
-    return .{ .items = try items.toOwnedSlice(allocator) };
-}
-
-fn buildOption(allocator: std.mem.Allocator, value: std.json.Value) !?Option {
-    var label: []const u8 = undefined;
-    var description: []const u8 = "";
-    var recommended = false;
-
-    switch (value) {
-        .string => |text| label = text,
-        .object => |obj| {
-            const label_val = obj.get("label") orelse return null;
-            if (label_val != .string) return null;
-            label = label_val.string;
-            if (obj.get("description")) |description_val| {
-                if (description_val == .string) description = description_val.string;
-            }
-            if (obj.get("recommended")) |recommended_val| {
-                if (recommended_val == .bool) recommended = recommended_val.bool;
-            }
-        },
-        else => return null,
-    }
-
-    const owned_label = try allocator.dupe(u8, label);
-    errdefer allocator.free(owned_label);
-    return .{
-        .label = owned_label,
-        .description = try allocator.dupe(u8, description),
-        .recommended = recommended,
-    };
-}
+/// Compatibility forwards for callers of the former menu parser API.
+pub const parseAskUser = @import("../tools/ask_user.zig").parseAskUser;
+pub const parseOptions = @import("../tools/ask_user.zig").parseOptions;
 
 pub fn recommendedIndex(options: []const Option) ?usize {
     for (options, 0..) |option, i| {
@@ -843,41 +756,6 @@ test "menu rows fit CJK text and flatten model control characters" {
     defer aw.deinit();
     try writeRow(&aw.writer, std.testing.allocator, "你\n好\x1b[2J世界", 7);
     try std.testing.expectEqualStrings("你 好" ++ RESET ++ "\x1b[K\r\n", aw.written());
-}
-
-test "parse ask_user arguments" {
-    const allocator = std.testing.allocator;
-    const question = try parseAskUser(allocator,
-        \\{"question":"How should I test this?","options":[{"label":"Add tests","description":"Covers the new branch.","recommended":true},{"label":"Skip tests"}]}
-    );
-    defer question.deinit(allocator);
-
-    try std.testing.expectEqualStrings("How should I test this?", question.text);
-    try std.testing.expectEqual(@as(usize, 2), question.options.items.len);
-    try std.testing.expectEqualStrings("Add tests", question.options.items[0].label);
-    try std.testing.expectEqualStrings("Covers the new branch.", question.options.items[0].description);
-    try std.testing.expect(question.options.items[0].recommended);
-    try std.testing.expectEqualStrings("", question.options.items[1].description);
-    try std.testing.expect(!question.options.items[1].recommended);
-}
-
-test "parse options accepts bare strings and skips malformed entries" {
-    const allocator = std.testing.allocator;
-    const options = try parseAskUser(allocator,
-        \\{"question":"Which?","options":["alpha",{"label":"beta"},42]}
-    );
-    defer options.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), options.options.items.len);
-    try std.testing.expectEqualStrings("alpha", options.options.items[0].label);
-    try std.testing.expectEqualStrings("beta", options.options.items[1].label);
-}
-
-test "ask_user arguments without options are rejected" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidQuestion, parseAskUser(allocator, "{\"question\":\"Which?\"}"));
-    try std.testing.expectError(error.InvalidQuestion, parseAskUser(allocator, "{\"question\":\"Which?\",\"options\":[]}"));
-    try std.testing.expectError(error.InvalidQuestion, parseAskUser(allocator, "not json"));
 }
 
 test "a numbered answer picks that option" {

@@ -5,7 +5,6 @@
 //! and the plan travel together: a cleared history keeps the plan, a resumed
 //! session brings it back, and a new session starts without one.
 const std = @import("std");
-const text = @import("../util/text.zig");
 
 pub const max_steps: usize = 50;
 pub const max_title_bytes: usize = 200;
@@ -37,19 +36,10 @@ pub const Status = enum {
 
 /// One step as the model sends it: the status arrives as text, and is read
 /// with `Status.parse` so the error can name what was wrong.
-pub const ArgumentStep = struct {
-    title: []const u8,
-    status: ?[]const u8 = null,
-    note: ?[]const u8 = null,
-};
+pub const ArgumentStep = @import("../tools/plan.zig").ArgumentStep;
 
-/// The arguments of a `plan` call.
-pub const Arguments = struct {
-    steps: ?[]const ArgumentStep = null,
-    index: ?usize = null,
-    status: ?[]const u8 = null,
-    note: ?[]const u8 = null,
-};
+/// Compatibility aliases; tool arguments belong to the tool.
+pub const Arguments = @import("../tools/plan.zig").Arguments;
 
 pub const Step = struct {
     title: []u8,
@@ -232,25 +222,7 @@ pub const Plan = struct {
     /// Null index means replacement (including clearing); otherwise the caller
     /// supplies the status captured before updating that 1-based step.
     pub fn describeChange(self: *const Plan, allocator: std.mem.Allocator, index: ?usize, previous_status: ?Status, note_changed: bool) ![]u8 {
-        var aw: std.Io.Writer.Allocating = .init(allocator);
-        errdefer aw.deinit();
-        if (index) |number| {
-            if (number == 0 or number > self.steps.items.len) return error.NoSuchStep;
-            const status = self.steps.items[number - 1].status;
-            if (previous_status) |previous| {
-                try aw.writer.print("Step {d}: {s} -> {s}", .{ number, @tagName(previous), @tagName(status) });
-            } else {
-                try aw.writer.print("Step {d}: {s}", .{ number, @tagName(status) });
-            }
-            if (note_changed) try aw.writer.writeAll("; note updated");
-            try aw.writer.writeAll(".\n");
-        } else if (self.steps.items.len == 0) {
-            try aw.writer.writeAll("Plan cleared.\n");
-        } else {
-            const progress = self.tally();
-            try aw.writer.print("Plan saved: {d} steps, {d} completed, {d} blocked.\n", .{ progress.total, progress.done, progress.blocked });
-        }
-        return aw.toOwnedSlice();
+        return @import("../tools/plan.zig").describeChange(self, allocator, index, previous_status, note_changed);
     }
 };
 
@@ -258,54 +230,11 @@ pub const Plan = struct {
 /// are a whole checklist, and the JSON would take ten times the room to say
 /// the same thing. Returns false when they are not a call this program can
 /// read, so the caller can show what actually came in.
-pub fn writeCallSummary(w: *std.Io.Writer, allocator: std.mem.Allocator, arguments_json: []const u8) !bool {
-    const parsed = std.json.parseFromSlice(Arguments, allocator, arguments_json, .{}) catch return false;
-    defer parsed.deinit();
-    const args = parsed.value;
-    if (args.steps) |steps| {
-        try w.print("{d} steps", .{steps.len});
-        for (steps, 0..) |step, i| {
-            if (i == 3) {
-                try w.writeAll(", …");
-                break;
-            }
-            try w.writeAll(if (i == 0) ": " else ", ");
-            try writeOnOneLine(w, step.title);
-        }
-        return true;
-    }
-    if (args.index) |index| {
-        try w.print("step {d}", .{index});
-        if (args.status) |status| {
-            try w.writeAll(" → ");
-            try writeOnOneLine(w, status);
-        }
-        if (args.note) |note| {
-            try w.writeAll(" · ");
-            try writeOnOneLine(w, note);
-        }
-        return true;
-    }
-    try w.writeAll("read");
-    return true;
-}
+pub const writeCallSummary = @import("../tools/plan.zig").writeCallSummary;
 
 fn freeStep(a: std.mem.Allocator, step: Step) void {
     a.free(step.title);
     if (step.note) |note| a.free(note);
-}
-
-/// Sanitised text from the model, held to one line: a title carrying a newline
-/// would otherwise draw over the line the call is announced on.
-fn writeOnOneLine(w: *std.Io.Writer, raw: []const u8) !void {
-    var start: usize = 0;
-    for (raw, 0..) |byte, i| {
-        if (byte != '\n' and byte != '\r' and byte != '\t') continue;
-        try text.writeSanitized(w, raw[start..i]);
-        try w.writeByte(' ');
-        start = i + 1;
-    }
-    try text.writeSanitized(w, raw[start..]);
 }
 
 fn freeSteps(a: std.mem.Allocator, steps: []const Step) void {

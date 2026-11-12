@@ -147,11 +147,40 @@ sentence saying what to fix, rather than as an error. `ctx` carries the `std.Io`
 the allocator, and — for a tool that starts a program or reads cached output —
 the environment to hand it and this run's `cache_dir`.
 
-The tools the agent answers itself — memory, the plan, sub-agents, questions to
-the user, the MCP loader and `announce_task` — are listed the same way beside
-their methods in `src/agent/mod.zig` (`session_tools`). Only a tool of a
-connected MCP server is matched by its prefix rather than by name, because its
-name is the server's.
+Session tools — memory, the plan, sub-agents, questions to the user, the MCP
+loader and `announce_task` — also own their implementations in `src/tools/` and
+share the dispatch registry. They access session state through `ctx.agent`;
+Agent retains session ownership, supervised-run lifecycles and terminal IO.
+Tool-specific argument summaries and dynamic progress labels belong to the
+spec's optional `summary` and `progress` callbacks, not name checks in Agent.
+Only a connected MCP server's tool is matched by its prefix rather than a
+built-in spec, because its name is discovered at runtime.
+
+### Execution hooks
+
+`Tool.hooks` provides tool-local `before` and `after` callbacks;
+`Context.hooks` wraps the entire dispatch, including MCP calls. Both use the
+`Hooks` type from `tool.zig` and receive the context, name and raw arguments.
+`ctx.hook_data` can carry caller-owned state for the duration of the call.
+The normal execution order is:
+
+```
+context.before → tool.before → run → tool.after → context.after → size limit
+```
+
+A before callback returns `null` to continue, or an owned `ToolResult` to skip
+execution. A before error or short-circuit skips that layer's after callback;
+an enclosing after callback still observes the inner outcome. After receives
+`anyerror!ToolResult`, allowing it to transform a result or handle a run error.
+It takes ownership of result content and must return it, or free it when
+replacing the result or returning an error. Hooks are synchronous and dispatch
+does not retain caller state.
+
+Agent installs `ccr.afterExecute` as its context after hook. This caches
+oversized materialized output (including MCP output) before dispatch clips the
+result, and returns a preview with a `ccr_retrieve` id. No cache directory or a
+cache-write failure leaves the original result for normal clipping. Bash keeps
+its streaming CCR cache so it need not materialize arbitrarily large output.
 
 ## Documentation
 

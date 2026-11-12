@@ -40,6 +40,7 @@ const ccr = @import("ccr.zig");
 /// What a built-in tool is, and what one is given besides its arguments.
 pub const Tool = tool_mod.Tool;
 pub const Context = tool_mod.Context;
+pub const Hooks = tool_mod.Hooks;
 
 /// Send one call to the built-in tool that answers it.
 pub const execute = dispatch.execute;

@@ -56,8 +56,22 @@ pub const all = [_]tool.Tool{
 /// where a long output may be cached, and the environment a program it starts is
 /// handed. The arguments are the model's JSON, unread: the tool parses them.
 pub fn execute(ctx: tool.Context, name: []const u8, arguments: []const u8) !ToolResult {
-    inline for (all) |spec| {
-        if (std.mem.eql(u8, name, spec.name)) return spec.run(ctx, arguments);
+    return executeWithSpecs(&all, ctx, name, arguments);
+}
+
+fn executeWithSpecs(comptime specs: []const tool.Tool, ctx: tool.Context, name: []const u8, arguments: []const u8) !ToolResult {
+    const result = if (try ctx.hooks.beforeExecute(ctx, name, arguments)) |result|
+        result
+    else
+        try ctx.hooks.afterExecute(ctx, name, arguments, executeRaw(specs, ctx, name, arguments));
+    // Applied after middleware, so CCR hooks can preserve output before clipping.
+    // This also covers quiet calls and callers outside the agent UI.
+    return @import("result.zig").clipOversized(ctx.allocator, result);
+}
+
+fn executeRaw(comptime specs: []const tool.Tool, ctx: tool.Context, name: []const u8, arguments: []const u8) !ToolResult {
+    inline for (specs) |spec| {
+        if (std.mem.eql(u8, name, spec.name)) return spec.execute(ctx, arguments);
     }
     // MCP names are discovered at runtime; all calls still share this entry.
     if (std.mem.startsWith(u8, name, @import("../mcp/mod.zig").tool_prefix)) {
@@ -65,6 +79,14 @@ pub fn execute(ctx: tool.Context, name: []const u8, arguments: []const u8) !Tool
         return agent.mcp_registry.call(ctx.allocator, name, arguments);
     }
     return error.UnknownTool;
+}
+
+/// Presentation metadata, without tool-name checks in the host UI.
+pub fn presentation(name: []const u8) ?tool.Tool {
+    inline for (all) |spec| {
+        if (std.mem.eql(u8, name, spec.name)) return spec;
+    }
+    return null;
 }
 
 pub fn isQuiet(name: []const u8) bool {
@@ -89,6 +111,129 @@ pub fn specOf(comptime name: []const u8) tool.Tool {
 // Tests
 // ---------------------------------------------------------------------------
 
+test "global and local hooks nest, short circuit and propagate errors before clipping" {
+    const H = struct {
+        events: std.ArrayList(u8) = .empty,
+        mode: enum { normal, outer_short, inner_short, outer_before_error, before_error, run_error, after_error, oversized } = .normal,
+        fn state(ctx: tool.Context, name: []const u8, args: []const u8) !*@This() {
+            try std.testing.expectEqualStrings("test", name);
+            try std.testing.expectEqualStrings("raw arguments", args);
+            try std.testing.expectEqual(@as(usize, 29), ctx.index);
+            return @ptrCast(@alignCast(ctx.hook_data.?));
+        }
+        fn value(ctx: tool.Context) !ToolResult {
+            return .{ .content = try ctx.allocator.dupe(u8, "result"), .is_error = false };
+        }
+        fn outerBefore(ctx: tool.Context, name: []const u8, args: []const u8) !?ToolResult {
+            const self = try state(ctx, name, args);
+            try self.events.append(ctx.allocator, 'A');
+            if (self.mode == .outer_before_error) return error.BeforeFailed;
+            if (self.mode == .outer_short) return try value(ctx);
+            return null;
+        }
+        fn innerBefore(ctx: tool.Context, name: []const u8, args: []const u8) !?ToolResult {
+            const self = try state(ctx, name, args);
+            try self.events.append(ctx.allocator, 'B');
+            if (self.mode == .before_error) return error.BeforeFailed;
+            if (self.mode == .inner_short) return try value(ctx);
+            return null;
+        }
+        fn run(ctx: tool.Context, args: []const u8) !ToolResult {
+            const self = try state(ctx, "test", args);
+            try self.events.append(ctx.allocator, 'R');
+            if (self.mode == .run_error) return error.RunFailed;
+            if (self.mode == .oversized) {
+                const content = try ctx.allocator.alloc(u8, @import("result.zig").max_output_bytes + 100);
+                @memset(content, 'x');
+                return .{ .content = content, .is_error = false };
+            }
+            return value(ctx);
+        }
+        fn innerAfter(ctx: tool.Context, name: []const u8, args: []const u8, outcome: anyerror!ToolResult) !ToolResult {
+            const self = try state(ctx, name, args);
+            try self.events.append(ctx.allocator, 'b');
+            return outcome;
+        }
+        fn outerAfter(ctx: tool.Context, name: []const u8, args: []const u8, outcome: anyerror!ToolResult) !ToolResult {
+            const self = try state(ctx, name, args);
+            try self.events.append(ctx.allocator, 'a');
+            const result = outcome catch |err| {
+                if (self.mode == .run_error) {
+                    try std.testing.expectEqual(error.RunFailed, err);
+                    return value(ctx);
+                }
+                return err;
+            };
+            if (self.mode == .after_error) {
+                result.deinit(ctx.allocator);
+                return error.AfterFailed;
+            }
+            if (self.mode == .oversized) {
+                defer result.deinit(ctx.allocator);
+                try std.testing.expect(result.content.len > @import("result.zig").max_output_bytes);
+                try std.testing.expect(!result.truncated and !result.is_error);
+                // Remain oversized so the dispatch's final clip is also exercised.
+                return .{ .content = try ctx.allocator.dupe(u8, result.content), .is_error = false };
+            }
+            return result;
+        }
+    };
+    const specs = [_]tool.Tool{.{ .name = "test", .description = "test", .parameters_json = "{}", .run = H.run, .hooks = .{ .before = H.innerBefore, .after = H.innerAfter } }};
+    const Case = struct { mode: @FieldType(H, "mode"), events: []const u8, err: ?anyerror = null };
+    for ([_]Case{
+        .{ .mode = .normal, .events = "ABRba" },
+        .{ .mode = .outer_short, .events = "A" },
+        .{ .mode = .inner_short, .events = "ABa" },
+        .{ .mode = .outer_before_error, .events = "A", .err = error.BeforeFailed },
+        .{ .mode = .before_error, .events = "ABa", .err = error.BeforeFailed },
+        .{ .mode = .run_error, .events = "ABRba" },
+        .{ .mode = .after_error, .events = "ABRba", .err = error.AfterFailed },
+        .{ .mode = .oversized, .events = "ABRba" },
+    }) |case| {
+        var state: H = .{ .mode = case.mode };
+        defer state.events.deinit(std.testing.allocator);
+        const ctx: tool.Context = .{ .io = std.testing.io, .allocator = std.testing.allocator, .index = 29, .hook_data = &state, .hooks = .{ .before = H.outerBefore, .after = H.outerAfter } };
+        const outcome = executeWithSpecs(&specs, ctx, "test", "raw arguments");
+        if (case.err) |err| {
+            try std.testing.expectError(err, outcome);
+        } else {
+            const result = try outcome;
+            defer result.deinit(ctx.allocator);
+            if (case.mode == .oversized) {
+                try std.testing.expect(result.truncated and result.is_error);
+                try std.testing.expect(result.content.len <= @import("result.zig").max_output_bytes);
+            } else try std.testing.expectEqualStrings("result", result.content);
+        }
+        try std.testing.expectEqualStrings(case.events, state.events.items);
+    }
+}
+
+test "dynamic MCP prefix passes through global hooks without agent context" {
+    const H = struct {
+        calls: usize = 0,
+        fn before(ctx: tool.Context, name: []const u8, args: []const u8) !?ToolResult {
+            try std.testing.expectEqualStrings(@import("../mcp/mod.zig").tool_prefix ++ "dynamic", name);
+            try std.testing.expectEqualStrings("{}", args);
+            const self: *@This() = @ptrCast(@alignCast(ctx.hook_data.?));
+            self.calls += 1;
+            return null;
+        }
+        fn after(ctx: tool.Context, _: []const u8, _: []const u8, outcome: anyerror!ToolResult) !ToolResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx.hook_data.?));
+            self.calls += 1;
+            const result = try outcome;
+            errdefer result.deinit(ctx.allocator);
+            try std.testing.expect(result.is_error);
+            try std.testing.expectEqualStrings("Error: this tool requires an agent context.", result.content);
+            return result;
+        }
+    };
+    var state: H = .{};
+    const result = try execute(.{ .io = std.testing.io, .allocator = std.testing.allocator, .hook_data = &state, .hooks = .{ .before = H.before, .after = H.after } }, @import("../mcp/mod.zig").tool_prefix ++ "dynamic", "{}");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
+
 /// Run one call the way the agent does, with this process's environment.
 fn call(name: []const u8, arguments: []const u8) !ToolResult {
     var env = std.process.Environ.Map.init(std.testing.allocator);
@@ -98,6 +243,26 @@ fn call(name: []const u8, arguments: []const u8) !ToolResult {
         .allocator = std.testing.allocator,
         .env = &env,
     }, name, arguments);
+}
+
+test "presentation callbacks belong to tool specs and preserve fallback" {
+    const ctx: tool.Context = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer out.deinit();
+    const plan = presentation("plan").?;
+    try std.testing.expect(try plan.summary.?(ctx, &out.writer, "{\"steps\":[{\"title\":\"a\\nb\\u001b[2J\"}]}"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), '\n') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), 0x1b) == null);
+    out.clearRetainingCapacity();
+    try std.testing.expect(!try plan.summary.?(ctx, &out.writer, "not json"));
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    const patch = presentation("apply_patch").?;
+    try std.testing.expect(patch.summary_block);
+    try std.testing.expect(!try patch.summary.?(ctx, &out.writer, "{}"));
+    try std.testing.expect(presentation("subagent").?.delegated);
+    try std.testing.expect(presentation("subagent_stop").?.progress != null);
+    try std.testing.expect(presentation("bash").?.summary == null);
+    try std.testing.expect(presentation("unknown") == null);
 }
 
 test "session and MCP tools require an agent context" {
