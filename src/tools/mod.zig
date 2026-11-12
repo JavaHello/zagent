@@ -1,4 +1,6 @@
-//! The built-in host tools, one file per tool.
+//! Built-in host and session tools, one file per tool.
+//! Session tools use Context.agent to access the owning agent's state; their
+//! specs, schemas and dispatch share the same registry as host tools.
 //!
 //! Each tool keeps its implementation, its arguments and its tests together —
 //! `bash.zig`, `read.zig`, `write.zig`, `edit.zig`, `apply_patch.zig`, `ls.zig`, `rg.zig`, `grep.zig`,
@@ -41,6 +43,7 @@ pub const Context = tool_mod.Context;
 
 /// Send one call to the built-in tool that answers it.
 pub const execute = dispatch.execute;
+pub const isQuiet = dispatch.isQuiet;
 
 // The shape of a tool result and the one size limit it is held to.
 pub const ToolStatus = result_mod.ToolStatus;

@@ -16,11 +16,16 @@ const result_mod = @import("result.zig");
 
 pub const ToolResult = result_mod.ToolResult;
 
-/// What a tool is given besides the arguments of the call: where to read and
-/// write, and the two pieces of run state a tool that starts a program needs.
+/// What a tool is given besides its JSON arguments: IO, allocation, program
+/// environment and optional agent state for session tools such as subagent.
 pub const Context = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
+    /// Session state for tools such as subagent; host-only calls may omit it.
+    agent: ?*@import("../agent/mod.zig").Agent = null,
+    /// Answers collected together for the questions in this model message.
+    answers: ?*@import("../agent/mod.zig").Agent.QuestionAnswers = null,
+    index: usize = 0,
     /// The environment a program the tool runs is handed; null inherits this
     /// process's.
     env: ?*const std.process.Environ.Map = null,
@@ -65,6 +70,8 @@ pub const Tool = struct {
     /// What the terminal shows while the tool runs. Null for a tool that must
     /// not have that line — it writes on the terminal itself.
     label: ?[]const u8 = null,
+    /// Writes its own terminal announcement, before the usual call preview.
+    quiet: bool = false,
     /// Read the call's arguments, validate them, and do what they ask. A call
     /// this function cannot use comes back with `is_error` set rather than as
     /// an error: what the model needs is a sentence telling it what to fix.

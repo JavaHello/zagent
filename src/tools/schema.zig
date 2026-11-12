@@ -80,73 +80,24 @@ pub const grep = hostDefinition(dispatch.specOf("grep"));
 pub const find = hostDefinition(dispatch.specOf("find"));
 pub const http = hostDefinition(dispatch.specOf("http"));
 
-// The tools the agent itself answers. They work on the session's own state —
-// its memory, its plan, its second agents, its questions to the user — so they
-// are methods of the agent rather than files under `tools/`, and their
-// definitions are written here.
-pub const memory_search = ToolDefinition{
-    .name = "memory_search",
-    .description = "Search durable workspace notes by keyword and return the ranked matches. Lexical matching for Chinese and English, not semantic.",
-    .parameters_json =
-    \\{"type":"object","properties":{"query":{"type":"string","description":"Short keywords, non-empty UTF-8, at most 512 bytes"},"limit":{"type":"integer","minimum":1,"maximum":10,"description":"Maximum notes to return, default 5"}},"required":["query"]}
-    ,
-};
+// Session tools use the same specs as dispatch, while their implementations
+// delegate the session-state work to Agent.
+pub const memory_search = hostDefinition(dispatch.specOf("memory_search"));
 
-pub const ask_user = ToolDefinition{
-    .name = "ask_user",
-    .description = "Ask the user to choose between concrete options when the request is ambiguous or a decision only they can make blocks progress. Several such calls sent together are put to the user as one form.",
-    .parameters_json =
-    \\{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}
-    ,
-};
+pub const ask_user = hostDefinition(dispatch.specOf("ask_user"));
 
-pub const announce_task = ToolDefinition{
-    .name = "announce_task",
-    .description = "Announce the task being started: a short title for the terminal and a description of the goal and approach, in the user's language. Call it before the first tool call of every turn that does work, including a task that follows chat.",
-    .parameters_json =
-    \\{"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":79,"description":"Concise task title, fewer than 80 Unicode characters, not the user's raw text"},"description":{"type":"string","minLength":1,"description":"Brief goal and practical approach shown to the user"}},"required":["title","description"],"additionalProperties":false}
-    ,
-};
+pub const announce_task = hostDefinition(dispatch.specOf("announce_task"));
 
-pub const memory_save = ToolDefinition{
-    .name = "memory_save",
-    .description = "Save one durable note to memory so it survives this session: add a note, or replace or delete an exact existing one.",
-    .parameters_json =
-    \\{"type":"object","properties":{"text":{"type":"string","description":"Note to add, new note for replace, or exact existing note for delete"},"action":{"type":"string","enum":["add","replace","delete"],"description":"Default add; replace and delete require an exact existing note"},"old_text":{"type":"string","description":"Exact existing note to replace; required only for replace"}},"required":["text"]}
-    ,
-};
+pub const memory_save = hostDefinition(dispatch.specOf("memory_save"));
 
-pub const plan = ToolDefinition{
-    .name = "plan",
-    .description = "Read or update the plan for the work in progress: with no arguments it returns the complete plan, with 'steps' it replaces the whole plan (an empty array clears it), and with 'index' plus 'status' or 'note' it updates one step. Successful updates return only a brief change acknowledgement, not the checklist; call with no arguments to read it. The plan belongs to the session — it is saved with it and restored when it is resumed — so it, not the message history, is the map of long work.",
-    .parameters_json =
-    \\{"type":"object","properties":{"steps":{"type":"array","description":"The complete ordered plan, replacing the current one: one short line per step that can be verified on its own. At most 50 steps.","maxItems":50,"items":{"type":"object","properties":{"title":{"type":"string","description":"One line: what this step accomplishes"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"],"description":"Defaults to pending; at most one step is in_progress"},"note":{"type":"string","description":"Optional one-line reason kept under the step, for example why it is blocked"}},"required":["title"]}},"index":{"type":"integer","minimum":1,"description":"1-based step to update, when 'steps' is omitted"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"],"description":"New status for that step"},"note":{"type":"string","description":"New note for that step; an empty string removes the old one"}},"required":[]}
-    ,
-};
+pub const plan = hostDefinition(dispatch.specOf("plan"));
 
-pub const subagent = ToolDefinition{
-    .name = "subagent",
-    .description = "Hand one self-contained task to a sub-agent that works on its own and returns a short report. The sub-agent does not read this conversation, cannot ask the user and cannot change the plan, so the task must carry everything it needs. Give it a 'title' — a one-line summary of the task, fewer than 80 characters — because that is what the terminal shows while the run works. Use it for a step whose tool output would flood this conversation; verify its work yourself before marking a plan step done. The sub-agent has no limits of its own: you watch it instead. 'checkin_seconds' is how long it works before it is asked for a progress report, and the call returns with that report, the final report, or the end of the run. A run that reported is paused: call subagent again with its 'id' to let it carry on, or subagent_stop with its 'id' to stop it and take its final report.",
-    .parameters_json =
-    \\{"type":"object","properties":{"task":{"type":"string","description":"One self-contained task: what to do and how it is verified, in full, since the sub-agent does not read this conversation. Omit it to resume or to start a second sub-agent by 'id'."},"title":{"type":"string","maxLength":79,"description":"One-line summary of the task, fewer than 80 Unicode characters: the terminal shows it on the call's line and while the run works. Omit it and that line falls back to the task itself."},"context":{"type":"string","description":"Optional facts the sub-agent needs: file paths, decisions already made, the shape of the expected change. Keep it short."},"id":{"type":"string","description":"The id of a sub-agent that is paused at a progress report: the call lets it carry on and returns its next report or its final one. Omit it to start a new sub-agent with 'task'."},"checkin_seconds":{"type":"integer","minimum":0,"maximum":3600,"description":"How long the sub-agent works before it is asked for a progress report, default 300. It is not a limit on the work: at the check-in the run pauses with that report, and you decide whether to go on. 0 asks for the report at the next request boundary."}},"required":[]}
-    ,
-};
+pub const subagent = hostDefinition(dispatch.specOf("subagent"));
 
-pub const report = ToolDefinition{
-    .name = "report",
-    .description = "Send the agent that called you a short progress report and wait for its decision. It is how a check-in is answered: the caller reads the report, then either tells you to continue or stops the task and asks for your final report. Keep it to a status line — what is done, what you ran, what is left — not the final answer.",
-    .parameters_json =
-    \\{"type":"object","properties":{"summary":{"type":"string","description":"Short progress report: what you have done and changed, what you ran and what it printed, what is verified, and what is left"}},"required":["summary"]}
-    ,
-};
+pub const report = hostDefinition(dispatch.specOf("report"));
 
-pub const subagent_stop = ToolDefinition{
-    .name = "subagent_stop",
-    .description = "Stop a sub-agent that is paused at a progress report and take its final report as the tool result. It gets one last turn to write that report and does no new work, so anything unfinished is named as unfinished.",
-    .parameters_json =
-    \\{"type":"object","properties":{"id":{"type":"string","description":"The id of the paused sub-agent, as its progress report named it"}},"required":["id"]}
-    ,
-};
+pub const subagent_stop = hostDefinition(dispatch.specOf("subagent_stop"));
+pub const load_mcp_tools = hostDefinition(dispatch.specOf("load_mcp_tools"));
 
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
@@ -195,6 +146,8 @@ test "built-in definitions have valid schemas and unique names" {
 
 test "every host tool the model is offered is one dispatch runs" {
     for (dispatch.all) |spec| {
+        // The MCP loader is advertised only when a service has tools.
+        if (std.mem.eql(u8, spec.name, load_mcp_tools.name)) continue;
         var listed = false;
         for (builtin) |definition| {
             if (std.mem.eql(u8, definition.name, spec.name)) listed = true;

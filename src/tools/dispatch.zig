@@ -8,9 +8,8 @@
 //! validates its own arguments where it lives; this file passes the model's JSON
 //! on unread and gives the tool's result back.
 //!
-//! A name that is not in the table is a fault in this program rather than
-//! something the model can cause: the tools advertised to it are built from the
-//! same specs, see `schema.zig`.
+//! MCP tools are discovered at runtime and forwarded through the agent's
+//! registry. Other names must appear in the same specs used by `schema.zig`.
 const std = @import("std");
 const tool = @import("tool.zig");
 const bash = @import("bash.zig");
@@ -28,7 +27,7 @@ const ccr = @import("ccr.zig");
 
 const ToolResult = tool.ToolResult;
 
-/// Every built-in host tool, in the order it is listed in.
+/// Every built-in tool, including tools that operate on agent state.
 pub const all = [_]tool.Tool{
     bash.spec,
     read.spec,
@@ -42,6 +41,15 @@ pub const all = [_]tool.Tool{
     find.spec,
     http.spec,
     ccr.spec,
+    @import("memory_search.zig").spec,
+    @import("memory_save.zig").spec,
+    @import("ask_user.zig").spec,
+    @import("announce_task.zig").spec,
+    @import("plan.zig").spec,
+    @import("subagent.zig").spec,
+    @import("subagent_stop.zig").spec,
+    @import("report.zig").spec,
+    @import("load_mcp_tools.zig").spec,
 };
 
 /// Run one built-in tool. `ctx` carries what a tool needs besides its arguments:
@@ -51,7 +59,19 @@ pub fn execute(ctx: tool.Context, name: []const u8, arguments: []const u8) !Tool
     inline for (all) |spec| {
         if (std.mem.eql(u8, name, spec.name)) return spec.run(ctx, arguments);
     }
+    // MCP names are discovered at runtime; all calls still share this entry.
+    if (std.mem.startsWith(u8, name, @import("../mcp/mod.zig").tool_prefix)) {
+        const agent = ctx.agent orelse return ctx.refuse("Error: this tool requires an agent context.");
+        return agent.mcp_registry.call(ctx.allocator, name, arguments);
+    }
     return error.UnknownTool;
+}
+
+pub fn isQuiet(name: []const u8) bool {
+    inline for (all) |spec| {
+        if (std.mem.eql(u8, name, spec.name)) return spec.quiet;
+    }
+    return false;
 }
 
 /// The spec of one built-in tool, by name, at comptime. The definition the
@@ -78,6 +98,23 @@ fn call(name: []const u8, arguments: []const u8) !ToolResult {
         .allocator = std.testing.allocator,
         .env = &env,
     }, name, arguments);
+}
+
+test "session and MCP tools require an agent context" {
+    const a = std.testing.allocator;
+    const names = [_][]const u8{
+        "memory_search", "memory_save",   "ask_user", "announce_task",  "plan",
+        "subagent",      "subagent_stop", "report",   "load_mcp_tools", @import("../mcp/mod.zig").tool_prefix ++ "test",
+    };
+    for (names) |name| {
+        const result = try call(name, "{}");
+        defer result.deinit(a);
+        try std.testing.expect(result.is_error);
+        try std.testing.expectEqualStrings("Error: this tool requires an agent context.", result.content);
+    }
+    try std.testing.expect(isQuiet("announce_task"));
+    try std.testing.expect(!isQuiet("subagent"));
+    try std.testing.expect(!isQuiet("unknown"));
 }
 
 test "read dispatch forwards the page the caller asked for" {

@@ -6,8 +6,7 @@ const dispatch = @import("dispatch.zig");
 ///
 /// A host tool's label is the one its own spec declares, so a tool is named
 /// once whether the terminal is showing it, the model is being told about it,
-/// or a call is being dispatched to it. The tools the agent answers itself are
-/// not in that list, so their labels are written here.
+/// or a call is being dispatched to it. Session tools use that same list.
 ///
 /// The labels are written down rather than taken from the call: a tool name is
 /// model output, and a name carrying escape sequences would be written straight
@@ -17,14 +16,6 @@ const dispatch = @import("dispatch.zig");
 pub fn progressLabel(name: []const u8) ?[]const u8 {
     inline for (dispatch.all) |spec| {
         if (std.mem.eql(u8, name, spec.name)) return spec.label;
-    }
-    const labels = [_]struct { name: []const u8, label: []const u8 }{
-        .{ .name = "memory_save", .label = "saving memory…" },
-        .{ .name = "memory_search", .label = "searching memory…" },
-        .{ .name = "plan", .label = "plan…" },
-    };
-    for (labels) |entry| {
-        if (std.mem.eql(u8, name, entry.name)) return entry.label;
     }
     return null;
 }

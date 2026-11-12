@@ -1105,10 +1105,12 @@ const Server = struct {
 };
 
 pub const Registry = struct {
-    pub const loader_name = "load_mcp_tools";
-    const loader_json =
-        \\{"name":"load_mcp_tools","description":"Load a relevant MCP server's tools before using them. Choose an exact server name from the MCP service directory only when needed for the user's request. Loaded tools become available on the next request.","parameters":{"type":"object","properties":{"server":{"type":"string","description":"Exact MCP server name from the directory"}},"required":["server"],"additionalProperties":false}}
-    ;
+    const loader_spec = @import("../tools/load_mcp_tools.zig").spec;
+    pub const loader_name = loader_spec.name;
+    // These static strings contain no JSON escapes; schema tests validate them.
+    const loader_json = "{\"name\":\"" ++ loader_spec.name ++
+        "\",\"description\":\"" ++ loader_spec.description ++
+        "\",\"parameters\":" ++ loader_spec.parameters_json ++ "}";
     allocator: std.mem.Allocator,
     io: std.Io,
     servers: []Server,
