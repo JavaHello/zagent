@@ -5,7 +5,8 @@
 Every launch creates a fresh session ID, saved automatically in the directory's
 global state folder as `sessions/<id>.json`. The startup message and `/session`
 show the ID and resume command. `/new` creates another ID without overwriting
-the previous conversation; `/clear` empties only the current session.
+the previous conversation, and clears the screen back to the startup report;
+`/clear` empties only the current session.
 
 From the original working directory, restore a session with:
 
@@ -60,7 +61,7 @@ sessions go to [memory](memory.md) instead.
 | Command    | Effect |
 |------------|--------|
 | `/session` | Show the current session ID and resume command |
-| `/new`     | Create a new session and empty the scratch directory |
+| `/new`     | Start a new session on a cleared screen, emptying the scratch directory |
 | `/clear`   | Clear conversation history, keeping the session and the plan |
 | `/status`  | Show token usage and account quota |
 

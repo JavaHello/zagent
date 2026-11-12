@@ -29,7 +29,7 @@ const HELP_HEAD =
     \\Commands:
     \\  /help        Show this help message
     \\  /clear       Clear conversation history
-    \\  /new         Create a new session and empty the scratch directory
+    \\  /new         New session: new id, cleared screen, empty scratch
     \\  /session     Show the current session ID and resume command
     \\  /plan        Show the plan; /plan clear drops it
     \\  /memory      List saved memories
@@ -451,56 +451,10 @@ fn runRepl(
     // animation must not draw a second prompt above it.
     agent.progress_prompt = if (ln.is_tty and !screen.isActive()) PROMPT else null;
 
-    {
-        // The wordmark is drawn through an allocating writer because a
-        // truecolour one costs a few kilobytes of escape sequences. Colour is
-        // for a terminal only: piped to a file it would be noise.
-        var aw: std.Io.Writer.Allocating = .init(allocator);
-        defer aw.deinit();
-        try banner.write(&aw.writer, .{
-            .mode = banner.detect(env, ln.term_supported and (stdout.isTty(io) catch false)),
-            .columns = if (screen.isActive()) screen.cols else term.columns(stdout),
-        });
-        // The startup report belongs to the header, and the terminal was taken
-        // over after the servers were started: this is where it can be read.
-        if (mcp_report.len > 0) try aw.writer.writeAll(mcp_report);
-        try aw.writer.writeByte('\n');
-        try writeOut(&screen, stdout, io, aw.written());
-    }
-    {
-        // The label is dim and the model name is not, so the eye lands on the
-        // value rather than on the word "Model".
-        const model_line = if (config.provider) |selected|
-            try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}" ++ DIM ++ " · {s}\n" ++ RESET, .{ config.model, selected.name() })
-        else
-            try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}\n", .{config.model});
-        defer allocator.free(model_line);
-        try writeOut(&screen, stdout, io, model_line);
-    }
-    if (agent.session_id) |id| {
-        const message = try std.fmt.allocPrint(allocator, "  Session  {s}\n  Resume   zagent --resume {s}\n", .{ id, id });
-        defer allocator.free(message);
-        try writeOut(&screen, stdout, io, message);
-    }
-    if (trace.*) |opened| {
-        const message = try std.fmt.allocPrint(allocator, DIM ++ "  Debug    recording; report {s}\n" ++ RESET, .{opened.report_path});
-        defer allocator.free(message);
-        try writeOut(&screen, stdout, io, message);
-    }
-    try writeOut(&screen, stdout, io, DIM ++ "  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
-
-    if (config.api_key.len == 0 and config.provider != .codex) {
-        // Name the variable that actually applies, so a provider user is not
-        // told to export a key for some other service.
-        const key_var = if (config.provider) |selected| selected.spec().api_key_env else "OPENAI_API_KEY";
-        const msg = try std.fmt.allocPrint(
-            allocator,
-            YELLOW ++ "Warning: {s} is not set.\n  export {s}=your-key\n\n" ++ RESET,
-            .{ key_var, key_var },
-        );
-        defer allocator.free(msg);
-        try writeOut(&screen, stderr, io, msg);
-    }
+    // The opening report is drawn again by `/new`, so it is one function: a
+    // session this process opens later has to look like the one it opened on.
+    const colour = ln.term_supported and (stdout.isTty(io) catch false);
+    try writeHeader(allocator, io, env, &screen, config, agent, mcp_report, trace, colour);
 
     // The API history was loaded before the terminal existed. Seed the screen's
     // conversation log now so scrolling and redraws retain the restored turns.
@@ -586,6 +540,11 @@ fn runRepl(
             defer allocator.free(message);
             try writeOut(&screen, stdout, io, message);
         } else if (std.mem.eql(u8, line, "/new")) {
+            // The id of the session being left outlives it: the line that
+            // announces the new session names the old one, so the conversation
+            // that just left the screen can be found again.
+            const previous = if (agent.session_id) |id| try allocator.dupe(u8, id) else null;
+            defer if (previous) |id| allocator.free(id);
             agent.startSession(null) catch |err| {
                 const message = try std.fmt.allocPrint(allocator, "Cannot create session: {s}\n", .{@errorName(err)});
                 defer allocator.free(message);
@@ -600,9 +559,22 @@ fn runRepl(
                 defer allocator.free(message);
                 try writeOut(&screen, stderr, io, message);
             };
-            const message = try std.fmt.allocPrint(allocator, "New session: {s}\nResume: zagent --resume {s}\n", .{ agent.session_id.?, agent.session_id.? });
+            // Nothing of the old session may stay visible: an answer above the
+            // prompt would be read as this session's own context. The screen is
+            // emptied and the opening report drawn again, so a new session
+            // begins on the screen a new process begins on.
+            screen.clearLog();
+            try writeHeader(allocator, io, env, &screen, config, agent, mcp_report, trace, colour);
+            const message = if (previous) |id|
+                try std.fmt.allocPrint(allocator, DIM ++ "  ── new session ── the previous conversation is off the screen; zagent --resume {s} brings it back\n" ++ RESET, .{id})
+            else
+                try std.fmt.allocPrint(allocator, DIM ++ "  ── new session ── the previous conversation is off the screen\n" ++ RESET, .{});
             defer allocator.free(message);
             try writeOut(&screen, stdout, io, message);
+            // The header ends with the blank line the next prompt needs, so the
+            // loop's trailing newline would leave one row more than a fresh
+            // start does.
+            continue;
         } else if (std.mem.eql(u8, line, "/clear")) {
             agent.clearHistory();
             try writeOut(&screen, stdout, io, DIM ++ "Conversation history cleared.\n" ++ RESET);
@@ -678,6 +650,77 @@ fn reportCommandError(
     const message = try std.fmt.allocPrint(allocator, RED ++ "Error: {s}: {s}" ++ RESET ++ "\n", .{ command, @errorName(err) });
     defer allocator.free(message);
     try writeOut(screen, std.Io.File.stderr(), io, message);
+}
+
+/// The opening report: wordmark, model, session, hints.
+///
+/// It is drawn once when the process starts and again by `/new`, which is why
+/// it is a function rather than a block at the top of the REPL: the session the
+/// process opens with and one started later have to look the same, so that a
+/// cleared screen reads as a fresh start.
+fn writeHeader(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    screen: *Screen,
+    config: Config,
+    agent: *Agent,
+    mcp_report: []const u8,
+    trace: *?*debug.Recorder,
+    /// Whether the terminal can take colour and the wordmark's letterforms.
+    colour: bool,
+) !void {
+    const stdout = std.Io.File.stdout();
+    {
+        // The wordmark is drawn through an allocating writer because a
+        // truecolour one costs a few kilobytes of escape sequences. Colour is
+        // for a terminal only: piped to a file it would be noise.
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        try banner.write(&aw.writer, .{
+            .mode = banner.detect(env, colour),
+            .columns = if (screen.isActive()) screen.cols else term.columns(stdout),
+        });
+        // The startup report belongs to the header, and the terminal was taken
+        // over after the servers were started: this is where it can be read.
+        if (mcp_report.len > 0) try aw.writer.writeAll(mcp_report);
+        try aw.writer.writeByte('\n');
+        try writeOut(screen, stdout, io, aw.written());
+    }
+    {
+        // The label is dim and the model name is not, so the eye lands on the
+        // value rather than on the word "Model".
+        const model_line = if (config.provider) |selected|
+            try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}" ++ DIM ++ " · {s}\n" ++ RESET, .{ config.model, selected.name() })
+        else
+            try std.fmt.allocPrint(allocator, DIM ++ "  Model  " ++ RESET ++ "{s}\n" ++ RESET, .{config.model});
+        defer allocator.free(model_line);
+        try writeOut(screen, stdout, io, model_line);
+    }
+    if (agent.session_id) |id| {
+        const message = try std.fmt.allocPrint(allocator, "  Session  {s}\n  Resume   zagent --resume {s}\n", .{ id, id });
+        defer allocator.free(message);
+        try writeOut(screen, stdout, io, message);
+    }
+    if (trace.*) |opened| {
+        const message = try std.fmt.allocPrint(allocator, DIM ++ "  Debug    recording; report {s}\n" ++ RESET, .{opened.report_path});
+        defer allocator.free(message);
+        try writeOut(screen, stdout, io, message);
+    }
+    try writeOut(screen, stdout, io, DIM ++ "  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
+
+    if (config.api_key.len == 0 and config.provider != .codex) {
+        // Name the variable that actually applies, so a provider user is not
+        // told to export a key for some other service.
+        const key_var = if (config.provider) |selected| selected.spec().api_key_env else "OPENAI_API_KEY";
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            YELLOW ++ "Warning: {s} is not set.\n  export {s}=your-key\n\n" ++ RESET,
+            .{ key_var, key_var },
+        );
+        defer allocator.free(msg);
+        try writeOut(screen, std.Io.File.stderr(), io, msg);
+    }
 }
 
 /// The editor reports how many rows it needs at the bottom. Reserving them is

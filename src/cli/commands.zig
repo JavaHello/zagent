@@ -25,7 +25,7 @@ pub const Command = struct {
 pub const all = [_]Command{
     .{ .name = "/help", .description = "Show this help message" },
     .{ .name = "/clear", .description = "Clear conversation history" },
-    .{ .name = "/new", .description = "Create a new session and empty the scratch directory" },
+    .{ .name = "/new", .description = "Start a new session on a cleared screen" },
     .{ .name = "/session", .description = "Show the current session ID and resume command" },
     .{ .name = "/plan", .description = "Show the plan: /plan [clear]" },
     .{ .name = "/memory", .description = "List saved memories" },

@@ -126,7 +126,7 @@ summaries distinguish missing cache reports from a reported zero.
 |---------------|----------------------------------|
 | `/help`       | Show help                        |
 | `/clear`      | Clear conversation history       |
-| `/new`        | Create a new session and empty the scratch directory |
+| `/new`        | Start a new session on a cleared screen |
 | `/session`    | Show the current session ID and resume command |
 | `/plan`       | Show the plan; `/plan clear` drops it |
 | `/memory`     | List saved memories              |

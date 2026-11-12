@@ -380,6 +380,36 @@ pub const Screen = struct {
         self.rendered_len = self.transcript.items.len;
     }
 
+    /// Throw the visible conversation away, for `/new`.
+    ///
+    /// A terminal cannot be asked what it holds, so the transcript is what a
+    /// redraw works from: dropping it and marking the screen dirty is what
+    /// makes the next frame clear the whole screen and paint a blank log
+    /// region. Output still queued was written for the session being left, and
+    /// the status line, the selection and the scroll position belonged to it
+    /// too, so none of them survive.
+    pub fn clearLog(self: *Screen) void {
+        if (!self.active) return;
+        self.queue_mutex.lockUncancelable(self.io);
+        self.queued.clearRetainingCapacity();
+        self.queue_mutex.unlock(self.io);
+        self.transcript.clearRetainingCapacity();
+        self.rendered_len = 0;
+        self.scroll_rows = 0;
+        self.anchor = null;
+        self.anchor_end = 0;
+        self.selection_start = 0;
+        self.selection_end = 0;
+        self.dragging = false;
+        self.progress_len = 0;
+        self.pending_progress_len = 0;
+        self.progress_changed = false;
+        self.notice_len = 0;
+        self.notice_started = null;
+        self.status_dirty = true;
+        self.dirty = true;
+    }
+
     /// Only called by the foreground layout, before the editor redraws its
     /// input. Do not save the editor cursor over the saved log position.
     fn repaintStatus(self: *Screen) !void {
@@ -1134,6 +1164,53 @@ test "the log region keeps at least one row above the input" {
 /// Read what a screen wrote to its temporary output file.
 fn readOutput(dir: std.Io.Dir, allocator: std.mem.Allocator) ![]u8 {
     return dir.readFileAlloc(std.testing.io, "out", allocator, .limited(1 << 20));
+}
+
+test "clearing the log for a new session empties the screen and the queue" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.out = file;
+    s.buffered = true;
+    s.cols = 40;
+    try s.writeLog("old conversation\n");
+    try s.reserveInput(1, false);
+    const before = try readOutput(tmp.dir, a);
+    defer a.free(before);
+    try std.testing.expect(std.mem.indexOf(u8, before, "old conversation") != null);
+
+    // Progress, a queued answer and a selection all belong to the session that
+    // is about to be left.
+    s.setProgress("thinking…");
+    try s.writeLog("streaming answer");
+    s.selection_start = 0;
+    s.selection_end = 4;
+    s.scroll_rows = 1;
+    s.clearLog();
+    try std.testing.expectEqual(@as(usize, 0), s.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.queued.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.rendered_len);
+    try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
+    try std.testing.expectEqual(@as(usize, 0), s.progress_len);
+    try std.testing.expectEqual(s.selection_start, s.selection_end);
+    try std.testing.expect(s.dirty);
+
+    // The next frame clears the whole screen and paints nothing above the
+    // prompt: the new session starts on the screen a new process starts on.
+    try s.reserveInput(1, false);
+    const after = try readOutput(tmp.dir, a);
+    defer a.free(after);
+    const frame = after[before.len..];
+    try std.testing.expect(std.mem.indexOf(u8, frame, ansi.HOME_POSITION ++ ansi.CLEAR_SCREEN_END) != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "old conversation") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "streaming answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "thinking") == null);
+    try std.testing.expectEqual(@as(usize, 0), s.transcript.items.len);
 }
 
 test "the conversation is drawn in a region above the reserved input row" {
