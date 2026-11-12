@@ -75,11 +75,12 @@ try:
             assert result.returncode == 0, result.stderr
             return result.stdout + result.stderr
 
-        # Before the model writes anything, the prompt says there is no plan and
-        # where the plan lives, so an agent starting from nothing knows to build one.
+        # The prompt gives fixed usage guidance, never runtime plan state.
         output = run('Plan the refactor')
         assert len(requests) == len(calls) + 1, (len(requests), output)
-        assert 'No plan is saved yet' in instructions(requests[0])
+        assert 'with no arguments to read the complete current plan' in instructions(requests[0])
+        assert all(instructions(body) == instructions(requests[0]) for body in requests)
+        assert 'No plan is saved yet' not in instructions(requests[0])
         plan_schema = next(tool['parameters'] for tool in requests[0]['tools']
                            if tool.get('name') == 'plan')
         properties = plan_schema['properties']
@@ -92,14 +93,9 @@ try:
                    if item.get('type') == 'function_call_output']
         assert len(results) == len(calls), results
 
-        # A plan comes back with where the work stands, not just its steps.
-        assert not results[0][0]
-        assert 'Plan 1/3 done. Next: 2. Write src/plan.zig' in results[0][1], results[0][1]
-
-        # One step moves without the rest being rewritten by the model.
-        assert not results[1][0]
-        assert 'Plan 2/3 done. Next: 3. Wire the plan tool' in results[1][1], results[1][1]
-        assert '2. [x] Write src/plan.zig\n   note: compiles' in results[1][1], results[1][1]
+        # Mutations acknowledge only the change, without repeating the checklist.
+        assert results[0] == (False, 'Plan saved: 3 steps, 1 completed, 0 blocked.\n'), results[0]
+        assert results[1] == (False, 'Step 2: in_progress -> completed; note updated.\n'), results[1]
 
         # A step that is not there, and a status with no step to apply it to,
         # are reported as errors rather than silently applied.
@@ -110,20 +106,20 @@ try:
         assert not results[4][0]
         assert '2/3 done' in results[4][1], results[4][1]
 
-        # in_progress works for both replacement and updates, with the same mark.
-        assert '2. [~] Write src/plan.zig' in results[0][1], results[0]
-        assert not results[5][0]
-        assert '3. [~] Wire the plan tool' in results[5][1], results[5]
+        assert '1. [x] Read the tool schemas' in results[4][1], results[4]
+        assert '2. [x] Write src/plan.zig\n   note: compiles' in results[4][1], results[4]
+        assert '3. [ ] Wire the plan tool' in results[4][1], results[4]
+        assert results[5] == (False, 'Step 3: pending -> in_progress.\n'), results[5]
 
         # Neither old enum spelling is accepted, in either tool shape.
         for result in results[6:]:
             assert result[0], result
             assert 'must be pending, in_progress, completed or blocked' in result[1], result
 
-        # The prompt after the tool call describes the plan the tool wrote,
-        # which is how a lost context picks the work back up.
-        assert '1/3 done' in instructions(requests[1]), instructions(requests[1])
-        assert '2/3 done' in instructions(requests[2]), instructions(requests[2])
+        # Neither titles nor progress leak into the fixed system prompt.
+        for body in requests:
+            assert 'Write src/plan.zig' not in instructions(body)
+            assert '2/3 done' not in instructions(body)
 
         # Nothing about the plan is a file: it is state of the session, saved in
         # the same snapshot as the messages, and no plan.md exists anywhere.
@@ -143,13 +139,12 @@ try:
         assert json.loads(snapshot.read_text())['plan']
         assert json.loads(snapshot.read_text())['messages'] == []
 
-        # A fresh process restoring the session gets the plan back, and the
-        # prompt says so before the model asks for anything.
+        # Restore keeps runtime state without embedding it in the prompt.
         before = len(requests)
         run('--resume', session, 'where were we?')
         assert len(requests) == before + 1
-        assert '2/3 done' in instructions(requests[-1]), instructions(requests[-1])
-        assert 'saved with this session' in instructions(requests[-1])
+        assert '2/3 done' not in instructions(requests[-1]), instructions(requests[-1])
+        assert 'with no arguments to read the complete current plan' in instructions(requests[-1])
 
         # /plan clear empties it in memory and in the snapshot.
         output = run('--resume', session, stdin='/plan clear\n/plan\n/quit\n')
@@ -160,7 +155,7 @@ try:
         before = len(requests)
         run('--resume', session, 'anything left?')
         assert len(requests) == before + 1
-        assert 'No plan is saved yet' in instructions(requests[-1])
+        assert 'No plan is saved yet' not in instructions(requests[-1])
         print('PASS: plan kept in memory, saved with the session, restored and cleared')
 finally:
     server.shutdown()

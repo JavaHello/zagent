@@ -74,9 +74,8 @@ pub const Info = struct {
 
     /// The bullet the system prompt carries about the machine.
     ///
-    /// Rendered from the fields rather than kept as a finished string: the
-    /// prompt is rebuilt whenever the plan or the MCP directory changes, and
-    /// each rebuild has to describe the same machine it started on.
+    /// Rendered from the captured fields rather than probing again, so main
+    /// and sub-agent prompts describe the same machine they started on.
     pub fn writePromptNote(self: Info, w: *std.Io.Writer) !void {
         try w.print("\n- Host system: {s} ({s}, {s})", .{ self.os, self.kernel, self.arch });
         if (self.cpus > 0) try w.print(", {d} CPUs", .{self.cpus});

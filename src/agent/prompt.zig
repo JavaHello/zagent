@@ -3,12 +3,10 @@
 //!
 //! Kept apart from the agent loop because none of it depends on the loop: it is
 //! text assembled from the registry, the search programs, the host, the
-//! workspace and the plan, and the loop only asks for it when a run begins or
-//! the plan changes.
+//! workspace at startup. Runtime plan state is accessed only through tools.
 const std = @import("std");
 const mcp = @import("../mcp/mod.zig");
 const tools = @import("../tools/mod.zig");
-const plan_mod = @import("../state/plan.zig");
 const sysinfo = @import("../host/sysinfo.zig");
 const sgr = @import("../ui/style.zig");
 
@@ -120,7 +118,6 @@ pub fn buildSystemPrompt(
     host: *const sysinfo.Info,
     workspace: []const u8,
     scratch: []const u8,
-    plan: *const plan_mod.Plan,
 ) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -166,11 +163,8 @@ pub fn buildSystemPrompt(
         try aw.writer.writeAll("\n- Memory holds lasting preferences and project facts only, never transient status or secrets. Consult it before relying on past preferences, conventions or decisions and before replacing or deleting a note; prefer current instructions and verified facts over stale notes, and correct obsolete notes instead of adding contradictions.\n");
     }
 
-    // The plan is the one piece of session state named in the prompt itself: a
-    // cleared conversation loses the messages, while the checklist in memory
-    // keeps the map of the work. The prompt is rebuilt whenever the plan
-    // changes, so the bullet never describes an older one.
-    try plan.writePromptNote(&aw.writer);
+    // Only usage guidance belongs here; runtime state is read through the tool.
+    try aw.writer.writeAll("\n- Use **plan** to maintain a checklist for multi-step work. The runtime keeps it in memory and saves it with the session, independently of conversation history. Call **plan** with no arguments to read the complete current plan, including after context loss or session restore. Updates return only a short change acknowledgement, not the full checklist.\n");
 
     return aw.toOwnedSlice();
 }

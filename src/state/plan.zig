@@ -228,33 +228,29 @@ pub const Plan = struct {
         return aw.toOwnedSlice();
     }
 
-    /// The one bullet the system prompt carries about the plan. Short on
-    /// purpose: it is sent with every request.
-    pub fn writePromptNote(self: *const Plan, w: *std.Io.Writer) !void {
-        if (self.steps.items.len == 0) {
-            try w.writeAll(
-                "\n- No plan is saved yet. Before the first edit of work with several steps, save one with" ++
-                    " **plan** — one short line per verifiable step — and mark each step as it is verified." ++
-                    " The plan belongs to the session: it is saved with it and comes back when the session is" ++
-                    " resumed, while **/new** starts without one.\n",
-            );
-            return;
+    /// A compact acknowledgement after a successful mutation, never a checklist.
+    /// Null index means replacement (including clearing); otherwise the caller
+    /// supplies the status captured before updating that 1-based step.
+    pub fn describeChange(self: *const Plan, allocator: std.mem.Allocator, index: ?usize, previous_status: ?Status, note_changed: bool) ![]u8 {
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        if (index) |number| {
+            if (number == 0 or number > self.steps.items.len) return error.NoSuchStep;
+            const status = self.steps.items[number - 1].status;
+            if (previous_status) |previous| {
+                try aw.writer.print("Step {d}: {s} -> {s}", .{ number, @tagName(previous), @tagName(status) });
+            } else {
+                try aw.writer.print("Step {d}: {s}", .{ number, @tagName(status) });
+            }
+            if (note_changed) try aw.writer.writeAll("; note updated");
+            try aw.writer.writeAll(".\n");
+        } else if (self.steps.items.len == 0) {
+            try aw.writer.writeAll("Plan cleared.\n");
+        } else {
+            const progress = self.tally();
+            try aw.writer.print("Plan saved: {d} steps, {d} completed, {d} blocked.\n", .{ progress.total, progress.done, progress.blocked });
         }
-        const progress = self.tally();
-        if (progress.next) |next| {
-            try w.print(
-                "\n- The plan is in progress ({d}/{d} done, next: {d}. {s}). It is kept in memory and saved" ++
-                    " with this session, so a cleared conversation and a resumed session still have it: read it" ++
-                    " with **plan** before choosing the next step, and keep it current as steps are verified.\n",
-                .{ progress.done, progress.total, next, self.steps.items[next - 1].title },
-            );
-            return;
-        }
-        try w.print(
-            "\n- The plan has no open step ({d}/{d} done). Write the plan for the next piece of work with" ++
-                " **plan**, or clear it once the task is finished.\n",
-            .{ progress.done, progress.total },
-        );
+        return aw.toOwnedSlice();
     }
 };
 
@@ -440,27 +436,38 @@ test "a plan is stepped, cleared and restored from its stored form" {
     try std.testing.expectEqualStrings("reason", restored.steps.items[1].note.?);
 }
 
-test "the prompt follows the plan" {
+test "mutation acknowledgements are compact while reads keep the full plan" {
     const a = std.testing.allocator;
     var plan = Plan.init(a);
     defer plan.deinit();
     try plan.setSteps(&.{
-        .{ .title = "done already", .status = .completed },
-        .{ .title = "in hand", .status = .in_progress },
-        .{ .title = "plain line" },
+        .{ .title = "first private title", .status = .completed },
+        .{ .title = "second private title", .status = .in_progress },
     });
-
-    var aw: std.Io.Writer.Allocating = .init(a);
-    defer aw.deinit();
-    try plan.writePromptNote(&aw.writer);
-    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "1/3 done, next: 2. in hand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "saved with this session") != null);
-
+    const saved = try plan.describeChange(a, null, null, false);
+    defer a.free(saved);
+    try std.testing.expectEqualStrings("Plan saved: 2 steps, 1 completed, 0 blocked.\n", saved);
+    const previous = plan.steps.items[1].status;
+    try plan.update(2, .blocked, "needs fixture");
+    const changed = try plan.describeChange(a, 2, previous, true);
+    defer a.free(changed);
+    try std.testing.expectEqualStrings("Step 2: in_progress -> blocked; note updated.\n", changed);
+    try plan.update(2, null, "");
+    const note = try plan.describeChange(a, 2, null, true);
+    defer a.free(note);
+    try std.testing.expectEqualStrings("Step 2: blocked; note updated.\n", note);
+    const read = try plan.describe(a);
+    defer a.free(read);
+    try std.testing.expect(std.mem.indexOf(u8, read, "1. [x] first private title\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read, "2. [!] second private title\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read, "needs fixture") == null);
+    try std.testing.expectEqual(Status.blocked, plan.steps.items[1].status);
+    try std.testing.expectError(error.NoSuchStep, plan.describeChange(a, 0, null, false));
+    try std.testing.expectError(error.NoSuchStep, plan.describeChange(a, 3, null, false));
     plan.clear();
-    aw.clearRetainingCapacity();
-    try plan.writePromptNote(&aw.writer);
-    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "No plan is saved yet") != null);
-    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "**plan**") != null);
+    const cleared = try plan.describeChange(a, null, null, false);
+    defer a.free(cleared);
+    try std.testing.expectEqualStrings("Plan cleared.\n", cleared);
 }
 
 test "a plan call is summarised for the terminal on one line" {

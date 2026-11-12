@@ -258,7 +258,7 @@ pub const Agent = struct {
         var scratch = try scratch_mod.Scratch.init(io, allocator, env);
         errdefer scratch.deinit(allocator);
         const system_content = switch (options.role) {
-            .main => try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, &host, workspace, scratch.path, &plan),
+            .main => try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, &host, workspace, scratch.path),
             .subagent => try buildSubagentPrompt(allocator, mcp_registry, memory.enabled, search, &host, workspace, scratch.path),
         };
         errdefer allocator.free(system_content);
@@ -399,45 +399,7 @@ pub const Agent = struct {
         self.closeRuns();
         for (self.history.items[1..]) |msg| msg.deinit(self.allocator);
         self.history.shrinkRetainingCapacity(1);
-        // A conversation that starts over starts from what outlived it: the
-        // prompt names the plan, which is state of the session rather than of
-        // the messages, so it is rebuilt rather than kept.
-        self.refreshSystemPrompt() catch {};
         self.checkpoint() catch {};
-    }
-
-    /// Rebuild the system prompt in place from the state it describes. The
-    /// plan changes as the work moves, and the MCP directory grows when a
-    /// service is loaded, so the prompt is rebuilt at those points instead of
-    /// being fixed at startup. A failure leaves the previous prompt in place.
-    fn refreshSystemPrompt(self: *Agent) !void {
-        if (self.history.items.len == 0) return;
-        const content = switch (self.role) {
-            .main => try buildSystemPrompt(
-                self.allocator,
-                self.mcp_registry,
-                self.memory.enabled,
-                self.search,
-                &self.host,
-                self.workspace,
-                self.scratch.path,
-                &self.plan,
-            ),
-            // A sub-agent has no plan of its own; its durable history is internal:
-            // its prompt says what the task is and what the report holds.
-            .subagent => try buildSubagentPrompt(
-                self.allocator,
-                self.mcp_registry,
-                self.memory.enabled,
-                self.search,
-                &self.host,
-                self.workspace,
-                self.scratch.path,
-            ),
-        };
-        errdefer self.allocator.free(content);
-        if (self.history.items[0].content) |old| self.allocator.free(old);
-        self.history.items[0].content = content;
     }
 
     /// Switch only after the new snapshot has been created or fully validated.
@@ -480,9 +442,6 @@ pub const Agent = struct {
         self.session_path = path;
         self.session_id = id;
         self.client.resetTokenCounters();
-        // The prompt names the plan's progress, so it is rebuilt for the plan
-        // this session brought rather than the one the process started with.
-        self.refreshSystemPrompt() catch {};
         // Another session is another piece of work: the task the old one
         // announced says nothing about this one.
         self.forgetTask();
@@ -715,6 +674,7 @@ pub const Agent = struct {
             };
         }
 
+        var previous_status: ?plan_mod.Status = null;
         if (args.steps) |raw_steps| {
             var converted: std.ArrayList(plan_mod.NewStep) = .empty;
             defer converted.deinit(self.allocator);
@@ -730,10 +690,6 @@ pub const Agent = struct {
                 .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
                 .is_error = true,
             };
-            // The system prompt names the plan and where it stands, so the
-            // request after this call describes this plan rather than the one
-            // from startup. A read below changes nothing and rebuilds nothing.
-            self.refreshSystemPrompt() catch {};
         } else {
             const status = if (args.status) |label| plan_mod.Status.parse(label) orelse return .{
                 .content = try std.fmt.allocPrint(self.allocator, "Error: status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
@@ -745,6 +701,8 @@ pub const Agent = struct {
                     .is_error = true,
                 };
             }
+            if (args.index.? > 0 and args.index.? <= self.plan.steps.items.len)
+                previous_status = self.plan.steps.items[args.index.? - 1].status;
             self.plan.update(args.index.?, status, args.note) catch |err| switch (err) {
                 error.NoSuchStep => return .{
                     .content = try std.fmt.allocPrint(self.allocator, "Error: there is no step {d}; the plan has {d}.", .{ args.index.?, self.plan.steps.items.len }),
@@ -755,10 +713,9 @@ pub const Agent = struct {
                     .is_error = true,
                 },
             };
-            self.refreshSystemPrompt() catch {};
         }
 
-        return .{ .content = try self.plan.describe(self.allocator), .is_error = false };
+        return .{ .content = try self.plan.describeChange(self.allocator, args.index, previous_status, args.note != null), .is_error = false };
     }
 
     /// `/plan`: show the checklist, or `/plan clear` to drop it.
@@ -779,7 +736,6 @@ pub const Agent = struct {
             return;
         }
         self.plan.clear();
-        self.refreshSystemPrompt() catch {};
         // The session snapshot is where the plan lives once this process is
         // gone, so a cleared plan is saved before the command reports success.
         self.checkpoint() catch |err| {
