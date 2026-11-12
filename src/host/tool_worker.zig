@@ -47,16 +47,9 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
             const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
             defer parsed.deinit();
             const fields = parsed.value.object;
-            if (!fields.contains("content")) {
-                const old_text = try openai.extractStringArg(allocator, arguments, "old_text");
-                defer allocator.free(old_text);
-                const new_text = try openai.extractStringArg(allocator, arguments, "new_text");
-                defer allocator.free(new_text);
-                break :blk try tools.editFile(io, allocator, path, old_text, new_text);
-            }
             if (fields.contains("old_text") or fields.contains("new_text")) {
                 break :blk .{
-                    .content = try allocator.dupe(u8, "Error: use either 'content' or 'old_text' and 'new_text', not both"),
+                    .content = try allocator.dupe(u8, "Error: write takes 'path' and 'content'; use edit for 'old_text' and 'new_text'"),
                     .is_error = true,
                 };
             }
@@ -68,6 +61,19 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, env: *const std.process
             };
             defer allocator.free(content);
             break :blk try tools.writeFile(io, allocator, path, content);
+        } else if (std.mem.eql(u8, name, "edit")) {
+            const parsed = std.json.parseFromSlice(struct {
+                path: []const u8,
+                old_text: []const u8,
+                new_text: []const u8,
+            }, allocator, arguments, .{}) catch {
+                break :blk .{
+                    .content = try allocator.dupe(u8, "Error: edit requires 'path', 'old_text' and 'new_text' strings; do not pass 'content'"),
+                    .is_error = true,
+                };
+            };
+            defer parsed.deinit();
+            break :blk try tools.editFile(io, allocator, parsed.value.path, parsed.value.old_text, parsed.value.new_text);
         } else if (std.mem.eql(u8, name, "apply_patch")) {
             const patch_text = openai.extractStringArg(allocator, arguments, "patch") catch {
                 break :blk .{
@@ -246,6 +252,26 @@ test "write creates overwrites and rejects mixed modes; legacy names are removed
     }
 }
 
+test "write and edit reject missing or mixed arguments" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const cases = [_]struct { name: []const u8, args: []const u8 }{
+        .{ .name = "write", .args = "{}" },
+        .{ .name = "write", .args = "{\"path\":\"unused\"}" },
+        .{ .name = "edit", .args = "{}" },
+        .{ .name = "edit", .args = "{\"old_text\":\"old\",\"new_text\":\"new\"}" },
+        .{ .name = "edit", .args = "{\"path\":\"unused\",\"new_text\":\"new\"}" },
+        .{ .name = "edit", .args = "{\"path\":\"unused\",\"old_text\":\"old\"}" },
+        .{ .name = "edit", .args = "{\"path\":\"unused\",\"old_text\":\"old\",\"new_text\":\"new\",\"content\":\"bad\"}" },
+    };
+    for (cases) |case| {
+        const result = try execute(std.testing.io, a, &env, case.name, case.args);
+        defer result.deinit(a);
+        try std.testing.expect(result.is_error);
+    }
+}
+
 test "http dispatches to request argument validation" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
@@ -271,7 +297,10 @@ test "read write and ls operate on an existing file" {
     const before = try execute(io, a, &env, "read", args);
     defer before.deinit(a);
     try std.testing.expectEqualStrings("1:before\n", before.content);
-    const edited = try execute(io, a, &env, "write", args);
+    const legacy = try execute(io, a, &env, "write", args);
+    defer legacy.deinit(a);
+    try std.testing.expect(legacy.is_error);
+    const edited = try execute(io, a, &env, "edit", args);
     defer edited.deinit(a);
     try std.testing.expect(!edited.is_error);
     const after = try execute(io, a, &env, "read", args);
@@ -320,7 +349,7 @@ test "filesystem tools dispatch without legacy aliases" {
         defer result.deinit(a);
         try std.testing.expect(result.is_error);
     }
-    for ([_][]const u8{"write"}) |name| {
+    for ([_][]const u8{"edit"}) |name| {
         const result = try execute(std.testing.io, a, &env, name, "{\"path\":\"/zagent-missing-test-directory/file\",\"old_text\":\"old\",\"new_text\":\"new\"}");
         defer result.deinit(a);
         try std.testing.expect(result.is_error);

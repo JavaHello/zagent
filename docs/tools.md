@@ -11,7 +11,8 @@ answer with the result — until the task is done, see
 |------|--------------|------|
 | `bash` | Run a Bash command | below |
 | `read` | Read one numbered page of a file | below |
-| `write` | Create or overwrite a file, or replace one exact block | below |
+| `write` | Create or overwrite a whole file | below |
+| `edit` | Replace one exact block in a file | below |
 | `ls` | List a directory | below |
 | `apply_patch` | Apply a Git unified diff | [Patching](patching.md) |
 | `rg` / `grep` | Search file contents | [Searching](searching.md) |
@@ -64,19 +65,29 @@ cut on a UTF-8 boundary, with the suggestion to read the rest with `bash`.
 
 ## `write`
 
-Two shapes, never mixed:
-
-- `content` creates the file or overwrites it whole.
-- `old_text` and `new_text` replace one exact block, which must match exactly
-  once. No match or two matches leaves the file untouched.
+Creates a file or overwrites its entire contents. For an exact block replacement,
+use `edit` instead.
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `path`   | yes | The file to write |
-| `content` | one mode | Entire file contents, for creation or full replacement |
-| `old_text` + `new_text` | other mode | The exact block to replace and its replacement |
+| `path` | yes | The file to write |
+| `content` | yes | Entire file contents, for creation or full replacement |
 
 A write is atomic and keeps the file's permissions.
+
+## `edit`
+
+Replaces one exact block in an existing file. The non-empty `old_text` must match
+exactly once; no match or multiple matches leaves the file untouched. `new_text`
+may be empty to delete the matched block.
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `path` | yes | The file to edit |
+| `old_text` | yes | The exact, non-empty block to replace |
+| `new_text` | yes | Its replacement |
+
+An edit is atomic and keeps the file's permissions.
 
 ## `ls`
 

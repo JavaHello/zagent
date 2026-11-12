@@ -67,7 +67,8 @@ src/
     mod.zig      — Re-exports the tool API the rest of the program uses
     bash.zig     — bash
     read.zig     — read: one numbered page of a file
-    write.zig    — write: whole-file writes and exact-block edits
+    write.zig    — write: whole-file writes
+    edit.zig     — edit: exact-block replacements
     apply_patch.zig — apply_patch: a Git unified diff
     ls.zig       — ls
     rg.zig       — rg

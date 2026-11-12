@@ -11,7 +11,7 @@
 - **交互式 REPL** — 全屏对话，提示符固定在最后一行；↑/↓ 可以调出本次及以往运行
   的输入历史；`Ctrl+Z` 挂起、`fg` 重绘整屏。[说明](docs/ui.md)
 - **单次查询** — 直接把问题作为命令行参数传入
-- **工具调用** — `bash`、`read`、`write`、`apply_patch`、`ls`、`rg`/`grep`、
+- **工具调用** — `bash`、`read`、`write`（整文件写入）、`edit`（精确替换）、`apply_patch`、`ls`、`rg`/`grep`、
   `fd`/`find`、`http`、`ask_user`、`plan`、`memory_save`/`memory_search`、
   `announce_task`。[工具](docs/tools.md) · [搜索](docs/searching.md) ·
   [补丁](docs/patching.md) · [HTTP](docs/http.md)

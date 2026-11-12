@@ -1,7 +1,7 @@
 //! The built-in host tools, one file per tool.
 //!
 //! Each tool keeps its implementation and its tests together — `bash.zig`,
-//! `read.zig`, `write.zig`, `apply_patch.zig`, `ls.zig`, `rg.zig`, `grep.zig`,
+//! `read.zig`, `write.zig`, `edit.zig`, `apply_patch.zig`, `ls.zig`, `rg.zig`, `grep.zig`,
 //! `fd.zig`, `find.zig`, `http.zig` — over a small shared floor: `result.zig`
 //! for the shape and size of a result, `progress.zig` for the progress labels,
 //! `args.zig` for reading a call's JSON arguments, `search.zig` for what the
@@ -51,7 +51,7 @@ pub const readFilePage = read.readFilePage;
 
 // write
 pub const writeFile = write.writeFile;
-pub const editFile = write.editFile;
+pub const editFile = @import("edit.zig").editFile;
 
 // apply_patch
 pub const applyPatch = apply_patch.applyPatch;

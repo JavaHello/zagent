@@ -13,7 +13,7 @@ between runs.
   bottom and a prompt history that ↑/↓ recall across runs; `Ctrl+Z` suspends and
   `fg` redraws the whole record. [Details](docs/ui.md)
 - **Single-query mode** — pass a question directly as a CLI argument
-- **Tool use** — the agent runs tools to do the work: `bash`, `read`, `write`,
+- **Tool use** — the agent runs tools to do the work: `bash`, `read`, `write`, `edit`,
   `apply_patch`, `ls`, `rg`/`grep`, `fd`/`find`, `http`, `ask_user`, `plan`,
   `memory_save`/`memory_search` and `announce_task`.
   [Tools](docs/tools.md) · [Searching](docs/searching.md) ·

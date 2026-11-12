@@ -129,7 +129,7 @@ try:
         # It is not offered the tools that belong to the agent on the terminal.
         assert tool_names(child[0]).isdisjoint(
             {'ask_user', 'announce_task', 'subagent', 'subagent_stop', 'plan', 'memory_save'}), tool_names(child[0])
-        assert {'bash', 'read', 'write', 'apply_patch'} <= tool_names(child[0]), tool_names(child[0])
+        assert {'bash', 'read', 'write', 'edit', 'apply_patch'} <= tool_names(child[0]), tool_names(child[0])
 
         # Its own tools really ran, and its progress never reached the parent's
         # conversation: only the report did.

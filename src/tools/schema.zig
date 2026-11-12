@@ -77,11 +77,37 @@ pub const read = ToolDefinition{
 
 pub const write = ToolDefinition{
     .name = "write",
-    .description = "Create or overwrite a file with content, or replace one exact, unique text block using old_text and new_text. Never combine the two modes; a replacement that is missing or ambiguous changes nothing.",
+    .description = "Create or overwrite an entire file with content. Use edit for exact text replacements.",
     .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Entire file contents for creation or full replacement"},"old_text":{"type":"string","description":"Exact non-empty text to replace"},"new_text":{"type":"string","description":"Replacement text"}},"required":["path"]}
+    \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Entire file contents for creation or full replacement"}},"required":["path","content"],"additionalProperties":false}
     ,
 };
+
+pub const edit = ToolDefinition{
+    .name = "edit",
+    .description = "Replace one exact, unique text block in an existing file. Missing or ambiguous matches change nothing. Use write to create or overwrite a whole file.",
+    .parameters_json =
+    \\{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","minLength":1,"description":"Exact non-empty text to replace"},"new_text":{"type":"string","description":"Replacement text; may be empty"}},"required":["path","old_text","new_text"],"additionalProperties":false}
+    ,
+};
+
+test "write and edit have separate required arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const w = try write.function(arena.allocator());
+    const e = try edit.function(arena.allocator());
+    const wr = w.parameters.object.get("required").?.array.items;
+    const er = e.parameters.object.get("required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), wr.len);
+    try std.testing.expectEqualStrings("path", wr[0].string);
+    try std.testing.expectEqualStrings("content", wr[1].string);
+    try std.testing.expectEqual(@as(usize, 3), er.len);
+    try std.testing.expectEqualStrings("path", er[0].string);
+    try std.testing.expectEqualStrings("old_text", er[1].string);
+    try std.testing.expectEqualStrings("new_text", er[2].string);
+    try std.testing.expect(!w.parameters.object.get("properties").?.object.contains("old_text"));
+    try std.testing.expect(!e.parameters.object.get("properties").?.object.contains("content"));
+}
 
 pub const apply_patch = ToolDefinition{
     .name = "apply_patch",
@@ -198,9 +224,9 @@ pub const subagent_stop = ToolDefinition{
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,          read, write,    apply_patch,   ls,
-    rg,            fd,            grep, find,     http,          ask_user,
-    memory_save,   announce_task, plan, subagent, subagent_stop, report,
+    memory_search, bash, read,     write,         edit,   apply_patch, ls,
+    rg,            fd,   grep,     find,          http,   ask_user,    memory_save,
+    announce_task, plan, subagent, subagent_stop, report,
 };
 
 test "built-in definitions have valid schemas and unique names" {

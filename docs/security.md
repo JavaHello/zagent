@@ -47,7 +47,7 @@ working directory, in the system prompt.
 The agent is told to use it for complex or multi-step work and for anything that
 would change the user's system, settings or configuration, so the workspace and
 the host stay untouched; only the finished deliverable is copied back. Existing
-tools such as `write`, `read`, `apply_patch` and `bash` work there, so no
+tools such as `write`, `edit`, `read`, `apply_patch` and `bash` work there, so no
 separate file API is needed.
 
 The directory is temporary, not durable: it belongs to the process, so agents

@@ -54,9 +54,9 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     ]
     calls.append(('bash', {'command': 'sleep 5; echo SHOULD_HAVE_TIMED_OUT', 'timeout_seconds': 1}))
     calls.extend([
-        ('write', {'path': 'notes.md', 'old_text': 'Analysis verified.', 'new_text': 'Analysis checked.'}),
-        ('write', {'path': 'notes.md', 'old_text': 'not present', 'new_text': 'MUST_NOT_APPEAR'}),
-        ('write', {'path': 'escape', 'old_text': 'SHOULD_NOT_ESCAPE', 'new_text': 'DIRECT_EDIT_WORKED'}),
+        ('edit', {'path': 'notes.md', 'old_text': 'Analysis verified.', 'new_text': 'Analysis checked.'}),
+        ('edit', {'path': 'notes.md', 'old_text': 'not present', 'new_text': 'MUST_NOT_APPEAR'}),
+        ('edit', {'path': 'escape', 'old_text': 'SHOULD_NOT_ESCAPE', 'new_text': 'DIRECT_EDIT_WORKED'}),
         ('bash', {'command': '/bin/echo HOST_WRITE > host-write.txt && cat host-write.txt'}),
     ])
     observed = []
