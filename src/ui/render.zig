@@ -1077,6 +1077,9 @@ pub const Renderer = struct {
         };
         self.wrap.setup(prefix, prefix);
         self.wrap.allow_wrap = self.options.wrap_code and prefix.width(self.theme) > 0;
+        // Start the line before flow sees whitespace: prose drops leading
+        // spaces on an unstarted line, but code indentation is content.
+        try self.wrap.ensureLine();
         // Code is emitted verbatim — no markers are interpreted inside a fence
         // — but it is still sanitised: a fence is not a licence for escapes.
         try self.rawText(line);
@@ -1471,6 +1474,15 @@ test "a fence labels itself and bars every line" {
         "```zig\nconst x = 1;\ntry foo();\n```",
         80,
     );
+}
+
+test "a fence preserves leading spaces in code and character diagrams" {
+    try expectPlain(
+        "  text\n  ▏ 创建协程\n  ▏                 ↓\n  ▏        ┌────────┼─────────┐\n  ▏        │        │         │\n",
+        "```text\n创建协程\n                ↓\n       ┌────────┼─────────┐\n       │        │         │\n```",
+        80,
+    );
+    try expectPlain("  ▏     return x;\n", "```\n    return x;\n```", 80);
 }
 
 test "a fence body is not parsed as markdown" {
