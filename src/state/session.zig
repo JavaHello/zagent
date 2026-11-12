@@ -172,8 +172,8 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
     var plan = plan_mod.Plan.init(allocator);
     defer plan.deinit();
     try plan.setSteps(&.{
-        .{ .title = "read the code", .status = .done },
-        .{ .title = "write the module", .status = .active, .note = "half way" },
+        .{ .title = "read the code", .status = .completed },
+        .{ .title = "write the module", .status = .in_progress, .note = "half way" },
     });
     var calls = [_]openai.ToolCallData{.{ .id = "1", .name = "shell", .arguments = "{}" }};
     var messages = [_]Message{
@@ -190,7 +190,7 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
     try std.testing.expectEqualStrings("done", loaded.messages.items[1].content.?);
     try std.testing.expectEqualDeep(messages[1].tool_status, loaded.messages.items[1].tool_status);
     try std.testing.expectEqual(@as(usize, 2), loaded.plan.steps.items.len);
-    try std.testing.expectEqual(plan_mod.Status.active, loaded.plan.steps.items[1].status);
+    try std.testing.expectEqual(plan_mod.Status.in_progress, loaded.plan.steps.items[1].status);
     try std.testing.expectEqualStrings("half way", loaded.plan.steps.items[1].note.?);
     try save(io, allocator, path, messages[0..1], &plan);
     try std.testing.expectError(error.InvalidSessionToolSequence, load(io, allocator, path));
@@ -200,6 +200,10 @@ test "snapshots reject removed fields and require the current schema" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.MissingField, std.json.parseFromSlice(StoredMessage, a, "{\"role\":\"tool\",\"content\":\"old\",\"reasoning_content\":null,\"tool_calls\":null,\"tool_call_id\":\"1\"}", .{}));
     try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Snapshot, a, "{\"version\":2,\"workspace\":\"\",\"messages\":[],\"plan\":[],\"scratch_dirs\":[]}", .{}));
+    // Replaced plan enum values are not migrated or silently discarded.
+    inline for (.{ "active", "done" }) |status| {
+        try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(Snapshot, a, "{\"version\":2,\"workspace\":\"\",\"messages\":[],\"plan\":[{\"title\":\"old step\",\"status\":\"" ++ status ++ "\"}]}", .{}));
+    }
     try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .{}));
     try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"version\":2,\"workspace\":\"\",\"messages\":[]}", .{}));
 }

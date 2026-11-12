@@ -16,9 +16,14 @@ Plan 2/5 done. Next: 3. Wire the plan tool
 The model owns the checklist through the `plan` tool, which has three shapes: no
 arguments returns the checklist with its progress and the step to take next,
 `steps` replaces the whole plan, and `index` with `status` or `note` moves one
-step without the rest being rewritten. `[ ]` is pending, `[~]` is the step in
-hand, `[x]` is done and `[!]` is blocked; an optional `note:` line under a step
-carries why. At most 50 steps of 200 bytes each.
+step without the rest being rewritten. The only statuses are `pending` (`[ ]`),
+`in_progress` (`[~]`, the step in hand), `completed` (`[x]`) and `blocked` (`[!]`);
+an optional `note:` line under a step carries why. Tool calls and session
+snapshots use these same four values; `active` and `done` are not aliases.
+At most 50 steps of 200 bytes each.
+
+Old session snapshots containing `active` or `done` plan statuses cannot be
+resumed without updating those values to `in_progress` or `completed`.
 
 The plan is runtime state of the session, not a file of its own: it lives in
 memory while zagent runs and is written into the session snapshot next to the

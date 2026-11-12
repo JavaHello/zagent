@@ -14,14 +14,19 @@ binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 requests = []
 calls = [
     ('plan', {'steps': [
-        {'title': 'Read the tool schemas', 'status': 'done'},
-        {'title': 'Write src/plan.zig', 'status': 'active'},
+        {'title': 'Read the tool schemas', 'status': 'completed'},
+        {'title': 'Write src/plan.zig', 'status': 'in_progress'},
         {'title': 'Wire the plan tool'},
     ]}),
-    ('plan', {'index': 2, 'status': 'done', 'note': 'compiles'}),
-    ('plan', {'index': 9, 'status': 'done'}),
-    ('plan', {'status': 'done'}),
+    ('plan', {'index': 2, 'status': 'completed', 'note': 'compiles'}),
+    ('plan', {'index': 9, 'status': 'completed'}),
+    ('plan', {'status': 'completed'}),
     ('plan', {}),
+    ('plan', {'index': 3, 'status': 'in_progress'}),
+    ('plan', {'steps': [{'title': 'Rejected alias', 'status': 'active'}]}),
+    ('plan', {'steps': [{'title': 'Rejected alias', 'status': 'done'}]}),
+    ('plan', {'index': 3, 'status': 'active'}),
+    ('plan', {'index': 3, 'status': 'done'}),
 ]
 
 
@@ -75,6 +80,11 @@ try:
         output = run('Plan the refactor')
         assert len(requests) == len(calls) + 1, (len(requests), output)
         assert 'No plan is saved yet' in instructions(requests[0])
+        plan_schema = next(tool['parameters'] for tool in requests[0]['tools']
+                           if tool.get('name') == 'plan')
+        properties = plan_schema['properties']
+        for status in (properties['status'], properties['steps']['items']['properties']['status']):
+            assert status['enum'] == ['pending', 'in_progress', 'completed', 'blocked'], status
         session = re.search(r'(?:Session\s+|Session: )([a-f0-9]{32})', output)[1]
         snapshot = state / 'sessions' / f'{session}.json'
 
@@ -100,6 +110,16 @@ try:
         assert not results[4][0]
         assert '2/3 done' in results[4][1], results[4][1]
 
+        # in_progress works for both replacement and updates, with the same mark.
+        assert '2. [~] Write src/plan.zig' in results[0][1], results[0]
+        assert not results[5][0]
+        assert '3. [~] Wire the plan tool' in results[5][1], results[5]
+
+        # Neither old enum spelling is accepted, in either tool shape.
+        for result in results[6:]:
+            assert result[0], result
+            assert 'must be pending, in_progress, completed or blocked' in result[1], result
+
         # The prompt after the tool call describes the plan the tool wrote,
         # which is how a lost context picks the work back up.
         assert '1/3 done' in instructions(requests[1]), instructions(requests[1])
@@ -110,16 +130,16 @@ try:
         assert not list(state.glob('*.md')), list(state.glob('*.md'))
         saved = json.loads(snapshot.read_text())
         assert saved['plan'] == [
-            {'title': 'Read the tool schemas', 'status': 'done', 'note': None},
-            {'title': 'Write src/plan.zig', 'status': 'done', 'note': 'compiles'},
-            {'title': 'Wire the plan tool', 'status': 'pending', 'note': None},
+            {'title': 'Read the tool schemas', 'status': 'completed', 'note': None},
+            {'title': 'Write src/plan.zig', 'status': 'completed', 'note': 'compiles'},
+            {'title': 'Wire the plan tool', 'status': 'in_progress', 'note': None},
         ], saved['plan']
 
         # /plan shows it in the restored session, and /clear keeps it: the plan
         # is not part of the messages that get emptied.
         output = run('--resume', session, stdin='/plan\n/clear\n/quit\n')
         assert '2/3 done. Next: 3. Wire the plan tool' in output, output
-        assert '3. [ ] Wire the plan tool' in output, output
+        assert '3. [~] Wire the plan tool' in output, output
         assert json.loads(snapshot.read_text())['plan']
         assert json.loads(snapshot.read_text())['messages'] == []
 

@@ -13,8 +13,8 @@ pub const max_note_bytes: usize = 300;
 
 pub const Status = enum {
     pending,
-    active,
-    done,
+    in_progress,
+    completed,
     blocked,
 
     /// Accept the spelling a model is likely to send, exactly or in any case.
@@ -28,8 +28,8 @@ pub const Status = enum {
     pub fn mark(self: Status) []const u8 {
         return switch (self) {
             .pending => "[ ]",
-            .active => "[~]",
-            .done => "[x]",
+            .in_progress => "[~]",
+            .completed => "[x]",
             .blocked => "[!]",
         };
     }
@@ -79,7 +79,7 @@ pub const Tally = struct {
     total: usize = 0,
     done: usize = 0,
     blocked: usize = 0,
-    /// 1-based number of the step to take next: the first active one, else the
+    /// 1-based number of the step to take next: the first in_progress one, else the
     /// first pending one, and null when no step is open.
     next: ?usize = null,
 };
@@ -102,9 +102,9 @@ pub const Plan = struct {
         var result: Tally = .{ .total = self.steps.items.len };
         for (self.steps.items, 0..) |step, i| {
             switch (step.status) {
-                .done => result.done += 1,
+                .completed => result.done += 1,
                 .blocked => result.blocked += 1,
-                .active => if (result.next == null) {
+                .in_progress => if (result.next == null) {
                     result.next = i + 1;
                 },
                 .pending => {},
@@ -347,14 +347,31 @@ fn normalize(a: std.mem.Allocator, raw: []const u8, limit: usize) ![]u8 {
     return aw.toOwnedSlice();
 }
 
+test "plan statuses are exactly four values, parsed case-insensitively" {
+    try std.testing.expectEqual(@as(usize, 4), @typeInfo(Status).@"enum".field_names.len);
+    inline for (.{ "pending", "in_progress", "completed", "blocked" }) |name| {
+        const status = Status.parse(name).?;
+        try std.testing.expectEqualStrings(name, @tagName(status));
+        const parsed = try std.json.parseFromSlice(Status, std.testing.allocator, "\"" ++ name ++ "\"", .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(status, parsed.value);
+    }
+    try std.testing.expectEqual(Status.in_progress, Status.parse("IN_PROGRESS").?);
+    try std.testing.expectEqual(Status.completed, Status.parse("COMPLETED").?);
+    for ([_][]const u8{ "active", "ACTIVE", "done", "DONE", "working" }) |name| {
+        try std.testing.expectEqual(@as(?Status, null), Status.parse(name));
+    }
+    try std.testing.expectEqualStrings("[~]", Status.parse("in_progress").?.mark());
+}
+
 test "steps are normalised, marked and tallied" {
     const a = std.testing.allocator;
     var plan = Plan.init(a);
     defer plan.deinit();
 
     try plan.setSteps(&.{
-        .{ .title = "  read\tthe  schemas ", .status = .done },
-        .{ .title = "write plan.zig", .status = .active },
+        .{ .title = "  read\tthe  schemas ", .status = .completed },
+        .{ .title = "write plan.zig", .status = .in_progress },
         .{ .title = "wire the tool", .note = "  after   the schema  " },
         .{ .title = "blocked step", .status = .blocked },
     });
@@ -364,7 +381,7 @@ test "steps are normalised, marked and tallied" {
     try std.testing.expectEqual(@as(usize, 4), progress.total);
     try std.testing.expectEqual(@as(usize, 1), progress.done);
     try std.testing.expectEqual(@as(usize, 1), progress.blocked);
-    // An active step outranks an earlier pending one: it is the work in hand.
+    // An in_progress step outranks an earlier pending one: it is the work in hand.
     try std.testing.expectEqual(@as(?usize, 2), progress.next);
 
     // A rejected step leaves the plan the model already has.
@@ -382,14 +399,14 @@ test "a plan is stepped, cleared and restored from its stored form" {
     var plan = Plan.init(a);
     defer plan.deinit();
     try plan.setSteps(&.{
-        .{ .title = "read the code", .status = .done },
-        .{ .title = "write the module", .status = .active },
+        .{ .title = "read the code", .status = .completed },
+        .{ .title = "write the module", .status = .in_progress },
         .{ .title = "run the tests" },
     });
-    try std.testing.expectError(error.NoSuchStep, plan.update(9, .done, null));
-    try std.testing.expectError(error.NoSuchStep, plan.update(0, .done, null));
+    try std.testing.expectError(error.NoSuchStep, plan.update(9, .completed, null));
+    try std.testing.expectError(error.NoSuchStep, plan.update(0, .completed, null));
 
-    try plan.update(2, .done, "compiles");
+    try plan.update(2, .completed, "compiles");
     try plan.update(3, .blocked, "waits for the fixture");
     try std.testing.expectEqualStrings("compiles", plan.steps.items[1].note.?);
 
@@ -401,7 +418,7 @@ test "a plan is stepped, cleared and restored from its stored form" {
     defer restored.deinit();
     try restored.restore(stored);
     try std.testing.expectEqual(@as(usize, 3), restored.steps.items.len);
-    try std.testing.expectEqual(Status.done, restored.steps.items[1].status);
+    try std.testing.expectEqual(Status.completed, restored.steps.items[1].status);
     try std.testing.expectEqualStrings("waits for the fixture", restored.steps.items[2].note.?);
 
     restored.clear();
@@ -414,7 +431,7 @@ test "a plan is stepped, cleared and restored from its stored form" {
     // Snapshot data from elsewhere is cleaned like a tool call, and a step
     // this program cannot use is skipped instead of failing the session.
     try restored.restore(&.{
-        .{ .title = "  still   here ", .status = .done },
+        .{ .title = "  still   here ", .status = .completed },
         .{ .title = "   " },
         .{ .title = "blocked", .status = .blocked, .note = " reason " },
     });
@@ -428,8 +445,8 @@ test "the prompt follows the plan" {
     var plan = Plan.init(a);
     defer plan.deinit();
     try plan.setSteps(&.{
-        .{ .title = "done already", .status = .done },
-        .{ .title = "in hand", .status = .active },
+        .{ .title = "done already", .status = .completed },
+        .{ .title = "in hand", .status = .in_progress },
         .{ .title = "plain line" },
     });
 
@@ -455,8 +472,8 @@ test "a plan call is summarised for the terminal on one line" {
     try std.testing.expect(try writeCallSummary(&aw.writer, a, "{\"steps\":[{\"title\":\"one\\ntwo\"},{\"title\":\"b\"}]}"));
     try std.testing.expectEqualStrings("2 steps: one two, b", aw.written());
     aw.clearRetainingCapacity();
-    try std.testing.expect(try writeCallSummary(&aw.writer, a, "{\"index\":2,\"status\":\"done\",\"note\":\"ok\"}"));
-    try std.testing.expectEqualStrings("step 2 → done · ok", aw.written());
+    try std.testing.expect(try writeCallSummary(&aw.writer, a, "{\"index\":2,\"status\":\"completed\",\"note\":\"ok\"}"));
+    try std.testing.expectEqualStrings("step 2 → completed · ok", aw.written());
     aw.clearRetainingCapacity();
     try std.testing.expect(try writeCallSummary(&aw.writer, a, "{}"));
     try std.testing.expectEqualStrings("read", aw.written());

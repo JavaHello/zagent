@@ -719,7 +719,7 @@ pub const Agent = struct {
             try converted.ensureTotalCapacity(self.allocator, raw_steps.len);
             for (raw_steps) |step| {
                 const status = if (step.status) |label| plan_mod.Status.parse(label) orelse return .{
-                    .content = try std.fmt.allocPrint(self.allocator, "Error: step status '{s}' must be pending, active, done or blocked.", .{label}),
+                    .content = try std.fmt.allocPrint(self.allocator, "Error: step status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
                     .is_error = true,
                 } else null;
                 converted.appendAssumeCapacity(.{ .title = step.title, .status = status, .note = step.note });
@@ -734,7 +734,7 @@ pub const Agent = struct {
             self.refreshSystemPrompt() catch {};
         } else {
             const status = if (args.status) |label| plan_mod.Status.parse(label) orelse return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: status '{s}' must be pending, active, done or blocked.", .{label}),
+                .content = try std.fmt.allocPrint(self.allocator, "Error: status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
                 .is_error = true,
             } else null;
             if (status == null and args.note == null) {
