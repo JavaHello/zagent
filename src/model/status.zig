@@ -17,6 +17,24 @@ const Quota = struct {
     rate_limit: ?Limits = null,
 };
 
+/// Show requested Codex settings, not a claim about the server's chosen tier.
+pub fn formatCodexSettings(a: std.mem.Allocator, service_tier: ?[]const u8, reasoning_effort: ?[]const u8) ![]u8 {
+    const tier = nonEmpty(service_tier) orelse "default";
+    const effort = nonEmpty(reasoning_effort) orelse "default (server-selected)";
+    return std.fmt.allocPrint(a, "Codex fast mode: {s} (service_tier: {s})\nreasoning_effort: {s}\n", .{
+        if (std.mem.eql(u8, tier, "fast") or std.mem.eql(u8, tier, "priority")) @as([]const u8, "enabled") else "disabled",
+        tier,
+        effort,
+    });
+}
+
+fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    if (value) |text| {
+        if (text.len > 0) return text;
+    }
+    return null;
+}
+
 pub fn formatQuota(a: std.mem.Allocator, body: []const u8) ![]u8 {
     const parsed = try std.json.parseFromSlice(Quota, a, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -45,6 +63,26 @@ fn writeWindow(w: *std.Io.Writer, label: []const u8, window: Window) !void {
     if (window.reset_after_seconds) |seconds|
         try w.print("; resets in {d}h {d}m {d}s", .{ seconds / 3600, seconds / 60 % 60, seconds % 60 });
     try w.writeByte('\n');
+}
+
+test "Codex settings show fast mode and reasoning effort" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "fast", "priority" }) |tier| {
+        const output = try formatCodexSettings(a, tier, "high");
+        defer a.free(output);
+        try std.testing.expect(std.mem.indexOf(u8, output, "fast mode: enabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, tier) != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "reasoning_effort: high\n") != null);
+    }
+    for ([_]?[]const u8{ null, "", "default", "flex" }) |tier| {
+        const output = try formatCodexSettings(a, tier, if (tier == null) null else "");
+        defer a.free(output);
+        try std.testing.expect(std.mem.indexOf(u8, output, "fast mode: disabled") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "reasoning_effort: default (server-selected)\n") != null);
+        if (tier) |value| {
+            if (value.len > 0) try std.testing.expect(std.mem.indexOf(u8, output, value) != null);
+        }
+    }
 }
 
 test "quota formats both windows and ignores new fields" {
