@@ -83,6 +83,7 @@ pub const Agent = struct {
     tool_env: *const std.process.Environ.Map,
     session_path: ?[]u8,
     session_id: ?[]u8 = null,
+    child_record: ?@import("../state/session.zig").Child = null,
     /// The working directory commands run in, named in the system prompt.
     workspace: [:0]u8,
     /// What machine this run is on: the OS and its version, the kernel, the
@@ -117,7 +118,7 @@ pub const Agent = struct {
     /// same provider, model and key as the one that called it.
     config: *const Config,
     /// Whether this agent is the one on the terminal, or one a tool call
-    /// started. A sub-agent has no terminal, no session and no plan of its own.
+    /// started. A sub-agent has no terminal or plan; durable parents give it a child session.
     role: Role = .main,
     /// The agent that started this one. Its interrupt flag is checked too, so
     /// Esc stops the whole tree rather than the outer turn alone.
@@ -176,7 +177,7 @@ pub const Agent = struct {
         /// the plan.
         main,
         /// An agent a tool call started for one task. It reports back through
-        /// its caller instead of printing, and starts no session.
+        /// its caller instead of printing, with a child session when the parent is durable.
         subagent,
     };
 
@@ -422,7 +423,7 @@ pub const Agent = struct {
                 self.scratch.path,
                 &self.plan,
             ),
-            // A sub-agent has no plan of its own and no session to describe:
+            // A sub-agent has no plan of its own; its durable history is internal:
             // its prompt says what the task is and what the report holds.
             .subagent => try buildSubagentPrompt(
                 self.allocator,
@@ -464,6 +465,7 @@ pub const Agent = struct {
         }
         defer loaded.deinit(self.allocator);
         try self.history.ensureTotalCapacity(self.allocator, loaded.messages.items.len + 1);
+        self.closeRuns();
         // The system prompt names this process's working and scratch
         // directories, so switching sessions replaces the messages only.
         for (self.history.items[1..]) |message| message.deinit(self.allocator);
@@ -530,7 +532,7 @@ pub const Agent = struct {
     }
 
     fn checkpoint(self: *Agent) !void {
-        if (self.session_path) |path| try @import("../state/session.zig").save(self.io, self.allocator, path, self.history.items[1..], &self.plan);
+        if (self.session_path) |path| try @import("../state/session.zig").saveChild(self.io, self.allocator, path, self.history.items[1..], &self.plan, self.child_record);
     }
 
     /// `/memory`: list what is saved, newest last.
@@ -1016,10 +1018,13 @@ pub const Agent = struct {
         // A run that reported back is paused at that report: this call is the
         // caller's answer to it, and the next wait starts from here.
         if (parsed.value.id) |id| {
-            const run = self.findRun(id) orelse return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: no sub-agent has the id \"{s}\". A run that reported back names its own id; one that has finished is gone.", .{id}),
+            const run = self.findRun(id) orelse (self.restoreRun(id, checkin) catch |err| return .{
+                .content = if (err == error.FileNotFound)
+                    try std.fmt.allocPrint(self.allocator, "Error: no saved sub-agent has the id \"{s}\".", .{id})
+                else
+                    try std.fmt.allocPrint(self.allocator, "Error: could not restore sub-agent \"{s}\": {s}.", .{ id, @errorName(err) }),
                 .is_error = true,
-            };
+            });
             run.supervisor.carryOn(checkin == 0);
             return self.waitRun(run, checkin);
         }
@@ -1070,14 +1075,34 @@ pub const Agent = struct {
     /// empty: a run without one is named by its task on the lines that would
     /// have shown it.
     fn startRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, checkin_seconds: u32) !*Run {
+        return self.createRun(task, context, title, checkin_seconds, null);
+    }
+
+    fn restoreRun(self: *Agent, id: []const u8, checkin: u32) !*Run {
+        if (id.len < 2 or id[0] != 's') return error.InvalidSessionId;
+        _ = try std.fmt.parseInt(usize, id[1..], 10);
+        return self.createRun("", "", "", checkin, id);
+    }
+
+    fn createRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, checkin_seconds: u32, restore_id: ?[]const u8) !*Run {
+        const session = @import("../state/session.zig");
         const run = try self.allocator.create(Run);
         errdefer self.allocator.destroy(run);
-
-        self.run_counter += 1;
-        const id = try std.fmt.allocPrint(self.allocator, "s{d}", .{self.run_counter});
+        // Reserve ids against durable children, including completed ones.
+        while (true) {
+            self.run_counter += 1;
+            const parent_path = self.session_path orelse break;
+            const candidate = try std.fmt.allocPrint(self.allocator, "{s}.s{d}.json", .{ parent_path, self.run_counter });
+            defer self.allocator.free(candidate);
+            std.Io.Dir.cwd().access(self.io, candidate, .{}) catch |err| switch (err) {
+                error.FileNotFound => break,
+                else => return err,
+            };
+        }
+        const id = if (restore_id) |value| try self.allocator.dupe(u8, value) else try std.fmt.allocPrint(self.allocator, "s{d}", .{self.run_counter});
         errdefer self.allocator.free(id);
         const owned_title = try self.allocator.dupe(u8, title);
-        errdefer self.allocator.free(owned_title);
+        errdefer self.allocator.free(run.title);
         run.* = .{
             .id = id,
             .title = owned_title,
@@ -1104,6 +1129,30 @@ pub const Agent = struct {
             child.trace_agent = child.trace_agent_owned.?;
         }
         run.child = child;
+        if (self.session_path) |parent_path| {
+            child.session_path = try std.fmt.allocPrint(self.allocator, "{s}.{s}.json", .{ parent_path, id });
+            child.child_record = .{ .parent = self.session_id orelse "", .id = id, .title = run.title };
+        }
+        var continuation: []const u8 = task;
+        if (restore_id != null) {
+            const path = child.session_path orelse return error.NoSession;
+            try std.Io.Dir.cwd().access(self.io, path, .{});
+            var loaded = try session.load(self.io, self.allocator, path);
+            defer loaded.deinit(self.allocator);
+            const record = loaded.child orelse return error.InvalidSessionId;
+            continuation = switch (record.status) {
+                .completed => "The caller explicitly requested continuation of this completed task. Continue from saved history; do not repeat already completed work unless needed for the follow-up.",
+                .failed => "The caller requested continuation of this failed task. Review the saved failure and history before proceeding. Unconfirmed tool outcomes are unknown; inspect before retrying side effects.",
+                .running, .interrupted => "The process restarted: this task was interrupted. Continue from saved history. Unconfirmed tool outcomes are unknown; inspect before retrying any side effects.",
+            };
+            if (!std.mem.eql(u8, record.parent, self.session_id orelse "") or !std.mem.eql(u8, record.id, id)) return error.InvalidSessionId;
+            const restored_title = try self.allocator.dupe(u8, record.title);
+            self.allocator.free(run.title);
+            run.title = restored_title;
+            child.child_record.?.title = run.title;
+            try child.history.appendSlice(self.allocator, loaded.messages.items);
+            loaded.messages.clearRetainingCapacity();
+        }
         // The two ways a run stops for a reason other than its caller's
         // decision: this process asking for the task to stop, and the child
         // itself being told to.
@@ -1112,7 +1161,7 @@ pub const Agent = struct {
 
         var prompt: std.ArrayList(u8) = .empty;
         errdefer prompt.deinit(self.allocator);
-        try prompt.appendSlice(self.allocator, task);
+        try prompt.appendSlice(self.allocator, continuation);
         if (context.len > 0) {
             try prompt.appendSlice(self.allocator, "\n\nWhat the agent that asked you already knows:\n");
             try prompt.appendSlice(self.allocator, context);
@@ -1531,6 +1580,7 @@ pub const Agent = struct {
                 var asked: ?QuestionAnswers = try self.askQuestions(tool_calls);
                 defer if (asked) |prepared| prepared.deinit(self.allocator);
 
+                if (self.child_record != null) try self.checkpoint();
                 for (tool_calls, 0..) |call, index| {
                     try self.checkInterrupted();
                     // The call is recorded before it runs, so a call that
@@ -1575,6 +1625,7 @@ pub const Agent = struct {
                         .tool_call_id = call_id,
                         .tool_status = result.status(),
                     });
+                    if (self.child_record != null) try self.checkpoint();
                 }
                 // A sub-agent's report is the reply that stands on its finished
                 // work, not the commentary it wrote before asking for tools:
@@ -2341,6 +2392,17 @@ const Run = struct {
 fn childTurn(child: *Agent, supervisor: *subagent.Supervisor, prompt: []u8) void {
     defer child.allocator.free(prompt);
     child.processQuery(prompt) catch |err| {
+        if (child.child_record) |*record| record.status = if (err == error.Canceled) .interrupted else .failed;
+        child.checkpoint() catch |checkpoint_err| {
+            supervisor.finish(checkpoint_err);
+            return;
+        };
+        supervisor.finish(err);
+        return;
+    };
+    if (child.child_record) |*record| record.status = .completed;
+    child.checkpoint() catch |err| {
+        if (child.child_record) |*record| record.status = .failed;
         supervisor.finish(err);
         return;
     };
@@ -2833,6 +2895,77 @@ test "a follow-up that announces no task keeps the one in the title" {
     const replaced = try harness.agent.announceTask("{\"title\":\"别的任务\",\"description\":\"换一件事。\"}");
     replaced.deinit(allocator);
     try std.testing.expectEqualStrings("别的任务", harness.agent.current_task);
+}
+
+test "paused report snapshot reconstructs partial batch without replay" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const harness = try TestHarness.init(a, io);
+    defer harness.deinit(a);
+    var silence = try Silence.init(io);
+    defer silence.deinit(io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    harness.agent.session_path = try std.fs.path.join(a, &.{ directory, "parent.json" });
+    harness.agent.session_id = try a.dupe(u8, "parent");
+    const progress = "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"done\",\"name\":\"ls\",\"arguments\":\"{}\"},{\"type\":\"function_call\",\"call_id\":\"rep\",\"name\":\"report\",\"arguments\":\"{\\\"summary\\\":\\\"saved halfway report\\\"}\"},{\"type\":\"function_call\",\"call_id\":\"pending\",\"name\":\"ls\",\"arguments\":\"{}\"}]}";
+    var mock: MockTransport = .{ .replies = &.{ progress, completed_answer } };
+    defer mock.deinit(a);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    const run = try harness.agent.startRun("work", "", "", 60);
+    const report = try harness.agent.waitRun(run, 60);
+    defer report.deinit(a);
+    // Load while the report handshake is blocked: no verdict has been saved.
+    var loaded = try @import("../state/session.zig").load(io, a, run.child.session_path.?);
+    defer loaded.deinit(a);
+    const messages = loaded.messages.items;
+    const n = messages.len;
+    try std.testing.expectEqualStrings("done", messages[n - 3].tool_call_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, messages[n - 3].content.?, "NOT replayed") == null);
+    try std.testing.expectEqualStrings("rep", messages[n - 2].tool_call_id.?);
+    try std.testing.expectEqualStrings("pending", messages[n - 1].tool_call_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, messages[n - 1].content.?, "NOT replayed") != null);
+    const calls = messages[n - 4].tool_calls.?;
+    try std.testing.expect(std.mem.indexOf(u8, calls[1].arguments, "saved halfway report") != null);
+    run.supervisor.carryOn(false);
+    const finished = try harness.agent.waitRun(run, 60);
+    defer finished.deinit(a);
+}
+
+test "durable child can be reconstructed under its old id without replaying tools" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const harness = try TestHarness.init(a, io);
+    defer harness.deinit(a);
+    var silence = try Silence.init(io);
+    defer silence.deinit(io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    harness.agent.session_path = try std.fs.path.join(a, &.{ directory, "parent.json" });
+    harness.agent.session_id = try a.dupe(u8, "parent");
+    var mock: MockTransport = .{ .replies = &.{ completed_answer, completed_answer, completed_answer } };
+    defer mock.deinit(a);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    const first = try harness.agent.startRun("original task", "original context", "title", 60);
+    const first_result = try harness.agent.waitRun(first, 60);
+    defer first_result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), harness.agent.runs.items.len);
+    harness.agent.run_counter = 0;
+    const restored = try harness.agent.restoreRun("s1", 60);
+    try std.testing.expectEqualStrings("s1", restored.id);
+    try std.testing.expectEqualStrings("title", restored.title);
+    const restored_result = try harness.agent.waitRun(restored, 60);
+    defer restored_result.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "original context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "explicitly requested continuation of this completed task") != null);
+    const next = try harness.agent.startRun("new task", "", "", 60);
+    try std.testing.expect(!std.mem.eql(u8, next.id, "s1"));
+    const next_result = try harness.agent.waitRun(next, 60);
+    defer next_result.deinit(a);
 }
 
 test "a subagent runs its own turn and reports back" {

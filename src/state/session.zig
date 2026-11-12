@@ -20,6 +20,15 @@ const Snapshot = struct {
     workspace: []const u8,
     messages: []StoredMessage,
     plan: []plan_mod.Stored,
+    child: ?Child = null,
+};
+
+/// Child identity is scoped to the parent snapshot's path.
+pub const Child = struct {
+    parent: []const u8,
+    id: []const u8,
+    title: []const u8,
+    status: enum { running, interrupted, completed, failed } = .running,
 };
 /// Bumped when a field is added, so an older snapshot is refused instead of
 /// resumed with half its state.
@@ -29,11 +38,17 @@ const schema_version: u32 = 2;
 pub const Loaded = struct {
     messages: std.ArrayList(Message),
     plan: plan_mod.Plan,
+    child: ?Child = null,
 
     pub fn deinit(self: *Loaded, allocator: std.mem.Allocator) void {
         for (self.messages.items) |message| message.deinit(allocator);
         self.messages.deinit(allocator);
         self.plan.deinit();
+        if (self.child) |child| {
+            allocator.free(child.parent);
+            allocator.free(child.id);
+            allocator.free(child.title);
+        }
         self.* = undefined;
     }
 };
@@ -51,6 +66,37 @@ pub fn validateId(id: []const u8) !void {
     }
 }
 
+test "child pending tools become unknown outcomes and running becomes interrupted" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    const path = try std.fs.path.join(a, &.{ directory, "child.json" });
+    defer a.free(path);
+    var plan = plan_mod.Plan.init(a);
+    defer plan.deinit();
+    var calls = [_]openai.ToolCallData{.{ .id = "unknown", .name = "bash", .arguments = "{}" }};
+    var messages = [_]Message{.{ .role = "assistant", .content = null, .reasoning_content = "thinking", .tool_calls = &calls, .tool_call_id = null }};
+    try saveChild(io, a, path, &messages, &plan, .{ .parent = "parent", .id = "s7", .title = "child title" });
+    var loaded = try load(io, a, path);
+    defer loaded.deinit(a);
+    try std.testing.expectEqualStrings("parent", loaded.child.?.parent);
+    try std.testing.expectEqualStrings("s7", loaded.child.?.id);
+    try std.testing.expectEqualStrings("child title", loaded.child.?.title);
+    try std.testing.expect(loaded.child.?.status == .interrupted);
+    try std.testing.expectEqual(@as(usize, 2), loaded.messages.items.len);
+    try std.testing.expectEqualStrings("unknown", loaded.messages.items[1].tool_call_id.?);
+    try std.testing.expect(loaded.messages.items[1].tool_status.?.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, loaded.messages.items[1].content.?, "NOT replayed") != null);
+    try saveChild(io, a, path, loaded.messages.items, &plan, .{ .parent = "parent", .id = "s7", .title = "child title", .status = .completed });
+    var again = try load(io, a, path);
+    defer again.deinit(a);
+    try std.testing.expect(again.child.?.status == .completed);
+    try std.testing.expectEqual(@as(usize, 2), again.messages.items.len);
+}
+
 test "session IDs are unique and cannot escape the session directory" {
     const a = std.testing.allocator;
     const first = try newId(std.testing.io, a);
@@ -64,6 +110,10 @@ test "session IDs are unique and cannot escape the session directory" {
 }
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages: []Message, plan: *const plan_mod.Plan) !void {
+    return saveChild(io, allocator, path, messages, plan, null);
+}
+
+pub fn saveChild(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages: []Message, plan: *const plan_mod.Plan, child: ?Child) !void {
     const cwd = std.Io.Dir.cwd();
     const workspace = try cwd.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(workspace);
@@ -85,6 +135,7 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, messages
         .workspace = workspace,
         .messages = messages,
         .plan = steps,
+        .child = child,
     }, .{}, &file_writer.interface);
     try file_writer.interface.flush();
     try cwd.rename(temporary, cwd, path, io);
@@ -150,14 +201,36 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Loaded 
         }
         try messages.append(allocator, message);
     }
-    if (pending != null) return error.InvalidSessionToolSequence;
+    if (pending) |calls| {
+        if (parsed.value.child == null) return error.InvalidSessionToolSequence;
+        // Never replay an unacknowledged side effect. Close the protocol with
+        // an explicit unknown outcome; the model must inspect before retrying.
+        for (calls[next_tool..]) |call| {
+            const content = try allocator.dupe(u8, "Interrupted before confirmation. Outcome unknown; inspect state before retrying. This tool was NOT replayed.");
+            errdefer allocator.free(content);
+            const id = try allocator.dupe(u8, call.id);
+            errdefer allocator.free(id);
+            try messages.append(allocator, .{ .role = "tool", .content = content, .reasoning_content = null, .tool_calls = null, .tool_call_id = id, .tool_status = .{ .is_error = true } });
+        }
+    }
     const plan = restored: {
         var value = plan_mod.Plan.init(allocator);
         errdefer value.deinit();
         try value.restore(parsed.value.plan);
         break :restored value;
     };
-    return .{ .messages = messages, .plan = plan };
+    var child = parsed.value.child;
+    if (child) |*value| {
+        const parent = try allocator.dupe(u8, value.parent);
+        errdefer allocator.free(parent);
+        const id = try allocator.dupe(u8, value.id);
+        errdefer allocator.free(id);
+        value.title = try allocator.dupe(u8, value.title);
+        value.parent = parent;
+        value.id = id;
+        if (value.status == .running) value.status = .interrupted;
+    }
+    return .{ .messages = messages, .plan = plan, .child = child };
 }
 
 test "session roundtrip retains tool calls, reasoning and the plan" {
