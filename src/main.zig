@@ -619,7 +619,7 @@ fn runRepl(
             agent.forgetCommand(argument) catch |err| try reportCommandError(allocator, &screen, io, "forget", err);
         } else if (std.mem.eql(u8, line, "/status")) {
             const counts = agent.client.tokenCounts();
-            const msg = try std.fmt.allocPrint(allocator, "Model: {s}\nWorkspace: {s}\nScratch: {s}\nLast turn tokens (server usage or estimate): input {d}, output {d}\n", .{ config.model, agent.workspace, agent.scratch.path, counts.input, counts.output });
+            const msg = try std.fmt.allocPrint(allocator, "Model: {s}\nWorkspace: {s}\nScratch: {s}\nLast turn tokens (server usage only): input {d} (cached {d}), output {d} (reasoning {d}), total {d}\nUsage reported: {d}/{d} calls; missing usage is unknown, not estimated.\nCached/reasoning tokens are included in input/output, not added again.\n", .{ config.model, agent.workspace, agent.scratch.path, counts.input, counts.cached, counts.output, counts.reasoning, counts.total, counts.usage_reports, counts.requests });
             defer allocator.free(msg);
             try writeOut(&screen, stdout, io, msg);
             var status_client = @import("model/openai.zig").Client.init(allocator, io, config);

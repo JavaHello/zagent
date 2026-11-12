@@ -106,7 +106,7 @@ zagent
 | `/remember <文本>` | 保存一条记忆 |
 | `/forget <序号\|all>` | 删除一条或全部记忆 |
 | `/model` | 显示当前模型 |
-| `/status` | 显示 token 用量和账户额度 |
+| `/status` | 显示本轮服务端 token 累计（输入、输出、总数、缓存命中、推理）、usage 返回调用数和账户额度 |
 | `/mcp` | 列出 MCP 服务及其工具 |
 | `/debug` | 记录每一步并写出 HTML 报告 |
 | `/quit` | 退出 |

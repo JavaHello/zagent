@@ -226,6 +226,15 @@ fn writeResponseNode(w: *std.Io.Writer, arena: std.mem.Allocator, event: std.jso
     });
     if (integer(event, "in_tokens")) |input| {
         try meta_aw.writer.print(" · in {d} / out {d} tokens", .{ input, integer(event, "out_tokens") orelse 0 });
+        if (integer(event, "total_tokens")) |total| {
+            try meta_aw.writer.print(" · total {d}", .{total});
+        }
+        if (integer(event, "cached_tokens")) |cached| {
+            try meta_aw.writer.print(" · cached {d}", .{cached});
+        }
+        if (integer(event, "reasoning_tokens")) |reasoning| {
+            try meta_aw.writer.print(" · reasoning {d}", .{reasoning});
+        }
     } else {
         try meta_aw.writer.writeAll(" · usage not reported");
     }

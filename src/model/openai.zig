@@ -205,6 +205,9 @@ pub const Message = struct {
 pub const Usage = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+    cached_tokens: u64 = 0,
+    reasoning_tokens: u64 = 0,
 };
 
 pub const ApiResponse = struct {
@@ -274,10 +277,14 @@ pub const Client = struct {
     /// Which agent and which request of the turn the next exchange belongs to.
     /// The agent sets it before every call, so one trace can hold a whole tree.
     trace_ctx: trace_mod.Ctx = .{},
-    /// Live token accounting, read by the spinner while a request is in
-    /// flight. These are totals for the current query, not per request.
+    /// Strict server-reported totals for the current query; never estimates.
     input_tokens: std.atomic.Value(u64) = .init(0),
     output_tokens: std.atomic.Value(u64) = .init(0),
+    total_tokens: std.atomic.Value(u64) = .init(0),
+    cached_tokens: std.atomic.Value(u64) = .init(0),
+    reasoning_tokens: std.atomic.Value(u64) = .init(0),
+    requests: std.atomic.Value(u64) = .init(0),
+    usage_reports: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: Config) Client {
         return .{
@@ -352,45 +359,51 @@ pub const Client = struct {
     pub fn resetTokenCounters(self: *Client) void {
         self.input_tokens.store(0, .monotonic);
         self.output_tokens.store(0, .monotonic);
+        self.total_tokens.store(0, .monotonic);
+        self.cached_tokens.store(0, .monotonic);
+        self.reasoning_tokens.store(0, .monotonic);
+        self.requests.store(0, .monotonic);
+        self.usage_reports.store(0, .monotonic);
     }
 
-    pub fn tokenCounts(self: *Client) struct { input: u64, output: u64 } {
+    pub fn tokenCounts(self: *const Client) struct { input: u64, output: u64, total: u64, cached: u64, reasoning: u64, requests: u64, usage_reports: u64 } {
         return .{
             .input = self.input_tokens.load(.monotonic),
             .output = self.output_tokens.load(.monotonic),
+            .total = self.total_tokens.load(.monotonic),
+            .cached = self.cached_tokens.load(.monotonic),
+            .reasoning = self.reasoning_tokens.load(.monotonic),
+            .requests = self.requests.load(.monotonic),
+            .usage_reports = self.usage_reports.load(.monotonic),
         };
     }
 
-    /// Add another client's totals to this one. A sub-agent's requests are part
-    /// of what the query that started it cost, so they are counted where the
-    /// user reads the totals instead of being hidden from them.
+    /// Include all sub-agent requests, even those without a usage report.
     pub fn absorbUsage(self: *Client, other: *const Client) void {
         _ = self.input_tokens.fetchAdd(other.input_tokens.load(.monotonic), .monotonic);
         _ = self.output_tokens.fetchAdd(other.output_tokens.load(.monotonic), .monotonic);
+        _ = self.total_tokens.fetchAdd(other.total_tokens.load(.monotonic), .monotonic);
+        _ = self.cached_tokens.fetchAdd(other.cached_tokens.load(.monotonic), .monotonic);
+        _ = self.reasoning_tokens.fetchAdd(other.reasoning_tokens.load(.monotonic), .monotonic);
+        _ = self.requests.fetchAdd(other.requests.load(.monotonic), .monotonic);
+        _ = self.usage_reports.fetchAdd(other.usage_reports.load(.monotonic), .monotonic);
     }
 
     fn addUsage(self: *Client, usage: ?Usage) void {
         const u = usage orelse return;
         _ = self.input_tokens.fetchAdd(u.input_tokens, .monotonic);
         _ = self.output_tokens.fetchAdd(u.output_tokens, .monotonic);
+        _ = self.total_tokens.fetchAdd(u.total_tokens, .monotonic);
+        _ = self.cached_tokens.fetchAdd(u.cached_tokens, .monotonic);
+        _ = self.reasoning_tokens.fetchAdd(u.reasoning_tokens, .monotonic);
+        _ = self.usage_reports.fetchAdd(1, .monotonic);
     }
 
-    /// Replace the live estimates made for one streaming request with the real
-    /// numbers the server reported once it finished. The estimates were added
-    /// to the running totals as they were made; the difference is all that is
-    /// left to apply.
-    fn correctUsage(self: *Client, in_estimate: u64, out_estimate: u64, usage: ?Usage) void {
-        const u = usage orelse return;
-        if (u.input_tokens >= in_estimate) {
-            _ = self.input_tokens.fetchAdd(u.input_tokens - in_estimate, .monotonic);
-        } else {
-            _ = self.input_tokens.fetchSub(in_estimate - u.input_tokens, .monotonic);
-        }
-        if (u.output_tokens >= out_estimate) {
-            _ = self.output_tokens.fetchAdd(u.output_tokens - out_estimate, .monotonic);
-        } else {
-            _ = self.output_tokens.fetchSub(out_estimate - u.output_tokens, .monotonic);
-        }
+    /// Account before parsing business output, which can fail independently.
+    fn recordResponseUsage(self: *Client, body: []const u8) void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return;
+        defer parsed.deinit();
+        self.addUsage(parseUsage(parsed.value));
     }
 
     pub fn deinit(self: *Client) void {
@@ -407,7 +420,7 @@ pub const Client = struct {
         return message;
     }
 
-    /// Use the same request projection as the live counter, including tool
+    /// Estimate the wire request independently of accounting, including tool
     /// schemas and the Codex adapter, without sending or authenticating.
     pub fn estimateRequestTokens(self: *Client, messages: []const Message, extra_tools: []const []const u8) !u64 {
         const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools }, true, self.search);
@@ -515,6 +528,9 @@ pub const Client = struct {
             .tool_calls = recorded orelse &.{},
             .in_tokens = if (parsed.usage) |usage| usage.input_tokens else null,
             .out_tokens = if (parsed.usage) |usage| usage.output_tokens else null,
+            .total_tokens = if (parsed.usage) |usage| usage.total_tokens else null,
+            .cached_tokens = if (parsed.usage) |usage| usage.cached_tokens else null,
+            .reasoning_tokens = if (parsed.usage) |usage| usage.reasoning_tokens else null,
             .ms = started.untilNow(self.io, .awake).toMilliseconds(),
             .raw = raw.items,
         });
@@ -526,6 +542,7 @@ pub const Client = struct {
     /// to `sink` as they arrive, and the final event carries the complete
     /// response object, which is parsed exactly like a non-streaming reply.
     fn exchangeStreaming(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
+        _ = self.requests.fetchAdd(1, .monotonic);
         if (self.transport) |transport| {
             // Tests drive the buffered path; streaming is a network detail.
             const body = try transport.send(transport.context, self.allocator, req_json);
@@ -533,9 +550,8 @@ pub const Client = struct {
             if (raw) |buffer| buffer.appendSlice(self.allocator, body) catch {};
             if (self.http_error) |message| self.allocator.free(message);
             self.http_error = null;
-            const parsed = try parseResponse(self.allocator, body);
-            self.addUsage(parsed.usage);
-            return parsed;
+            self.recordResponseUsage(body);
+            return parseResponse(self.allocator, body);
         }
 
         const headers = [_]std.http.Header{
@@ -562,6 +578,17 @@ pub const Client = struct {
         var redirect_buffer: [8192]u8 = undefined;
         var response = try req.receiveHead(&redirect_buffer);
 
+        // Inspect headers before creating the body reader, which invalidates
+        // the response head's borrowed storage.
+        var json_response = false;
+        var header_it = response.head.iterateHeaders();
+        while (header_it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type") and
+                std.mem.indexOf(u8, header.value, "application/json") != null)
+            {
+                json_response = true;
+            }
+        }
         const decompress_buffer: []u8 = switch (response.head.content_encoding) {
             .identity => &.{},
             .zstd => try self.allocator.alloc(u8, std.compress.zstd.default_window_len),
@@ -579,6 +606,7 @@ pub const Client = struct {
             defer aw.deinit();
             _ = reader.streamRemaining(&aw.writer) catch {};
             if (raw) |buffer| buffer.appendSlice(self.allocator, aw.written()) catch {};
+            self.recordResponseUsage(aw.written());
             self.recordHttpError(response.head.status, aw.written());
             return error.ApiError;
         }
@@ -586,13 +614,15 @@ pub const Client = struct {
         if (self.http_error) |message| self.allocator.free(message);
         self.http_error = null;
 
-        // Estimate the request size so the spinner has an input-token count
-        // before the server reports the real one. The real number replaces
-        // this estimate once the final event arrives.
-        const in_estimate = estimateTokens(req_json);
-        _ = self.input_tokens.fetchAdd(in_estimate, .monotonic);
+        if (json_response) {
+            var buffered: std.Io.Writer.Allocating = .init(self.allocator);
+            defer buffered.deinit();
+            _ = try reader.streamRemaining(&buffered.writer);
+            if (raw) |buffer| buffer.appendSlice(self.allocator, buffered.written()) catch {};
+            self.recordResponseUsage(buffered.written());
+            return parseResponse(self.allocator, buffered.written());
+        }
 
-        var out_estimate: u64 = 0;
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(self.allocator);
         var data: std.ArrayList(u8) = .empty;
@@ -614,7 +644,7 @@ pub const Client = struct {
             while (i < avail.len) : (i += 1) {
                 const byte = avail[i];
                 if (byte == '\n') {
-                    try self.handleSseLine(line.items, &data, sink, &completed, &out_estimate);
+                    try self.handleSseLine(line.items, &data, sink, &completed);
                     line.clearRetainingCapacity();
                 } else if (byte != '\r') {
                     try line.append(self.allocator, byte);
@@ -623,15 +653,16 @@ pub const Client = struct {
             reader.toss(avail.len);
         }
         if (line.items.len > 0) {
-            try self.handleSseLine(line.items, &data, sink, &completed, &out_estimate);
+            try self.handleSseLine(line.items, &data, sink, &completed);
         }
+
+        if (data.items.len > 0) try self.dispatchSse(data.items, sink, &completed);
 
         const final_body = completed orelse return error.ResponseNotCompleted;
         const parsed = parseResponse(self.allocator, final_body) catch |err| {
             if (err == error.ApiError) self.recordHttpError(response.head.status, final_body);
             return err;
         };
-        self.correctUsage(in_estimate, out_estimate, parsed.usage);
         return parsed;
     }
 
@@ -641,7 +672,6 @@ pub const Client = struct {
         data: *std.ArrayList(u8),
         sink: StreamSink,
         completed: *?[]u8,
-        out_estimate: *u64,
     ) !void {
         if (line.len == 0) {
             // A blank line ends the event. Dispatch on the JSON object's own
@@ -649,7 +679,7 @@ pub const Client = struct {
             // may not always set.
             if (data.items.len == 0) return;
             defer data.clearRetainingCapacity();
-            try self.dispatchSse(data.items, sink, completed, out_estimate);
+            try self.dispatchSse(data.items, sink, completed);
             return;
         }
         if (line[0] == ':') return;
@@ -667,12 +697,11 @@ pub const Client = struct {
         data: []const u8,
         sink: StreamSink,
         completed: *?[]u8,
-        out_estimate: *u64,
     ) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
         defer parsed.deinit();
         const root = parsed.value;
-        if (root != .object) return;
+        if (root != .object or completed.* != null) return;
 
         if (root.object.get("type")) |kind| {
             if (kind == .string and (std.mem.eql(u8, kind.string, "response.output_text.delta") or
@@ -681,9 +710,6 @@ pub const Client = struct {
                 const delta = root.object.get("delta") orelse return;
                 if (delta != .string) return;
                 sink.onText(sink.context, delta.string);
-                const estimate = estimateTokens(delta.string);
-                out_estimate.* += estimate;
-                _ = self.output_tokens.fetchAdd(estimate, .monotonic);
                 return;
             }
         }
@@ -691,10 +717,15 @@ pub const Client = struct {
         // The terminal events (completed, incomplete, failed) all carry the
         // full `response` object, which is exactly what the buffered parser
         // expects.
+        const kind = root.object.get("type") orelse return;
+        if (kind != .string or !(std.mem.eql(u8, kind.string, "response.completed") or
+            std.mem.eql(u8, kind.string, "response.incomplete") or
+            std.mem.eql(u8, kind.string, "response.failed"))) return;
         const response_obj = root.object.get("response") orelse return;
-        if (response_obj == .null) return;
+        if (response_obj != .object) return;
         const encoded = std.json.Stringify.valueAlloc(self.allocator, response_obj, .{}) catch return;
-        if (completed.*) |old| self.allocator.free(old);
+        // Persist usage at the terminal event, even if the connection later fails.
+        self.addUsage(parseUsage(response_obj));
         completed.* = encoded;
     }
 
@@ -916,6 +947,34 @@ fn reasoningText(allocator: std.mem.Allocator, output: std.json.Value) !?[]u8 {
     return try aw.toOwnedSlice();
 }
 
+/// Missing or malformed counters are zero, not estimates. A report needs at
+/// least one explicit nonnegative integer counter; an empty object is not one.
+fn usageCounter(object: std.json.Value, name: []const u8) ?u64 {
+    if (object != .object) return null;
+    const value = object.object.get(name) orelse return null;
+    if (value != .integer or value.integer < 0) return null;
+    return @intCast(value.integer);
+}
+
+fn parseUsage(root: std.json.Value) ?Usage {
+    if (root != .object) return null;
+    const usage = root.object.get("usage") orelse return null;
+    if (usage != .object) return null;
+    const input = usageCounter(usage, "input_tokens");
+    const output = usageCounter(usage, "output_tokens");
+    const total = usageCounter(usage, "total_tokens");
+    const cached = usageCounter(usage.object.get("input_tokens_details") orelse .null, "cached_tokens");
+    const reasoning = usageCounter(usage.object.get("output_tokens_details") orelse .null, "reasoning_tokens");
+    if (input == null and output == null and total == null and cached == null and reasoning == null) return null;
+    return .{
+        .input_tokens = input orelse 0,
+        .output_tokens = output orelse 0,
+        .total_tokens = total orelse 0,
+        .cached_tokens = cached orelse 0,
+        .reasoning_tokens = reasoning orelse 0,
+    };
+}
+
 /// Parse only terminal Responses objects. Incomplete tool calls never execute.
 pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiResponse {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -995,22 +1054,13 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     errdefer if (reasoning) |value| allocator.free(value);
     const reason = try allocator.dupe(u8, if (truncated) "length" else if (calls.items.len > 0) "tool_calls" else "stop");
     errdefer allocator.free(reason);
-    const usage: ?Usage = if (root.object.get("usage")) |usage_value| blk: {
-        if (usage_value != .object) break :blk null;
-        const input = usage_value.object.get("input_tokens");
-        const out = usage_value.object.get("output_tokens");
-        break :blk .{
-            .input_tokens = if (input) |v| if (v == .integer) @intCast(v.integer) else 0 else 0,
-            .output_tokens = if (out) |v| if (v == .integer) @intCast(v.integer) else 0 else 0,
-        };
-    } else null;
     return .{
         .content = text,
         .reasoning_content = reasoning,
         .response_items = raw_items,
         .tool_calls = if (calls.items.len > 0) try calls.toOwnedSlice(allocator) else null,
         .finish_reason = reason,
-        .usage = usage,
+        .usage = parseUsage(root),
     };
 }
 
@@ -1035,11 +1085,10 @@ fn tryParseApiErrorMessage(allocator: std.mem.Allocator, body: []const u8) ?[]co
     return allocator.dupe(u8, msg_val.string) catch null;
 }
 
-/// Rough token count for the live status line, before the server reports the
-/// real usage. It approximates OpenAI's tokenizer well enough to watch a reply
-/// stream: ASCII text is about four bytes per token, and each non-ASCII
-/// codepoint (CJK included) counts as one. The real numbers replace this at
-/// the end of the request.
+/// Rough token estimate, independent of server-reported accounting.
+/// Used only for preflight sizing and trace request metadata:
+/// ASCII text is about four bytes per token, and each non-ASCII codepoint
+/// (CJK included) counts as one. Never contributes to usage counters.
 pub fn estimateTokens(bytes: []const u8) u64 {
     var tokens: u64 = 0;
     var ascii_run: u64 = 0;
@@ -1289,11 +1338,10 @@ test "sse deltas stream to the sink and the final event is captured" {
 
     var completed: ?[]u8 = null;
     defer if (completed) |c| allocator.free(c);
-    var out_estimate: u64 = 0;
 
-    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}", sink, &completed, &out_estimate);
-    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"world\"}", sink, &completed, &out_estimate);
-    try client.dispatchSse("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}", sink, &completed, &out_estimate);
+    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}", sink, &completed);
+    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"world\"}", sink, &completed);
+    try client.dispatchSse("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}", sink, &completed);
 
     try std.testing.expectEqualStrings("Hello world", capture.seen.items);
     try std.testing.expect(completed != null);
@@ -1381,4 +1429,143 @@ fn codexRequest(a: std.mem.Allocator, ordinary: []const u8, options: CodexOption
     }
     try parsed.value.object.put(parsed.arena.allocator(), "instructions", .{ .string = instructions.written() });
     return std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
+
+test "usage parsing is strict safe and never synthesizes total" {
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "{}",                                                                              "{\"usage\":null}",                                    "{\"usage\":false}", "{\"usage\":{}}",
+        "{\"usage\":{\"input_tokens\":-1,\"output_tokens\":\"20\",\"total_tokens\":1.5}}", "{\"usage\":{\"input_tokens\":18446744073709551616}}",
+    };
+    for (cases) |body| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(?Usage, null), parseUsage(parsed.value));
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"usage":{"input_tokens":12,"output_tokens":4,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":2}}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(Usage{ .input_tokens = 12, .output_tokens = 4, .cached_tokens = 7, .reasoning_tokens = 2 }, parseUsage(parsed.value).?);
+    const malformed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"usage":{"input_tokens":-2,"output_tokens":0,"total_tokens":99,"input_tokens_details":3,"output_tokens_details":{"reasoning_tokens":-4}}}
+    , .{});
+    defer malformed.deinit();
+    try std.testing.expectEqual(Usage{ .total_tokens = 99 }, parseUsage(malformed.value).?);
+}
+
+const UsageTestTransport = struct {
+    body: []const u8 = "",
+    fail: bool = false,
+    fn send(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.fail) return error.TestDisconnect;
+        return allocator.dupe(u8, self.body);
+    }
+    fn onText(_: *anyopaque, _: []const u8) void {}
+};
+
+test "buffered exchanges account usage before business errors and count every attempt" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const config = try Config.load(a, std.testing.io, &env);
+    defer config.deinit();
+    var client = Client.init(a, std.testing.io, config);
+    defer client.deinit();
+    var transport = UsageTestTransport{};
+    client.transport = .{ .context = &transport, .send = UsageTestTransport.send };
+    const sink = StreamSink{ .context = &transport, .onText = UsageTestTransport.onText };
+    const cases = [_]struct { body: []const u8, err: anyerror }{
+        .{ .body = "{\"status\":\"failed\",\"error\":{},\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens_details\":{\"reasoning_tokens\":2}}}", .err = error.ApiError },
+        .{ .body = "{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":1}}", .err = error.ResponseNotCompleted },
+        .{ .body = "{\"status\":\"completed\",\"output\":[],\"usage\":{\"output_tokens\":2}}", .err = error.EmptyResponse },
+        .{ .body = "{\"status\":\"failed\",\"error\":{}}", .err = error.ApiError },
+    };
+    for (cases) |case| {
+        transport.body = case.body;
+        try std.testing.expectError(case.err, client.exchangeStreaming("", "", "{}", sink, null));
+    }
+    transport.fail = true;
+    try std.testing.expectError(error.TestDisconnect, client.exchangeStreaming("", "", "{}", sink, null));
+    const counts = client.tokenCounts();
+    try std.testing.expectEqual(@as(u64, 10), counts.input);
+    try std.testing.expectEqual(@as(u64, 5), counts.output);
+    try std.testing.expectEqual(@as(u64, 12), counts.total);
+    try std.testing.expectEqual(@as(u64, 4), counts.cached);
+    try std.testing.expectEqual(@as(u64, 2), counts.reasoning);
+    try std.testing.expectEqual(@as(u64, 5), counts.requests);
+    try std.testing.expectEqual(@as(u64, 3), counts.usage_reports);
+    var parent = Client.init(a, std.testing.io, config);
+    defer parent.deinit();
+    parent.absorbUsage(&client);
+    try std.testing.expectEqualDeep(counts, parent.tokenCounts());
+    client.resetTokenCounters();
+    const zero = client.tokenCounts();
+    inline for (.{ "input", "output", "total", "cached", "reasoning", "requests", "usage_reports" }) |field| {
+        try std.testing.expectEqual(@as(u64, 0), @field(zero, field));
+    }
+}
+
+test "SSE counts only first terminal usage immediately even when output is invalid" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const config = try Config.load(a, std.testing.io, &env);
+    defer config.deinit();
+    var client = Client.init(a, std.testing.io, config);
+    defer client.deinit();
+    var context: u8 = 0;
+    const sink = StreamSink{ .context = &context, .onText = UsageTestTransport.onText };
+    for ([_][]const u8{ "response.completed", "response.incomplete", "response.failed" }) |kind| {
+        client.resetTokenCounters();
+        var completed: ?[]u8 = null;
+        defer if (completed) |body| a.free(body);
+        try client.dispatchSse("{\"type\":\"response.created\",\"response\":{\"usage\":{\"input_tokens\":900}}}", sink, &completed);
+        try client.dispatchSse("{\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":900}}}", sink, &completed);
+        try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"long text not estimated\"}", sink, &completed);
+        try std.testing.expect(completed == null);
+        try std.testing.expectEqual(@as(u64, 0), client.tokenCounts().input);
+        try std.testing.expectEqual(@as(u64, 0), client.tokenCounts().output);
+        const event = try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"response\":{{\"usage\":{{\"input_tokens\":5,\"total_tokens\":8}}}}}}", .{kind});
+        defer a.free(event);
+        try client.dispatchSse(event, sink, &completed);
+        // Accounting has already happened; no final parse or clean EOF needed.
+        try std.testing.expectEqual(@as(u64, 5), client.tokenCounts().input);
+        try std.testing.expectEqual(@as(u64, 8), client.tokenCounts().total);
+        try std.testing.expectEqual(@as(u64, 1), client.tokenCounts().usage_reports);
+        try client.dispatchSse(event, sink, &completed);
+        try std.testing.expectEqual(@as(u64, 1), client.tokenCounts().usage_reports);
+        try std.testing.expectError(error.InvalidResponse, parseResponse(a, completed.?));
+    }
+}
+
+test "public streaming buffered response preserves full usage and missing usage stays unknown" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const config = try Config.load(a, std.testing.io, &env);
+    defer config.deinit();
+    var client = Client.init(a, std.testing.io, config);
+    defer client.deinit();
+    var transport = UsageTestTransport{ .body =
+        \\{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cached_tokens":6},"output_tokens_details":{"reasoning_tokens":3}}}
+    };
+    client.transport = .{ .context = &transport, .send = UsageTestTransport.send };
+    const sink = StreamSink{ .context = &transport, .onText = UsageTestTransport.onText };
+    const response = try client.respondStreaming(&.{}, &.{}, sink);
+    defer response.deinit(a);
+    try std.testing.expectEqual(Usage{ .input_tokens = 10, .output_tokens = 5, .total_tokens = 15, .cached_tokens = 6, .reasoning_tokens = 3 }, response.usage.?);
+    const before = client.tokenCounts();
+    transport.body =
+        \\{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"not estimated"}]}]}
+    ;
+    const unknown = try client.respondStreaming(&.{}, &.{}, sink);
+    defer unknown.deinit(a);
+    try std.testing.expect(unknown.usage == null);
+    const after = client.tokenCounts();
+    try std.testing.expectEqual(before.input, after.input);
+    try std.testing.expectEqual(before.output, after.output);
+    try std.testing.expectEqual(@as(u64, 2), after.requests);
+    try std.testing.expectEqual(@as(u64, 1), after.usage_reports);
 }

@@ -919,11 +919,16 @@ pub const Agent = struct {
         self.terminal_title.update("ready", self.current_task);
         const elapsed_ms = self.query_started.?.untilNow(self.io, .awake).toMilliseconds();
         const counts = self.client.tokenCounts();
-        try self.emit(std.Io.File.stderr(), DIM ++ "  Worked for {d}.{d}s · in {d} · out {d} tokens\n" ++ RESET, .{
+        try self.emit(std.Io.File.stderr(), DIM ++ "  Worked for {d}.{d}s · in {d} (cached {d}) · out {d} (reasoning {d}) · total {d} tokens · usage {d}/{d} calls\n" ++ RESET, .{
             @divTrunc(elapsed_ms, 1000),
             @divTrunc(@mod(elapsed_ms, 1000), 100),
             counts.input,
+            counts.cached,
             counts.output,
+            counts.reasoning,
+            counts.total,
+            counts.usage_reports,
+            counts.requests,
         });
         try self.checkInterrupted();
         // The final answer settles the turn; its text is not a status protocol.
