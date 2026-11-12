@@ -61,7 +61,7 @@ pub const memory_search = ToolDefinition{
 
 pub const bash = ToolDefinition{
     .name = "bash",
-    .description = "Execute a Bash command and return its output.",
+    .description = "Execute a Bash command once. Long output keeps each stream's head and tail; redirect verbose output to a file and read it in pages.",
     .parameters_json =
     \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}
     ,
@@ -69,7 +69,7 @@ pub const bash = ToolDefinition{
 
 pub const read = ToolDefinition{
     .name = "read",
-    .description = "Read a file or one page of it, numbered by line.",
+    .description = "Read a file page, numbered by line. Follow the next offset for more; use limit to request fewer lines.",
     .parameters_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"integer","minimum":1,"description":"1-based number of the first line to read; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to read; defaults to as many as the output page holds"}},"required":["path"]}
     ,
@@ -101,7 +101,7 @@ pub const ls = ToolDefinition{
 
 pub const rg = ToolDefinition{
     .name = "rg",
-    .description = "Search file contents with a regular expression and return matching lines with file and line number. Skips binary files.",
+    .description = "Search file contents with a regular expression and return matching lines with file and line number. Skips binary files. Results are paged; narrow pattern, path or glob when more remain.",
     .parameters_json =
     \\{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob to search (e.g. README* or src/*.zig); defaults to the current directory. Path globs expand before searching, unlike the recursive glob filter."},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"},"context_lines":{"type":"integer","minimum":0,"description":"Number of surrounding lines before and after each match; defaults to 0"},"max_matches":{"type":"integer","minimum":1,"description":"Stop after this many matching lines per file (not a global limit); defaults to unlimited."},"hidden":{"type":"boolean","description":"Include hidden files (default false)"},"no_ignore":{"type":"boolean","description":"Disable ignore files (default false)"}},"required":["pattern"]}
     ,

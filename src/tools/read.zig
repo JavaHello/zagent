@@ -302,8 +302,9 @@ test "read cuts a line longer than a page without splitting a character" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Line 1 alone is longer") != null);
     // The line was given all the room its prefix left, cut back to a character.
     const room = std.mem.indexOf(u8, result.content, "\n").? - "1:".len;
-    try std.testing.expect(room <= page_room_bytes - "1:".len);
-    try std.testing.expect(room > page_room_bytes - "1:".len - 3);
+    // Include the newline in the page budget before rounding to UTF-8.
+    try std.testing.expect(room <= page_room_bytes - "1:".len - 1);
+    try std.testing.expect(room > page_room_bytes - "1:".len - 1 - 3);
     try std.testing.expectEqual(@as(usize, 0), room % 3);
 }
 

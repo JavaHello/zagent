@@ -877,11 +877,14 @@ pub const Agent = struct {
         self.terminal_title.update("ready", self.current_task);
         const elapsed_ms = self.query_started.?.untilNow(self.io, .awake).toMilliseconds();
         const counts = self.client.tokenCounts();
-        try self.emit(std.Io.File.stderr(), DIM ++ "  Worked for {d}.{d}s · in {d} (cached {d}) · out {d} (reasoning {d}) · total {d} tokens · usage {d}/{d} calls\n" ++ RESET, .{
+        try self.emit(std.Io.File.stderr(), DIM ++ "  Worked for {d}.{d}s · in {d} (cached {d}, {s}; cache reports {d}/{d}) · out {d} (reasoning {d}) · total {d} tokens · usage {d}/{d} calls\n" ++ RESET, .{
             @divTrunc(elapsed_ms, 1000),
             @divTrunc(@mod(elapsed_ms, 1000), 100),
             counts.input,
             counts.cached,
+            if (counts.cache_usage_reports == 0) "unknown" else if (counts.cache_usage_reports < counts.requests) "partial" else "reported",
+            counts.cache_usage_reports,
+            counts.requests,
             counts.output,
             counts.reasoning,
             counts.total,

@@ -89,7 +89,7 @@ test "tool selection composes runtime subsets and MCP schemas without mutating d
     defer selected.deinit(a);
     try selected.appendSlice(a, &.{ tool_schema.read, tool_schema.grep });
     const extra = [_][]const u8{
-        \\{"type":"function","function":{"name":"grep","parameters":{"type":"object","properties":{}}}}
+        \\{"type":"function","function":{"name":"mcp__a","parameters":{"type":"object","properties":{}}}}
         ,
         \\{"type":"function","name":"mcp__flat","parameters":{"type":"object","properties":{}}}
         ,
@@ -100,7 +100,7 @@ test "tool selection composes runtime subsets and MCP schemas without mutating d
     defer parsed.deinit();
     const tools = parsed.value.object.get("tools").?.array.items;
     try std.testing.expectEqual(@as(usize, 4), tools.len);
-    for (tools, [_][]const u8{ "read", "grep", "grep", "mcp__flat" }) |tool, name| {
+    for (tools, [_][]const u8{ "read", "grep", "mcp__a", "mcp__flat" }) |tool, name| {
         try std.testing.expectEqualStrings(name, tool.object.get("name").?.string);
         try std.testing.expect(!tool.object.get("strict").?.bool);
         try std.testing.expect(tool.object.get("function") == null);
@@ -203,6 +203,7 @@ pub const Message = struct {
 /// Token usage the server reported for one request. Optional because a failed
 /// or cut-off request may not carry it.
 pub const Usage = struct {
+    cache_usage_reported: bool = false,
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     total_tokens: u64 = 0,
@@ -252,6 +253,9 @@ pub const Client = struct {
     api_key: []const u8,
     codex_auth_path: ?[]const u8 = null,
     codex_options: CodexOptions = .{},
+    /// Borrowed from Config, with the same lifetime as model and codex_options.
+    prompt_cache_key: ?[]const u8 = null,
+    prompt_cache_retention: ?[]const u8 = null,
     credentials: ?codex_auth.Credentials = null,
     base_url: []const u8,
     model: []const u8,
@@ -282,6 +286,7 @@ pub const Client = struct {
     output_tokens: std.atomic.Value(u64) = .init(0),
     total_tokens: std.atomic.Value(u64) = .init(0),
     cached_tokens: std.atomic.Value(u64) = .init(0),
+    cache_usage_reports: std.atomic.Value(u64) = .init(0),
     reasoning_tokens: std.atomic.Value(u64) = .init(0),
     requests: std.atomic.Value(u64) = .init(0),
     usage_reports: std.atomic.Value(u64) = .init(0),
@@ -294,6 +299,8 @@ pub const Client = struct {
             .api_key = config.api_key,
             .codex_auth_path = config.codex_auth_path,
             .codex_options = .{ .reasoning_effort = config.reasoning_effort, .service_tier = config.service_tier },
+            .prompt_cache_key = config.prompt_cache_key,
+            .prompt_cache_retention = config.prompt_cache_retention,
             .base_url = config.base_url,
             .model = config.model,
             .max_tokens = config.max_tokens,
@@ -361,17 +368,19 @@ pub const Client = struct {
         self.output_tokens.store(0, .monotonic);
         self.total_tokens.store(0, .monotonic);
         self.cached_tokens.store(0, .monotonic);
+        self.cache_usage_reports.store(0, .monotonic);
         self.reasoning_tokens.store(0, .monotonic);
         self.requests.store(0, .monotonic);
         self.usage_reports.store(0, .monotonic);
     }
 
-    pub fn tokenCounts(self: *const Client) struct { input: u64, output: u64, total: u64, cached: u64, reasoning: u64, requests: u64, usage_reports: u64 } {
+    pub fn tokenCounts(self: *const Client) struct { input: u64, output: u64, total: u64, cached: u64, reasoning: u64, requests: u64, usage_reports: u64, cache_usage_reports: u64 } {
         return .{
             .input = self.input_tokens.load(.monotonic),
             .output = self.output_tokens.load(.monotonic),
             .total = self.total_tokens.load(.monotonic),
             .cached = self.cached_tokens.load(.monotonic),
+            .cache_usage_reports = self.cache_usage_reports.load(.monotonic),
             .reasoning = self.reasoning_tokens.load(.monotonic),
             .requests = self.requests.load(.monotonic),
             .usage_reports = self.usage_reports.load(.monotonic),
@@ -384,6 +393,7 @@ pub const Client = struct {
         _ = self.output_tokens.fetchAdd(other.output_tokens.load(.monotonic), .monotonic);
         _ = self.total_tokens.fetchAdd(other.total_tokens.load(.monotonic), .monotonic);
         _ = self.cached_tokens.fetchAdd(other.cached_tokens.load(.monotonic), .monotonic);
+        _ = self.cache_usage_reports.fetchAdd(other.cache_usage_reports.load(.monotonic), .monotonic);
         _ = self.reasoning_tokens.fetchAdd(other.reasoning_tokens.load(.monotonic), .monotonic);
         _ = self.requests.fetchAdd(other.requests.load(.monotonic), .monotonic);
         _ = self.usage_reports.fetchAdd(other.usage_reports.load(.monotonic), .monotonic);
@@ -395,6 +405,7 @@ pub const Client = struct {
         _ = self.output_tokens.fetchAdd(u.output_tokens, .monotonic);
         _ = self.total_tokens.fetchAdd(u.total_tokens, .monotonic);
         _ = self.cached_tokens.fetchAdd(u.cached_tokens, .monotonic);
+        if (u.cache_usage_reported) _ = self.cache_usage_reports.fetchAdd(1, .monotonic);
         _ = self.reasoning_tokens.fetchAdd(u.reasoning_tokens, .monotonic);
         _ = self.usage_reports.fetchAdd(1, .monotonic);
     }
@@ -423,14 +434,27 @@ pub const Client = struct {
     /// Estimate the wire request independently of accounting, including tool
     /// schemas and the Codex adapter, without sending or authenticating.
     pub fn estimateRequestTokens(self: *Client, messages: []const Message, extra_tools: []const []const u8) !u64 {
+        const request = try self.buildWireRequest(messages, extra_tools);
+        defer self.allocator.free(request);
+        return estimateTokens(request);
+    }
+
+    /// Shared projection for estimation and sending. With no cache options the
+    /// original serialization is returned unchanged (including for Codex).
+    fn buildWireRequest(self: *Client, messages: []const Message, extra_tools: []const []const u8) ![]u8 {
         const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools }, true, self.search);
-        defer self.allocator.free(ordinary);
-        if (self.codex_auth_path != null) {
-            const adapted = try codexRequest(self.allocator, ordinary, self.codex_options);
-            defer self.allocator.free(adapted);
-            return estimateTokens(adapted);
-        }
-        return estimateTokens(ordinary);
+        const request = if (self.codex_auth_path != null) adapted: {
+            defer self.allocator.free(ordinary);
+            break :adapted try codexRequest(self.allocator, ordinary, self.codex_options);
+        } else ordinary;
+        if (self.prompt_cache_key == null and self.prompt_cache_retention == null) return request;
+        defer self.allocator.free(request);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, request, .{});
+        defer parsed.deinit();
+        const arena = parsed.arena.allocator();
+        if (self.prompt_cache_key) |key| try parsed.value.object.put(arena, "prompt_cache_key", .{ .string = key });
+        if (self.prompt_cache_retention) |retention| try parsed.value.object.put(arena, "prompt_cache_retention", .{ .string = retention });
+        return std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{});
     }
 
     /// Stream a Responses request with built-in and MCP tools.
@@ -448,24 +472,8 @@ pub const Client = struct {
         const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
         defer self.allocator.free(auth_header);
 
-        const ordinary_json = try buildRequestWithToolSelection(
-            self.allocator,
-            self.model,
-            messages,
-            self.max_tokens,
-            .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools },
-            true,
-            self.search,
-        );
-        defer self.allocator.free(ordinary_json);
-        const use_codex = self.codex_auth_path != null;
-        const req_json = if (use_codex)
-            try codexRequest(self.allocator, ordinary_json, self.codex_options)
-        else
-            ordinary_json;
-        defer {
-            if (use_codex) self.allocator.free(req_json);
-        }
+        const req_json = try self.buildWireRequest(messages, extra_tools);
+        defer self.allocator.free(req_json);
 
         return try self.performResponseStream(response_url, auth_header, req_json, sink);
     }
@@ -529,7 +537,7 @@ pub const Client = struct {
             .in_tokens = if (parsed.usage) |usage| usage.input_tokens else null,
             .out_tokens = if (parsed.usage) |usage| usage.output_tokens else null,
             .total_tokens = if (parsed.usage) |usage| usage.total_tokens else null,
-            .cached_tokens = if (parsed.usage) |usage| usage.cached_tokens else null,
+            .cached_tokens = if (parsed.usage) |usage| (if (usage.cache_usage_reported) usage.cached_tokens else null) else null,
             .reasoning_tokens = if (parsed.usage) |usage| usage.reasoning_tokens else null,
             .ms = started.untilNow(self.io, .awake).toMilliseconds(),
             .raw = raw.items,
@@ -867,9 +875,20 @@ pub fn buildRequestWithToolSelection(
             }
             try functions.append(arena, try tool.function(arena));
         }
+        const builtin_count = functions.items.len;
         for (selected.extra) |entry| {
             const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, entry, .{});
             try functions.append(arena, try readFunction(parsed));
+        }
+        std.mem.sort(tool_schema.Function, functions.items[builtin_count..], {}, struct {
+            fn lessThan(_: void, a: tool_schema.Function, b: tool_schema.Function) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lessThan);
+        for (functions.items, 0..) |function, i| {
+            for (functions.items[0..i]) |previous| {
+                if (std.mem.eql(u8, previous.name, function.name)) return error.DuplicateToolName;
+            }
         }
     }
     return std.json.Stringify.valueAlloc(allocator, Request{
@@ -971,6 +990,7 @@ fn parseUsage(root: std.json.Value) ?Usage {
         .output_tokens = output orelse 0,
         .total_tokens = total orelse 0,
         .cached_tokens = cached orelse 0,
+        .cache_usage_reported = cached != null,
         .reasoning_tokens = reasoning orelse 0,
     };
 }
@@ -1117,6 +1137,83 @@ pub fn estimateTokens(bytes: []const u8) u64 {
     }
     tokens += (ascii_run + 3) / 4;
     return @max(tokens, 1);
+}
+
+test "extra tool order is stable and every duplicate name is rejected" {
+    const a = std.testing.allocator;
+    const x = "{\"name\":\"x\",\"parameters\":{}}";
+    const y = "{\"name\":\"y\",\"parameters\":{}}";
+    const different_x = "{\"name\":\"x\",\"parameters\":{\"type\":\"object\"}}";
+    const first = try buildRequestWithToolSelection(a, "m", &.{}, 10, .{ .extra = &.{ x, y } }, false, .{});
+    defer a.free(first);
+    const second = try buildRequestWithToolSelection(a, "m", &.{}, 10, .{ .extra = &.{ y, x } }, false, .{});
+    defer a.free(second);
+    try std.testing.expectEqualStrings(first, second);
+    for ([_][]const u8{ x, different_x }) |duplicate| {
+        try std.testing.expectError(error.DuplicateToolName, buildRequestWithToolSelection(a, "m", &.{}, 10, .{ .extra = &.{ x, duplicate } }, false, .{}));
+    }
+    try std.testing.expectError(error.DuplicateToolName, buildRequestWithToolSelection(a, "m", &.{}, 10, .{ .extra = &.{"{\"name\":\"read\",\"parameters\":{}}"} }, false, .{}));
+    try std.testing.expectError(error.DuplicateToolName, buildRequestWithToolSelection(a, "m", &.{}, 10, .{ .builtin = &.{ tool_schema.read, tool_schema.read } }, false, .{}));
+}
+
+test "cache usage distinguishes absent from explicit zero" {
+    const a = std.testing.allocator;
+    const absent = try std.json.parseFromSlice(std.json.Value, a, "{\"usage\":{\"input_tokens\":1}}", .{});
+    defer absent.deinit();
+    const zero = try std.json.parseFromSlice(std.json.Value, a, "{\"usage\":{\"input_tokens_details\":{\"cached_tokens\":0}}}", .{});
+    defer zero.deinit();
+    try std.testing.expect(!parseUsage(absent.value).?.cache_usage_reported);
+    try std.testing.expect(parseUsage(zero.value).?.cache_usage_reported);
+}
+
+test "cache options are borrowed and projected identically for ordinary and Codex requests" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    var config = try Config.load(a, std.testing.io, &env);
+    defer config.deinit();
+    // Restore borrowed test values before Config frees its owned strings.
+    const original_key = config.prompt_cache_key;
+    const original_retention = config.prompt_cache_retention;
+    defer {
+        config.prompt_cache_key = original_key;
+        config.prompt_cache_retention = original_retention;
+    }
+    const keys = [_]?[]const u8{ null, "", null, "key\"\\value", "both" };
+    const retentions = [_]?[]const u8{ null, null, "in_memory", "in_memory", "24h" };
+    for ([_]bool{ false, true }) |codex| {
+        for (keys, retentions) |key, retention| {
+            config.prompt_cache_key = key;
+            config.prompt_cache_retention = retention;
+            var client = Client.init(a, std.testing.io, config);
+            defer client.deinit();
+            if (key) |value| {
+                try std.testing.expect(client.prompt_cache_key.?.ptr == value.ptr);
+            } else try std.testing.expect(client.prompt_cache_key == null);
+            if (retention) |value| {
+                try std.testing.expect(client.prompt_cache_retention.?.ptr == value.ptr);
+            } else try std.testing.expect(client.prompt_cache_retention == null);
+            client.codex_auth_path = if (codex) "unused" else null;
+            const request = try client.buildWireRequest(&.{}, &.{});
+            defer a.free(request);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
+            defer parsed.deinit();
+            if (key) |value| {
+                try std.testing.expectEqualStrings(value, parsed.value.object.get("prompt_cache_key").?.string);
+            } else try std.testing.expect(!parsed.value.object.contains("prompt_cache_key"));
+            if (retention) |value| {
+                try std.testing.expectEqualStrings(value, parsed.value.object.get("prompt_cache_retention").?.string);
+            } else try std.testing.expect(!parsed.value.object.contains("prompt_cache_retention"));
+            try std.testing.expectEqual(estimateTokens(request), try client.estimateRequestTokens(&.{}, &.{}));
+            if (key == null and retention == null) {
+                const ordinary = try buildRequestWithToolSelection(a, client.model, &.{}, client.max_tokens, .{}, true, client.search);
+                defer a.free(ordinary);
+                const baseline = if (codex) try codexRequest(a, ordinary, client.codex_options) else try a.dupe(u8, ordinary);
+                defer a.free(baseline);
+                try std.testing.expectEqualStrings(baseline, request);
+            }
+        }
+    }
 }
 
 test "extract string arg" {
@@ -1446,7 +1543,7 @@ test "usage parsing is strict safe and never synthesizes total" {
         \\{"usage":{"input_tokens":12,"output_tokens":4,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":2}}}
     , .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(Usage{ .input_tokens = 12, .output_tokens = 4, .cached_tokens = 7, .reasoning_tokens = 2 }, parseUsage(parsed.value).?);
+    try std.testing.expectEqual(Usage{ .input_tokens = 12, .output_tokens = 4, .cached_tokens = 7, .cache_usage_reported = true, .reasoning_tokens = 2 }, parseUsage(parsed.value).?);
     const malformed = try std.json.parseFromSlice(std.json.Value, a,
         \\{"usage":{"input_tokens":-2,"output_tokens":0,"total_tokens":99,"input_tokens_details":3,"output_tokens_details":{"reasoning_tokens":-4}}}
     , .{});
@@ -1493,6 +1590,7 @@ test "buffered exchanges account usage before business errors and count every at
     try std.testing.expectEqual(@as(u64, 5), counts.output);
     try std.testing.expectEqual(@as(u64, 12), counts.total);
     try std.testing.expectEqual(@as(u64, 4), counts.cached);
+    try std.testing.expectEqual(@as(u64, 1), counts.cache_usage_reports);
     try std.testing.expectEqual(@as(u64, 2), counts.reasoning);
     try std.testing.expectEqual(@as(u64, 5), counts.requests);
     try std.testing.expectEqual(@as(u64, 3), counts.usage_reports);
@@ -1502,7 +1600,7 @@ test "buffered exchanges account usage before business errors and count every at
     try std.testing.expectEqualDeep(counts, parent.tokenCounts());
     client.resetTokenCounters();
     const zero = client.tokenCounts();
-    inline for (.{ "input", "output", "total", "cached", "reasoning", "requests", "usage_reports" }) |field| {
+    inline for (.{ "input", "output", "total", "cached", "reasoning", "requests", "usage_reports", "cache_usage_reports" }) |field| {
         try std.testing.expectEqual(@as(u64, 0), @field(zero, field));
     }
 }
@@ -1555,7 +1653,7 @@ test "public streaming buffered response preserves full usage and missing usage 
     const sink = StreamSink{ .context = &transport, .onText = UsageTestTransport.onText };
     const response = try client.respondStreaming(&.{}, &.{}, sink);
     defer response.deinit(a);
-    try std.testing.expectEqual(Usage{ .input_tokens = 10, .output_tokens = 5, .total_tokens = 15, .cached_tokens = 6, .reasoning_tokens = 3 }, response.usage.?);
+    try std.testing.expectEqual(Usage{ .input_tokens = 10, .output_tokens = 5, .total_tokens = 15, .cached_tokens = 6, .cache_usage_reported = true, .reasoning_tokens = 3 }, response.usage.?);
     const before = client.tokenCounts();
     transport.body =
         \\{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"not estimated"}]}]}

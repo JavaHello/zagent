@@ -184,6 +184,7 @@ pub const Trace = struct {
     }
 
     pub fn request(self: *Trace, ctx: Ctx, url: []const u8, model: []const u8, body: []const u8, est_tokens: u64) void {
+        const metadata = requestMetadata(self.allocator, body) catch RequestMetadata{};
         const slice = self.piece(body);
         defer self.freePiece(slice);
         self.writeEvent(.{
@@ -196,6 +197,9 @@ pub const Trace = struct {
             .url = url,
             .model = model,
             .est_tokens = est_tokens,
+            .tool_schema_bytes = metadata.tool_schema_bytes,
+            .tool_set_sha256 = metadata.tool_set_sha256[0..],
+            .input_bytes = metadata.input_bytes,
             .bytes = slice.bytes,
             .body_truncated = slice.truncated,
             .body = slice.text,
@@ -455,6 +459,30 @@ pub const Trace = struct {
 /// agent and the client stays as it is, and every one of them does nothing: the
 /// methods are empty and inline, so nothing of the recorder reaches the binary.
 /// Adding a method to `Trace` means adding it here too.
+const RequestMetadata = struct {
+    tool_schema_bytes: usize = 0,
+    tool_set_sha256: [64]u8 = @splat('0'),
+    input_bytes: usize = 0,
+};
+
+// Only sizes and a digest are added to the existing trace; never schema text.
+fn requestMetadata(allocator: std.mem.Allocator, body: []const u8) !RequestMetadata {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    var result: RequestMetadata = .{};
+    if (parsed.value != .object) return result;
+    const tools = try std.json.Stringify.valueAlloc(allocator, parsed.value.object.get("tools") orelse .null, .{});
+    defer allocator.free(tools);
+    result.tool_schema_bytes = tools.len;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tools, &digest, .{});
+    result.tool_set_sha256 = std.fmt.bytesToHex(digest, .lower);
+    const input = try std.json.Stringify.valueAlloc(allocator, parsed.value.object.get("input") orelse .null, .{});
+    defer allocator.free(input);
+    result.input_bytes = input.len;
+    return result;
+}
+
 const Noop = struct {
     /// Kept so the lines that name the files still type-check. A build without
     /// tracing never has a file to name, and never prints one.
@@ -562,6 +590,18 @@ fn repaired(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Er
         }
     }
     return try out.toOwnedSlice(allocator);
+}
+
+test "request metadata fingerprints tools independently of input" {
+    const a = std.testing.allocator;
+    const first = try requestMetadata(a, "{\"tools\":[{\"name\":\"read\"}],\"input\":\"private\"}");
+    const second = try requestMetadata(a, "{\"tools\":[{\"name\":\"read\"}],\"input\":\"different private text\"}");
+    const third = try requestMetadata(a, "{\"tools\":[],\"input\":\"private\"}");
+    try std.testing.expectEqual(@as(usize, 17), first.tool_schema_bytes);
+    try std.testing.expectEqual(@as(usize, 9), first.input_bytes);
+    try std.testing.expectEqualSlices(u8, &first.tool_set_sha256, &second.tool_set_sha256);
+    try std.testing.expect(!std.mem.eql(u8, &first.tool_set_sha256, &third.tool_set_sha256));
+    try std.testing.expect(second.input_bytes > first.input_bytes);
 }
 
 test "a payload is cut on a character boundary" {

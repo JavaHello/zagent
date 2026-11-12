@@ -93,6 +93,18 @@ zagent
 已导出的 key 自动选择。自动选择规则和 Responses 协议的用法见
 [服务商（英文）](docs/providers.md)。
 
+## 可选 prompt cache 控制
+
+可在环境或配置文件设置 `AI_PROMPT_CACHE_KEY`、`AI_PROMPT_CACHE_RETENTION`，环境优先。
+两者默认均未设置，不发送显式缓存字段。retention 只接受 `in_memory` 或 `24h`，
+其他值导致配置加载返回 `InvalidPromptCacheRetention`。兼容端点启用前需确认支持这些字段。
+key 应使用稳定、非敏感的标识，不要使用秘密或每轮新生成的随机值；不设置这些字段也可能自动缓存。
+参见[配置示例](zagent.example.conf)。
+
+读取／搜索分页与命令输出的默认预算约为 12 KiB，单个工具结果的硬上限仍为 40 KiB。
+长命令输出分别保留 stdout、stderr 的头尾，并标明中间省略；需要中间内容时，主动将输出重定向到文件后分页读取。
+Debug 请求事件包含输入字节数、工具 schema 字节数及工具集合的 SHA-256 指纹；每轮摘要区分缓存字段未报告与明确报告为零。
+
 ## 交互命令
 
 | 命令 | 说明 |

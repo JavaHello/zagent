@@ -20,6 +20,8 @@ const ConfigFile = struct {
     model: ?[]u8 = null,
     reasoning_effort: ?[]u8 = null,
     service_tier: ?[]u8 = null,
+    prompt_cache_key: ?[]u8 = null,
+    prompt_cache_retention: ?[]u8 = null,
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
     debug: ?bool = null,
@@ -31,6 +33,8 @@ const ConfigFile = struct {
         if (self.model) |value| allocator.free(value);
         if (self.reasoning_effort) |value| allocator.free(value);
         if (self.service_tier) |value| allocator.free(value);
+        if (self.prompt_cache_key) |value| allocator.free(value);
+        if (self.prompt_cache_retention) |value| allocator.free(value);
         self.* = .{};
     }
 };
@@ -153,6 +157,10 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         try setString(allocator, &config.reasoning_effort, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_SERVICE_TIER")) {
         try setString(allocator, &config.service_tier, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_PROMPT_CACHE_KEY")) {
+        try setString(allocator, &config.prompt_cache_key, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_PROMPT_CACHE_RETENTION")) {
+        try setString(allocator, &config.prompt_cache_retention, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
@@ -347,6 +355,14 @@ fn resolve(
     errdefer if (reasoning_effort) |value| allocator.free(value);
     const service_tier = try resolveOptionalSetting(allocator, env, "AI_SERVICE_TIER", &file_config.service_tier);
     errdefer if (service_tier) |value| allocator.free(value);
+    const prompt_cache_key = try resolveOptionalSetting(allocator, env, "AI_PROMPT_CACHE_KEY", &file_config.prompt_cache_key);
+    errdefer if (prompt_cache_key) |value| allocator.free(value);
+    const prompt_cache_retention = try resolveOptionalSetting(allocator, env, "AI_PROMPT_CACHE_RETENTION", &file_config.prompt_cache_retention);
+    errdefer if (prompt_cache_retention) |value| allocator.free(value);
+    if (prompt_cache_retention) |value| {
+        if (!std.mem.eql(u8, value, "in_memory") and !std.mem.eql(u8, value, "24h"))
+            return error.InvalidPromptCacheRetention;
+    }
 
     const api_key = blk: {
         // AI_KEY is the provider-agnostic spelling and wins outright.
@@ -391,6 +407,8 @@ fn resolve(
         .model = model,
         .reasoning_effort = reasoning_effort,
         .service_tier = service_tier,
+        .prompt_cache_key = prompt_cache_key,
+        .prompt_cache_retention = prompt_cache_retention,
         .max_tokens = max_tokens,
         .max_iterations = max_iterations,
         .provider = selected_provider,
@@ -405,6 +423,9 @@ pub const Config = struct {
     model: []const u8,
     reasoning_effort: ?[]const u8 = null,
     service_tier: ?[]const u8 = null,
+    prompt_cache_key: ?[]const u8 = null,
+    /// Only "in_memory" and "24h" are accepted; null leaves server defaults.
+    prompt_cache_retention: ?[]const u8 = null,
     max_tokens: u32,
     max_iterations: u32,
     /// The built-in preset that supplied the defaults, if one was selected.
@@ -431,6 +452,8 @@ pub const Config = struct {
         if (self.codex_auth_path) |path| self.allocator.free(path);
         if (self.reasoning_effort) |value| self.allocator.free(value);
         if (self.service_tier) |value| self.allocator.free(value);
+        if (self.prompt_cache_key) |value| self.allocator.free(value);
+        if (self.prompt_cache_retention) |value| self.allocator.free(value);
         self.allocator.free(self.api_key);
         self.allocator.free(self.base_url);
         self.allocator.free(self.model);
@@ -504,6 +527,67 @@ test "Codex options resolve from environment and file, or remain absent" {
     try std.testing.expect(empty.service_tier == null);
 }
 
+fn checkCacheAllocationFailures(allocator: std.mem.Allocator) !void {
+    var env = try testEnv(allocator, &.{
+        .{ "AI_PROMPT_CACHE_KEY", "environment-project" },
+        .{ "AI_PROMPT_CACHE_RETENTION", "24h" },
+    });
+    defer env.deinit();
+    var file = try testFile(allocator, &.{
+        .{ "AI_PROMPT_CACHE_KEY", "file-project" },
+        .{ "AI_PROMPT_CACHE_RETENTION", "in_memory" },
+    });
+    defer file.deinit(allocator);
+    const config = try resolve(allocator, &file, &env);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("environment-project", config.prompt_cache_key.?);
+    try std.testing.expectEqualStrings("24h", config.prompt_cache_retention.?);
+}
+
+test "prompt cache environment precedence and allocation cleanup" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCacheAllocationFailures, .{});
+}
+
+test "prompt cache file values, blanks and invalid retention" {
+    const a = std.testing.allocator;
+    var env = try testEnv(a, &.{});
+    defer env.deinit();
+    for ([_][]const u8{ "in_memory", "24h", "" }) |retention| {
+        var file = try testFile(a, &.{
+            .{ "AI_PROMPT_CACHE_KEY", "project" },
+            .{ "AI_PROMPT_CACHE_RETENTION", retention },
+        });
+        defer file.deinit(a);
+        const config = try resolve(a, &file, &env);
+        defer config.deinit();
+        try std.testing.expectEqualStrings("project", config.prompt_cache_key.?);
+        if (retention.len == 0) {
+            try std.testing.expect(config.prompt_cache_retention == null);
+        } else try std.testing.expectEqualStrings(retention, config.prompt_cache_retention.?);
+    }
+    for ([_][]const u8{ "1h", "24H", " in_memory" }) |invalid| {
+        var file = try testFile(a, &.{.{ "AI_PROMPT_CACHE_RETENTION", invalid }});
+        defer file.deinit(a);
+        try std.testing.expectError(error.InvalidPromptCacheRetention, resolve(a, &file, &env));
+        var invalid_env = try testEnv(a, &.{.{ "AI_PROMPT_CACHE_RETENTION", invalid }});
+        defer invalid_env.deinit();
+        var empty_file = ConfigFile{};
+        defer empty_file.deinit(a);
+        try std.testing.expectError(error.InvalidPromptCacheRetention, resolve(a, &empty_file, &invalid_env));
+    }
+    var blank_env = try testEnv(a, &.{
+        .{ "AI_PROMPT_CACHE_KEY", "" },
+        .{ "AI_PROMPT_CACHE_RETENTION", "" },
+    });
+    defer blank_env.deinit();
+    var blank_file = try testFile(a, &.{.{ "AI_PROMPT_CACHE_KEY", "" }});
+    defer blank_file.deinit(a);
+    const blank = try resolve(a, &blank_file, &blank_env);
+    defer blank.deinit();
+    try std.testing.expect(blank.prompt_cache_key == null);
+    try std.testing.expect(blank.prompt_cache_retention == null);
+}
+
 test "config defaults" {
     const allocator = std.testing.allocator;
     var env = try testEnv(allocator, &.{});
@@ -516,6 +600,8 @@ test "config defaults" {
     defer config.deinit();
 
     try std.testing.expectEqual(@as(?Provider, null), config.provider);
+    try std.testing.expect(config.prompt_cache_key == null);
+    try std.testing.expect(config.prompt_cache_retention == null);
     try std.testing.expectEqualStrings("https://api.openai.com/v1", config.base_url);
     try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
     try std.testing.expectEqualStrings("", config.api_key);

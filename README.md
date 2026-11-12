@@ -103,6 +103,23 @@ An explicit `AI_URL`, `AI_MODEL` or key always wins over the preset, and
 autodetection and the Responses API mapping:
 [Providers](docs/providers.md).
 
+## Optional prompt cache controls
+
+`AI_PROMPT_CACHE_KEY` and `AI_PROMPT_CACHE_RETENTION` can be set in the environment
+or config file (environment wins). Both default to unset: no explicit cache fields
+are sent. Retention accepts only `in_memory` or `24h`; other values fail configuration
+loading with `InvalidPromptCacheRetention`. Confirm support before enabling these
+on a compatible endpoint. Use a stable, non-secret key, not a secret or a new random
+value each turn. Automatic server-side caching may work without either field.
+See [the example config](zagent.example.conf).
+
+Read/search pages and shell output use an approximately 12 KiB default budget;
+individual tool results still have a 40 KiB hard limit. Long shell output keeps
+both ends of stdout and stderr and marks omitted content. Redirect large output
+to a file and read pages when the omitted middle matters. Debug request events
+include input bytes, tool schema bytes and a SHA-256 tool-set fingerprint; turn
+summaries distinguish missing cache reports from a reported zero.
+
 ## REPL commands
 
 | Command       | Description                      |

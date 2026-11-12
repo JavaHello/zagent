@@ -42,7 +42,10 @@ pub fn deduplicateReadResult(
                     if (std.mem.eql(u8, &digest, &previous_key)) {
                         var content_digest: [32]u8 = undefined;
                         std.crypto.hash.sha2.Sha256.hash(content, &content_digest, .{});
-                        return std.fmt.allocPrint(allocator, duplicate_marker, .{ std.fmt.bytesToHex(content_digest, .lower), id });
+                        const marker = try std.fmt.allocPrint(allocator, duplicate_marker, .{ std.fmt.bytesToHex(content_digest, .lower), id });
+                        if (marker.len < content.len) return marker;
+                        allocator.free(marker);
+                        return allocator.dupe(u8, content);
                     }
                     break;
                 }
@@ -84,21 +87,22 @@ fn readKey(allocator: std.mem.Allocator, call: openai.ToolCallData, content: []c
 
 test "read deduplication compares effective arguments and contents only in live history" {
     const a = std.testing.allocator;
+    const long_content = "file contents: abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
     var calls = [_]openai.ToolCallData{.{ .id = "original", .name = "read", .arguments = "{\"path\":\"a.zig\"}" }};
     const messages = [_]Message{
         .{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = &calls, .tool_call_id = null },
-        .{ .role = "tool", .content = "file contents", .reasoning_content = null, .tool_calls = null, .tool_call_id = "original" },
+        .{ .role = "tool", .content = long_content, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original" },
     };
     const duplicate = try deduplicateReadResult(a, &messages, .{
         .id = "new",
         .name = "read",
         .arguments = "{ \"offset\": 1, \"path\": \"a.zig\" }",
-    }, "file contents", false);
+    }, long_content, false);
     defer a.free(duplicate);
     try std.testing.expect(std.mem.startsWith(u8, duplicate, "[Duplicate read omitted:"));
     try std.testing.expect(std.mem.indexOf(u8, duplicate, "original") != null);
 
-    const Case = struct { name: []const u8 = "read", args: []const u8 = "{\"path\":\"a.zig\"}", content: []const u8 = "file contents", is_error: bool = false };
+    const Case = struct { name: []const u8 = "read", args: []const u8 = "{\"path\":\"a.zig\"}", content: []const u8 = long_content, is_error: bool = false };
     for ([_]Case{
         .{ .args = "{\"path\":\"b.zig\"}" },
         .{ .args = "{\"path\":\"a.zig\",\"offset\":2}" },
@@ -120,10 +124,23 @@ test "read deduplication compares effective arguments and contents only in live 
         messages[0],
         .{ .role = "tool", .content = duplicate, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original" },
     };
-    const reread = try deduplicateReadResult(a, &compacted, calls[0], "file contents", false);
+    const reread = try deduplicateReadResult(a, &compacted, calls[0], long_content, false);
     defer a.free(reread);
-    try std.testing.expectEqualStrings("file contents", reread);
-    const empty = try deduplicateReadResult(a, &.{}, calls[0], "file contents", false);
+    try std.testing.expectEqualStrings(long_content, reread);
+    const empty = try deduplicateReadResult(a, &.{}, calls[0], long_content, false);
     defer a.free(empty);
-    try std.testing.expectEqualStrings("file contents", empty);
+    try std.testing.expectEqualStrings(long_content, empty);
+
+    // Even identical reads must not grow the context (including equal sizes).
+    const boundary = try std.fmt.allocPrint(a, duplicate_marker, .{ "0000000000000000000000000000000000000000000000000000000000000000", "original" });
+    defer a.free(boundary);
+    for ([_][]const u8{ "", "short", boundary }) |content| {
+        const short_messages = [_]Message{
+            messages[0],
+            .{ .role = "tool", .content = content, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original" },
+        };
+        const result = try deduplicateReadResult(a, &short_messages, calls[0], content, false);
+        defer a.free(result);
+        try std.testing.expectEqualStrings(content, result);
+    }
 }

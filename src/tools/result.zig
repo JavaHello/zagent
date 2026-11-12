@@ -49,11 +49,17 @@ pub const ToolResult = struct {
 pub const max_output_bytes: usize = 40 * 1024;
 
 /// Room one page of a tool that shapes its own output (`read`, `ls`, the
-/// searches) may fill. A little under `max_output_bytes`, so the line a page
+/// searches) may fill. A little under the default 12 KiB budget, so the line a page
 /// appends — where the next one starts, that results were left out, or which
 /// single row was too long — still fits under the limit the finished result is
 /// held to.
-pub const page_room_bytes: usize = max_output_bytes - 256;
+pub const default_output_bytes: usize = 12 * 1024;
+pub const page_room_bytes: usize = default_output_bytes - 256;
+
+test "default pages leave notice room without changing the hard limit" {
+    try std.testing.expectEqual(@as(usize, 12 * 1024 - 256), page_room_bytes);
+    try std.testing.expectEqual(@as(usize, 40 * 1024), max_output_bytes);
+}
 
 /// Cut a result down to `max_output_bytes` when a tool let more through, and
 /// report the cut as an error so the model narrows the call. Takes ownership of
