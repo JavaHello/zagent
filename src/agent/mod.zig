@@ -162,7 +162,7 @@ pub const Agent = struct {
     /// Where a `--debug` run records what this agent did. Null otherwise, and
     /// borrowed when set: the run that opened the trace outlives the agent and
     /// renders the report from it.
-    trace: ?*trace_mod.Trace = null,
+    trace: ?*trace_mod.Recorder = null,
     /// Who this agent is in the record. The agent on the terminal is "main";
     /// each sub-agent is named after the run that started it.
     trace_agent: []const u8 = "main",
@@ -342,7 +342,7 @@ pub const Agent = struct {
     /// Record this agent's steps from here on. Called once the session exists,
     /// because the trace is named after it, and by `/debug` when a run that
     /// started without one turns tracing on mid-session.
-    pub fn attachTrace(self: *Agent, trace: ?*trace_mod.Trace) void {
+    pub fn attachTrace(self: *Agent, trace: ?*trace_mod.Recorder) void {
         self.trace = trace;
         self.client.trace = trace;
         self.client.trace_ctx = self.traceCtx();

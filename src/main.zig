@@ -20,7 +20,12 @@ const RED = sgr.RED;
 const GREEN = sgr.GREEN;
 const YELLOW = sgr.YELLOW;
 
-const HELP =
+/// What a build that keeps no trace answers when it is asked to keep one. It
+/// is the whole of the tracing feature in such a binary: a flag, a command and
+/// a sentence, no recorder and no report renderer.
+const NO_TRACING = DIM ++ "Debug: this build records no traces; build it with -Dtrace to record one.\n" ++ RESET;
+
+const HELP_HEAD =
     \\Commands:
     \\  /help        Show this help message
     \\  /clear       Clear conversation history
@@ -33,7 +38,20 @@ const HELP =
     \\  /model       Show current model
     \\  /status      Show token usage and account quota
     \\  /mcp         List the MCP servers and their tools
-    \\  /debug       Record every step and write an HTML report
+;
+
+/// Only a build that can record offers the command, and only that build lists
+/// the flags that ask for a trace.
+const HELP_TRACE = "  /debug       Record every step and write an HTML report\n";
+
+const DEBUG_FLAGS =
+    "  --debug             Record every step and write an HTML report\n" ++
+    "  --debug-report <trace.jsonl>\n" ++
+    "                      Rebuild the HTML report of a trace\n";
+
+const DEBUG_ENV = "AI_DEBUG=1            Same as --debug\n";
+
+const HELP_TAIL =
     \\  /quit, /exit Exit zagent
     \\  /, @, $      Command / project file / reserved candidates
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
@@ -46,6 +64,8 @@ const HELP =
     \\  Ctrl+D       Exit zagent
     \\
 ;
+
+const HELP = HELP_HEAD ++ (if (debug.enabled) HELP_TRACE else "") ++ HELP_TAIL;
 
 // Prompt passed to linenoise. Colour codes are fine here because
 // the editor's width() implementation correctly ignores ANSI SGR sequences.
@@ -129,15 +149,13 @@ pub fn main(init: std.process.Init) !void {
             "  --help, -h          Show this help\n" ++
             "  --version           Show version\n" ++
             "  --resume <id>       Resume a saved session in this workspace\n" ++
-            "  --debug             Record every step and write an HTML report\n" ++
-            "  --debug-report <trace.jsonl>\n" ++
-            "                      Rebuild the HTML report of a trace\n" ++
+            (if (debug.enabled) DEBUG_FLAGS else "") ++
             "  login / logout      Sign in with ChatGPT / remove local credentials\n" ++
             "  models              List models for the selected provider\n\n" ++
             "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
             "AI_PROVIDER=openai-compatible  Any Responses-compatible vendor; set AI_URL and AI_MODEL.\n" ++
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
-            "AI_DEBUG=1            Same as --debug\n" ++
+            (if (debug.enabled) DEBUG_ENV else "") ++
             "AI_MEMORY_FILE        Store memory in another file\n" ++
             "Tools and local MCP servers run on the host with inherited environment and network access.\n" ++
             "Build with Zig 0.17.0.\n");
@@ -152,7 +170,12 @@ pub fn main(init: std.process.Init) !void {
     // credentials and no trust decision: the file is read, the page is written
     // beside it, and the run is over.
     if (args.items.len == 3 and std.mem.eql(u8, args.items[1], "--debug-report")) {
-        try writeDebugReport(allocator, io, args.items[2]);
+        if (comptime debug.enabled) {
+            try writeDebugReport(allocator, io, args.items[2]);
+        } else {
+            try printToStderr(allocator, io, NO_TRACING, .{});
+            std.process.exit(1);
+        }
         return;
     }
 
@@ -253,7 +276,10 @@ pub fn main(init: std.process.Init) !void {
     // Flags come before the query: the first word that is not one starts it.
     var query_start: usize = 1;
     var resume_id: ?[]const u8 = null;
-    var debug_on = config.debug;
+    // Asked for by the flag, the environment or the config file. A build
+    // without tracing says so once and runs untouched, rather than quitting on
+    // a switch it never had.
+    var tracing_requested = config.debug;
     while (query_start < args.items.len) {
         const arg = args.items[query_start];
         if (std.mem.eql(u8, arg, "--resume")) {
@@ -264,7 +290,7 @@ pub fn main(init: std.process.Init) !void {
             resume_id = args.items[query_start + 1];
             query_start += 2;
         } else if (std.mem.eql(u8, arg, "--debug")) {
-            debug_on = true;
+            tracing_requested = true;
             query_start += 1;
         } else break;
     }
@@ -314,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
     // Registered before the agent, so it runs after it: a sub-agent closed in
     // `agent.deinit` still has its last steps recorded, and the report is
     // written once nothing else can write to the trace.
-    var trace: ?*debug.Trace = null;
+    var trace: ?*debug.Recorder = null;
     defer if (trace) |opened| publishTrace(allocator, io, opened);
 
     var agent = try Agent.init(allocator, io, &config, &ln, env, &registry);
@@ -326,9 +352,13 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // The trace is named after the session, so it opens once the session does.
-    if (debug_on) {
-        trace = openTrace(allocator, io, env, agent.session_id);
-        if (trace) |opened| agent.attachTrace(opened);
+    if (comptime debug.enabled) {
+        if (tracing_requested) {
+            trace = openTrace(allocator, io, env, agent.session_id);
+            if (trace) |opened| agent.attachTrace(opened);
+        }
+    } else if (tracing_requested) {
+        try printToStderr(allocator, io, NO_TRACING, .{});
     }
 
     if (args.items.len > query_start) {
@@ -370,7 +400,7 @@ fn runRepl(
     mcp_report: []const u8,
     /// The run's trace, or the slot `/debug` opens one into. The pointer is
     /// what makes a trace turned on mid-session outlive this function.
-    trace: *?*debug.Trace,
+    trace: *?*debug.Recorder,
 ) !void {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
@@ -610,22 +640,7 @@ fn runRepl(
             try registry.writeStatus(&aw.writer);
             try writeOut(&screen, stdout, io, aw.written());
         } else if (std.mem.eql(u8, line, "/debug")) {
-            // A run that started without a trace can begin one here, which is
-            // how a problem is caught: it has already happened twice before
-            // anyone thinks to look.
-            if (trace.*) |opened| {
-                const message = try std.fmt.allocPrint(allocator, "Debug: report {s}\nDebug: trace  {s}\n", .{ opened.report_path, opened.jsonl_path });
-                defer allocator.free(message);
-                try writeOut(&screen, stdout, io, message);
-            } else if (openTrace(allocator, io, env, agent.session_id)) |opened| {
-                trace.* = opened;
-                agent.attachTrace(opened);
-                const message = try std.fmt.allocPrint(allocator, DIM ++ "Debug: recording from here; report {s}\n" ++ RESET, .{opened.report_path});
-                defer allocator.free(message);
-                try writeOut(&screen, stdout, io, message);
-            } else {
-                try writeOut(&screen, stderr, io, "Debug: this run cannot be recorded.\n");
-            }
+            try debugCommand(allocator, io, &screen, stdout, stderr, env, agent, trace);
         } else if (screen.isActive()) {
             try runtime.submit(line);
         } else {
@@ -711,6 +726,38 @@ const McpProgress = struct {
     }
 };
 
+/// `/debug`: report where the record is going, or start one, because a problem
+/// has usually already happened twice before anyone thinks to look. A build
+/// without tracing answers with the one sentence it has on the subject.
+fn debugCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    screen: *Screen,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
+    env: *const std.process.Environ.Map,
+    agent: *Agent,
+    trace: *?*debug.Recorder,
+) !void {
+    if (comptime !debug.enabled) {
+        try writeOut(screen, stderr, io, NO_TRACING);
+    } else {
+        if (trace.*) |opened| {
+            const message = try std.fmt.allocPrint(allocator, "Debug: report {s}\nDebug: trace  {s}\n", .{ opened.report_path, opened.jsonl_path });
+            defer allocator.free(message);
+            try writeOut(screen, stdout, io, message);
+        } else if (openTrace(allocator, io, env, agent.session_id)) |opened| {
+            trace.* = opened;
+            agent.attachTrace(opened);
+            const message = try std.fmt.allocPrint(allocator, DIM ++ "Debug: recording from here; report {s}\n" ++ RESET, .{opened.report_path});
+            defer allocator.free(message);
+            try writeOut(screen, stdout, io, message);
+        } else {
+            try writeOut(screen, stderr, io, "Debug: this run cannot be recorded.\n");
+        }
+    }
+}
+
 fn printToStderr(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -729,9 +776,9 @@ fn openTrace(
     io: std.Io,
     env: *const std.process.Environ.Map,
     session: ?[]const u8,
-) ?*debug.Trace {
-    const opened = allocator.create(debug.Trace) catch return null;
-    opened.* = debug.Trace.open(allocator, io, env, session) catch |err| {
+) ?*debug.Recorder {
+    const opened = allocator.create(debug.Recorder) catch return null;
+    opened.* = debug.Recorder.open(allocator, io, env, session) catch |err| {
         allocator.destroy(opened);
         printToStderr(allocator, io, "Debug: cannot record this run: {s}\n", .{@errorName(err)}) catch {};
         return null;
@@ -742,7 +789,7 @@ fn openTrace(
 /// Close the record and say where the report and the trace are. The report is
 /// rendered from the trace file, so a failure to render it loses the page but
 /// not the record.
-fn publishTrace(allocator: std.mem.Allocator, io: std.Io, opened: *debug.Trace) void {
+fn publishTrace(allocator: std.mem.Allocator, io: std.Io, opened: *debug.Recorder) void {
     const failed = if (opened.finish()) |_| false else |err| reported: {
         printToStderr(allocator, io, "Debug: the report could not be written: {s}\n", .{@errorName(err)}) catch {};
         break :reported true;

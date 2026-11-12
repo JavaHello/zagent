@@ -13,8 +13,14 @@
 //! never run at once — the caller waits while the child runs — and the mutex
 //! below is what keeps the file whole if that ever changes.
 const std = @import("std");
+const build_options = @import("build_options");
 const workspace = @import("../state/workspace.zig");
 const report = @import("report.zig");
+
+/// Whether this build records anything at all. Chosen when zagent is built
+/// rather than when it runs: a build without tracing has no recorder, no
+/// report renderer and no `--debug`, because none of that code is compiled.
+pub const enabled = build_options.trace;
 
 /// The most bytes of one payload kept in the trace: a request body, a response
 /// stream, a tool result. A long history or a large file would otherwise make
@@ -438,6 +444,89 @@ pub const Trace = struct {
         return repaired(self.allocator, cut) catch null orelse self.allocator.dupe(u8, cut) catch null;
     }
 };
+
+/// What a build without tracing compiles its way into. Every call site in the
+/// agent and the client stays as it is, and every one of them does nothing: the
+/// methods are empty and inline, so nothing of the recorder reaches the binary.
+/// Adding a method to `Trace` means adding it here too.
+const Noop = struct {
+    /// Kept so the lines that name the files still type-check. A build without
+    /// tracing never has a file to name, and never prints one.
+    jsonl_path: []const u8 = "",
+    report_path: []const u8 = "",
+
+    pub inline fn open(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        session: ?[]const u8,
+    ) !Noop {
+        _ = .{ allocator, io, env, session };
+        return error.TracingDisabled;
+    }
+
+    pub inline fn deinit(self: *Noop) void {
+        _ = self;
+    }
+
+    pub inline fn finish(self: *Noop) !void {
+        _ = self;
+    }
+
+    pub inline fn run(self: *Noop, info: Run) void {
+        _ = .{ self, info };
+    }
+
+    pub inline fn query(self: *Noop, ctx: Ctx, text: []const u8) void {
+        _ = .{ self, ctx, text };
+    }
+
+    pub inline fn request(
+        self: *Noop,
+        ctx: Ctx,
+        url: []const u8,
+        model: []const u8,
+        body: []const u8,
+        est_tokens: u64,
+    ) void {
+        _ = .{ self, ctx, url, model, body, est_tokens };
+    }
+
+    pub inline fn response(self: *Noop, ctx: Ctx, reply: Reply) void {
+        _ = .{ self, ctx, reply };
+    }
+
+    pub inline fn failure(self: *Noop, ctx: Ctx, message: []const u8, raw: []const u8, ms: i64) void {
+        _ = .{ self, ctx, message, raw, ms };
+    }
+
+    pub inline fn toolCall(self: *Noop, ctx: Ctx, name: []const u8, call_id: []const u8, arguments: []const u8) void {
+        _ = .{ self, ctx, name, call_id, arguments };
+    }
+
+    pub inline fn toolResult(
+        self: *Noop,
+        ctx: Ctx,
+        name: []const u8,
+        call_id: []const u8,
+        content: []const u8,
+        outcome: Outcome,
+    ) void {
+        _ = .{ self, ctx, name, call_id, content, outcome };
+    }
+
+    pub inline fn note(self: *Noop, ctx: Ctx, level: []const u8, text: []const u8) void {
+        _ = .{ self, ctx, level, text };
+    }
+
+    pub inline fn turn(self: *Noop, ctx: Ctx, summary: Turn) void {
+        _ = .{ self, ctx, summary };
+    }
+};
+
+/// The recorder a run holds: the real one when this build keeps a trace, and a
+/// shape that does nothing when it does not.
+pub const Recorder = if (enabled) Trace else Noop;
 
 /// The opening of a payload, cut where a character ends so the line stays
 /// readable. The whole payload is too long to keep: see `max_payload_bytes`.

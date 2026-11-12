@@ -43,7 +43,8 @@ between runs.
   one animated line with the time so far. [Live progress](docs/ui.md#live-progress)
 - **Debug tracing** — `--debug` records every request, response, tool call and
   result, and renders the run as one self-contained HTML flowchart to read when
-  something went wrong. [Debug tracing](docs/debug.md)
+  something went wrong. It is a build option, so a release binary carries none of
+  it. [Debug tracing](docs/debug.md)
 - **Provider presets** — `openai`, `deepseek`, `openai-compatible` for any
   vendor speaking the Responses API, and `codex` for a ChatGPT subscription.
   [Providers](docs/providers.md) · [ChatGPT / Codex](docs/codex.md)

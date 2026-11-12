@@ -33,7 +33,9 @@
 - **实时进度** — 等待模型、执行工具、观察子 agent 各有一行动画和已用时间。
   [实时进度](docs/ui.md#live-progress)
 - **调试追踪** — `--debug` 记录每一次请求、返回、工具调用与结果，并把整次运行渲染
-  成一张单文件 HTML 流程图，出问题时照着查。[调试追踪（英文）](docs/debug.md)
+  成一张单文件 HTML 流程图，出问题时照着查。它是编译期选项，正式版本里不含这部分
+  代码（重新编译时加 `-Dtrace` 可打开）。
+  [调试追踪（英文）](docs/debug.md)
 - **服务商预设** — `openai`、`deepseek`、面向任意 Responses 兼容厂商的
   `openai-compatible`，以及用 ChatGPT 订阅的 `codex`。
   [服务商](docs/providers.md) · [ChatGPT / Codex](docs/codex.md)

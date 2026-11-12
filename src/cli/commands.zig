@@ -7,6 +7,11 @@ const sgr = @import("../ui/style.zig");
 const DIM = sgr.DIM;
 const RESET = sgr.RESET;
 
+/// A build without tracing still lists the command, because the user who types
+/// it deserves to be told why nothing was recorded. What the row says is the
+/// difference: the command itself is one sentence in such a binary.
+const tracing = @import("../debug/trace.zig").enabled;
+
 /// One REPL command offered to the user.
 pub const Command = struct {
     /// Including the leading slash, exactly as it has to be typed.
@@ -29,7 +34,10 @@ pub const all = [_]Command{
     .{ .name = "/model", .description = "Show current model" },
     .{ .name = "/status", .description = "Show token usage and account quota" },
     .{ .name = "/mcp", .description = "List the MCP servers and their tools" },
-    .{ .name = "/debug", .description = "Record every step and write an HTML report" },
+    .{ .name = "/debug", .description = if (tracing)
+        "Record every step and write an HTML report"
+    else
+        "Not in this build; rebuild with -Dtrace to record a run" },
     .{ .name = "/quit", .description = "Exit zagent" },
     .{ .name = "/exit", .description = "Exit zagent" },
 };

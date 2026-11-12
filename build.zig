@@ -4,6 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Debug tracing is a tool for working on zagent, not something a released
+    // binary carries: a Debug build records every step, a release build leaves
+    // the recorder and its report out entirely. `-Dtrace` overrides either way,
+    // so a release build can still be made to record when that is what it takes
+    // to find a bug.
+    const trace = b.option(
+        bool,
+        "trace",
+        "Record debug traces and render their reports (default: on for Debug builds)",
+    ) orelse (optimize == .debug);
+
+    const options = b.addOptions();
+    options.addOption(bool, "trace", trace);
+
     const exe = b.addExecutable(.{
         .name = "zagent",
         .root_module = b.createModule(.{
@@ -12,6 +26,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addOptions("build_options", options);
 
     b.installArtifact(exe);
 
@@ -29,6 +44,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe_tests.root_module.addOptions("build_options", options);
     const run_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

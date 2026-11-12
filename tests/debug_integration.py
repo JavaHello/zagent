@@ -14,6 +14,12 @@ BINARY = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 ANSWER = 'DEBUG_REPORT_DONE'
 CALL = ('bash', {'command': 'echo DEBUG_TOOL_OUTPUT "<b>bold</b>"'})
 
+# Tracing is a build option, and a release build has none of it: the suite has
+# nothing to test there, and says so rather than failing.
+if '--debug' not in subprocess.run([str(BINARY), '--help'], capture_output=True, text=True).stdout:
+    print('SKIP: this binary was built without debug tracing (-Dtrace=false)')
+    raise SystemExit(0)
+
 requests = []
 fail_next = False
 

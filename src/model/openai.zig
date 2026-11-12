@@ -270,7 +270,7 @@ pub const Client = struct {
     transport: ?Transport = null,
     /// Where a debug run records what was sent and what came back. Null unless
     /// the run was started with `--debug`.
-    trace: ?*trace_mod.Trace = null,
+    trace: ?*trace_mod.Recorder = null,
     /// Which agent and which request of the turn the next exchange belongs to.
     /// The agent sets it before every call, so one trace can hold a whole tree.
     trace_ctx: trace_mod.Ctx = .{},
@@ -459,10 +459,28 @@ pub const Client = struct {
 
     /// The exchange, recorded when the run is being debugged.
     ///
+    /// A build without tracing sends the request and keeps nothing of it: the
+    /// recorder is not part of such a binary at all, so the branch that would
+    /// wrap the exchange is not compiled.
+    fn performResponseStream(
+        self: *Client,
+        response_url: []const u8,
+        auth_header: []const u8,
+        req_json: []const u8,
+        sink: StreamSink,
+    ) !ApiResponse {
+        if (comptime trace_mod.enabled) {
+            if (self.trace != null) return self.recordedResponseStream(response_url, auth_header, req_json, sink);
+        }
+        return self.exchangeStreaming(response_url, auth_header, req_json, sink, null);
+    }
+
+    /// The same exchange, with its bytes written into the trace the run holds.
+    ///
     /// The recording wraps the whole exchange rather than sitting inside it: a
     /// request that fails part-way is exactly the one whose bytes are wanted,
     /// and the body has to be caught as it arrives, before the reader drops it.
-    fn performResponseStream(
+    fn recordedResponseStream(
         self: *Client,
         response_url: []const u8,
         auth_header: []const u8,

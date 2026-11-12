@@ -24,6 +24,23 @@ thinks to look.
 /debug          # record from here, or report where the record is going
 ```
 
+## Which builds record
+
+Recording is chosen when zagent is built, not only when it runs. A `Debug`
+build has the recorder and the report renderer in it; a release build leaves
+both out of the binary — no `--debug`, no `/debug`, no `--debug-report` — so a
+shipped zagent carries none of this code:
+
+```sh
+zig build                                      # Debug: tracing compiled in
+zig build -Doptimize=ReleaseFast               # release: no tracing at all
+zig build -Doptimize=ReleaseFast -Dtrace       # a release that can still record
+zig build -Doptimize=Debug -Dtrace=false       # a Debug build without it
+```
+
+In a build without tracing, `--debug`, `AI_DEBUG` and `/debug` each answer with
+one line saying the binary cannot record, and the run goes on unrecorded.
+
 ## What is recorded
 
 One JSON object per line is appended as the run happens, so a crash, a timeout

@@ -3,10 +3,17 @@
 ## Build
 
 ```bash
-zig build
+zig build                                  # Debug build, with debug tracing
+zig build -Doptimize=ReleaseFast           # release build, without it
+zig build -Doptimize=ReleaseFast -Dtrace   # release build that can still trace
 ```
 
 The binary is written to `zig-out/bin/zagent`. Zig 0.17.x is required.
+
+Debug tracing is a build option rather than a runtime one, so a release binary
+has no recorder and no report renderer in it. `zig build test-integration` uses
+the default Debug build, which is why the tracing suite runs there. See
+[Debug tracing](debug.md#which-builds-record).
 
 ## Tests
 
