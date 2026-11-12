@@ -32,6 +32,8 @@
   再说完成了什么、还差什么。[完成状态](docs/agent-loop.md#completion-status)
 - **实时进度** — 等待模型、执行工具、观察子 agent 各有一行动画和已用时间。
   [实时进度](docs/ui.md#live-progress)
+- **调试追踪** — `--debug` 记录每一次请求、返回、工具调用与结果，并把整次运行渲染
+  成一张单文件 HTML 流程图，出问题时照着查。[调试追踪（英文）](docs/debug.md)
 - **服务商预设** — `openai`、`deepseek`、面向任意 Responses 兼容厂商的
   `openai-compatible`，以及用 ChatGPT 订阅的 `codex`。
   [服务商](docs/providers.md) · [ChatGPT / Codex](docs/codex.md)
@@ -104,6 +106,7 @@ zagent
 | `/model` | 显示当前模型 |
 | `/status` | 显示 token 用量和账户额度 |
 | `/mcp` | 列出 MCP 服务及其工具 |
+| `/debug` | 记录每一步并写出 HTML 报告 |
 | `/quit` | 退出 |
 
 Enter 提交，Alt+Enter 或 Ctrl+J 换行，`Ctrl+Z` 挂起，`Ctrl+D` 退出，Esc 中断
@@ -135,6 +138,7 @@ Enter 提交，Alt+Enter 或 Ctrl+J 换行，`Ctrl+Z` 挂起，`Ctrl+D` 退出�
 | [HTTP requests](docs/http.md) | `http` 工具 |
 | [Sub-agents](docs/subagents.md) | 子 agent 与检查点 |
 | [MCP servers](docs/mcp.md) | `mcp.json` 与工具懒加载 |
+| [Debug tracing](docs/debug.md) | `--debug`：每一步记录与 HTML 报告 |
 | [Sessions](docs/sessions.md) | 持久会话、`--resume`、上下文 |
 | [Plan](docs/plan.md) | 进行中工作的清单 |
 | [Memory](docs/memory.md) | 跨会话的长期记忆 |

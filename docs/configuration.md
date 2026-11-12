@@ -36,6 +36,7 @@ and `mcp.example.json` shows every member an MCP entry takes.
 | `AI_REASONING_EFFORT` | *(unset)*                         | Codex only: sent as `reasoning.effort`          |
 | `AI_SERVICE_TIER`   | *(unset)*                           | Codex only: sent as `service_tier`              |
 | `AI_MEMORY_FILE`    | Global workspace state: `memory.md` | Override where the notes are stored             |
+| `AI_DEBUG`          | *(unset)*                           | Any value but `0`/`false`/`off`/`no` records a debug trace; see [Debug tracing](debug.md) |
 
 Provider-specific API keys (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) are read from
 the environment; use `AI_KEY` in the config file when you want one key for

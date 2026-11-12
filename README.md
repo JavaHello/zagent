@@ -41,6 +41,9 @@ between runs.
   [Completion status](docs/agent-loop.md#completion-status)
 - **Live progress** — waiting, running a tool and watching a sub-agent each get
   one animated line with the time so far. [Live progress](docs/ui.md#live-progress)
+- **Debug tracing** — `--debug` records every request, response, tool call and
+  result, and renders the run as one self-contained HTML flowchart to read when
+  something went wrong. [Debug tracing](docs/debug.md)
 - **Provider presets** — `openai`, `deepseek`, `openai-compatible` for any
   vendor speaking the Responses API, and `codex` for a ChatGPT subscription.
   [Providers](docs/providers.md) · [ChatGPT / Codex](docs/codex.md)
@@ -114,6 +117,7 @@ autodetection and the Responses API mapping:
 | `/model`      | Show the current model           |
 | `/status`     | Show token usage and account quota |
 | `/mcp`        | List the MCP servers and their tools |
+| `/debug`      | Record every step and write an HTML report |
 | `/quit`       | Exit                             |
 
 Enter submits, Alt+Enter or Ctrl+J inserts a newline, `Ctrl+Z` suspends, `Ctrl+D`
@@ -144,6 +148,7 @@ before pointing it at anything unfamiliar.
 | [HTTP requests](docs/http.md) | The `http` tool |
 | [Sub-agents](docs/subagents.md) | A second agent and its check-ins |
 | [MCP servers](docs/mcp.md) | `mcp.json` and lazy tool loading |
+| [Debug tracing](docs/debug.md) | `--debug`: every step, and the HTML report of a run |
 | [Sessions](docs/sessions.md) | Durable conversations, `--resume`, context |
 | [Plan](docs/plan.md) | The checklist of the work in progress |
 | [Memory](docs/memory.md) | Durable notes between sessions |

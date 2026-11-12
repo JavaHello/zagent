@@ -22,6 +22,7 @@ const ConfigFile = struct {
     service_tier: ?[]u8 = null,
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
+    debug: ?bool = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
         if (self.provider) |value| allocator.free(value);
@@ -156,7 +157,21 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
         config.max_iterations = std.fmt.parseInt(u32, value, 10) catch default_max_iterations;
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_DEBUG")) {
+        config.debug = flagValue(value);
     }
+}
+
+/// A switch that is on unless it is plainly off: an exported `AI_DEBUG` with
+/// any value at all is a request for the trace, and only the spellings of "no"
+/// take it back.
+fn flagValue(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len == 0) return false;
+    return !std.mem.eql(u8, trimmed, "0") and
+        !std.ascii.eqlIgnoreCase(trimmed, "false") and
+        !std.ascii.eqlIgnoreCase(trimmed, "off") and
+        !std.ascii.eqlIgnoreCase(trimmed, "no");
 }
 
 /// Read a whole file through a `std.Io.File.Reader`, growing the buffer as needed.
@@ -364,6 +379,11 @@ fn resolve(
         default_max_iterations,
     );
 
+    // The environment wins over the file, as it does for every other setting:
+    // `AI_DEBUG=0 zagent --debug` is a trace anyway, because the flag is read
+    // by the command line rather than here.
+    const debug = if (env.get("AI_DEBUG")) |value| flagValue(value) else (file_config.debug orelse false);
+
     return .{
         .allocator = allocator,
         .api_key = api_key,
@@ -374,6 +394,7 @@ fn resolve(
         .max_tokens = max_tokens,
         .max_iterations = max_iterations,
         .provider = selected_provider,
+        .debug = debug,
     };
 }
 
@@ -389,6 +410,9 @@ pub const Config = struct {
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
     codex_auth_path: ?[]const u8 = null,
+    /// Whether to record a debug trace and render its report. `--debug` on the
+    /// command line turns it on as well; nothing here can turn it off.
+    debug: bool = false,
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Config {
         var file_config = try loadConfigFile(io, allocator, env);
@@ -519,6 +543,34 @@ test "removed presentation, compaction and memory settings are ignored" {
     try std.testing.expect(!@hasField(Config, "compact_keep"));
     try std.testing.expect(!@hasField(Config, "memory"));
     try std.testing.expect(!@hasField(Config, "memory_auto"));
+}
+
+test "debug tracing is a switch the file and the environment can both set" {
+    const allocator = std.testing.allocator;
+    // Off unless asked for: nothing is recorded by accident.
+    var env = try testEnv(allocator, &.{});
+    defer env.deinit();
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+    const quiet = try resolve(allocator, &file_config, &env);
+    defer quiet.deinit();
+    try std.testing.expect(!quiet.debug);
+
+    // Any value but the spellings of "no" turns it on, in the file...
+    var on_text = try testFile(allocator, &.{.{ "AI_DEBUG", "1" }});
+    defer on_text.deinit(allocator);
+    const from_file = try resolve(allocator, &on_text, &env);
+    defer from_file.deinit();
+    try std.testing.expect(from_file.debug);
+
+    // ...and in the environment, which wins over the file either way.
+    var off_env = try testEnv(allocator, &.{.{ "AI_DEBUG", "off" }});
+    defer off_env.deinit();
+    var on_file = try testFile(allocator, &.{.{ "AI_DEBUG", "1" }});
+    defer on_file.deinit(allocator);
+    const off = try resolve(allocator, &on_file, &off_env);
+    defer off.deinit();
+    try std.testing.expect(!off.debug);
 }
 
 test "provider preset supplies defaults" {

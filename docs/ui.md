@@ -57,6 +57,7 @@ the answer is written straight to stdout, so `zagent "q" > notes.md` is clean.
 | `/model`      | Show the current model           |
 | `/status`     | Show token usage and account quota |
 | `/mcp`        | List the MCP servers and their tools |
+| `/debug`      | Record every step and write an HTML report; see [Debug tracing](debug.md) |
 | `/quit`       | Exit                             |
 | `Tab` / `Enter` | Insert the selected candidate   |
 | `Ctrl+Z`      | Suspend; resume with `fg`        |
@@ -103,8 +104,9 @@ behind the task: it is handed to the running task and sent to the model with
 its next request, so you can redirect the work in progress instead of waiting
 for it to finish and asking again. A reply that is already streaming is not cut
 short — the guidance lands with the request after it. Read-only commands
-(`/help`, `/model`, `/status`, `/mcp`, `/session`) still run immediately; the
-ones that change session state wait for the task to end.
+(`/help`, `/model`, `/status`, `/mcp`, `/session`) still run immediately, and so
+does `/debug`, which starts recording from the next step; the ones that change
+session state wait for the task to end.
 
 Press **Esc** to interrupt the current task, terminate its running tools, and
 discard input typed while it ran, keeping your own draft. If a completion popup

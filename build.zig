@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
         "tests/interrupt_integration.py",
         "tests/session_integration.py",
         "tests/scratch_integration.py",
+        "tests/debug_integration.py",
     }) |script| {
         const command = b.addSystemCommand(&.{"python3"});
         command.addFileArg(b.path(script));

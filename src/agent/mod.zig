@@ -1,5 +1,6 @@
 const std = @import("std");
 const openai = @import("../model/openai.zig");
+const trace_mod = @import("../debug/trace.zig");
 const tools = @import("../tools/mod.zig");
 const diff = @import("../diff/mod.zig");
 const text = @import("../util/text.zig");
@@ -158,6 +159,17 @@ pub const Agent = struct {
     /// whoever started the agent outlives it, and the agent only reads this and
     /// calls through it.
     mcp_registry: *mcp.Registry,
+    /// Where a `--debug` run records what this agent did. Null otherwise, and
+    /// borrowed when set: the run that opened the trace outlives the agent and
+    /// renders the report from it.
+    trace: ?*trace_mod.Trace = null,
+    /// Who this agent is in the record. The agent on the terminal is "main";
+    /// each sub-agent is named after the run that started it.
+    trace_agent: []const u8 = "main",
+    /// The name above when this agent had to make one, freed with it.
+    trace_agent_owned: ?[]u8 = null,
+    /// Which request of the turn is in flight, numbered from one.
+    trace_iteration: usize = 0,
 
     pub const Role = enum {
         /// The agent a person talks to: it owns the terminal, the session and
@@ -229,6 +241,9 @@ pub const Agent = struct {
         // settings: the loop is driven without a socket, so the requests the
         // sub-agent makes are scripted by the same test.
         if (parent) |p| client.transport = p.client.transport;
+        // A debug run writes the whole tree into one file: a sub-agent records
+        // into the trace its caller holds, under its own name.
+        if (parent) |p| client.trace = p.client.trace;
         const workspace: [:0]u8 = if (parent) |p|
             try allocator.dupeSentinel(u8, p.workspace, 0)
         else
@@ -290,6 +305,7 @@ pub const Agent = struct {
                 (std.Io.File.stdout().isTty(io) catch false) and
                 (std.Io.File.stderr().isTty(io) catch false),
             .mcp_registry = mcp_registry,
+            .trace = if (parent) |p| p.trace else null,
             .terminal_title = term.Title.init(io, interactive and linenoise.term_supported),
         };
     }
@@ -301,6 +317,7 @@ pub const Agent = struct {
         self.closeRuns();
         self.runs.deinit(self.allocator);
         if (self.current_task.len > 0) self.allocator.free(self.current_task);
+        if (self.trace_agent_owned) |label| self.allocator.free(label);
         for (self.inbox.items) |line| self.allocator.free(line);
         self.inbox.deinit(self.allocator);
         self.host.deinit(self.allocator);
@@ -320,6 +337,34 @@ pub const Agent = struct {
     /// lines normally use.
     pub fn attachScreen(self: *Agent, screen: ?*Screen) void {
         self.screen = screen;
+    }
+
+    /// Record this agent's steps from here on. Called once the session exists,
+    /// because the trace is named after it, and by `/debug` when a run that
+    /// started without one turns tracing on mid-session.
+    pub fn attachTrace(self: *Agent, trace: ?*trace_mod.Trace) void {
+        self.trace = trace;
+        self.client.trace = trace;
+        self.client.trace_ctx = self.traceCtx();
+        const opened = trace orelse return;
+        // Only the agent on the terminal describes the run: a sub-agent's
+        // events are steps inside it, not another run.
+        if (self.role != .main) return;
+        opened.run(.{
+            .session = self.session_id orelse "",
+            .workspace = self.workspace,
+            .scratch = self.scratch.path,
+            .model = self.config.model,
+            .provider = if (self.config.provider) |selected| selected.name() else "",
+            .base_url = self.config.base_url,
+            .max_tokens = self.config.max_tokens,
+            .max_iterations = self.config.max_iterations,
+        });
+    }
+
+    /// Which agent and which request a step belongs to, as the trace records it.
+    fn traceCtx(self: *Agent) trace_mod.Ctx {
+        return .{ .agent = self.trace_agent, .iteration = self.trace_iteration };
     }
 
     /// One status or answer line: into the conversation when a screen owns it,
@@ -854,6 +899,7 @@ pub const Agent = struct {
 
         try self.appendUserMessage(aw.written());
         try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ guidance from the terminal added to this task\n" ++ RESET, .{});
+        if (self.trace) |trace| trace.note(self.traceCtx(), "info", "guidance typed while the task ran was added to this request");
         try self.checkpoint();
         return true;
     }
@@ -1045,6 +1091,13 @@ pub const Agent = struct {
             .supervisor = &run.supervisor,
         });
         errdefer child.deinit();
+        // Named in the record after the run the caller watches: two sub-agents
+        // interleave their steps in one trace, and the name is how a reader
+        // tells which one a request belongs to. Only a debug run pays for it.
+        if (child.trace != null) {
+            child.trace_agent_owned = try std.fmt.allocPrint(self.allocator, "subagent {s}", .{run.id});
+            child.trace_agent = child.trace_agent_owned.?;
+        }
         run.child = child;
         // The two ways a run stops for a reason other than its caller's
         // decision: this process asking for the task to stop, and the child
@@ -1296,15 +1349,18 @@ pub const Agent = struct {
         if (due.stop) {
             try self.appendUserMessage(stop_prompt);
             try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ the caller stopped this task\n" ++ RESET, .{});
+            if (self.trace) |trace| trace.note(self.traceCtx(), "info", "the caller stopped this task");
         } else {
             try self.appendUserMessage(report_request_prompt);
             try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ the caller asked for a progress report\n" ++ RESET, .{});
+            if (self.trace) |trace| trace.note(self.traceCtx(), "info", "the caller asked for a progress report");
         }
         try self.checkpoint();
     }
 
     fn processQueryInner(self: *Agent, query: []const u8) !void {
         try self.appendUserMessage(query);
+        if (self.trace) |trace| trace.query(self.traceCtx(), query);
         try self.checkpoint();
         self.terminal_title.update("thinking…", self.current_task);
 
@@ -1377,6 +1433,10 @@ pub const Agent = struct {
         // A sub-agent's turn ends when its caller stops it, not when a budget
         // runs out, so the loop has no count of its own there.
         while (self.max_iterations == null or iteration < self.max_iterations.?) : (iteration += 1) {
+            // Requests are numbered from one in the record, so "request #2"
+            // means the second one of this turn, whichever agent made it.
+            self.trace_iteration = iteration + 1;
+            self.client.trace_ctx = self.traceCtx();
             try self.checkInterrupted();
             // A line typed while the last request was running goes out with
             // this one: it belongs to the task in progress. A continuation
@@ -1412,6 +1472,7 @@ pub const Agent = struct {
                     try carried.appendSlice(self.allocator, partial);
                     try self.appendAssistantFragment(partial, response.reasoning_content);
                     try self.emit(std.Io.File.stderr(), DIM ++ "  … reply cut off by the output limit; continuing where it stopped\n" ++ RESET, .{});
+                    if (self.trace) |trace| trace.note(self.traceCtx(), "warn", "the reply was cut off by the output limit; the model was asked to continue");
                     try self.appendUserMessage(continue_prompt);
                     continue;
                 }
@@ -1422,6 +1483,7 @@ pub const Agent = struct {
                 empty_continuations += 1;
                 if (continuation_start == null) continuation_start = self.history.items.len;
                 try self.emit(std.Io.File.stderr(), DIM ++ "  … reply cut off before any text; asking for a smaller step\n" ++ RESET, .{});
+                if (self.trace) |trace| trace.note(self.traceCtx(), "warn", "the reply was cut off before any text; the model was asked for a smaller step");
                 try self.appendUserMessage(if (carried.items.len > 0) continue_prompt else restart_prompt);
                 continue;
             }
@@ -1466,6 +1528,10 @@ pub const Agent = struct {
 
                 for (tool_calls, 0..) |call, index| {
                     try self.checkInterrupted();
+                    // The call is recorded before it runs, so a call that
+                    // never returns is still in the record with its arguments.
+                    if (self.trace) |trace| trace.toolCall(self.traceCtx(), call.name, call.id, call.arguments);
+                    const tool_started = std.Io.Timestamp.now(self.io, .awake);
                     const result = self.executeTool(call, index, if (asked) |*prepared| prepared else null) catch |err| blk: {
                         if (self.interrupted.load(.acquire)) return error.Canceled;
                         const error_content = try std.fmt.allocPrint(
@@ -1479,6 +1545,16 @@ pub const Agent = struct {
                             .timed_out = err == error.Timeout,
                         };
                     };
+                    // The result as the model will read it: before a duplicate
+                    // is folded away or a page is clipped, so the reason for
+                    // what the model saw is in the record.
+                    if (self.trace) |trace| trace.toolResult(self.traceCtx(), call.name, call.id, result.content, .{
+                        .is_error = result.is_error,
+                        .exit_code = result.exit_code,
+                        .timed_out = result.timed_out,
+                        .truncated = result.truncated,
+                        .ms = tool_started.untilNow(self.io, .awake).toMilliseconds(),
+                    });
                     defer result.deinit(self.allocator);
 
                     const result_content = try compact.deduplicateReadResult(self.allocator, self.history.items, call, result.content, result.is_error);
@@ -1569,9 +1645,15 @@ pub const Agent = struct {
                 try self.settleContinuations(&continuation_start, carried.items, null);
                 stream.flushPending() catch {};
                 try self.emit(std.Io.File.stderr(), RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{max});
+                if (self.trace) |trace| trace.note(self.traceCtx(), "error", "the iteration limit was reached; the turn ends without an answer");
             }
         }
 
+        if (self.trace) |trace| trace.turn(self.traceCtx(), .{
+            .completed = turn.completed,
+            .tool_calls = turn.tool_calls,
+            .ms = if (self.query_started) |started| started.untilNow(self.io, .awake).toMilliseconds() else 0,
+        });
         return turn;
     }
 

@@ -24,6 +24,7 @@ overview.
 | [HTTP requests](http.md) | The `http` tool, downloads, redirects and limits |
 | [Sub-agents](subagents.md) | Handing a task to a second agent and watching it |
 | [MCP servers](mcp.md) | `mcp.json`, lazy tool loading and the protocol zagent speaks |
+| [Debug tracing](debug.md) | `--debug`: every request, response and tool call, and the HTML report of a run |
 
 ## What survives a turn
 

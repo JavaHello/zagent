@@ -78,6 +78,7 @@ $XDG_STATE_HOME/zagent/workspaces/<sha256-of-canonical-path>/
   trusted             # full canonical path, checked when loading approval
   memory.md
   sessions/<id>.json
+  debug/<session-id>-<epoch>.jsonl, .html   # only with --debug, see Debug tracing
 ```
 
 Without `XDG_STATE_HOME`, the base is `~/.local/state`. Symlink aliases share

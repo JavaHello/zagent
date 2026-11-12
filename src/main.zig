@@ -1,6 +1,7 @@
 const std = @import("std");
 const Config = @import("model/config.zig").Config;
 const Agent = @import("agent/mod.zig").Agent;
+const debug = @import("debug/trace.zig");
 const provider = @import("model/provider.zig");
 const history = @import("cli/history.zig");
 const commands = @import("cli/commands.zig");
@@ -32,6 +33,7 @@ const HELP =
     \\  /model       Show current model
     \\  /status      Show token usage and account quota
     \\  /mcp         List the MCP servers and their tools
+    \\  /debug       Record every step and write an HTML report
     \\  /quit, /exit Exit zagent
     \\  /, @, $      Command / project file / reserved candidates
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
@@ -127,11 +129,15 @@ pub fn main(init: std.process.Init) !void {
             "  --help, -h          Show this help\n" ++
             "  --version           Show version\n" ++
             "  --resume <id>       Resume a saved session in this workspace\n" ++
+            "  --debug             Record every step and write an HTML report\n" ++
+            "  --debug-report <trace.jsonl>\n" ++
+            "                      Rebuild the HTML report of a trace\n" ++
             "  login / logout      Sign in with ChatGPT / remove local credentials\n" ++
             "  models              List models for the selected provider\n\n" ++
             "AI_PROVIDER=deepseek  Use DEEPSEEK_API_KEY\n" ++
             "AI_PROVIDER=openai-compatible  Any Responses-compatible vendor; set AI_URL and AI_MODEL.\n" ++
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
+            "AI_DEBUG=1            Same as --debug\n" ++
             "AI_MEMORY_FILE        Store memory in another file\n" ++
             "Tools and local MCP servers run on the host with inherited environment and network access.\n" ++
             "Build with Zig 0.17.0.\n");
@@ -139,6 +145,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.items.len == 2 and std.mem.eql(u8, args.items[1], "--version")) {
         try std.Io.File.stdout().writeStreamingAll(io, "zagent 0.1.0 (Zig 0.17)\n");
+        return;
+    }
+
+    // Turning a trace kept earlier into a report touches no workspace, no
+    // credentials and no trust decision: the file is read, the page is written
+    // beside it, and the run is over.
+    if (args.items.len == 3 and std.mem.eql(u8, args.items[1], "--debug-report")) {
+        try writeDebugReport(allocator, io, args.items[2]);
         return;
     }
 
@@ -236,15 +250,23 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Flags come before the query: the first word that is not one starts it.
     var query_start: usize = 1;
     var resume_id: ?[]const u8 = null;
-    if (args.items.len > 1 and std.mem.eql(u8, args.items[1], "--resume")) {
-        if (args.items.len < 3) {
-            try std.Io.File.stderr().writeStreamingAll(io, "Usage: zagent --resume <session-id> [query ...]\n");
-            std.process.exit(1);
-        }
-        resume_id = args.items[2];
-        query_start = 3;
+    var debug_on = config.debug;
+    while (query_start < args.items.len) {
+        const arg = args.items[query_start];
+        if (std.mem.eql(u8, arg, "--resume")) {
+            if (query_start + 1 >= args.items.len) {
+                try std.Io.File.stderr().writeStreamingAll(io, "Usage: zagent --resume <session-id> [query ...]\n");
+                std.process.exit(1);
+            }
+            resume_id = args.items[query_start + 1];
+            query_start += 2;
+        } else if (std.mem.eql(u8, arg, "--debug")) {
+            debug_on = true;
+            query_start += 1;
+        } else break;
     }
 
     // The terminal is created here rather than inside the REPL so that the
@@ -289,6 +311,12 @@ pub fn main(init: std.process.Init) !void {
     }
     try registry.writeStartup(&report.writer);
 
+    // Registered before the agent, so it runs after it: a sub-agent closed in
+    // `agent.deinit` still has its last steps recorded, and the report is
+    // written once nothing else can write to the trace.
+    var trace: ?*debug.Trace = null;
+    defer if (trace) |opened| publishTrace(allocator, io, opened);
+
     var agent = try Agent.init(allocator, io, &config, &ln, env, &registry);
     defer agent.deinit();
 
@@ -297,10 +325,19 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    // The trace is named after the session, so it opens once the session does.
+    if (debug_on) {
+        trace = openTrace(allocator, io, env, agent.session_id);
+        if (trace) |opened| agent.attachTrace(opened);
+    }
+
     if (args.items.len > query_start) {
         // No wordmark and no screen in this mode, so the report goes out here,
         // to stderr: stdout belongs to the answer, and `zagent "..." > notes.md`
         // stays clean.
+        if (trace) |opened| {
+            try printToStderr(allocator, io, DIM ++ "Debug: recording this run; report {s}\n" ++ RESET, .{opened.report_path});
+        }
         if (report.written().len > 0) {
             try stderr.writeStreamingAll(io, report.written());
             try stderr.writeStreamingAll(io, "\n");
@@ -314,7 +351,7 @@ pub fn main(init: std.process.Init) !void {
         try agent.processQuery(query);
     } else {
         // Interactive REPL mode
-        try runRepl(allocator, io, env, &agent, config, &ln, history_path, &registry, report.written());
+        try runRepl(allocator, io, env, &agent, config, &ln, history_path, &registry, report.written(), &trace);
         if (agent.session_id) |id| {
             try printToStderr(allocator, io, "Resume session: zagent --resume {s}\n", .{id});
         }
@@ -331,6 +368,9 @@ fn runRepl(
     history_path: ?[]const u8,
     registry: *const mcp.Registry,
     mcp_report: []const u8,
+    /// The run's trace, or the slot `/debug` opens one into. The pointer is
+    /// what makes a trace turned on mid-session outlive this function.
+    trace: *?*debug.Trace,
 ) !void {
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
@@ -409,6 +449,11 @@ fn runRepl(
     }
     if (agent.session_id) |id| {
         const message = try std.fmt.allocPrint(allocator, "  Session  {s}\n  Resume   zagent --resume {s}\n", .{ id, id });
+        defer allocator.free(message);
+        try writeOut(&screen, stdout, io, message);
+    }
+    if (trace.*) |opened| {
+        const message = try std.fmt.allocPrint(allocator, DIM ++ "  Debug    recording; report {s}\n" ++ RESET, .{opened.report_path});
         defer allocator.free(message);
         try writeOut(&screen, stdout, io, message);
     }
@@ -494,6 +539,7 @@ fn runRepl(
         if (runtime.busy() and line[0] == '/' and !plan_read_only and
             !std.mem.eql(u8, line, "/status") and !std.mem.eql(u8, line, "/help") and
             !std.mem.eql(u8, line, "/model") and !std.mem.eql(u8, line, "/mcp") and !std.mem.eql(u8, line, "/session") and
+            !std.mem.eql(u8, line, "/debug") and
             !std.mem.eql(u8, line, "/quit") and !std.mem.eql(u8, line, "/exit"))
         {
             try screen.writeLog("This command changes session state; retry after the current task finishes.\n");
@@ -563,6 +609,23 @@ fn runRepl(
             defer aw.deinit();
             try registry.writeStatus(&aw.writer);
             try writeOut(&screen, stdout, io, aw.written());
+        } else if (std.mem.eql(u8, line, "/debug")) {
+            // A run that started without a trace can begin one here, which is
+            // how a problem is caught: it has already happened twice before
+            // anyone thinks to look.
+            if (trace.*) |opened| {
+                const message = try std.fmt.allocPrint(allocator, "Debug: report {s}\nDebug: trace  {s}\n", .{ opened.report_path, opened.jsonl_path });
+                defer allocator.free(message);
+                try writeOut(&screen, stdout, io, message);
+            } else if (openTrace(allocator, io, env, agent.session_id)) |opened| {
+                trace.* = opened;
+                agent.attachTrace(opened);
+                const message = try std.fmt.allocPrint(allocator, DIM ++ "Debug: recording from here; report {s}\n" ++ RESET, .{opened.report_path});
+                defer allocator.free(message);
+                try writeOut(&screen, stdout, io, message);
+            } else {
+                try writeOut(&screen, stderr, io, "Debug: this run cannot be recorded.\n");
+            }
         } else if (screen.isActive()) {
             try runtime.submit(line);
         } else {
@@ -659,6 +722,52 @@ fn printToStderr(
     try std.Io.File.stderr().writeStreamingAll(io, message);
 }
 
+/// Open a trace for this run, saying where it went. Failure to record is never
+/// failure of the run: it is reported and the answer goes on without it.
+fn openTrace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    session: ?[]const u8,
+) ?*debug.Trace {
+    const opened = allocator.create(debug.Trace) catch return null;
+    opened.* = debug.Trace.open(allocator, io, env, session) catch |err| {
+        allocator.destroy(opened);
+        printToStderr(allocator, io, "Debug: cannot record this run: {s}\n", .{@errorName(err)}) catch {};
+        return null;
+    };
+    return opened;
+}
+
+/// Close the record and say where the report and the trace are. The report is
+/// rendered from the trace file, so a failure to render it loses the page but
+/// not the record.
+fn publishTrace(allocator: std.mem.Allocator, io: std.Io, opened: *debug.Trace) void {
+    const failed = if (opened.finish()) |_| false else |err| reported: {
+        printToStderr(allocator, io, "Debug: the report could not be written: {s}\n", .{@errorName(err)}) catch {};
+        break :reported true;
+    };
+    if (!failed) {
+        printToStderr(allocator, io, DIM ++ "Debug: report " ++ RESET ++ "{s}\n", .{opened.report_path}) catch {};
+    }
+    printToStderr(allocator, io, DIM ++ "Debug: trace  " ++ RESET ++ "{s}\n", .{opened.jsonl_path}) catch {};
+    opened.deinit();
+    allocator.destroy(opened);
+}
+
+/// Turn a trace kept earlier into its report, beside it.
+fn writeDebugReport(allocator: std.mem.Allocator, io: std.Io, jsonl_path: []const u8) !void {
+    const html_path = try @import("debug/report.zig").htmlPathFor(allocator, jsonl_path);
+    defer allocator.free(html_path);
+    @import("debug/report.zig").writeFile(allocator, io, jsonl_path, html_path) catch |err| {
+        try printToStderr(allocator, io, "Cannot read the trace: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const stdout = std.Io.File.stdout();
+    try stdout.writeStreamingAll(io, html_path);
+    try stdout.writeStreamingAll(io, "\n");
+}
+
 // The other modules are only reachable from `main`, which a test build never
 // analyzes, so their tests would otherwise be dropped from `zig build test`.
 test {
@@ -690,6 +799,8 @@ test {
     _ = @import("ui/spinner.zig");
     _ = @import("mcp/mod.zig");
     _ = @import("mcp/transport.zig");
+    _ = @import("debug/trace.zig");
+    _ = @import("debug/report.zig");
 }
 
 test "config loads" {

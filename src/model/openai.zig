@@ -1,6 +1,7 @@
 const std = @import("std");
 const search_tools = @import("../tools/mod.zig");
 const codex_auth = @import("codex_auth.zig");
+const trace_mod = @import("../debug/trace.zig");
 const Config = @import("config.zig").Config;
 pub const tool_schema = @import("../tools/schema.zig");
 pub const ToolDefinition = tool_schema.ToolDefinition;
@@ -267,6 +268,12 @@ pub const Client = struct {
     builtin_omit: []const []const u8 = &.{},
     /// Set only by tests; see `Transport`.
     transport: ?Transport = null,
+    /// Where a debug run records what was sent and what came back. Null unless
+    /// the run was started with `--debug`.
+    trace: ?*trace_mod.Trace = null,
+    /// Which agent and which request of the turn the next exchange belongs to.
+    /// The agent sets it before every call, so one trace can hold a whole tree.
+    trace_ctx: trace_mod.Ctx = .{},
     /// Live token accounting, read by the spinner while a request is in
     /// flight. These are totals for the current query, not per request.
     input_tokens: std.atomic.Value(u64) = .init(0),
@@ -450,15 +457,62 @@ pub const Client = struct {
         return try self.performResponseStream(response_url, auth_header, req_json, sink);
     }
 
+    /// The exchange, recorded when the run is being debugged.
+    ///
+    /// The recording wraps the whole exchange rather than sitting inside it: a
+    /// request that fails part-way is exactly the one whose bytes are wanted,
+    /// and the body has to be caught as it arrives, before the reader drops it.
+    fn performResponseStream(
+        self: *Client,
+        response_url: []const u8,
+        auth_header: []const u8,
+        req_json: []const u8,
+        sink: StreamSink,
+    ) !ApiResponse {
+        const trace = self.trace orelse
+            return self.exchangeStreaming(response_url, auth_header, req_json, sink, null);
+
+        trace.request(self.trace_ctx, response_url, self.model, req_json, estimateTokens(req_json));
+        const started = std.Io.Timestamp.now(self.io, .awake);
+        var raw: std.ArrayList(u8) = .empty;
+        defer raw.deinit(self.allocator);
+
+        const parsed = self.exchangeStreaming(response_url, auth_header, req_json, sink, &raw) catch |err| {
+            // What the server said is more useful than the error's name, when
+            // it said anything at all.
+            const message = self.http_error orelse @errorName(err);
+            trace.failure(self.trace_ctx, message, raw.items, started.untilNow(self.io, .awake).toMilliseconds());
+            return err;
+        };
+        const calls = parsed.tool_calls orelse &.{};
+        const recorded = self.allocator.alloc(trace_mod.Call, calls.len) catch null;
+        defer if (recorded) |entries| self.allocator.free(entries);
+        if (recorded) |entries| for (calls, entries) |call, *entry| {
+            entry.* = .{ .id = call.id, .name = call.name, .arguments = call.arguments };
+        };
+        trace.response(self.trace_ctx, .{
+            .finish_reason = parsed.finish_reason,
+            .content = parsed.content,
+            .reasoning = parsed.reasoning_content,
+            .tool_calls = recorded orelse &.{},
+            .in_tokens = if (parsed.usage) |usage| usage.input_tokens else null,
+            .out_tokens = if (parsed.usage) |usage| usage.output_tokens else null,
+            .ms = started.untilNow(self.io, .awake).toMilliseconds(),
+            .raw = raw.items,
+        });
+        return parsed;
+    }
+
     /// A streaming Responses request. The body is an SSE stream: every event
     /// is a `data:` line carrying one JSON object. Text deltas are forwarded
     /// to `sink` as they arrive, and the final event carries the complete
     /// response object, which is parsed exactly like a non-streaming reply.
-    fn performResponseStream(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink) !ApiResponse {
+    fn exchangeStreaming(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
         if (self.transport) |transport| {
             // Tests drive the buffered path; streaming is a network detail.
             const body = try transport.send(transport.context, self.allocator, req_json);
             defer self.allocator.free(body);
+            if (raw) |buffer| buffer.appendSlice(self.allocator, body) catch {};
             if (self.http_error) |message| self.allocator.free(message);
             self.http_error = null;
             const parsed = try parseResponse(self.allocator, body);
@@ -506,6 +560,7 @@ pub const Client = struct {
             var aw: std.Io.Writer.Allocating = .init(self.allocator);
             defer aw.deinit();
             _ = reader.streamRemaining(&aw.writer) catch {};
+            if (raw) |buffer| buffer.appendSlice(self.allocator, aw.written()) catch {};
             self.recordHttpError(response.head.status, aw.written());
             return error.ApiError;
         }
@@ -536,6 +591,7 @@ pub const Client = struct {
                 };
                 continue;
             }
+            if (raw) |buffer| buffer.appendSlice(self.allocator, avail) catch {};
             var i: usize = 0;
             while (i < avail.len) : (i += 1) {
                 const byte = avail[i];

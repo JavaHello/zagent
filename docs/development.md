@@ -23,8 +23,8 @@ popups, steering, sessions, memory, plans and sub-agents. They drive the real
 binary against a local mock model endpoint, and cover file editing, patching,
 searching, working-directory isolation, symlink escapes, environment isolation,
 network isolation, API retries, session recovery, input typed into a running
-task, binary replacement during a run, and the exit status at the execution
-limit. No isolation backend is required.
+task, binary replacement during a run, the debug trace and its HTML report, and
+the exit status at the execution limit. No isolation backend is required.
 
 A single suite can also be run directly:
 
@@ -32,6 +32,7 @@ A single suite can also be run directly:
 python3 tests/execution_integration.py
 python3 tests/completion_integration.py
 python3 tests/responses_failure_integration.py
+python3 tests/debug_integration.py
 ```
 
 ## Project structure
@@ -89,6 +90,9 @@ src/
     style.zig    — The SGR codes and styles everything else draws with
     selection.zig — Turning a drag into the text to copy
   diff/          — Unified diffs: reading one, applying one, drawing one (mod.zig)
+  debug/         — The record a `--debug` run keeps, and its report
+    trace.zig    — One JSON line per step: requests, responses, tool calls, results
+    report.zig   — The self-contained HTML flowchart rendered from a trace
   state/         — What outlives a turn
     memory.zig   — Durable notes: file format, local retrieval, edits
     plan.zig     — The session plan: steps, snapshot form, prompt bullet
