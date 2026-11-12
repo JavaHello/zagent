@@ -96,7 +96,7 @@ pub const Agent = struct {
     /// the model never has to ask for a place to work. Not a sandbox, and not
     /// durable: a new session empties it and the process removes it on exit.
     scratch: scratch_mod.Scratch,
-    /// Durable notes loaded at startup and updated by the remember tool.
+    /// Durable notes loaded at startup and updated by the memory_save tool.
     memory: memory_mod.Memory,
     /// The checklist of the work in progress. It lives in memory, is changed by
     /// the plan tool and `/plan`, and is saved with the session rather than in
@@ -502,7 +502,7 @@ pub const Agent = struct {
         try self.writeLogOrStdout(aw.written());
     }
 
-    /// `/remember <text>`: save a note by hand, as the model's remember tool
+    /// `/remember <text>`: save a note by hand, as the model's memory_save tool
     /// does, and make it part of this session's system prompt.
     pub fn rememberCommand(self: *Agent, note: []const u8) !void {
         if (!self.memory.enabled) {
@@ -584,9 +584,9 @@ pub const Agent = struct {
         };
     }
 
-    /// The remember tool: save one durable note and tell the model whether it
+    /// The memory_save tool: save one durable note and tell the model whether it
     /// was new.
-    fn rememberTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
+    fn memorySaveTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
         if (!self.memory.enabled) {
             return .{
                 .content = try self.allocator.dupe(u8, "Memory is unavailable: no storage path could be resolved."),
@@ -595,7 +595,7 @@ pub const Agent = struct {
         }
         const note = openai.extractStringArg(self.allocator, arguments, "text") catch {
             return .{
-                .content = try self.allocator.dupe(u8, "Error: remember needs a non-empty 'text' string"),
+                .content = try self.allocator.dupe(u8, "Error: memory_save needs a non-empty 'text' string"),
                 .is_error = true,
             };
         };
@@ -616,7 +616,7 @@ pub const Agent = struct {
         for (self.memory.entries.items) |entry| _ = try staged.add(entry);
         const added = staged.edit(parsed.value.action, note, parsed.value.old_text) catch |err| switch (err) {
             error.EmptyMemory => return .{
-                .content = try self.allocator.dupe(u8, "Error: remember needs a non-empty 'text' string"),
+                .content = try self.allocator.dupe(u8, "Error: memory_save needs a non-empty 'text' string"),
                 .is_error = true,
             },
             else => return .{
@@ -2123,8 +2123,8 @@ pub const Agent = struct {
                 spinner.Spinner.disabled(self.io);
             defer spin.stop();
 
-            if (std.mem.eql(u8, call.name, "remember")) {
-                break :blk try self.rememberTool(call.arguments);
+            if (std.mem.eql(u8, call.name, "memory_save")) {
+                break :blk try self.memorySaveTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "memory_search")) {
                 break :blk try self.memorySearchTool(call.arguments);
             } else if (std.mem.eql(u8, call.name, "plan")) {
@@ -2952,7 +2952,7 @@ test "a subagent runs its own turn and reports back" {
     const child = mock.requests.items[1];
     try std.testing.expect(std.mem.indexOf(u8, child, "You are a sub-agent") != null);
     try std.testing.expect(std.mem.indexOf(u8, child, "delegate the counting") == null);
-    for ([_][]const u8{ "\"ask_user\"", "\"announce_task\"", "\"subagent\"", "\"plan\"", "\"remember\"" }) |name| {
+    for ([_][]const u8{ "\"ask_user\"", "\"announce_task\"", "\"subagent\"", "\"plan\"", "\"memory_save\"" }) |name| {
         try std.testing.expect(std.mem.indexOf(u8, child, name) == null);
     }
 

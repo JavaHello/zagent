@@ -141,7 +141,7 @@ pub fn buildSystemPrompt(
         }
     }
     if (!memory_enabled) {
-        try aw.writer.writeAll("\n- Durable memory is unavailable: no notes file could be resolved. Do not call **memory_search** or **remember**.\n");
+        try aw.writer.writeAll("\n- Durable memory is unavailable: no notes file could be resolved. Do not call **memory_search** or **memory_save**.\n");
     } else {
         try aw.writer.writeAll("\n- Memory holds lasting preferences and project facts only, never transient status or secrets. Consult it before relying on past preferences, conventions or decisions and before replacing or deleting a note; prefer current instructions and verified facts over stale notes, and correct obsolete notes instead of adding contradictions.\n");
     }
@@ -232,7 +232,7 @@ pub fn buildSubagentPrompt(
 /// memory and cannot start another sub-agent. Everything else — including the
 /// search programs this machine has — comes from the same startup defaults the
 /// agent on the terminal uses, so there is one place that decides them.
-pub const subagent_omitted = [_][]const u8{ "ask_user", "announce_task", "plan", "remember", "subagent", "subagent_stop" };
+pub const subagent_omitted = [_][]const u8{ "ask_user", "announce_task", "plan", "memory_save", "subagent", "subagent_stop" };
 
 /// What the agent on the terminal is not given: the report tool belongs to the
 /// sub-agent side of the handshake, and a caller that reported to itself would

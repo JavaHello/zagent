@@ -155,8 +155,8 @@ pub const announce_task = ToolDefinition{
     ,
 };
 
-pub const remember = ToolDefinition{
-    .name = "remember",
+pub const memory_save = ToolDefinition{
+    .name = "memory_save",
     .description = "Save one durable note to memory so it survives this session: add a note, or replace or delete an exact existing one.",
     .parameters_json =
     \\{"type":"object","properties":{"text":{"type":"string","description":"Note to add, new note for replace, or exact existing note for delete"},"action":{"type":"string","enum":["add","replace","delete"],"description":"Default add; replace and delete require an exact existing note"},"old_text":{"type":"string","description":"Exact existing note to replace; required only for replace"}},"required":["text"]}
@@ -200,7 +200,7 @@ pub const subagent_stop = ToolDefinition{
 pub const builtin = [_]ToolDefinition{
     memory_search, bash,          read, write,    apply_patch,   ls,
     rg,            fd,            grep, find,     http,          ask_user,
-    remember,      announce_task, plan, subagent, subagent_stop, report,
+    memory_save,   announce_task, plan, subagent, subagent_stop, report,
 };
 
 test "built-in definitions have valid schemas and unique names" {

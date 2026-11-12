@@ -20,7 +20,7 @@ pub fn progressLabel(name: []const u8) ?[]const u8 {
         .{ .name = "grep", .label = "grep…" },
         .{ .name = "find", .label = "find…" },
         .{ .name = "http", .label = "http…" },
-        .{ .name = "remember", .label = "remember…" },
+        .{ .name = "memory_save", .label = "saving memory…" },
         .{ .name = "memory_search", .label = "searching memory…" },
         .{ .name = "plan", .label = "plan…" },
     };

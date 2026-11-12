@@ -15,7 +15,7 @@ between runs.
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use** — the agent runs tools to do the work: `bash`, `read`, `write`,
   `apply_patch`, `ls`, `rg`/`grep`, `fd`/`find`, `http`, `ask_user`, `plan`,
-  `remember`/`memory_search` and `announce_task`.
+  `memory_save`/`memory_search` and `announce_task`.
   [Tools](docs/tools.md) · [Searching](docs/searching.md) ·
   [Patching](docs/patching.md) · [HTTP](docs/http.md)
 - **Multi-turn tool chaining** — the agent loops until the task is complete.

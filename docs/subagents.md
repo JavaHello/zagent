@@ -25,7 +25,7 @@ of 0 asks at the next request boundary.
 The child gets its own system prompt and its own
 [scratch directory](security.md#scratch-directory), and at startup only the task
 description and the optional context, so the task has to be self-contained. It
-is offered no `ask_user`, `plan`, `announce_task`, `remember`, `subagent_stop`
+is offered no `ask_user`, `plan`, `announce_task`, `memory_save`, `subagent_stop`
 or nesting of its own: both sides of the handshake belong to the caller, and
 what the child has is `report`.
 

@@ -43,7 +43,7 @@ test "omitted names drop from the startup defaults and search selection still ap
     // The six tools a sub-agent must not hold, as agent/prompt.zig names them:
     // it cannot ask the user, announce on a terminal it does not own, move the
     // plan, write the shared memory, start a run of its own, or stop one.
-    const omit = [_][]const u8{ "ask_user", "announce_task", "plan", "remember", "subagent", "subagent_stop" };
+    const omit = [_][]const u8{ "ask_user", "announce_task", "plan", "memory_save", "subagent", "subagent_stop" };
     for ([_]search_tools.SearchBackends{ .{}, .{ .rg = true }, .{ .fd = true }, .{ .rg = true, .fd = true } }) |search| {
         const body = try buildRequestWithToolSelection(allocator, "test", &.{}, 100, .{ .omit = &omit }, false, search);
         defer allocator.free(body);

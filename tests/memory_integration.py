@@ -18,7 +18,7 @@ calls = [
     ('memory_search', {'query': ''}),
     ('memory_search', {'query': 'tmux', 'limit': 11}),
     ('memory_search', {'query': 'tmux', 'limit': -1}),
-    ('remember', {'text': 'tmux new durable note'}),
+    ('memory_save', {'text': 'tmux new durable note'}),
     ('memory_search', {'query': 'tmux new', 'limit': 1}),
     ('memory_search', {'query': 'x' * 513}),
 ]

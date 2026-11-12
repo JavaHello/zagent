@@ -56,7 +56,7 @@ one instead of adopting an old one; `/new` empties it while keeping the path the
 system prompt names; and the whole tree, files included, is deleted at exit. The
 model may also delete the directory, or whatever it left in it, itself. Anything
 worth keeping has to be copied into the workspace or saved with
-[`remember`](memory.md) before the run ends. The directory is not saved with the
+[`memory_save`](memory.md) before the run ends. The directory is not saved with the
 session (`/status` shows the current path).
 
 These are ordinary host directories, not sandboxes or an extra authorization

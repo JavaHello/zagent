@@ -2,7 +2,7 @@
 
 zagent keeps durable notes between sessions in the global `memory.md` scoped to
 the workspace — a plain markdown list the user can read and edit. A note is
-saved when the model calls the `remember` tool at a key point (a preferred
+saved when the model calls the `memory_save` tool at a key point (a preferred
 convention, a project fact, a decision that future work must respect), or when
 the user runs `/remember <text>`. The main model decides what to save; there is
 no separate end-of-turn extraction request. Duplicates are ignored, and the list
@@ -20,7 +20,7 @@ needed.
 
 ## Editing
 
-`remember` can add, replace or delete an exact note; `/memory` lists all notes,
+`memory_save` can add, replace or delete an exact note; `/memory` lists all notes,
 and `/forget <n>` or `/forget all` removes them. A read or write failure never
 breaks a session.
 
@@ -37,5 +37,5 @@ AI_MEMORY_FILE=/path/to/notes.md zagent
 
 Protect a custom memory file from accidental commits.
 
-A [sub-agent](subagents.md) is offered no `remember`: durable notes are the
+A [sub-agent](subagents.md) is offered no `memory_save`: durable notes are the
 caller's business.

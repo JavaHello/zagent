@@ -12,7 +12,7 @@
   的输入历史；`Ctrl+Z` 挂起、`fg` 重绘整屏。[说明](docs/ui.md)
 - **单次查询** — 直接把问题作为命令行参数传入
 - **工具调用** — `bash`、`read`、`write`、`apply_patch`、`ls`、`rg`/`grep`、
-  `fd`/`find`、`http`、`ask_user`、`plan`、`remember`/`memory_search`、
+  `fd`/`find`、`http`、`ask_user`、`plan`、`memory_save`/`memory_search`、
   `announce_task`。[工具](docs/tools.md) · [搜索](docs/searching.md) ·
   [补丁](docs/patching.md) · [HTTP](docs/http.md)
 - **多轮工具链** — 模型循环调用工具直到任务完成。[代理循环](docs/agent-loop.md)

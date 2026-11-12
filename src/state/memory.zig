@@ -210,7 +210,7 @@ pub const Memory = struct {
             return;
         }
         if (self.entries.items.len == 0) {
-            try w.writeAll("No memories saved yet. Use /remember <text>, or let the agent call remember.\n");
+            try w.writeAll("No memories saved yet. Use /remember <text>, or let the agent call memory_save.\n");
             if (self.path) |path| try w.print("File: {s}\n", .{path});
             return;
         }
