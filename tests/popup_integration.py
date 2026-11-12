@@ -21,6 +21,10 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
     (root / 'src').mkdir()
     (root / 'src/alpha.zig').write_text('')
     (root / 'src/中文 file.zig').write_text('')
+    (root / 'abc').mkdir()
+    (root / 'abc/z.zig').write_text('')
+    (root / 'zz').mkdir()
+    (root / 'zz/az.zig').write_text('')
     (root / 'node_modules').mkdir()
     (root / 'node_modules/hidden.zig').write_text('')
     state = root / 'state' / 'zagent'
@@ -95,6 +99,14 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         send(b'\x15@hidden', b'No matching files')
         send('\x15@中文'.encode(), '@src/中文 file.zig  File'.encode())
         send(b'\t', '❯ @"src/中文 file.zig"'.encode())
+        # Queries are fzy subsequences, not substrings: "saz" has no contiguous
+        # occurrence anywhere, yet still finds src/alpha.zig.
+        send(b'\x15@saz', b'@src/alpha.zig  File')
+        # Ranking is by score: "az" prefers zz/az.zig, whose consecutive match
+        # beats abc/z.zig, even though abc/z.zig sorts first alphabetically.
+        send(b'\x15@az', b'@abc/z.zig  File')
+        send(b'\t', '❯ @zz/az.zig'.encode())
+        send(b'\x15', '❯ '.encode())
         # Complete in the middle of a line and retain its suffix.
         send(b'\x15check @alpha tail\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D', b'@src/alpha.zig  File')
         send(b'\t', '❯ check @src/alpha.zig tail'.encode())

@@ -54,6 +54,7 @@ src/
   cli/           — The terminal session around the loop
     commands.zig — Slash commands
     completion.zig — Command and @-path completion
+    fzy.zig      — The fuzzy scoring used to rank @-path completion
     history.zig  — Prompt history: where it is stored, and when it is saved
     runtime.zig  — The one thread that owns the terminal; workers only enqueue
   model/         — The model client and its configuration
