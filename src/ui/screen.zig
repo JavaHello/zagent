@@ -521,7 +521,7 @@ pub const Screen = struct {
         var inverse = false;
         while (index < view.len) {
             if (view[index] == 0x1b) {
-                const next = @import("../util/text.zig").skipAnsiEscape(view, index);
+                const next = @import("../util/terminal/ansi.zig").skipAnsiEscape(view, index);
                 try w.writeAll(view[index..next]);
                 if (inverse) try w.writeAll(ansi.INVERSE);
                 index = next;
@@ -601,7 +601,7 @@ fn statusWidth(bytes: []const u8) usize {
     var i: usize = 0;
     while (i < bytes.len) {
         if (bytes[i] == 0x1b) {
-            i = @import("../util/text.zig").skipAnsiEscape(bytes, i);
+            i = @import("../util/terminal/ansi.zig").skipAnsiEscape(bytes, i);
             continue;
         }
         const cp = term.decodeAt(bytes, i);
@@ -622,7 +622,7 @@ fn restoreRendition(w: *std.Io.Writer, prefix: []const u8) !void {
             i += 1;
             continue;
         }
-        const next = @import("../util/text.zig").skipAnsiEscape(prefix, i);
+        const next = @import("../util/terminal/ansi.zig").skipAnsiEscape(prefix, i);
         if (next >= i + 3 and prefix[i + 1] == '[' and prefix[next - 1] == 'm') {
             try w.writeAll(prefix[i..next]);
         }
@@ -640,7 +640,7 @@ fn visualRows(a: std.mem.Allocator, bytes: []const u8, cols: usize) ![]usize {
     var i: usize = 0;
     while (i < bytes.len) {
         if (bytes[i] == 0x1b) {
-            i = @import("../util/text.zig").skipAnsiEscape(bytes, i);
+            i = @import("../util/terminal/ansi.zig").skipAnsiEscape(bytes, i);
             continue;
         }
         if (bytes[i] == '\n') {

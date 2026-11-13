@@ -20,9 +20,10 @@ const std = @import("std");
 const sgr = @import("style.zig");
 const term = @import("term.zig");
 const text = @import("../util/text.zig");
+const vt = @import("../util/terminal/ansi.zig");
 
 /// Beyond this, an unmatched marker is treated as literal text. Without a cap,
-/// scanning for a closer is quadratic: `@import("../util/text.zig").repeat("*", 100_000)` would compare ~10^10
+/// scanning for a closer is quadratic: `text.repeat("*", 100_000)` would compare ~10^10
 /// bytes on a 100 KB reply.
 const max_span_scan: usize = 2048;
 /// Nesting caps. A prefix wider than the terminal would leave no room for
@@ -368,15 +369,15 @@ const Inline = struct {
 
             if (byte == 0x1b) {
                 try self.wrap.flow(self.cur, source[start..i]);
-                i = text.skipAnsiEscape(source, i);
+                i = vt.skipAnsiEscape(source, i);
                 start = i;
                 continue;
             }
 
-            if (text.isControl(byte) and byte != '\t') {
+            if (vt.isControl(byte) and byte != '\t') {
                 try self.wrap.flow(self.cur, source[start..i]);
                 var buf: [4]u8 = undefined;
-                try self.wrap.word(self.cur, text.escapeByte(&buf, byte));
+                try self.wrap.word(self.cur, vt.escapeByte(&buf, byte));
                 i += 1;
                 start = i;
                 continue;
@@ -391,7 +392,7 @@ const Inline = struct {
                 } else {
                     try self.wrap.flow(self.cur, source[start..i]);
                     var buf: [4]u8 = undefined;
-                    try self.wrap.word(self.cur, text.escapeByte(&buf, byte));
+                    try self.wrap.word(self.cur, vt.escapeByte(&buf, byte));
                     i += 1;
                     start = i;
                 }
@@ -1098,14 +1099,14 @@ pub const Renderer = struct {
             const byte = source[i];
             if (byte == 0x1b) {
                 try self.wrap.flow(.{}, source[start..i]);
-                i = text.skipAnsiEscape(source, i);
+                i = vt.skipAnsiEscape(source, i);
                 start = i;
                 continue;
             }
-            if (text.isControl(byte) and byte != '\t') {
+            if (vt.isControl(byte) and byte != '\t') {
                 try self.wrap.flow(.{}, source[start..i]);
                 var buf: [4]u8 = undefined;
-                try self.wrap.word(.{}, text.escapeByte(&buf, byte));
+                try self.wrap.word(.{}, vt.escapeByte(&buf, byte));
                 i += 1;
                 start = i;
                 continue;
@@ -1117,7 +1118,7 @@ pub const Renderer = struct {
                 } else {
                     try self.wrap.flow(.{}, source[start..i]);
                     var buf: [4]u8 = undefined;
-                    try self.wrap.word(.{}, text.escapeByte(&buf, byte));
+                    try self.wrap.word(.{}, vt.escapeByte(&buf, byte));
                     i += 1;
                     start = i;
                 }

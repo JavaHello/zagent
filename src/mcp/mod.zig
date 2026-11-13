@@ -14,9 +14,9 @@ const std = @import("std");
 const transport = @import("transport.zig");
 const tools = @import("../tools/mod.zig");
 const config = @import("../model/config.zig");
-// `text` is the name every other module imports this under, and also the name
-// of half the values in this one; it is imported as what it is used for here.
-const sanitize = @import("../util/text.zig");
+// `text` is the name of half the values in this module, so the sanitiser is
+// imported under what it is used for here.
+const sanitize = @import("../util/terminal/sanitize.zig");
 const style = @import("../ui/style.zig");
 
 /// The revision this client speaks. It is the current one: no session, no
@@ -1942,7 +1942,7 @@ test "MCP page and diagnostic allocation failures release partial results" {
 
 test "MCP pagination caps each page and frees cursor at the tool limit" {
     const a = std.testing.allocator;
-    const page = "{\"tools\":[" ++ sanitize.repeat("{\"name\":\"tool\"},", 256) ++ "{\"name\":\"extra\"}],\"nextCursor\":\"more\"}";
+    const page = "{\"tools\":[" ++ @import("../util/text.zig").repeat("{\"name\":\"tool\"},", 256) ++ "{\"name\":\"extra\"}],\"nextCursor\":\"more\"}";
     var connection = scriptedConnection(a, &.{.{ .result = page }});
     defer connection.deinit();
     // A separate arena catches accidental response destruction via this allocator.

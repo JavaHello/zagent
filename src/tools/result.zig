@@ -1,5 +1,5 @@
 const std = @import("std");
-const text = @import("../util/text.zig");
+const sanitize = @import("../util/terminal/sanitize.zig");
 
 pub const ToolStatus = struct {
     is_error: bool,
@@ -67,7 +67,7 @@ pub fn finalizeNormalizedResultOwned(normalized: []u8, status: ToolStatus) ToolR
 pub fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    try text.writeSanitized(&aw.writer, raw);
+    try sanitize.writeSanitized(&aw.writer, raw);
     if (aw.written().len == 0) try aw.writer.writeAll("(no output)");
     return aw.toOwnedSlice();
 }

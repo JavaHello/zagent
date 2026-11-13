@@ -110,7 +110,11 @@ src/
     workspace.zig — Trusted directories and the state directory inside them
     scratch.zig  — The per-run scratch directory
   util/          — Small shared modules
-    text.zig     — Sanitising, ANSI stripping and UTF-8 helpers
+    text.zig     — Text helpers that are about bytes: compile-time repetition
+    terminal/    — Everything printed from text this program did not write
+      ansi.zig   — Recognising the ANSI/VT sequences a terminal acts on
+      sanitize.zig — UTF-8, control bytes and one-line flattening
+      normalize.zig — CR redraws, blank-line runs and the line they leave
   editor/        — Line editing, history, popup and raw terminal handling
     linenoise.zig — The editor: read loop, key handling, popups and paste
     state.zig    — One edit in progress: buffer, cursor, rows and popup

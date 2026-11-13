@@ -8,7 +8,7 @@ const commands = @import("cli/commands.zig");
 const mcp = @import("mcp/mod.zig");
 const banner = @import("ui/banner.zig");
 const term = @import("ui/term.zig");
-const text = @import("util/text.zig");
+const sanitize = @import("util/terminal/sanitize.zig");
 const Screen = @import("ui/screen.zig").Screen;
 const Linenoise = @import("editor/linenoise.zig").Linenoise;
 
@@ -489,7 +489,7 @@ fn runRepl(
             var aw: std.Io.Writer.Allocating = .init(allocator);
             defer aw.deinit();
             try aw.writer.writeAll(PROMPT);
-            try text.writeSanitized(&aw.writer, line);
+            try sanitize.writeSanitized(&aw.writer, line);
             try aw.writer.writeByte('\n');
             try screen.writeLog(aw.written());
         }
@@ -874,6 +874,9 @@ test {
     _ = @import("ui/screen.zig");
     _ = @import("ui/banner.zig");
     _ = @import("util/text.zig");
+    _ = @import("util/terminal/ansi.zig");
+    _ = @import("util/terminal/sanitize.zig");
+    _ = @import("util/terminal/normalize.zig");
     _ = @import("ui/render.zig");
     _ = @import("ui/spinner.zig");
     _ = @import("mcp/mod.zig");

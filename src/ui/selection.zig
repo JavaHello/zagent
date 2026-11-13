@@ -1,7 +1,7 @@
 //! SGR mouse parsing and terminal-cell to transcript selection mapping.
 const std = @import("std");
 const term = @import("term.zig");
-const text = @import("../util/text.zig");
+const vt = @import("../util/terminal/ansi.zig");
 
 pub const Mouse = struct { button: usize, x: usize, y: usize, release: bool };
 pub fn parse(report: []const u8) ?Mouse {
@@ -22,7 +22,7 @@ pub fn offset(bytes: []const u8, cell: usize, after: bool) usize {
     var col: usize = 0;
     while (i < bytes.len) {
         if (bytes[i] == 0x1b) {
-            i = text.skipAnsiEscape(bytes, i);
+            i = vt.skipAnsiEscape(bytes, i);
             continue;
         }
         if (bytes[i] == '\n' or bytes[i] == '\r') return i;
@@ -50,7 +50,7 @@ pub fn plain(a: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var i: usize = 0;
     while (i < bytes.len) {
         if (bytes[i] == 0x1b) {
-            i = text.skipAnsiEscape(bytes, i);
+            i = vt.skipAnsiEscape(bytes, i);
             continue;
         }
         const cp = term.decodeAt(bytes, i);

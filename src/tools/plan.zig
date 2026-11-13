@@ -1,6 +1,6 @@
 const std = @import("std");
 const plan_mod = @import("../state/plan.zig");
-const text = @import("../util/text.zig");
+const sanitize = @import("../util/terminal/sanitize.zig");
 const Agent = @import("../agent/mod.zig").Agent;
 const tool = @import("tool.zig");
 
@@ -44,7 +44,7 @@ pub fn writeCallSummary(w: *std.Io.Writer, allocator: std.mem.Allocator, argumen
                 break;
             }
             try w.writeAll(if (i == 0) ": " else ", ");
-            try text.writeOnOneLine(w, step.title);
+            try sanitize.writeOnOneLine(w, step.title);
         }
         return true;
     }
@@ -52,11 +52,11 @@ pub fn writeCallSummary(w: *std.Io.Writer, allocator: std.mem.Allocator, argumen
         try w.print("step {d}", .{index});
         if (args.status) |status| {
             try w.writeAll(" → ");
-            try text.writeOnOneLine(w, status);
+            try sanitize.writeOnOneLine(w, status);
         }
         if (args.note) |note| {
             try w.writeAll(" · ");
-            try text.writeOnOneLine(w, note);
+            try sanitize.writeOnOneLine(w, note);
         }
         return true;
     }

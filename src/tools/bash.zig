@@ -3,7 +3,8 @@ const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 const args_mod = @import("args.zig");
 const ccr = @import("ccr.zig");
-const sanitize = @import("../util/text.zig");
+const sanitize = @import("../util/terminal/sanitize.zig");
+const normalize = @import("../util/terminal/normalize.zig");
 const host_exec = @import("../host/exec.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -94,12 +95,13 @@ const Tail = struct {
 /// What a command's two streams are collected into while it runs.
 ///
 /// The body is the text one result would show if it had no size limit: the
-/// sanitised stdout, then stderr under a label of its own, so a line read back
-/// later is never two streams run together. It is built as the output arrives
-/// rather than after the command ends — up to `cache_threshold_bytes` it is
-/// held as text, and past that the whole of it is streamed into the cache file,
-/// so a command that prints without end costs this process a fixed amount of
-/// memory instead of all of it.
+/// sanitised and normalised stdout, then stderr under a label of its own, so a
+/// line read back later is never two streams run together — and a progress bar
+/// redrawn in place is not one line per redraw. It is built as the output
+/// arrives rather than after the command ends — up to `cache_threshold_bytes` it
+/// is held as text, and past that the whole of it is streamed into the cache
+/// file, so a command that prints without end costs this process a fixed amount
+/// of memory instead of all of it.
 const Collector = struct {
     allocator: std.mem.Allocator,
     cache_dir: ?[]const u8,
@@ -127,13 +129,19 @@ const Collector = struct {
     /// Sanitising state of each stream: text arrives in pieces, and a sequence
     /// or a character cut in half by a chunk boundary is finished by the next.
     sanitizers: [2]sanitize.Chunked = .{ .{}, .{} },
+    /// Normalising state of each stream: the line in progress is held back
+    /// until the carriage return that may overwrite it, or its end, arrives.
+    normalizers: [2]normalize.Normalizer = .{ .{}, .{} },
     scratch: std.ArrayList(u8) = .empty,
+    normalized: std.ArrayList(u8) = .empty,
 
     pub fn feed(self: *Collector, io: std.Io, stream: host_exec.Stream, raw: []const u8) !void {
         if (stream == .stderr and !self.labelled) {
             self.labelled = true;
             // The body's own shape: stdout, a newline if it did not end with
-            // one, then the label stderr is read under.
+            // one, then the label stderr is read under. What stdout's normaliser
+            // is still holding is stdout's last line, so it goes out first.
+            try self.flushNormalizer(io, .stdout);
             if (self.bytes > 0 and self.last_byte != '\n') try self.append(io, "\n");
             try self.append(io, "stderr:\n");
         }
@@ -141,6 +149,27 @@ const Collector = struct {
         var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.scratch);
         defer self.scratch = aw.toArrayList();
         try self.sanitizers[@backingInt(stream)].feed(&aw.writer, raw);
+        try self.emitNormalized(io, stream, aw.written());
+    }
+
+    /// Normalise one sanitised piece of a stream and append what a terminal
+    /// would have ended up showing of it.
+    fn emitNormalized(self: *Collector, io: std.Io, stream: host_exec.Stream, raw: []const u8) !void {
+        if (raw.len == 0) return;
+        self.normalized.clearRetainingCapacity();
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.normalized);
+        defer self.normalized = aw.toArrayList();
+        try self.normalizers[@backingInt(stream)].feed(self.allocator, &aw.writer, raw);
+        try self.append(io, aw.written());
+    }
+
+    /// Write out the line a stream's normaliser is still holding: its end is
+    /// known because nothing more is coming for that stream.
+    fn flushNormalizer(self: *Collector, io: std.Io, stream: host_exec.Stream) !void {
+        self.normalized.clearRetainingCapacity();
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.normalized);
+        defer self.normalized = aw.toArrayList();
+        try self.normalizers[@backingInt(stream)].finish(&aw.writer);
         try self.append(io, aw.written());
     }
 
@@ -200,15 +229,17 @@ const Collector = struct {
         if (data.len > room) self.capped = true;
     }
 
-    /// Finish the body: whatever a sanitizer still holds is written out, and
-    /// the cache entry is closed. Answers what the whole output held, for the
-    /// notice a long one names it in.
+    /// Finish the body: whatever a sanitizer or a normaliser still holds is
+    /// written out, and the cache entry is closed. Answers what the whole output
+    /// held, for the notice a long one names it in.
     pub fn finish(self: *Collector, io: std.Io) !?ccr.Saved {
-        for (&self.sanitizers) |*sanitizer| {
-            var aw: std.Io.Writer.Allocating = .init(self.allocator);
-            defer aw.deinit();
-            try sanitizer.finish(&aw.writer);
-            try self.append(io, aw.written());
+        for ([_]host_exec.Stream{ .stdout, .stderr }) |stream| {
+            self.scratch.clearRetainingCapacity();
+            var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &self.scratch);
+            defer self.scratch = aw.toArrayList();
+            try self.sanitizers[@backingInt(stream)].finish(&aw.writer);
+            try self.emitNormalized(io, stream, aw.written());
+            try self.flushNormalizer(io, stream);
         }
         if (self.stream) |*stream| return stream.finish(io);
         return null;
@@ -225,7 +256,9 @@ const Collector = struct {
         if (self.stream) |*stream| stream.deinit(io, self.allocator);
         self.head.deinit(self.allocator);
         self.tail.deinit(self.allocator);
+        for (&self.normalizers) |*normalizer| normalizer.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
+        self.normalized.deinit(self.allocator);
     }
 };
 
@@ -452,6 +485,24 @@ test "shell status survives empty output, stderr, signals and truncation" {
     try std.testing.expect(long.content.len <= result_mod.max_output_bytes);
     try std.testing.expect(long.is_error and long.truncated);
     try std.testing.expect(std.mem.indexOf(u8, long.content, "Output cut") != null);
+}
+
+test "output is collected as the screen showed it, not as it was written" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { command: []const u8, expected: []const u8 }{
+        // A progress bar redrawn in place: one line per redraw would be lines
+        // of stale percentages read back as if they had all been printed.
+        .{ .command = "printf 'one\\rtwo\\rdone\\n'", .expected = "Exit code: 0\ndone\n" },
+        // A carriage return that ends the line is a line ending like any other.
+        .{ .command = "printf 'one\\r\\ntwo\\r\\n'", .expected = "Exit code: 0\none\ntwo\n" },
+        // Blank lines are layout; more than one of them in a row is not.
+        .{ .command = "printf 'a\\n\\n\\n\\nb\\n'", .expected = "Exit code: 0\na\n\nb\n" },
+    };
+    for (cases) |case| {
+        const result = try executeShell(std.testing.io, a, case.command);
+        defer result.deinit(a);
+        try std.testing.expectEqualStrings(case.expected, result.content);
+    }
 }
 
 test "long output is cached and the result names the id it is read back with" {

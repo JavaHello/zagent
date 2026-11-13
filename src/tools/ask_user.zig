@@ -1,6 +1,6 @@
 const std = @import("std");
 const menu = @import("../ui/menu.zig");
-const text = @import("../util/text.zig");
+const sanitize = @import("../util/terminal/sanitize.zig");
 const Agent = @import("../agent/mod.zig").Agent;
 const dismissed_question_message = @import("../agent/prompt.zig").dismissed_question_message;
 const tool = @import("tool.zig");
@@ -21,13 +21,13 @@ fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments_json: []const u8
     const questions = parseQuestions(ctx.allocator, arguments_json) catch return false;
     defer questions.deinit(ctx.allocator);
     if (questions.items.len == 1) {
-        try text.writeOnOneLine(w, questions.items[0].text);
+        try sanitize.writeOnOneLine(w, questions.items[0].text);
         return true;
     }
     try w.print("{d} questions: ", .{questions.items.len});
     for (questions.items, 0..) |question, index| {
         if (index > 0) try w.writeAll(" · ");
-        try text.writeOnOneLine(w, question.text);
+        try sanitize.writeOnOneLine(w, question.text);
     }
     return true;
 }

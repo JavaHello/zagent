@@ -66,7 +66,7 @@ pub fn writeCallBrief(w: *std.Io.Writer, raw: []const u8) !void {
         if (raw[used] == '\n' or raw[used] == '\r') break;
     }
     while (used > 0 and used < raw.len and (raw[used] & 0xC0) == 0x80) used -= 1;
-    try @import("../util/text.zig").writeSanitized(w, raw[0..used]);
+    try @import("../util/terminal/sanitize.zig").writeSanitized(w, raw[0..used]);
     if (used < raw.len) try w.writeAll("…");
 }
 

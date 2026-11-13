@@ -38,7 +38,7 @@
 
 const std = @import("std");
 const sgr = @import("../ui/style.zig");
-const text = @import("../util/text.zig");
+const sanitize = @import("../util/terminal/sanitize.zig");
 
 /// Longest file this will patch. The whole file is read into memory and rebuilt
 /// there, so this cap is what keeps a mistyped path from taking the process out.
@@ -1572,7 +1572,7 @@ pub fn render(w: *std.Io.Writer, patch_text: []const u8) !void {
         // printed as an escape, which is noise rather than a shorter line.
         var cut = @min(line.len, render_max_line_bytes);
         while (cut > 0 and cut < line.len and !std.unicode.utf8ValidateSlice(line[0..cut])) cut -= 1;
-        try text.writeSanitized(w, line[0..cut]);
+        try sanitize.writeSanitized(w, line[0..cut]);
         if (cut < line.len) try w.writeAll("…");
 
         if (style.len != 0) try w.writeAll(sgr.RESET);

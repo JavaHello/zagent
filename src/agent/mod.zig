@@ -2,7 +2,7 @@ const std = @import("std");
 const openai = @import("../model/openai.zig");
 const trace_mod = @import("../debug/trace.zig");
 const tools = @import("../tools/mod.zig");
-const text = @import("../util/text.zig");
+const sanitize = @import("../util/terminal/sanitize.zig");
 const menu = @import("../ui/menu.zig");
 const memory_mod = @import("../state/memory.zig");
 const plan_mod = @import("../state/plan.zig");
@@ -455,7 +455,7 @@ pub const Agent = struct {
                     var aw: std.Io.Writer.Allocating = .init(self.allocator);
                     defer aw.deinit();
                     try aw.writer.writeAll("\n" ++ BOLD ++ GREEN ++ "❯" ++ RESET ++ " ");
-                    try text.writeSanitized(&aw.writer, content);
+                    try sanitize.writeSanitized(&aw.writer, content);
                     try aw.writer.writeByte('\n');
                     try self.writeLogOrStdout(aw.written());
                 }
@@ -688,7 +688,7 @@ pub const Agent = struct {
         try aw.writer.writeAll("\n\n");
         for (lines.items, 0..) |line, index| {
             if (index > 0) try aw.writer.writeByte('\n');
-            try text.writeSanitized(&aw.writer, line);
+            try sanitize.writeSanitized(&aw.writer, line);
         }
 
         try self.appendUserMessage(aw.written());
@@ -1579,13 +1579,13 @@ pub const Agent = struct {
         const summarized = if (spec) |s| if (s.summary) |write| try write(ctx, &preview.writer, arguments) else false else false;
         const block = summarized and spec.?.summary_block;
         try w.writeAll(if (spec != null and spec.?.delegated) CYAN ++ "  ⇢ " else YELLOW ++ "  ⚙ ");
-        try text.writeSanitized(w, name);
+        try sanitize.writeSanitized(w, name);
         if (block) {
             try w.writeAll("\n" ++ RESET);
             try w.writeAll(preview.written());
         } else {
             try w.writeAll(RESET ++ " ");
-            try text.writeSanitized(w, if (summarized) preview.written() else arguments);
+            try sanitize.writeSanitized(w, if (summarized) preview.written() else arguments);
             try w.writeByte('\n');
         }
     }
@@ -1669,7 +1669,7 @@ pub const Agent = struct {
                 defer raw.deinit();
                 const label = try write(.{ .io = self.io, .allocator = self.allocator, .agent = self }, &raw, arguments) orelse return null;
                 buf.clearRetainingCapacity();
-                try text.writeSanitized(&buf.writer, label);
+                try sanitize.writeSanitized(&buf.writer, label);
                 return buf.written();
             }
         }
@@ -1689,7 +1689,7 @@ pub const Agent = struct {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         try aw.writer.writeAll(if (is_error) RED ++ "  ✗ " else DIM ++ "  ✓ ");
-        try text.writeSanitized(&aw.writer, content[0..preview_len]);
+        try sanitize.writeSanitized(&aw.writer, content[0..preview_len]);
         if (content.len > preview_len) try aw.writer.writeAll("...");
         try aw.writer.writeAll("\n" ++ RESET);
         try self.emit(std.Io.File.stderr(), "{s}", .{aw.written()});

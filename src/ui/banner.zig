@@ -4,7 +4,7 @@
 //! custom palette. Redirected output, TERM=dumb and NO_COLOR stay uncoloured.
 
 const std = @import("std");
-const text = @import("../util/text.zig");
+const sanitize = @import("../util/terminal/sanitize.zig");
 const style = @import("style.zig");
 
 pub const ColorMode = enum { none, ansi };
@@ -100,7 +100,7 @@ test "ANSI wordmark uses only the terminal palette and preserves glyphs" {
     defer std.testing.allocator.free(plain);
     var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw.deinit();
-    try text.writeSanitized(&aw.writer, out);
+    try sanitize.writeSanitized(&aw.writer, out);
     try std.testing.expectEqualStrings(plain, aw.written());
     var lines = std.mem.splitScalar(u8, out, '\n');
     _ = lines.next();

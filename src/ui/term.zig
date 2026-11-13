@@ -7,7 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const wcwidth = @import("../unicode_width/wcwidth.zig").wcwidth;
-const text = @import("../util/text.zig");
+const vt = @import("../util/terminal/ansi.zig");
 const ansi = @import("style.zig");
 
 /// Used when the terminal size cannot be read, and on Windows.
@@ -73,7 +73,7 @@ fn writeTitleText(w: *std.Io.Writer, bytes: []const u8, limit: usize) !void {
             return;
         }
         if (bytes[i] == 0x1b) {
-            i = text.skipAnsiEscape(bytes, i);
+            i = vt.skipAnsiEscape(bytes, i);
             continue;
         }
         const cp = decodeAt(bytes, i);
@@ -138,7 +138,7 @@ pub fn width(bytes: []const u8) usize {
     var i: usize = 0;
     while (i < bytes.len) {
         if (bytes[i] == 0x1b) {
-            i = text.skipAnsiEscape(bytes, i);
+            i = vt.skipAnsiEscape(bytes, i);
             continue;
         }
         const cp = decodeAt(bytes, i);

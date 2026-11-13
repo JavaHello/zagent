@@ -1,5 +1,5 @@
 const std = @import("std");
-const text = @import("../util/text.zig");
+const sanitize = @import("../util/terminal/sanitize.zig");
 const Agent = @import("../agent/mod.zig").Agent;
 const tool = @import("tool.zig");
 
@@ -20,7 +20,7 @@ fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments_json: []const u8
     const parsed = std.json.parseFromSlice(struct { title: []const u8 }, ctx.allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return false;
     defer parsed.deinit();
     if (parsed.value.title.len == 0) return false;
-    try text.writeOnOneLine(w, parsed.value.title);
+    try sanitize.writeOnOneLine(w, parsed.value.title);
     return true;
 }
 
