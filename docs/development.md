@@ -67,7 +67,7 @@ src/
     mod.zig      — Re-exports the tool API the rest of the program uses
     tool.zig     — What a built-in tool is: name, description, schema, label, run
     bash.zig     — bash
-    read.zig     — read: one numbered page of a file
+    read.zig     — read: one numbered page of a file, a repeat folded into a marker
     write.zig    — write: whole-file writes
     edit.zig     — edit: exact-block replacements
     apply_patch.zig — apply_patch: a Git unified diff
@@ -111,7 +111,6 @@ src/
     scratch.zig  — The per-run scratch directory
   util/          — Small shared modules
     text.zig     — Sanitising, ANSI stripping and UTF-8 helpers
-    compact.zig  — Dropping tool results, deduplicating repeated reads
   editor/        — Line editing, history, popup and raw terminal handling
     linenoise.zig — The editor: read loop, key handling, popups and paste
     state.zig    — One edit in progress: buffer, cursor, rows and popup
@@ -155,6 +154,13 @@ Tool-specific argument summaries and dynamic progress labels belong to the
 spec's optional `summary` and `progress` callbacks, not name checks in Agent.
 Only a connected MCP server's tool is matched by its prefix rather than a
 built-in spec, because its name is discovered at runtime.
+
+`read` uses `ctx.agent` for the opposite reason to a session tool: it reads the
+conversation already in the history, so a page read a second time is answered
+with a marker naming the earlier result instead of a second copy of it. That
+rewriting happens in the tool, where the call's arguments and its output are
+both in hand; the agent loop appends whatever a tool returns and keeps no
+knowledge of which tool could repeat itself.
 
 ### Execution hooks
 

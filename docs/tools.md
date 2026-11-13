@@ -89,6 +89,12 @@ larger than a megabyte can be read without loading it whole. A single line
 longer than the output limit (minified JSON, say) comes back as its beginning,
 cut on a UTF-8 boundary, with the suggestion to read the rest with `bash`.
 
+A page already in the conversation is not repeated: a read whose path, page and
+output are identical to an earlier one is answered with a one-line marker naming
+that earlier result and the SHA-256 of the contents. The marker is never counted
+as the earlier result still being there — once it is gone from the context, the
+page is read in full again, see [Sessions](sessions.md#context).
+
 ## `write`
 
 Creates a file or overwrites its entire contents. For an exact block replacement,

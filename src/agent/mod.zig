@@ -4,7 +4,6 @@ const trace_mod = @import("../debug/trace.zig");
 const tools = @import("../tools/mod.zig");
 const text = @import("../util/text.zig");
 const menu = @import("../ui/menu.zig");
-const compact = @import("../util/compact.zig");
 const memory_mod = @import("../state/memory.zig");
 const plan_mod = @import("../state/plan.zig");
 const mcp = @import("../mcp/mod.zig");
@@ -1261,9 +1260,9 @@ pub const Agent = struct {
                             .timed_out = err == error.Timeout,
                         };
                     };
-                    // The result as the model will read it: before a duplicate
-                    // is folded away or a page is clipped, so the reason for
-                    // what the model saw is in the record.
+                    // The result as the model reads it, so the record holds
+                    // what the model was handed — down to a repeated page the
+                    // read tool answered with a marker.
                     if (self.trace) |trace| trace.toolResult(self.traceCtx(), call.name, call.id, result.content, .{
                         .is_error = result.is_error,
                         .exit_code = result.exit_code,
@@ -1273,7 +1272,7 @@ pub const Agent = struct {
                     });
                     defer result.deinit(self.allocator);
 
-                    const result_content = try compact.deduplicateReadResult(self.allocator, self.history.items, call, result.content, result.is_error);
+                    const result_content = try self.allocator.dupe(u8, result.content);
                     errdefer self.allocator.free(result_content);
                     const call_id = try self.allocator.dupe(u8, call.id);
                     errdefer self.allocator.free(call_id);

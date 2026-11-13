@@ -868,7 +868,6 @@ test {
     _ = @import("ui/menu.zig");
     _ = @import("cli/completion.zig");
     _ = @import("cli/commands.zig");
-    _ = @import("util/compact.zig");
     _ = @import("state/memory.zig");
     _ = @import("ui/style.zig");
     _ = @import("ui/term.zig");

@@ -42,10 +42,11 @@ no summary request, no automatic token threshold and no way for the model to
 drop its own earlier results, because it cannot reliably judge how much of its
 context is still needed. `/clear` starts over.
 
-The one saving that does happen is free and mechanical: when the same file
-region is read again with identical output, the second result is replaced by a
-one-line marker that points at the earlier result instead of repeating it, while
-both calls and results stay paired — a Responses request must answer every
+The one saving that does happen is free and mechanical, and the `read` tool
+makes it where it answers the call: when the same file region is read again with
+identical output, the second result is replaced by a one-line marker that points
+at the earlier result instead of repeating it, while both calls and results stay
+paired — a Responses request must answer every
 `function_call` with its `function_call_output`, and the assistant message
 replays the exact output items it was given.
 
