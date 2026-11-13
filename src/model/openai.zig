@@ -40,10 +40,10 @@ test "search registration follows installed backends and advertises renamed file
 
 test "omitted names drop from the startup defaults and search selection still applies" {
     const allocator = std.testing.allocator;
-    // The six tools a sub-agent must not hold, as agent/prompt.zig names them:
+    // The five tools a sub-agent must not hold, as agent/prompt.zig names them:
     // it cannot ask the user, announce on a terminal it does not own, move the
-    // plan, write the shared memory, start a run of its own, or stop one.
-    const omit = [_][]const u8{ "ask_user", "announce_task", "plan", "memory_save", "subagent", "subagent_stop" };
+    // plan, write the shared memory, or start a run of its own.
+    const omit = [_][]const u8{ "ask_user", "announce_task", "plan", "memory_save", "subagent" };
     for ([_]search_tools.SearchBackends{ .{}, .{ .rg = true }, .{ .fd = true }, .{ .rg = true, .fd = true } }) |search| {
         const body = try buildRequestWithToolSelection(allocator, "test", &.{}, 100, .{ .omit = &omit }, false, search);
         defer allocator.free(body);

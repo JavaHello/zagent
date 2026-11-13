@@ -17,7 +17,8 @@
   [补丁](docs/patching.md) · [HTTP](docs/http.md)
 - **多轮工具链** — 模型循环调用工具直到任务完成。[代理循环](docs/agent-loop.md)
 - **子 agent** — 把一件自足的任务交给同一个进程里的第二个 agent，并「看着」它：
-  到检查点回一份进度报告，由你决定它继续还是停止。[子 agent](docs/subagents.md)
+  每隔一段自检时间在终端打一份进度报告，到期限就停下并说明做完了什么、还剩什么。
+  [子 agent](docs/subagents.md)
 - **MCP 服务** — 启动 `mcp.json` 里描述的服务，把它们的工具按需加载给模型。
   [MCP](docs/mcp.md)
 - **会话计划** — 进行中工作的清单，`/clear` 之后仍在，`--resume` 时还原。
@@ -152,7 +153,7 @@ Enter 提交，Alt+Enter 或 Ctrl+J 换行，`Ctrl+Z` 挂起，`Ctrl+D` 退出�
 | [Searching](docs/searching.md) | `rg`、`grep`、`fd`、`find` |
 | [Patching](docs/patching.md) | `apply_patch` 与 unified diff |
 | [HTTP requests](docs/http.md) | `http` 工具 |
-| [Sub-agents](docs/subagents.md) | 子 agent 与检查点 |
+| [Sub-agents](docs/subagents.md) | 子 agent、自检与期限 |
 | [MCP servers](docs/mcp.md) | `mcp.json` 与工具懒加载 |
 | [Debug tracing](docs/debug.md) | `--debug`：每一步记录与 HTML 报告 |
 | [Sessions](docs/sessions.md) | 持久会话、`--resume`、上下文 |

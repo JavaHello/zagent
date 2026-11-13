@@ -21,8 +21,9 @@ between runs.
 - **Multi-turn tool chaining** — the agent loops until the task is complete.
   [The agent loop](docs/agent-loop.md)
 - **Sub-agents** — hand one self-contained task to a second agent and watch it:
-  a check-in comes back as a progress report, and you decide whether it carries
-  on. [Sub-agents](docs/subagents.md)
+  every self-check interval it reports its progress on the terminal, and at its
+  deadline it stops and says what is done and what is left.
+  [Sub-agents](docs/subagents.md)
 - **MCP servers** — start the servers described in `mcp.json` and give their
   tools to the model beside the built-in ones, loaded on demand.
   [MCP servers](docs/mcp.md)
@@ -166,7 +167,7 @@ before pointing it at anything unfamiliar.
 | [Searching](docs/searching.md) | `rg`, `grep`, `fd`, `find` |
 | [Patching](docs/patching.md) | `apply_patch` and unified diffs |
 | [HTTP requests](docs/http.md) | The `http` tool |
-| [Sub-agents](docs/subagents.md) | A second agent and its check-ins |
+| [Sub-agents](docs/subagents.md) | A second agent, its self-checks and its deadline |
 | [MCP servers](docs/mcp.md) | `mcp.json` and lazy tool loading |
 | [Debug tracing](docs/debug.md) | `--debug`: every step, and the HTML report of a run |
 | [Sessions](docs/sessions.md) | Durable conversations, `--resume`, context |

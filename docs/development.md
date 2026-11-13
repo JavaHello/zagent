@@ -50,7 +50,7 @@ src/
   agent/         — The agent loop
     mod.zig      — Call API → execute tools → repeat → check completion
     prompt.zig   — The system prompt, the sub-agent prompt, and their limits
-    subagent.zig — The check-in handshake between a caller and a sub-agent
+    subagent.zig — What a caller and its sub-agent share: self-checks, deadline
   cli/           — The terminal session around the loop
     commands.zig — Slash commands
     completion.zig — Command and @-path completion

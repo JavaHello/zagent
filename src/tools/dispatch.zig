@@ -47,7 +47,6 @@ pub const all = [_]tool.Tool{
     @import("announce_task.zig").spec,
     @import("plan.zig").spec,
     @import("subagent.zig").spec,
-    @import("subagent_stop.zig").spec,
     @import("report.zig").spec,
     @import("load_mcp_tools.zig").spec,
 };
@@ -247,7 +246,6 @@ test "presentation callbacks belong to tool specs and preserve fallback" {
     try std.testing.expect(patch.summary_block);
     try std.testing.expect(!try patch.summary.?(ctx, &out.writer, "{}"));
     try std.testing.expect(presentation("subagent").?.delegated);
-    try std.testing.expect(presentation("subagent_stop").?.progress != null);
     try std.testing.expect(presentation("bash").?.summary == null);
     // Every call is shown on the terminal, so the two session tools whose
     // arguments are prose name themselves instead of leaving JSON behind.
@@ -259,8 +257,8 @@ test "presentation callbacks belong to tool specs and preserve fallback" {
 test "session and MCP tools require an agent context" {
     const a = std.testing.allocator;
     const names = [_][]const u8{
-        "memory_search", "memory_save",   "ask_user", "announce_task",  "plan",
-        "subagent",      "subagent_stop", "report",   "load_mcp_tools", @import("../mcp/mod.zig").tool_prefix ++ "test",
+        "memory_search", "memory_save", "ask_user",       "announce_task",                                 "plan",
+        "subagent",      "report",      "load_mcp_tools", @import("../mcp/mod.zig").tool_prefix ++ "test",
     };
     for (names) |name| {
         const result = try call(name, "{}");

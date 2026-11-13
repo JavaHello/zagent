@@ -22,7 +22,7 @@ answer with the result — until the task is done, see
 | `plan` | Keep the checklist of the work in progress | [Plan](plan.md) |
 | `memory_save`, `memory_search` | Save and recall durable notes | [Memory](memory.md) |
 | `announce_task` | Name the task on the terminal | [Interface](ui.md#task-announcement) |
-| `subagent`, `subagent_stop`, `report` | Hand a task to a second agent | [Sub-agents](subagents.md) |
+| `subagent`, `report` | Hand a task to a second agent | [Sub-agents](subagents.md) |
 | `load_mcp_tools` | Load an MCP service's tools on demand | [MCP servers](mcp.md) |
 
 Which search programs are offered is decided once at startup from `PATH`:

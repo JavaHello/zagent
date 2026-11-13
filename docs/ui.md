@@ -180,8 +180,9 @@ single-query mode and render on stderr.
 Waiting for the model, and running a tool, each get one animated line
 (`⠋ bash… 8s`) with the time so far, so a long wait never looks like a hang. A
 [sub-agent](subagents.md#on-the-terminal)'s wait is marked as one, in cyan and
-named. Live progress is off unless both stdout and stderr are a terminal, where
-the line can be taken and given back.
+named, and its self-checks are printed under the line it gives back for them.
+Live progress is off unless both stdout and stderr are a terminal, where the
+line can be taken and given back.
 
 ## Task announcement
 

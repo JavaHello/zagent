@@ -5,9 +5,9 @@ const tool = @import("tool.zig");
 
 pub const spec: tool.Tool = .{
     .name = "subagent",
-    .description = "Hand one self-contained task to a sub-agent that works on its own and returns a short report. The sub-agent does not read this conversation, cannot ask the user and cannot change the plan, so the task must carry everything it needs. Give it a 'title' — a one-line summary of the task, fewer than 80 characters — because that is what the terminal shows while the run works. Use it for a step whose tool output would flood this conversation; verify its work yourself before marking a plan step done. The sub-agent has no limits of its own: you watch it instead. 'checkin_seconds' is how long it works before it is asked for a progress report, and the call returns with that report, the final report, or the end of the run. A run that reported is paused: call subagent again with its 'id' to let it carry on, or subagent_stop with its 'id' to stop it and take its final report.",
+    .description = "Hand one self-contained task to a sub-agent that works on its own and returns one final report. The sub-agent does not read this conversation, cannot ask the user and cannot change the plan, so the task must carry everything it needs. Give it a 'title' — a one-line summary of the task, fewer than 80 characters — because that is what the terminal shows while the run works. Use it for a step whose tool output would flood this conversation; verify its work yourself before marking a plan step done. Two clocks bound the run, and both are yours to set: every 'self_check_seconds' the sub-agent is asked to check itself, and that progress report is printed on the terminal for the user, never returned to you; at 'deadline_seconds' it must stop and say what is done and what is left, and that report is what this call returns. There is nothing in between: you wait for the end of the run.",
     .parameters_json =
-    \\{"type":"object","properties":{"task":{"type":"string","description":"One self-contained task: what to do and how it is verified, in full, since the sub-agent does not read this conversation. Omit it to resume or to start a second sub-agent by 'id'."},"title":{"type":"string","maxLength":79,"description":"One-line summary of the task, fewer than 80 Unicode characters: the terminal shows it on the call's line and while the run works. Omit it and that line falls back to the task itself."},"context":{"type":"string","description":"Optional facts the sub-agent needs: file paths, decisions already made, the shape of the expected change. Keep it short."},"id":{"type":"string","description":"The id of a sub-agent that is paused at a progress report: the call lets it carry on and returns its next report or its final one. Omit it to start a new sub-agent with 'task'."},"checkin_seconds":{"type":"integer","minimum":0,"maximum":3600,"description":"How long the sub-agent works before it is asked for a progress report, default 300. It is not a limit on the work: at the check-in the run pauses with that report, and you decide whether to go on. 0 asks for the report at the next request boundary."}},"required":[]}
+    \\{"type":"object","properties":{"task":{"type":"string","description":"One self-contained task: what to do and how it is verified, in full, since the sub-agent does not read this conversation. Omit it to resume a saved run by 'id'."},"title":{"type":"string","maxLength":79,"description":"One-line summary of the task, fewer than 80 Unicode characters: the terminal shows it on the call's line and while the run works. Omit it and that line falls back to the task itself."},"context":{"type":"string","description":"Optional facts the sub-agent needs: file paths, decisions already made, the shape of the expected change. Keep it short."},"id":{"type":"string","description":"The id of a run saved by an earlier session: the call restores it, lets it carry on with this same task and returns its final report. Omit it to start a new sub-agent with 'task'."},"self_check_seconds":{"type":"integer","minimum":0,"maximum":3600,"description":"How long the sub-agent works between self-checks, default 600. At each one it is asked for a progress report that is printed on the terminal for the user; the run carries on by itself and nothing comes back to you. 0 asks at its next request boundary."},"deadline_seconds":{"type":"integer","minimum":1,"maximum":86400,"description":"How long the sub-agent may run, default 3600. At the deadline it stops working and writes its final report — what is done and what is left undone — which is what this call returns. A few minutes of grace are given for that report to be written."}},"required":[]}
     ,
     .run = run,
     .summary = writeRunName,
@@ -85,34 +85,39 @@ pub fn execute(self: *Agent, arguments: []const u8) anyerror!tool.ToolResult {
         title: ?[]const u8 = null,
         context: ?[]const u8 = null,
         id: ?[]const u8 = null,
-        checkin_seconds: ?u32 = null,
+        self_check_seconds: ?u32 = null,
+        deadline_seconds: ?u32 = null,
     };
     const parsed = std.json.parseFromSlice(Arguments, self.allocator, arguments, .{}) catch {
         return .{
-            .content = try self.allocator.dupe(u8, "Error: subagent takes a 'task' string to start a run, or the 'id' of a paused run to let it carry on; it may also take 'title', 'context' and 'checkin_seconds' (0-3600)."),
+            .content = try self.allocator.dupe(u8, "Error: subagent takes a 'task' string to start a run, or the 'id' of a saved run to let it carry on; it may also take 'title', 'context', 'self_check_seconds' (0-3600) and 'deadline_seconds' (1-86400)."),
             .is_error = true,
         };
     };
     defer parsed.deinit();
-    const checkin = parsed.value.checkin_seconds orelse prompt.default_subagent_checkin_seconds;
-    if (checkin > prompt.max_subagent_checkin_seconds) return .{
-        .content = try std.fmt.allocPrint(self.allocator, "Error: checkin_seconds must be between 0 and {d}. It is how long the sub-agent works before it is asked for a progress report, not a limit on the work.", .{prompt.max_subagent_checkin_seconds}),
+    const self_check = parsed.value.self_check_seconds orelse prompt.default_subagent_self_check_seconds;
+    if (self_check > prompt.max_subagent_self_check_seconds) return .{
+        .content = try std.fmt.allocPrint(self.allocator, "Error: self_check_seconds must be between 0 and {d}: it is how often the sub-agent is asked for a progress report, not a limit on the work.", .{prompt.max_subagent_self_check_seconds}),
+        .is_error = true,
+    };
+    const deadline = parsed.value.deadline_seconds orelse prompt.default_subagent_deadline_seconds;
+    if (deadline == 0 or deadline > prompt.max_subagent_deadline_seconds) return .{
+        .content = try std.fmt.allocPrint(self.allocator, "Error: deadline_seconds must be between 1 and {d}: it is when the sub-agent stops working and reports what is done and what is left.", .{prompt.max_subagent_deadline_seconds}),
         .is_error = true,
     };
     if (parsed.value.id) |id| {
-        const child = self.findRun(id) orelse (self.restoreRun(id, checkin) catch |err| return .{
+        const child = self.findRun(id) orelse (self.restoreRun(id, self_check) catch |err| return .{
             .content = if (err == error.FileNotFound)
                 try std.fmt.allocPrint(self.allocator, "Error: no saved sub-agent has the id \"{s}\".", .{id})
             else
                 try std.fmt.allocPrint(self.allocator, "Error: could not restore sub-agent \"{s}\": {s}.", .{ id, @errorName(err) }),
             .is_error = true,
         });
-        child.supervisor.carryOn(checkin == 0);
-        return self.waitRun(child, checkin);
+        return self.waitRun(child, self_check, deadline);
     }
     const task = std.mem.trim(u8, parsed.value.task orelse "", " \t\r\n");
     if (task.len == 0 or task.len > prompt.max_subagent_task_bytes or !std.unicode.utf8ValidateSlice(task)) return .{
-        .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's task must be non-empty UTF-8 of at most {d} bytes: say what to do, and leave documents in files it can read. Pass the 'id' of a paused run instead to let it carry on.", .{prompt.max_subagent_task_bytes}),
+        .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's task must be non-empty UTF-8 of at most {d} bytes: say what to do, and leave documents in files it can read. Pass the 'id' of a saved run instead to let it carry on.", .{prompt.max_subagent_task_bytes}),
         .is_error = true,
     };
     const context: []const u8 = if (parsed.value.context) |value| std.mem.trim(u8, value, " \t\r\n") else "";
@@ -125,11 +130,11 @@ pub fn execute(self: *Agent, arguments: []const u8) anyerror!tool.ToolResult {
         .content = try std.fmt.allocPrint(self.allocator, "Error: the title must be one line of at most {d} Unicode characters: it is the summary the terminal shows while the run works, and the task itself says the rest. Leave it out to fall back to the task.", .{prompt.max_subagent_title_chars}),
         .is_error = true,
     };
-    const child = self.startRun(task, context, title, checkin) catch |err| return .{
+    const child = self.startRun(task, context, title, self_check) catch |err| return .{
         .content = try std.fmt.allocPrint(self.allocator, "The sub-agent could not start: {s}.", .{@errorName(err)}),
         .is_error = true,
     };
-    return self.waitRun(child, checkin);
+    return self.waitRun(child, self_check, deadline);
 }
 
 fn validRunTitle(title: []const u8) bool {

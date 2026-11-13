@@ -5,7 +5,7 @@ const tool = @import("tool.zig");
 
 pub const spec: tool.Tool = .{
     .name = "report",
-    .description = "Send the agent that called you a short progress report and wait for its decision. It is how a check-in is answered: the caller reads the report, then either tells you to continue or stops the task and asks for your final report. Keep it to a status line — what is done, what you ran, what is left — not the final answer.",
+    .description = "Print a short progress report for the user and carry straight on. It is how a self-check is answered: the runtime asks for one at the interval the caller set, the report goes to the terminal, and the task continues — nothing comes back to you but the acknowledgement. Keep it to a status line: what is done, what you ran, what is left. Not the final answer.",
     .parameters_json =
     \\{"type":"object","properties":{"summary":{"type":"string","description":"Short progress report: what you have done and changed, what you ran and what it printed, what is verified, and what is left"}},"required":["summary"]}
     ,
@@ -38,14 +38,11 @@ pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
         try std.fmt.allocPrint(self.allocator, "{s}…", .{cutUtf8(summary, prompt.max_subagent_report_bytes)})
     else
         try self.allocator.dupe(u8, summary);
-    const verdict = supervisor.handOver(report) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-    };
+    // Handed over rather than answered: the caller shows it on the terminal
+    // and the task goes on, which is the whole of the exchange.
+    supervisor.publish(report);
     return .{
-        .content = try self.allocator.dupe(u8, switch (verdict) {
-            .continue_task => prompt.continue_verdict,
-            .stop => prompt.stop_verdict,
-        }),
+        .content = try self.allocator.dupe(u8, prompt.self_check_ack),
         .is_error = false,
     };
 }

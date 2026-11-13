@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""A sub-agent has no limits of its own: the caller watches it. At the check-in
-the child is asked for a progress report, the run pauses there, and the caller
-decides — here, to stop it and take its final report."""
+"""A sub-agent runs on two clocks the caller sets. A self-check asks it for a
+progress report, which is printed on the terminal and goes no further; the
+deadline stops the work and its final report is what the caller reads back."""
 import http.server
 import json
 from pathlib import Path
@@ -15,16 +15,17 @@ from mock_api import send_response, trust_workspace
 binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 requests = []
 
-# The order of these replies is the order of the handshake: the caller starts a
-# run checked in at its first boundary, the child reports, the caller stops it,
-# the child writes its last reply, the caller answers.
+# The order of these replies is the order of the run itself: the caller starts a
+# run self-checked at its first boundary with a deadline one second away, the
+# child reports, works past the deadline with a slow command, and is told to
+# finish when it comes back.
 script = [
     ('subagent', {'task': 'Split the source tree into one file per tool.',
-                  'title': 'Split the tree', 'checkin_seconds': 0}),
+                  'title': 'Split the tree', 'self_check_seconds': 0, 'deadline_seconds': 1}),
     ('report', {'summary': 'two of the four tools are split; nothing verified yet'}),
-    ('subagent_stop', {'id': 's1'}),
+    ('bash', {'command': 'sleep 2'}),
     ('answer', {'text': 'Final report: two files split, the other two are untouched.'}),
-    ('answer', {'text': 'Stopped the run.'}),
+    ('answer', {'text': 'Read the final report.'}),
 ]
 index = 0
 
@@ -90,7 +91,7 @@ def call_id_of(body, name):
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
-    with tempfile.TemporaryDirectory(prefix='zagent-checkin-') as directory:
+    with tempfile.TemporaryDirectory(prefix='zagent-selfcheck-') as directory:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'TERM': 'dumb', 'AI_URL': f'http://127.0.0.1:{server.server_port}/v1',
                'AI_MODEL': 'mock', 'AI_KEY': 'test'}
@@ -103,51 +104,44 @@ try:
         assert len(requests) == len(script), (len(requests), [is_subagent(body) for body in requests])
         parent = [body for body in requests if not is_subagent(body)]
         child = [body for body in requests if is_subagent(body)]
-        assert len(parent) == 3 and len(child) == 2, (len(parent), len(child))
+        assert len(parent) == 2 and len(child) == 3, (len(parent), len(child))
 
-        # The check-in reaches the child as a line of its own conversation, and
+        # The self-check reaches the child as a line of its own conversation, and
         # it answers with the report tool rather than with its final answer.
         child_first = json.dumps(child[0]['input'], ensure_ascii=False)
-        assert 'needs a progress report now' in child_first, child_first
+        assert 'check-in interval has passed' in child_first, child_first
         assert 'report' in tool_names(child[0]), tool_names(child[0])
-        # The report tool belongs to the child, and stopping a run to the caller.
+        # The report tool belongs to the child; the caller never holds it.
         assert 'report' not in tool_names(parent[0]), tool_names(parent[0])
-        assert 'subagent_stop' in tool_names(parent[0]), tool_names(parent[0])
-        assert 'subagent_stop' not in tool_names(child[0]), tool_names(child[0])
+        assert 'subagent_stop' not in tool_names(parent[0]), tool_names(parent[0])
 
-        # The paused run comes back as a progress report that names the id the
-        # caller answers with, and it is not an error: the run is alive.
-        progress_call = call_id_of(parent[1], 'subagent')
-        failed, report = status_of(tool_output(parent[1], progress_call))
-        assert not failed, report
-        assert 'progress report' in report, report
-        assert 'two of the four tools are split' in report, report
-        assert 'subagent_stop' in report and '"s1"' in report, report
-        assert 'Final report' not in report, report
-        # The run was named when it was started, so the report names it the
-        # same way the terminal does, and the caller reading two of them can
-        # tell which run it is looking at.
-        assert 's1 "Split the tree" progress report' in report, report
-        assert '⇢ subagent' in result.stderr and 'Split the tree' in result.stderr, result.stderr
-
-        # Stopped, the child is told twice: as the verdict on the report it was
-        # waiting at, and again at the only boundary it had left.
+        # The report comes back to the child as permission to carry on, not as a
+        # question, and the run is not paused anywhere.
         child_second = json.dumps(child[1]['input'], ensure_ascii=False)
-        assert 'Do no further work' in child_second, child_second
-        assert 'has stopped this task' in child_second, child_second
+        assert "printed on the caller's terminal" in child_second, child_second
 
-        # What the caller reads back is the child's final report, not its
-        # transcript and not the earlier commentary.
-        stop_call = call_id_of(parent[2], 'subagent_stop')
-        failed, final = status_of(tool_output(parent[2], stop_call))
+        # The deadline is what ends the work: the next boundary the child
+        # reaches is after it, and the report that was asked for is the one the
+        # caller reads.
+        child_third = json.dumps(child[2]['input'], ensure_ascii=False)
+        assert 'deadline has passed' in child_third, child_third
+        finish_call = call_id_of(parent[1], 'subagent')
+        failed, final = status_of(tool_output(parent[1], finish_call))
         assert not failed, final
-        assert 'Sub-agent stopped' in final, final
+        assert 'reached its deadline' in final, final
         assert 'two files split, the other two are untouched' in final, final
+        # Nothing of the self-check came back with it: the report went to the
+        # terminal, and the tool result is the end of the run alone.
         assert 'two of the four tools are split' not in final, final
 
-        # The run is over: the caller's session holds its own conversation and
-        # the run keeps the one it was stopped in, so a resume can pick it up.
-        # The child's scratch directory went with it.
+        # It was printed for the user instead, on a line that names the run.
+        assert 'self-check' in result.stderr, result.stderr
+        assert 'two of the four tools are split' in result.stderr, result.stderr
+        assert 's1 "Split the tree"' in result.stderr, result.stderr
+        assert '⇢ subagent' in result.stderr and 'Split the tree' in result.stderr, result.stderr
+
+        # The run keeps its own session, with the self-check it answered in it,
+        # and the child's scratch directory went with the child.
         sessions = sorted((state / 'sessions').glob('*.json'))
         assert len(sessions) == 2, sessions
         caller_session = next(path for path in sessions if '.json.s' not in path.name)
@@ -155,19 +149,15 @@ try:
         run_session = json.loads((state / 'sessions' / f'{caller_session.name}.s1.json').read_text())
         assert run_session['child']['id'] == 's1', run_session['child']
         assert run_session['child']['title'] == 'Split the tree', run_session['child']
-        # The child answered the stop with its final report, so the run
-        # finished rather than being cut off mid-turn.
         assert run_session['child']['status'] == 'completed', run_session['child']
-        # What the run kept is its own conversation: the check-in it answered
-        # with the report tool, and the final report it was stopped into.
         assert any(call['name'] == 'report'
                    for message in run_session['messages'] for call in message.get('tool_calls') or []), run_session['messages']
         assert 'two files split' in (run_session['messages'][-1].get('content') or ''), run_session['messages']
         assert not Path(scratch_of(child[0])).exists(), 'the child scratch outlived the child'
 
-        assert 'Stopped the run.' in result.stdout, result.stdout
-        assert 'Final report' not in result.stdout, result.stdout
-        print('PASS: a check-in pauses the sub-agent, and the caller stops it with its final report')
+        assert 'Read the final report.' in result.stdout, result.stdout
+        assert 'two files split' not in result.stdout, result.stdout
+        print('PASS: a self-check goes to the terminal, and the deadline ends the run with its final report')
 finally:
     server.shutdown()
     server.server_close()

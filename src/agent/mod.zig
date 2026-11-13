@@ -42,8 +42,12 @@ const restart_prompt = agent_prompt.restart_prompt;
 const steering_note = agent_prompt.steering_note;
 const CHOICE_PROMPT = agent_prompt.CHOICE_PROMPT;
 const error_preview_max = agent_prompt.error_preview_max;
-const report_request_prompt = agent_prompt.report_request_prompt;
-const stop_prompt = agent_prompt.stop_prompt;
+const self_check_prompt = agent_prompt.self_check_prompt;
+const deadline_prompt = agent_prompt.deadline_prompt;
+const subagent_deadline_grace_seconds = agent_prompt.subagent_deadline_grace_seconds;
+/// How long the waiting caller sleeps between looks at its own clocks. The
+/// same order as the supervisor's own poll: these are status checks, not work.
+const subagent_poll_ms: i64 = 100;
 const main_omitted = agent_prompt.main_omitted;
 const buildSystemPrompt = agent_prompt.buildSystemPrompt;
 const buildSubagentPrompt = agent_prompt.buildSubagentPrompt;
@@ -115,8 +119,9 @@ pub const Agent = struct {
     /// precedes a round of tool calls is not part of it: only the reply that
     /// stands on the finished work is.
     capture_mark: usize = 0,
-    /// The caller's side of the report handshake, for a sub-agent. Null for the
-    /// agent on the terminal, which has nobody to report to.
+    /// What this sub-agent shares with its caller: the self-check it is asked
+    /// for, the deadline it must meet. Null for the agent on the terminal, which
+    /// has nobody to check in with.
     supervisor: ?*subagent.Supervisor = null,
     /// The sub-agents this agent started and has not closed. A run that has
     /// reported back is paused, not finished: it stays here until the model
@@ -178,8 +183,8 @@ pub const Agent = struct {
         parent: ?*Agent = null,
         /// Where a sub-agent's answer goes.
         capture: ?*std.ArrayList(u8) = null,
-        /// The caller's side of the handshake this agent reports through. The
-        /// run that starts the child owns it and outlives the child.
+        /// What this child shares with its caller. The run that starts the
+        /// child owns it and outlives the child.
         supervisor: ?*subagent.Supervisor = null,
     };
 
@@ -301,8 +306,8 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
-        // A sub-agent left paused at a report would keep its task alive for the
-        // life of the process: the model that was going to resume it is gone.
+        // A sub-agent still running would keep its task alive for the life of
+        // the process: the caller that was watching it is gone.
         // Whatever is still open is closed here, before anything it borrows.
         self.closeRuns();
         self.tool_ui.spinner.stop();
@@ -745,7 +750,7 @@ pub const Agent = struct {
     }
 
     /// The `subagent` tool: hand one self-contained task to an agent of its own
-    /// and read back what it has done so far.
+    /// and read back what it did.
     ///
     /// The sub-agent is a second Agent in this process, running in a task of its
     /// own. It shares the provider, the working directory, the MCP servers and
@@ -755,11 +760,12 @@ pub const Agent = struct {
     /// is a report and not a claim of completion — the caller verifies the work
     /// before marking a step done.
     ///
-    /// It has no deadline of its own. What bounds it is this call:
-    /// after `checkin_seconds` the sub-agent is asked for a progress report
-    /// through its `report` tool, the run pauses there, and the report comes
-    /// back as the tool result. The caller then lets it carry on with its `id`,
-    /// or stops it with `subagent_stop`.
+    /// Two clocks bound it, and both belong to this call: every
+    /// `self_check_seconds` the child is asked for a progress report, which is
+    /// printed on the terminal and never reaches the model; at
+    /// `deadline_seconds` the child must stop and write its final report, and
+    /// that report is the tool result. Nothing comes back in between, so the
+    /// caller waits once and reads once.
     ///
     /// The error set is spelled out rather than inferred: this function starts
     /// an agent that runs the tool loop that calls this function, and an
@@ -769,23 +775,23 @@ pub const Agent = struct {
     }
 
     /// Start one sub-agent and the task that runs it. The run owns the child,
-    /// the handshake they share, and the buffer the child answers into; the
+    /// what the two sides share, and the buffer the child answers into; the
     /// caller of `subagent` only ever holds it by its id.
     ///
     /// `title` is the summary the terminal names the run with, and may be
     /// empty: a run without one is named by its task on the lines that would
     /// have shown it.
-    pub fn startRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, checkin_seconds: u32) !*Run {
-        return self.createRun(task, context, title, checkin_seconds, null);
+    pub fn startRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, self_check_seconds: u32) !*Run {
+        return self.createRun(task, context, title, self_check_seconds, null);
     }
 
-    pub fn restoreRun(self: *Agent, id: []const u8, checkin: u32) !*Run {
+    pub fn restoreRun(self: *Agent, id: []const u8, self_check_seconds: u32) !*Run {
         if (id.len < 2 or id[0] != 's') return error.InvalidSessionId;
         _ = try std.fmt.parseInt(usize, id[1..], 10);
-        return self.createRun("", "", "", checkin, id);
+        return self.createRun("", "", "", self_check_seconds, id);
     }
 
-    fn createRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, checkin_seconds: u32, restore_id: ?[]const u8) !*Run {
+    fn createRun(self: *Agent, task: []const u8, context: []const u8, title: []const u8, self_check_seconds: u32, restore_id: ?[]const u8) !*Run {
         const session = @import("../state/session.zig");
         const run = try self.allocator.create(Run);
         errdefer self.allocator.destroy(run);
@@ -855,7 +861,7 @@ pub const Agent = struct {
             loaded.messages.clearRetainingCapacity();
         }
         // The two ways a run stops for a reason other than its caller's
-        // decision: this process asking for the task to stop, and the child
+        // deadline: this process asking for the task to stop, and the child
         // itself being told to.
         run.supervisor.canceled = &child.interrupted;
         run.supervisor.caller_canceled = &self.interrupted;
@@ -871,10 +877,10 @@ pub const Agent = struct {
         const owned_prompt = try prompt.toOwnedSlice(self.allocator);
         // Taken out of the list above, so it owns itself until the task does.
         errdefer self.allocator.free(owned_prompt);
-        // A check-in of zero means the child's first boundary: asking before
+        // A self-check of zero means the child's first boundary: asking before
         // the task starts is what makes that the first request rather than
         // whichever one the child happens to reach next.
-        if (checkin_seconds == 0) run.supervisor.requestReport();
+        if (self_check_seconds == 0) run.supervisor.requestProgress();
         // In the list before the task starts: once the child is running, only
         // `closeRun` may free what it is using, and a failure below must not
         // leave a live task pointing at freed memory.
@@ -886,50 +892,108 @@ pub const Agent = struct {
         return run;
     }
 
-    /// Wait for the run's next stopping point — a progress report, the end of
-    /// its work, or a failure — and make it the tool result.
+    /// Watch the run until it ends, on the two clocks its caller set, and make
+    /// its final report the tool result.
     ///
-    /// `checkin_seconds` is the caller's tolerance, not a deadline for the
-    /// child: once it passes, the child is asked for a report and this keeps
-    /// waiting for it. A command that is already running is never cut short,
-    /// because a report that claims a check it did not finish is worse than a
-    /// report that arrives late.
-    pub fn waitRun(self: *Agent, run: *Run, checkin_seconds: u32) anyerror!tools.ToolResult {
-        const checkin_at = std.Io.Timestamp.addDuration(
-            std.Io.Timestamp.now(self.io, .awake),
-            .fromSeconds(@intCast(checkin_seconds)),
-        );
-        const outcome = run.supervisor.wait(checkin_at) catch |err| {
-            // Esc while the caller was waiting: nobody owns the child any more,
-            // and a child that kept going would edit files after a task was
-            // called off.
-            self.abortRun(run);
-            return err;
-        };
-        switch (outcome) {
-            .report => |report| {
-                defer self.allocator.free(report);
-                const elapsed_ms = run.started.untilNow(self.io, .awake).toMilliseconds();
-                var tag: std.Io.Writer.Allocating = .init(self.allocator);
-                defer tag.deinit();
-                try writeRunTag(&tag.writer, run);
-                return .{
-                    .content = try std.fmt.allocPrint(
-                        self.allocator,
-                        "Sub-agent {s} progress report, {d}s in:\n{s}\n\nIt is paused at that report, waiting for you. Call subagent with id \"{s}\" to let it carry on; call subagent_stop with id \"{s}\" to stop it and take its final report.",
-                        .{ tag.written(), @divTrunc(elapsed_ms, 1000), report, run.id, run.id },
-                    ),
-                    .is_error = false,
-                };
-            },
-            .done => return self.finishRun(run, "Sub-agent report — verify it before marking a plan step done:"),
-            .failed => |failure| return self.failRun(run, failure),
+    /// Every `self_check_seconds` the child is asked for a self-check, and what
+    /// it answers is printed on the terminal: the model that started the run
+    /// reads none of it, which is what makes the whole call one wait. At
+    /// `deadline_seconds` the child is told to stop working and write its final
+    /// report; the grace after that is for that report, not for more work, and
+    /// a child that misses it is stopped where it stands.
+    ///
+    /// A command that is already running is never cut short, because a report
+    /// that claims a check it did not finish is worse than a report that
+    /// arrives late.
+    pub fn waitRun(self: *Agent, run: *Run, self_check_seconds: u32, deadline_seconds: u32) anyerror!tools.ToolResult {
+        const interval_ms: i64 = @as(i64, @intCast(self_check_seconds)) * std.time.ms_per_s;
+        const deadline_at = inMs(run.started, @as(i64, @intCast(deadline_seconds)) * std.time.ms_per_s);
+        var check_at = inMs(run.started, interval_ms);
+        // Set once the deadline has been passed on to the child: the run is over
+        // from there, and `cut_at` is when the report it was asked for is given
+        // up on.
+        var deadline_sent = false;
+        var cut_at: ?std.Io.Timestamp = null;
+        while (true) {
+            const wake = run.supervisor.wait(nextWake(check_at, deadline_at, cut_at)) catch |err| {
+                // Esc while the caller was waiting: nobody owns the child any
+                // more, and a child that kept going would edit files after a
+                // task was called off.
+                self.abortRun(run);
+                return err;
+            };
+            switch (wake) {
+                .progress => |report| {
+                    defer self.allocator.free(report);
+                    try self.showSelfCheck(run, report);
+                    // A self-check the caller asked to be due at once is asked
+                    // for at once: with an interval of zero the child is
+                    // checked at its next boundary, and waiting for the next
+                    // look at the clock would make that the one after it.
+                    if (interval_ms == 0) run.supervisor.requestProgress();
+                    check_at = inMsNow(self.io, @max(interval_ms, subagent_poll_ms));
+                },
+                .done => return self.finishRun(run, if (deadline_sent)
+                    "Sub-agent reached its deadline and stopped. Its final report — what is done and what is left undone. Verify it before marking a plan step done:"
+                else
+                    "Sub-agent report — verify it before marking a plan step done:"),
+                .failed => |failure| return self.failRun(run, failure),
+                .timeout => {
+                    const now = std.Io.Timestamp.now(self.io, .awake);
+                    if (cut_at) |cut| {
+                        // The deadline stands until the run ends: a child that
+                        // answered it with more work instead of its report is
+                        // told again at the boundary after that.
+                        run.supervisor.setDeadline();
+                        if (cut.untilNow(self.io, .awake).nanoseconds >= 0) return self.cutRun(run);
+                        continue;
+                    }
+                    if (deadline_at.untilNow(self.io, .awake).nanoseconds >= 0) {
+                        deadline_sent = true;
+                        run.supervisor.setDeadline();
+                        cut_at = inMs(now, @as(i64, subagent_deadline_grace_seconds) * std.time.ms_per_s);
+                        continue;
+                    }
+                    if (check_at.untilNow(self.io, .awake).nanoseconds >= 0) {
+                        // Asked for once: a request the child has not reached a
+                        // boundary for yet is the one it will see, and asking
+                        // again on every poll would only set the same flag.
+                        if (!run.supervisor.progressPending()) run.supervisor.requestProgress();
+                        check_at = inMsNow(self.io, @max(interval_ms, subagent_poll_ms));
+                    }
+                },
+            }
         }
     }
 
+    /// Show a sub-agent's self-check on the terminal.
+    ///
+    /// It is the caller's line and the caller's terminal: the child's own
+    /// output is captured, so this is the only place its progress is read. The
+    /// animation the call owns is given the line back for it and taken again
+    /// afterwards, because a frame drawn over the report would erase it.
+    fn showSelfCheck(self: *Agent, run: *Run, report: []const u8) !void {
+        self.tool_ui.spinner.stop();
+        defer self.resumeCallProgress();
+        const elapsed_s = @divTrunc(run.started.untilNow(self.io, .awake).toMilliseconds(), std.time.ms_per_s);
+        var line: std.Io.Writer.Allocating = .init(self.allocator);
+        defer line.deinit();
+        try line.writer.print("  ⇢ self-check, {d}m {d}s in · ", .{
+            @divTrunc(elapsed_s, std.time.s_per_min),
+            @mod(elapsed_s, std.time.s_per_min),
+        });
+        try writeRunTag(&line.writer, run);
+        // The run carries on by itself: the report is the user's to read, and
+        // stopping it is theirs too, so the line says how.
+        try line.writer.writeAll(" · carrying on, Esc stops it\n");
+        try sanitize.writeSanitized(&line.writer, report);
+        try line.writer.writeAll("\n");
+        try self.emit(std.Io.File.stderr(), CYAN ++ "{s}" ++ RESET, .{line.written()});
+    }
+
     /// Read the answer a run ended on and close it. `heading` says how the run
-    /// got there, because a stopped run and one that finished read differently
-    /// to whoever has to verify the work.
+    /// got there, because a run that was cut by its deadline and one that
+    /// finished on its own read differently to whoever has to verify the work.
     fn finishRun(self: *Agent, run: *Run, heading: []const u8) anyerror!tools.ToolResult {
         // The report is the reply that stands on the finished work: the
         // commentary of earlier rounds stays in the capture before the mark.
@@ -958,32 +1022,26 @@ pub const Agent = struct {
         };
     }
 
-    /// The `subagent_stop` tool: the caller's answer to a progress report it
-    /// does not want to continue. The child gets one last turn to write its
-    /// final report and does no new work; that reply is the tool result.
-    pub fn subagentStopTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
-        return @import("../tools/subagent_stop.zig").execute(self, arguments);
-    }
-
-    /// Stop and join a supervised run, retaining ownership until its final reply.
-    pub fn stopRun(self: *Agent, run: *Run) anyerror!tools.ToolResult {
-        run.supervisor.stop();
-        // The stop is the verdict on the report the child is paused at. If it
-        // is not paused there, its next request boundary says the same thing.
-        // Either way the wait ends when the child writes its last reply.
-        while (true) {
-            const outcome = run.supervisor.wait(null) catch |err| {
-                self.abortRun(run);
-                return err;
-            };
-            switch (outcome) {
-                // A report sent before the stop arrived is not the final one:
-                // the child has already been told to finish.
-                .report => |report| self.allocator.free(report),
-                .done => return self.finishRun(run, "Sub-agent stopped. Its final report — verify it before marking a plan step done:"),
-                .failed => |failure| return self.failRun(run, failure),
-            }
-        }
+    /// A run that would not write its final report after the deadline: stop it
+    /// where it stands and read back what it wrote.
+    ///
+    /// The report is taken before the child is freed, and it is the honest one
+    /// — the last thing the child said, with the deadline named as the reason
+    /// the work stops there rather than the child claiming it was finished.
+    fn cutRun(self: *Agent, run: *Run) anyerror!tools.ToolResult {
+        const start = @min(run.child.capture_mark, run.capture.items.len);
+        const said = std.mem.trim(u8, run.capture.items[start..], " \t\r\n");
+        const answer = try self.allocator.dupe(u8, said);
+        defer self.allocator.free(answer);
+        self.abortRun(run);
+        if (answer.len == 0) return .{
+            .content = try self.allocator.dupe(u8, "The sub-agent passed its deadline and was stopped without a word. Inspect the working directory for what it did."),
+            .is_error = true,
+        };
+        return .{
+            .content = try std.fmt.allocPrint(self.allocator, "The sub-agent passed its deadline and was stopped mid-work. This is the last thing it said, not a finished report — what it left undone is unknown until you look:\n{s}", .{answer}),
+            .is_error = false,
+        };
     }
 
     /// Close every run this agent still holds. Not while a turn is running:
@@ -1025,46 +1083,43 @@ pub const Agent = struct {
     }
 
     /// Close a run that is still going: tell the child to stop, which it sees
-    /// at its next request boundary, or straight away if it is waiting at a
-    /// report. `closeRun` waits for it to be gone.
+    /// at its next request boundary, and wait for it to be gone. A command that
+    /// is already running is not cut: there is no way to end it that does not
+    /// also lose what it printed.
     fn abortRun(self: *Agent, run: *Run) void {
-        run.supervisor.stop();
         run.child.interrupted.store(true, .release);
         self.closeRun(run);
     }
 
-    /// The `report` tool: a sub-agent answering its caller's check-in.
+    /// The `report` tool: a sub-agent answering a self-check.
     ///
-    /// The sub-agent's model writes the summary and issues this tool call;
-    /// the parent does not construct either. The runtime only injects the
-    /// check-in request and relays the report to the parent, which decides
-    /// whether the sub-agent should continue or stop.
-    ///
-    /// The report is handed over here and the verdict is taken back here, in
-    /// the same call, which is what makes the check-in a pause rather than a
-    /// race: the child does nothing more until the caller has read it.
+    /// The sub-agent's model writes the summary and issues this tool call; the
+    /// parent does not construct either. The runtime only injects the
+    /// self-check request, and the report is handed over for the terminal
+    /// without anything coming back but an acknowledgement — the child keeps
+    /// working, and the caller sees nothing of it until the run ends.
     pub fn reportTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
         return @import("../tools/report.zig").execute(self, arguments);
     }
 
-    /// Take what the caller asked for at a request boundary: the progress
-    /// report it is waiting on, or the stop that ends this task. Both arrive as
-    /// a message in the conversation, the way a line the user typed does, and
-    /// both are answered inside the work in progress rather than after it.
+    /// Take what the run's clocks asked for at a request boundary: a
+    /// self-check, or the deadline that ends the work. Both arrive as a message
+    /// in the conversation, the way a line the user typed does, and both are
+    /// answered inside the work in progress rather than after it.
     fn applySupervision(self: *Agent) !void {
         const supervisor = self.supervisor orelse return;
         const due = supervisor.takeDue();
         if (!due.any()) return;
-        // The stop outranks a report asked for before it: one of them is a
-        // question, the other is the end of the task.
-        if (due.stop) {
-            try self.appendUserMessage(stop_prompt);
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ the caller stopped this task\n" ++ RESET, .{});
-            if (self.trace) |trace| trace.note(self.traceCtx(), "info", "the caller stopped this task");
+        // The deadline outranks a self-check asked for before it: one of them
+        // asks for a status line, the other is the end of the work.
+        if (due.deadline) {
+            try self.appendUserMessage(deadline_prompt);
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ the deadline passed: the final report\n" ++ RESET, .{});
+            if (self.trace) |trace| trace.note(self.traceCtx(), "info", "the deadline passed: the final report");
         } else {
-            try self.appendUserMessage(report_request_prompt);
-            try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ the caller asked for a progress report\n" ++ RESET, .{});
-            if (self.trace) |trace| trace.note(self.traceCtx(), "info", "the caller asked for a progress report");
+            try self.appendUserMessage(self_check_prompt);
+            try self.emit(std.Io.File.stderr(), DIM ++ "  ↳ a self-check: report progress and carry on\n" ++ RESET, .{});
+            if (self.trace) |trace| trace.note(self.traceCtx(), "info", "a self-check: report progress and carry on");
         }
         try self.checkpoint();
     }
@@ -1610,6 +1665,15 @@ pub const Agent = struct {
     /// preview lands on a cleared line whatever the call did.
     fn afterToolCall(ctx: tools.Context, name: []const u8, arguments: []const u8, outcome: anyerror!tools.ToolResult) !tools.ToolResult {
         if (ctx.agent) |self| self.tool_ui.spinner.stop();
+        if (ctx.agent) |self| {
+            // A sub-agent's report is not something to cache: it is the one
+            // thing the caller reads back from a run, and swapping it for a
+            // preview plus an id would hide exactly the text it has to verify.
+            // The same goes for everything a sub-agent itself runs — that
+            // transcript never reaches the caller, so nothing would ever read
+            // its entries back.
+            if (self.role == .subagent or std.mem.eql(u8, name, "subagent")) return outcome;
+        }
         return @import("../tools/ccr.zig").afterExecute(ctx, name, arguments, outcome);
     }
 
@@ -1629,6 +1693,17 @@ pub const Agent = struct {
             spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options)
         else
             spinner.Spinner.disabled(self.io);
+    }
+
+    /// Take the call's line again after something else wrote to the terminal.
+    /// The label is the one `startCallProgress` built for this call and nothing
+    /// has rebuilt it since, so the caption is still the same caption.
+    fn resumeCallProgress(self: *Agent) void {
+        const caption = self.tool_ui.label.written();
+        if (caption.len == 0) return;
+        var options = self.progressOptions();
+        options.style = CYAN;
+        self.tool_ui.spinner = spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options);
     }
 
     /// Run one tool call. Everything the user sees of the call — its line in
@@ -1774,20 +1849,20 @@ const ToolUi = struct {
     label: std.Io.Writer.Allocating,
 };
 
-/// One sub-agent this agent started: the child, the handshake they share, and
-/// the task running it.
+/// One sub-agent this agent started: the child, what the two share, and the
+/// task running it.
 ///
 /// Heap-allocated and owned by the `runs` list of the caller, because the run
 /// outlives the call that started it: the child holds pointers into this struct
-/// (its capture sink and its supervisor), and a paused run has to still be
-/// there when the model answers its report.
+/// (its capture sink and its supervisor), and a self-check that arrives while
+/// the caller is waiting has to have somewhere to land.
 const Run = struct {
-    /// The id the model names to resume or stop this run.
+    /// The id the model names to resume this run.
     id: []u8,
     /// The summary the terminal shows while the run works, empty when the
     /// caller gave none. Kept here rather than read back out of the arguments,
-    /// because a resume or a stop names only the id: the lines that report on
-    /// a run it did not just start still have to say which run they mean.
+    /// because a resume names only the id: the lines that report on a run the
+    /// caller did not just start still have to say which run they mean.
     title: []u8,
     child: *Agent,
     supervisor: subagent.Supervisor,
@@ -2072,6 +2147,27 @@ fn writeRunTag(w: *std.Io.Writer, run: *const Run) !void {
     try w.writeByte('"');
 }
 
+/// A moment `ms` milliseconds after `from`, on the clock the waits use.
+fn inMs(from: std.Io.Timestamp, ms: i64) std.Io.Timestamp {
+    return std.Io.Timestamp.addDuration(from, .fromMilliseconds(ms));
+}
+
+/// The same, counted from now.
+fn inMsNow(io: std.Io, ms: i64) std.Io.Timestamp {
+    return inMs(std.Io.Timestamp.now(io, .awake), ms);
+}
+
+/// The first of the caller's moments: the next self-check, the deadline, or the
+/// end of the grace it gave the child for its final report.
+fn nextWake(check_at: std.Io.Timestamp, deadline_at: std.Io.Timestamp, cut_at: ?std.Io.Timestamp) std.Io.Timestamp {
+    var next = check_at;
+    if (std.Io.Timestamp.compare(deadline_at, .lt, next)) next = deadline_at;
+    if (cut_at) |cut| {
+        if (std.Io.Timestamp.compare(cut, .lt, next)) next = cut;
+    }
+    return next;
+}
+
 /// A standalone agent with a hermetic environment for tests. The line editor
 /// and MCP registry live beside it because the agent only borrows them.
 const TestHarness = struct {
@@ -2271,7 +2367,7 @@ test "a follow-up that announces no task keeps the one in the title" {
     try std.testing.expectEqualStrings("别的任务", harness.agent.current_task);
 }
 
-test "paused report snapshot reconstructs partial batch without replay" {
+test "a self-check is kept in the child's record and the run goes on" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const harness = try TestHarness.init(a, io);
@@ -2288,24 +2384,41 @@ test "paused report snapshot reconstructs partial batch without replay" {
     var mock: MockTransport = .{ .replies = &.{ progress, completed_answer } };
     defer mock.deinit(a);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
-    const run = try harness.agent.startRun("work", "", "", 60);
-    const report = try harness.agent.waitRun(run, 60);
+    // A self-check of zero asks at the child's first boundary, so the report is
+    // answered in the middle of the batch and the work after it runs anyway.
+    const run = try harness.agent.startRun("work", "", "", 0);
+    const child_path = try a.dupe(u8, run.child.session_path.?);
+    defer a.free(child_path);
+    const report = try harness.agent.waitRun(run, 0, 3_600);
     defer report.deinit(a);
-    // Load while the report handshake is blocked: no verdict has been saved.
-    var loaded = try @import("../state/session.zig").load(io, a, run.child.session_path.?);
+    // The caller reads the last reply, not the self-check printed on its way.
+    try std.testing.expect(std.mem.indexOf(u8, report.content, "answer.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.content, "saved halfway report") == null);
+    // The child's own record keeps the self-check it answered, and the call
+    // after it: a report finishes nothing.
+    var loaded = try @import("../state/session.zig").load(io, a, child_path);
     defer loaded.deinit(a);
     const messages = loaded.messages.items;
-    const n = messages.len;
-    try std.testing.expectEqualStrings("done", messages[n - 3].tool_call_id.?);
-    try std.testing.expect(std.mem.indexOf(u8, messages[n - 3].content.?, "NOT replayed") == null);
-    try std.testing.expectEqualStrings("rep", messages[n - 2].tool_call_id.?);
-    try std.testing.expectEqualStrings("pending", messages[n - 1].tool_call_id.?);
-    try std.testing.expect(std.mem.indexOf(u8, messages[n - 1].content.?, "NOT replayed") != null);
-    const calls = messages[n - 4].tool_calls.?;
-    try std.testing.expect(std.mem.indexOf(u8, calls[1].arguments, "saved halfway report") != null);
-    run.supervisor.carryOn(false);
-    const finished = try harness.agent.waitRun(run, 60);
-    defer finished.deinit(a);
+    var reported = false;
+    var worked_on = false;
+    for (messages) |message| {
+        if (std.mem.eql(u8, message.tool_call_id orelse "", "rep")) {
+            reported = true;
+            try std.testing.expect(std.mem.indexOf(u8, message.content.?, "printed on the caller's terminal") != null);
+        }
+        if (std.mem.eql(u8, message.tool_call_id orelse "", "pending")) worked_on = true;
+    }
+    try std.testing.expect(reported and worked_on);
+    var asked = false;
+    for (messages) |message| {
+        for (message.tool_calls orelse &.{}) |call| {
+            if (std.mem.eql(u8, call.name, "report")) {
+                asked = true;
+                try std.testing.expect(std.mem.indexOf(u8, call.arguments, "saved halfway report") != null);
+            }
+        }
+    }
+    try std.testing.expect(asked);
 }
 
 test "durable child can be reconstructed under its old id without replaying tools" {
@@ -2325,20 +2438,20 @@ test "durable child can be reconstructed under its old id without replaying tool
     defer mock.deinit(a);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     const first = try harness.agent.startRun("original task", "original context", "title", 60);
-    const first_result = try harness.agent.waitRun(first, 60);
+    const first_result = try harness.agent.waitRun(first, 60, 3_600);
     defer first_result.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), harness.agent.runs.items.len);
     harness.agent.run_counter = 0;
     const restored = try harness.agent.restoreRun("s1", 60);
     try std.testing.expectEqualStrings("s1", restored.id);
     try std.testing.expectEqualStrings("title", restored.title);
-    const restored_result = try harness.agent.waitRun(restored, 60);
+    const restored_result = try harness.agent.waitRun(restored, 60, 3_600);
     defer restored_result.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "original context") != null);
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "explicitly requested continuation of this completed task") != null);
     const next = try harness.agent.startRun("new task", "", "", 60);
     try std.testing.expect(!std.mem.eql(u8, next.id, "s1"));
-    const next_result = try harness.agent.waitRun(next, 60);
+    const next_result = try harness.agent.waitRun(next, 60, 3_600);
     defer next_result.deinit(a);
 }
 
@@ -2376,48 +2489,43 @@ test "a subagent runs its own turn and reports back" {
     try std.testing.expect(std.mem.indexOf(u8, parent, "answer.") != null);
 }
 
-test "a check-in returns a progress report and the caller stops the run" {
+test "a self-check asks the child for a report and the caller waits for the end" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);
     defer harness.deinit(allocator);
     var silence = try Silence.init(std.testing.io);
     defer silence.deinit(std.testing.io);
 
-    // A check-in of zero is the child's first boundary, so the order of these
-    // replies is the order of the handshake itself: start, report, stop, the
-    // final report, the answer.
+    // A self-check of zero is the child's first boundary, so the order of these
+    // replies is the order of the run itself: start, self-check, report, the
+    // child's final answer, the caller's answer.
     const start =
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"sub\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"split the files\\\",\\\"checkin_seconds\\\":0}\"}]}";
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"sub\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"split the files\\\",\\\"self_check_seconds\\\":0}\"}]}";
     const progress =
         "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"rep\",\"name\":\"report\",\"arguments\":\"{\\\"summary\\\":\\\"two of four files split\\\"}\"}]}";
-    const halt =
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"halt\",\"name\":\"subagent_stop\",\"arguments\":\"{\\\"id\\\":\\\"s1\\\"}\"}]}";
-    var mock: MockTransport = .{ .replies = &.{ start, progress, halt, completed_answer, completed_answer } };
+    var mock: MockTransport = .{ .replies = &.{ start, progress, completed_answer, completed_answer } };
     defer mock.deinit(allocator);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("split the source tree");
 
     try harness.agent.runToolLoop();
-    try std.testing.expectEqual(@as(usize, 5), mock.requests.items.len);
+    try std.testing.expectEqual(@as(usize, 4), mock.requests.items.len);
 
-    // The child's first request carries the check-in as a line of its
+    // The child's first request carries the self-check as a line of its
     // conversation, the way a line the user typed would.
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "needs a progress report now") != null);
-    // The caller reads that report with the id to answer it with, and the
-    // child is paused at it rather than finished.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "check-in interval has passed") != null);
+    // The report comes back as permission to carry on, not as a question: the
+    // child's answer to it is the next request it makes.
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "two of four files split") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "paused at that report") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "subagent_stop") != null);
-    // The stop reaches the child twice: as the verdict on the report it was
-    // waiting at, and again at its next boundary, so a child cannot work on.
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "Do no further work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "has stopped this task") != null);
-    // What the caller is left with is the final report, not the transcript.
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[4], "Sub-agent stopped") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[4], "answer.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "printed on the caller's terminal") != null);
+    // The caller never sees the self-check. What it reads back is the final
+    // report, once, when the run ends.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "Sub-agent report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "two of four files split") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "answer.") != null);
 }
 
-test "a resume lets the sub-agent carry on, and it is checked again" {
+test "a self-check of zero asks again at every boundary" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);
     defer harness.deinit(allocator);
@@ -2425,52 +2533,48 @@ test "a resume lets the sub-agent carry on, and it is checked again" {
     defer silence.deinit(std.testing.io);
 
     const start =
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"sub\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"split the files\\\",\\\"checkin_seconds\\\":0}\"}]}";
-    const progress =
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"rep\",\"name\":\"report\",\"arguments\":\"{\\\"summary\\\":\\\"two of four files split\\\"}\"}]}";
-    const carry_on =
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"go\",\"name\":\"subagent\",\"arguments\":\"{\\\"id\\\":\\\"s1\\\",\\\"checkin_seconds\\\":0}\"}]}";
-    var mock: MockTransport = .{ .replies = &.{ start, progress, carry_on, completed_answer, completed_answer } };
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"sub\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"split the files\\\",\\\"self_check_seconds\\\":0}\"}]}";
+    const first_report =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"rep1\",\"name\":\"report\",\"arguments\":\"{\\\"summary\\\":\\\"two of four files split\\\"}\"}]}";
+    const second_report =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"rep2\",\"name\":\"report\",\"arguments\":\"{\\\"summary\\\":\\\"three of four files split\\\"}\"}]}";
+    var mock: MockTransport = .{ .replies = &.{ start, first_report, second_report, completed_answer, completed_answer } };
     defer mock.deinit(allocator);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("split the source tree");
 
     try harness.agent.runToolLoop();
+    // Two boundaries, two self-checks, and the same single wait for the caller.
     try std.testing.expectEqual(@as(usize, 5), mock.requests.items.len);
-
-    // The resume names the run, and the child reads the verdict as permission
-    // to go on rather than as a new task.
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "let it carry on") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "asks you to carry on") != null);
-    // Resuming with a check-in of zero asks again at the next boundary, so the
-    // child is watched as closely as the caller asked for.
-    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "needs a progress report now") != null);
-    // A run that ends on its own is read as the report it stands on.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "check-in interval has passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "two of four files split") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "check-in interval has passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "three of four files split") != null);
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[4], "Sub-agent report") != null);
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[4], "answer.") != null);
 }
 
-test "the two sides of the handshake are each refused on the other" {
+test "the report tool belongs to the child and the clocks are checked" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);
     defer harness.deinit(allocator);
 
-    // A caller has nobody to report to, and cannot stop a run it does not have.
+    // A caller has nobody to report to: the self-check is the child's, and a
+    // report from the agent on the terminal would only reach its own history.
     const reported = try harness.agent.reportTool("{\"summary\":\"halfway\"}");
     defer reported.deinit(allocator);
     try std.testing.expect(reported.is_error);
     try std.testing.expect(std.mem.indexOf(u8, reported.content, "belongs to a sub-agent") != null);
 
-    const stopped = try harness.agent.subagentStopTool("{\"id\":\"s9\"}");
-    defer stopped.deinit(allocator);
-    try std.testing.expect(stopped.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, stopped.content, "no sub-agent has the id") != null);
-
-    // A check-in that no caller could wait out is refused before a run starts.
-    const started = try harness.agent.subagentTool("{\"task\":\"anything\",\"checkin_seconds\":4000}");
-    defer started.deinit(allocator);
-    try std.testing.expect(started.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, started.content, "checkin_seconds") != null);
+    // A clock no run could keep is refused before the run starts.
+    const checked = try harness.agent.subagentTool("{\"task\":\"anything\",\"self_check_seconds\":4000}");
+    defer checked.deinit(allocator);
+    try std.testing.expect(checked.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, checked.content, "self_check_seconds") != null);
+    const undated = try harness.agent.subagentTool("{\"task\":\"anything\",\"deadline_seconds\":0}");
+    defer undated.deinit(allocator);
+    try std.testing.expect(undated.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, undated.content, "deadline_seconds") != null);
 }
 
 test "unified tools receive the owning agent through Context" {
@@ -2482,15 +2586,17 @@ test "unified tools receive the owning agent through Context" {
         .allocator = allocator,
         .agent = &harness.agent,
     };
-    const started = try tools.execute(ctx, "subagent", "{\"task\":\"anything\",\"checkin_seconds\":4000}");
+    const started = try tools.execute(ctx, "subagent", "{\"task\":\"anything\",\"self_check_seconds\":4000}");
     defer started.deinit(allocator);
     try std.testing.expect(started.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, started.content, "checkin_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, started.content, "self_check_seconds") != null);
 
-    const stopped = try tools.execute(ctx, "subagent_stop", "{\"id\":\"s9\"}");
-    defer stopped.deinit(allocator);
-    try std.testing.expect(stopped.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, stopped.content, "no sub-agent has the id") != null);
+    // A saved run that was never started here is named as missing, and the
+    // caller reads back why rather than a new run being started in its place.
+    const resumed = try tools.execute(ctx, "subagent", "{\"id\":\"s9\"}");
+    defer resumed.deinit(allocator);
+    try std.testing.expect(resumed.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, resumed.content, "could not restore sub-agent") != null);
 
     const plan = try tools.execute(ctx, "plan", "{}");
     defer plan.deinit(allocator);
@@ -2533,10 +2639,9 @@ test "the sub-agent's progress line names its task and keeps to one line" {
     // A tool whose wait asks the user a question gets no line at all.
     try std.testing.expectEqual(@as(?[]const u8, null), try harness.agent.callProgressLabel("ask_user", "{}", &label));
 
-    // A stop names the run it stops, which still knows its title.
+    // A call that names a run already going shows that run's title, so the
+    // second call on the same run reads as the same work.
     const run = try harness.agent.startRun("anything", "", "split the files", 3_600);
-    try std.testing.expectEqualStrings("subagent · split the files · stopping…", (try harness.agent.callProgressLabel("subagent_stop", "{\"id\":\"s1\"}", &label)).?);
-    // ...and a resume names it the same way, from the id alone.
     try std.testing.expectEqualStrings("subagent · split the files", (try harness.agent.callProgressLabel("subagent", "{\"id\":\"s1\"}", &label)).?);
     // The run was started only to be named, so it is stopped here: nothing
     // waits on it, and the harness closes whatever is left at deinit.

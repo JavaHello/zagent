@@ -7,11 +7,12 @@ run ID, title and status). Old version-2 snapshots without this record remain
 readable. Credentials and generated system prompts are not stored.
 
 The initial user message retains the task and caller context. Subsequent
-messages retain reasoning, tools, tool outcomes and reports (including report
-tool arguments). Children checkpoint after receiving a model tool batch, after
-each tool result, and at normal conversation boundaries; completion/failure
-updates the child status. A report's call is saved before the report handshake
-blocks, so its summary survives even before a verdict exists.
+messages retain reasoning, tools, tool outcomes and self-check reports
+(including report tool arguments). Children checkpoint after receiving a model
+tool batch, after each tool result, and at normal conversation boundaries;
+completion/failure updates the child status. A self-check report is saved with
+the turn it belongs to, so its summary survives a process that ends before the
+run does.
 
 Recovery is deliberately lazy: after opening the parent session, calling
 `subagent` with its previous `sN` reconstructs the child with a fresh runtime,
@@ -33,8 +34,7 @@ effects. This cannot determine whether an external operation committed before a
 crash, nor prevent the model from explicitly choosing a later retry.
 
 Limitations: there is no child-list UI or eager reconstruction; the caller must
-retain the ID from its history. `subagent_stop` currently only operates on live
-runs (restore with `subagent` first). Snapshot replacement uses the existing
+retain the ID from its history. Snapshot replacement uses the existing
 rename mechanism, not an fsync durability guarantee. Independent parent/child
 snapshots are not one transaction. Children started without a durable parent
 remain ephemeral. Old scratch contents are not restored.

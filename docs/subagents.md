@@ -9,29 +9,44 @@ printed, its tokens count in the calling turn's totals, and Esc stops both.
 It suits a step whose tool output would drown the main conversation — a wide
 search, repeated trial runs, one independent block of edits.
 
-## Watching a run
+## Two clocks
 
-A sub-agent has no deadline of its own: what bounds it
-is being watched. The model picks how long it works before a check-in
-(`checkin_seconds`, default 300). At that check-in the run pauses, the child is
-asked for a progress report through its `report` tool, and the report comes back
-as the tool result. The model then either lets it carry on by calling `subagent`
-again with the run's `id`, or stops it with `subagent_stop` and reads its final
-report — the stopped child writes that report and does no new work. A check-in
-of 0 asks at the next request boundary.
+A sub-agent is bounded by the two moments the caller names when it hands the
+task over, and by nothing else:
+
+- `self_check_seconds` (default 600) — every interval, the child is asked for a
+  self-check through its `report` tool. The report is a status line that is
+  printed on the terminal for the user and does not reach the caller at all; the
+  run carries on by itself. An interval of 0 asks at the child's next request
+  boundary.
+- `deadline_seconds` (default 3600) — at the deadline the child is told to stop
+  working and write its final report: what it changed, what it ran, what is
+  verified, and what is left undone. That report is what the tool call returns.
+  A few minutes of grace are given for the report itself; a child that misses
+  even that is stopped where it stands, and its last words are returned as the
+  report with the deadline named as the reason the work ended there.
+
+The model that started the run waits once and reads once. There is no verdict to
+give, no run to resume and no mid-run stop to ask for: the call returns when the
+child is done or its deadline has passed.
 
 ## What the child has
 
 The child gets its own system prompt and its own
 [scratch directory](security.md#scratch-directory), and at startup only the task
 description and the optional context, so the task has to be self-contained. It
-is offered no `ask_user`, `plan`, `announce_task`, `memory_save`, `subagent_stop`
-or nesting of its own: both sides of the handshake belong to the caller, and
-what the child has is `report`.
+is offered no `ask_user`, `plan`, `announce_task`, `memory_save` or nesting of
+its own; what it has that the main agent does not is `report`.
 
 The plan therefore stays with the main agent. A sub-agent's report is a report:
 the caller inspects the work and runs the verification itself, and only then
 marks a plan step done.
+
+## A saved run
+
+A child of a durable session keeps a session of its own, and `subagent` with its
+`id` restores it in a later process and lets it carry on. See
+[Durable sub-agent runs](subagent-sessions.md).
 
 ## On the terminal
 
@@ -40,12 +55,30 @@ A sub-agent's wait is marked as one: its call line is a cyan `⇢ subagent
 the tests… 12s`), so a second agent at work is told apart from the main model
 thinking.
 
+Each self-check is printed as it arrives, in cyan, with the run it belongs to
+and how long the run has been going:
+
+```
+  ⇢ self-check, 10m 0s in · s1 "Split the tree" · carrying on, Esc stops it
+two of the four tools are split; nothing verified yet
+```
+
+The run carries on by itself, so the line says which way the choice went; Esc,
+the same key that stops any other task, is what stops it.
+
 The name on those lines is the `title` the caller gave the run — one line of
 fewer than 80 characters, the summary of the task — and a call without one falls
-back to the task's own opening; a resume or a stop names the run by its `id` and
-the title it was started with. The name is model output, so its newlines are
-flattened and its escape sequences dropped, and a progress line is always one
-line.
+back to the task's own opening; a call that names an existing run by its `id`
+shows the title that run was started with. The name and the report are model
+output, so newlines are flattened, escape sequences dropped, and each line stays
+one line.
+
+## Not cached
+
+A sub-agent's report is never replaced by a `ccr` stand-in: it is the one text
+the caller verifies the work from, and a preview plus a cache id would hide
+exactly what it needs. Nothing a sub-agent runs on its own side is cached
+either, since that transcript never reaches the caller.
 
 ## Cost
 

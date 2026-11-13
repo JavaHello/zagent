@@ -96,15 +96,14 @@ pub const subagent = hostDefinition(dispatch.specOf("subagent"));
 
 pub const report = hostDefinition(dispatch.specOf("report"));
 
-pub const subagent_stop = hostDefinition(dispatch.specOf("subagent_stop"));
 pub const load_mcp_tools = hostDefinition(dispatch.specOf("load_mcp_tools"));
 
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash, read,     write,         edit,   apply_patch,  ls,
-    rg,            fd,   grep,     find,          http,   ask_user,     memory_save,
-    announce_task, plan, subagent, subagent_stop, report, ccr_retrieve,
+    memory_search, bash, read,     write,  edit,         apply_patch, ls,
+    rg,            fd,   grep,     find,   http,         ask_user,    memory_save,
+    announce_task, plan, subagent, report, ccr_retrieve,
 };
 
 test "write and edit have separate required arguments" {

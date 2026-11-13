@@ -41,7 +41,7 @@ described in
 
 ## Watching a sub-agent
 
-A [sub-agent](subagents.md) runs the same loop under the caller's eye: the
-caller decides how long it works before a check-in, reads its progress report,
-and either lets it carry on or stops it. Its tokens are added to the calling
-turn.
+A [sub-agent](subagents.md) runs the same loop on the two clocks its caller
+set: every self-check interval it reports its progress on the terminal, and at
+its deadline it stops and writes the final report the caller reads. Its tokens
+are added to the calling turn.
