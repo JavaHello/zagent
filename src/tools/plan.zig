@@ -96,7 +96,7 @@ fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
 pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     const parsed = std.json.parseFromSlice(Arguments, self.allocator, arguments, .{}) catch {
         return .{
-            .content = try self.allocator.dupe(u8, "Error: expected an object with an optional 'steps' array, or 'index' with 'status' or 'note'."),
+            .output = try self.allocator.dupe(u8, "Error: expected an object with an optional 'steps' array, or 'index' with 'status' or 'note'."),
             .is_error = true,
         };
     };
@@ -104,13 +104,13 @@ pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     const args = parsed.value;
     if (args.steps == null and args.index == null) {
         if (args.status != null or args.note != null) return .{
-            .content = try self.allocator.dupe(u8, "Error: 'status' and 'note' change the step named by 'index'; add the index, or send 'steps' to replace the plan."),
+            .output = try self.allocator.dupe(u8, "Error: 'status' and 'note' change the step named by 'index'; add the index, or send 'steps' to replace the plan."),
             .is_error = true,
         };
-        return .{ .content = try self.plan.describe(self.allocator), .is_error = false };
+        return .{ .output = try self.plan.describe(self.allocator), .is_error = false };
     }
     if (args.steps != null and args.index != null) return .{
-        .content = try self.allocator.dupe(u8, "Error: send either 'steps' or 'index', not both."),
+        .output = try self.allocator.dupe(u8, "Error: send either 'steps' or 'index', not both."),
         .is_error = true,
     };
     var previous_status: ?plan_mod.Status = null;
@@ -120,36 +120,36 @@ pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
         try converted.ensureTotalCapacity(self.allocator, raw_steps.len);
         for (raw_steps) |step| {
             const status = if (step.status) |label| plan_mod.Status.parse(label) orelse return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: step status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
+                .output = try std.fmt.allocPrint(self.allocator, "Error: step status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
                 .is_error = true,
             } else null;
             converted.appendAssumeCapacity(.{ .title = step.title, .status = status, .note = step.note });
         }
         self.plan.setSteps(converted.items) catch |err| return .{
-            .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
+            .output = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
             .is_error = true,
         };
     } else {
         const status = if (args.status) |label| plan_mod.Status.parse(label) orelse return .{
-            .content = try std.fmt.allocPrint(self.allocator, "Error: status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
+            .output = try std.fmt.allocPrint(self.allocator, "Error: status '{s}' must be pending, in_progress, completed or blocked.", .{label}),
             .is_error = true,
         } else null;
         if (status == null and args.note == null) return .{
-            .content = try self.allocator.dupe(u8, "Error: 'index' needs a 'status' or a 'note' to change."),
+            .output = try self.allocator.dupe(u8, "Error: 'index' needs a 'status' or a 'note' to change."),
             .is_error = true,
         };
         if (args.index.? > 0 and args.index.? <= self.plan.steps.items.len)
             previous_status = self.plan.steps.items[args.index.? - 1].status;
         self.plan.update(args.index.?, status, args.note) catch |err| switch (err) {
             error.NoSuchStep => return .{
-                .content = try std.fmt.allocPrint(self.allocator, "Error: there is no step {d}; the plan has {d}.", .{ args.index.?, self.plan.steps.items.len }),
+                .output = try std.fmt.allocPrint(self.allocator, "Error: there is no step {d}; the plan has {d}.", .{ args.index.?, self.plan.steps.items.len }),
                 .is_error = true,
             },
             else => return .{
-                .content = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
+                .output = try std.fmt.allocPrint(self.allocator, "The plan was not updated: {s}", .{@errorName(err)}),
                 .is_error = true,
             },
         };
     }
-    return .{ .content = try describeChange(&self.plan, self.allocator, args.index, previous_status, args.note != null), .is_error = false };
+    return .{ .output = try describeChange(&self.plan, self.allocator, args.index, previous_status, args.note != null), .is_error = false };
 }

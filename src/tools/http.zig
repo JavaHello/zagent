@@ -236,9 +236,9 @@ pub fn httpRequestWithin(io: std.Io, allocator: std.mem.Allocator, request: Http
     // leaves behind is a read that failed or a connection that closed, and
     // neither says what the wait was really about.
     if (!result.is_error or !deadline.passed()) return result;
-    allocator.free(result.content);
+    allocator.free(result.output);
     return .{
-        .content = try std.fmt.allocPrint(allocator, "Error: '{s}' did not answer within {d}s; the request was stopped.", .{ request.url, seconds }),
+        .output = try std.fmt.allocPrint(allocator, "Error: '{s}' did not answer within {d}s; the request was stopped.", .{ request.url, seconds }),
         .is_error = true,
         .timed_out = true,
     };
@@ -349,7 +349,7 @@ fn perform(allocator: std.mem.Allocator, deadline: *Deadline, request: HttpReque
 
     if (request.save_to) |path| {
         if (http_error) return .{
-            .content = try std.fmt.allocPrint(allocator, "{s}\nHTTP error: destination '{s}' was not changed.", .{ head_aw.written(), path }),
+            .output = try std.fmt.allocPrint(allocator, "{s}\nHTTP error: destination '{s}' was not changed.", .{ head_aw.written(), path }),
             .is_error = true,
         };
         const written = saveResponseBody(deadline.inner, allocator, &response, path) catch |err| return toolError(
@@ -362,7 +362,7 @@ fn perform(allocator: std.mem.Allocator, deadline: *Deadline, request: HttpReque
         defer aw.deinit();
         try aw.writer.print("Saved {d} bytes to '{s}'\n", .{ written, path });
         try aw.writer.writeAll(head_aw.written());
-        return .{ .content = try aw.toOwnedSlice(), .is_error = false };
+        return .{ .output = try aw.toOwnedSlice(), .is_error = false };
     }
 
     const body_text = if (has_body)
@@ -381,7 +381,7 @@ fn perform(allocator: std.mem.Allocator, deadline: *Deadline, request: HttpReque
         try aw.writer.writeAll("(empty body)");
     }
 
-    return .{ .content = try aw.toOwnedSlice(), .is_error = http_error };
+    return .{ .output = try aw.toOwnedSlice(), .is_error = http_error };
 }
 
 /// Write the status line and every response header. Takes the head's parts
@@ -650,7 +650,7 @@ test "http request reports a method it cannot send" {
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "BREW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "BREW") != null);
 }
 
 test "http request reports a url it cannot use" {
@@ -665,7 +665,7 @@ test "http request reports a url it cannot use" {
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "valid URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "valid URL") != null);
 }
 
 /// A server on the loopback interface that answers the one connection a test
@@ -739,8 +739,8 @@ test "an answered request comes back with its status and body" {
 
     try std.testing.expect(!result.is_error);
     try std.testing.expect(!result.timed_out);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "200 OK") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "hi") != null);
 }
 
 test "a server that never answers is stopped by the deadline" {
@@ -763,6 +763,6 @@ test "a server that never answers is stopped by the deadline" {
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error and result.timed_out);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "did not answer within 1s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "did not answer within 1s") != null);
     try std.testing.expect(started.untilNow(std.testing.io).raw.toSeconds() < 30);
 }

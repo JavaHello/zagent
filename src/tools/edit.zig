@@ -83,7 +83,7 @@ pub fn editFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, old_
     try atomic.file.writeStreamingAll(io, updated);
     try atomic.file.setPermissions(io, stat.permissions);
     try atomic.replace(io);
-    return .{ .content = try std.fmt.allocPrint(allocator, "Replaced one exact text block in '{s}' ({d} -> {d} bytes)", .{ path, original.len, updated.len }), .is_error = false };
+    return .{ .output = try std.fmt.allocPrint(allocator, "Replaced one exact text block in '{s}' ({d} -> {d} bytes)", .{ path, original.len, updated.len }), .is_error = false };
 }
 
 test "exact edits reject ambiguous text and preserve permissions" {

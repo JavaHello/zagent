@@ -1026,12 +1026,12 @@ pub const Agent = struct {
         defer self.closeRun(run);
         if (answer.len == 0) {
             return .{
-                .content = try self.allocator.dupe(u8, "The sub-agent finished without a report. Inspect the working directory for what it did."),
+                .output = try self.allocator.dupe(u8, "The sub-agent finished without a report. Inspect the working directory for what it did."),
                 .is_error = true,
             };
         }
         return .{
-            .content = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ heading, answer }),
+            .output = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ heading, answer }),
             .is_error = false,
         };
     }
@@ -1041,7 +1041,7 @@ pub const Agent = struct {
     fn failRun(self: *Agent, run: *Run, failure: anyerror) anyerror!tools.ToolResult {
         defer self.closeRun(run);
         return .{
-            .content = try std.fmt.allocPrint(self.allocator, "The sub-agent stopped: {s}. Whatever it changed is on disk; inspect it before retrying.", .{subagentFailure(failure)}),
+            .output = try std.fmt.allocPrint(self.allocator, "The sub-agent stopped: {s}. Whatever it changed is on disk; inspect it before retrying.", .{subagentFailure(failure)}),
             .is_error = true,
         };
     }
@@ -1059,11 +1059,11 @@ pub const Agent = struct {
         defer self.allocator.free(answer);
         self.abortRun(run);
         if (answer.len == 0) return .{
-            .content = try self.allocator.dupe(u8, "The sub-agent passed its deadline and was stopped without a word. Inspect the working directory for what it did."),
+            .output = try self.allocator.dupe(u8, "The sub-agent passed its deadline and was stopped without a word. Inspect the working directory for what it did."),
             .is_error = true,
         };
         return .{
-            .content = try std.fmt.allocPrint(self.allocator, "The sub-agent passed its deadline and was stopped mid-work. This is the last thing it said, not a finished report — what it left undone is unknown until you look:\n{s}", .{answer}),
+            .output = try std.fmt.allocPrint(self.allocator, "The sub-agent passed its deadline and was stopped mid-work. This is the last thing it said, not a finished report — what it left undone is unknown until you look:\n{s}", .{answer}),
             .is_error = false,
         };
     }
@@ -1322,7 +1322,7 @@ pub const Agent = struct {
                             .{ call.name, @errorName(err) },
                         );
                         break :blk tools.ToolResult{
-                            .content = error_content,
+                            .output = error_content,
                             .is_error = true,
                             .timed_out = err == error.Timeout,
                         };
@@ -1330,7 +1330,7 @@ pub const Agent = struct {
                     // The result as the model reads it, so the record holds
                     // what the model was handed — down to a repeated page the
                     // read tool answered with a marker.
-                    if (self.trace) |trace| trace.toolResult(self.traceCtx(), call.name, call.id, result.content, .{
+                    if (self.trace) |trace| trace.toolResult(self.traceCtx(), call.name, call.id, result.output, .{
                         .is_error = result.is_error,
                         .exit_code = result.exit_code,
                         .timed_out = result.timed_out,
@@ -1340,7 +1340,7 @@ pub const Agent = struct {
                     });
                     defer result.deinit(self.allocator);
 
-                    const result_content = try self.allocator.dupe(u8, result.content);
+                    const result_content = try self.allocator.dupe(u8, result.output);
                     errdefer self.allocator.free(result_content);
                     const call_id = try self.allocator.dupe(u8, call.id);
                     errdefer self.allocator.free(call_id);
@@ -1352,6 +1352,7 @@ pub const Agent = struct {
                         .tool_calls = null,
                         .tool_call_id = call_id,
                         .tool_status = result.status(),
+                        .tool_ccr_id = result.ccr_id,
                     });
                     if (self.child_record != null) try self.checkpoint();
                 }
@@ -1748,7 +1749,7 @@ pub const Agent = struct {
         // only previews the result the tool returned, guarded as it prints.
         const result = try tools.execute(ctx, call.name, call.arguments);
         errdefer result.deinit(self.allocator);
-        try self.previewToolResult(result.content, result.status());
+        try self.previewToolResult(result.output, result.status());
         return result;
     }
 
@@ -2460,8 +2461,8 @@ test "a self-check is kept in the child's record and the run goes on" {
     const report = try harness.agent.waitRun(run, 0, 3_600);
     defer report.deinit(a);
     // The caller reads the last reply, not the self-check printed on its way.
-    try std.testing.expect(std.mem.indexOf(u8, report.content, "answer.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report.content, "saved halfway report") == null);
+    try std.testing.expect(std.mem.indexOf(u8, report.output, "answer.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.output, "saved halfway report") == null);
     // The child's own record keeps the self-check it answered, and the call
     // after it: a report finishes nothing.
     var loaded = try @import("../state/session.zig").load(io, a, child_path);
@@ -2582,9 +2583,9 @@ test "a sub-agent's own results are cached and its report never is" {
 
     // The report is the one text the caller verifies the work from: it reaches
     // the caller whole, at any size, with no preview and no cache id.
-    const report = try Agent.afterToolCall(ctx, "subagent", "{}", .{ .content = try a.dupe(u8, long), .is_error = false });
+    const report = try Agent.afterToolCall(ctx, "subagent", "{}", .{ .output = try a.dupe(u8, long), .is_error = false });
     defer report.deinit(a);
-    try std.testing.expectEqualStrings(long, report.content);
+    try std.testing.expectEqualStrings(long, report.output);
     try std.testing.expect(report.ccr_id == null and !report.is_error);
 
     // What the sub-agent runs itself goes through the cache like any other
@@ -2592,15 +2593,15 @@ test "a sub-agent's own results are cached and its report never is" {
     // preview names the entry the child reads back with `ccr_retrieve`.
     harness.agent.role = .subagent;
     defer harness.agent.role = .main;
-    const own = try Agent.afterToolCall(ctx, "read", "{}", .{ .content = try a.dupe(u8, long), .is_error = false });
+    const own = try Agent.afterToolCall(ctx, "read", "{}", .{ .output = try a.dupe(u8, long), .is_error = false });
     defer own.deinit(a);
     try std.testing.expect(own.ccr_id != null and !own.is_error);
-    try std.testing.expect(own.content.len < long.len);
-    const marker = std.mem.indexOf(u8, own.content, "[ccr ") orelse return error.MissingCacheId;
-    try std.testing.expect(std.mem.indexOf(u8, own.content[marker..], "ccr_retrieve") != null);
+    try std.testing.expect(own.output.len < long.len);
+    const marker = std.mem.indexOf(u8, own.output, "[ccr ") orelse return error.MissingCacheId;
+    try std.testing.expect(std.mem.indexOf(u8, own.output[marker..], "ccr_retrieve") != null);
 
     // The entry holds the whole result, so the child can page through it.
-    const id = own.content[marker + "[ccr ".len ..][0..@import("../tools/ccr.zig").id_len];
+    const id = own.output[marker + "[ccr ".len ..][0..@import("../tools/ccr.zig").id_len];
     const path = try std.fmt.allocPrint(a, "{s}/{s}.log", .{ dir, id });
     defer a.free(path);
     const cached = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(long.len + 1));
@@ -2714,17 +2715,17 @@ test "the report tool belongs to the child and the clocks are checked" {
     const reported = try harness.agent.reportTool("{\"summary\":\"halfway\"}");
     defer reported.deinit(allocator);
     try std.testing.expect(reported.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, reported.content, "belongs to a sub-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reported.output, "belongs to a sub-agent") != null);
 
     // A clock no run could keep is refused before the run starts.
     const checked = try harness.agent.subagentTool("{\"task\":\"anything\",\"self_check_seconds\":4000}");
     defer checked.deinit(allocator);
     try std.testing.expect(checked.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, checked.content, "self_check_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checked.output, "self_check_seconds") != null);
     const undated = try harness.agent.subagentTool("{\"task\":\"anything\",\"deadline_seconds\":0}");
     defer undated.deinit(allocator);
     try std.testing.expect(undated.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, undated.content, "deadline_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, undated.output, "deadline_seconds") != null);
 }
 
 test "unified tools receive the owning agent through Context" {
@@ -2739,14 +2740,14 @@ test "unified tools receive the owning agent through Context" {
     const started = try tools.execute(ctx, "subagent", "{\"task\":\"anything\",\"self_check_seconds\":4000}");
     defer started.deinit(allocator);
     try std.testing.expect(started.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, started.content, "self_check_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, started.output, "self_check_seconds") != null);
 
     // A saved run that was never started here is named as missing, and the
     // caller reads back why rather than a new run being started in its place.
     const resumed = try tools.execute(ctx, "subagent", "{\"id\":\"s9\"}");
     defer resumed.deinit(allocator);
     try std.testing.expect(resumed.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, resumed.content, "could not restore sub-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resumed.output, "could not restore sub-agent") != null);
 
     const plan = try tools.execute(ctx, "plan", "{}");
     defer plan.deinit(allocator);
@@ -2813,12 +2814,12 @@ test "a title that cannot be one line is refused before a run starts" {
     const long = try harness.agent.subagentTool(aw.written());
     defer long.deinit(allocator);
     try std.testing.expect(long.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, long.content, "title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, long.output, "title") != null);
 
     const broken = try harness.agent.subagentTool("{\"task\":\"anything\",\"title\":\"one\\ntwo\"}");
     defer broken.deinit(allocator);
     try std.testing.expect(broken.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, broken.content, "one line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, broken.output, "one line") != null);
     try std.testing.expectEqual(@as(usize, 0), harness.agent.runs.items.len);
 }
 
@@ -3030,7 +3031,7 @@ test "a result's status is a line of its own, with the result under it" {
         .termination = "SIGTERM",
     });
     try std.testing.expectEqualStrings(
-        RED ++ "  ✗ SIGTERM\n    (no output)\n" ++ RESET,
+        RED ++ "  ✗ SIGTERM\n" ++ RESET,
         aw.written(),
     );
 }

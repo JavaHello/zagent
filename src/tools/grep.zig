@@ -86,9 +86,9 @@ test "grep includes context and stops matching per file" {
     });
     defer result.deinit(a);
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "before") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "after") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "needle later") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "after") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "needle later") == null);
 }
 
 test "search limits parse and reach both backends" {
@@ -149,7 +149,7 @@ test "grep finds a line and the file it is in" {
     defer result.deinit(allocator);
 
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "note.txt:2:the needle is here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "note.txt:2:the needle is here") != null);
 }
 
 test "grep expands path globs without interpreting user input as shell source" {
@@ -189,11 +189,11 @@ test "grep expands path globs without interpreting user input as shell source" {
         });
         defer result.deinit(allocator);
         try std.testing.expect(!result.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "README.md:1:needle") != null);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "README zh.md:1:needle") != null);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "README $(printf INJECTED).md:1:needle") != null);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "nested/") == null);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "other.md") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "README.md:1:needle") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "README zh.md:1:needle") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "README $(printf INJECTED).md:1:needle") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "nested/") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "other.md") == null);
 
         const missing_path = try std.fmt.allocPrint(allocator, "{s}/missing*", .{dir});
         defer allocator.free(missing_path);

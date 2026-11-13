@@ -117,9 +117,9 @@ fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     // Read is the one tool whose output a later call can repeat, so the second
     // copy is folded away here, where the page that was asked for and the
     // history it repeats are both at hand.
-    defer ctx.allocator.free(result.content);
+    defer ctx.allocator.free(result.output);
     return .{
-        .content = try deduplicateReadResult(ctx.allocator, history(ctx), arguments, result.content),
+        .output = try deduplicateReadResult(ctx.allocator, history(ctx), arguments, result.output),
         .is_error = false,
     };
 }
@@ -218,7 +218,7 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
         return toolError(allocator, "Error: offset is a 1-based line number and limit a count of lines; both must be at least 1", .{});
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         return .{
-            .content = try std.fmt.allocPrint(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) }),
+            .output = try std.fmt.allocPrint(allocator, "Error opening '{s}': {s}", .{ path, @errorName(err) }),
             .is_error = true,
         };
     };
@@ -267,11 +267,11 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
     // that is not in the file. The screen is guarded where it is written.
     if (resumes_at) |next| {
         return .{
-            .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ std.mem.trimEnd(u8, body.items, "\n"), next }),
+            .output = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ std.mem.trimEnd(u8, body.items, "\n"), next }),
             .is_error = false,
         };
     }
-    return .{ .content = try allocator.dupe(u8, body.items), .is_error = false };
+    return .{ .output = try allocator.dupe(u8, body.items), .is_error = false };
 }
 
 test "read takes a 1-based offset and a line limit" {
@@ -316,29 +316,29 @@ test "read streams a page from deep in a large file" {
     try std.testing.expect(!page.is_error);
     try std.testing.expectEqualStrings(
         "2:one\n3:two\n[Output truncated; continue with offset=4 (1-based line number).]",
-        page.content,
+        page.output,
     );
-    try std.testing.expect(std.mem.indexOf(u8, page.content, "continue with offset=4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.output, "continue with offset=4") != null);
 
     const tail = try readFilePage(io, a, path, .{ .offset = 4 });
     defer tail.deinit(a);
-    try std.testing.expectEqualStrings("4:last\n", tail.content);
+    try std.testing.expectEqualStrings("4:last\n", tail.output);
 
     // A page past the last line has no lines to show: the page is empty, and
     // says nothing a file does not.
     const beyond = try readFilePage(io, a, path, .{ .offset = 5 });
     defer beyond.deinit(a);
-    try std.testing.expectEqualStrings("", beyond.content);
+    try std.testing.expectEqualStrings("", beyond.output);
 
     // Even a first line larger than the presentation budget is returned whole.
     const full = try readFile(io, a, path);
     defer full.deinit(a);
     try std.testing.expect(!full.is_error);
-    try std.testing.expect(std.mem.startsWith(u8, full.content, "1:xxx"));
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "4:last") != null);
+    try std.testing.expect(std.mem.startsWith(u8, full.output, "1:xxx"));
+    try std.testing.expect(std.mem.indexOf(u8, full.output, "4:last") != null);
     // The cache, not the file reader, owns the presentation budget: a read of
     // a large file is handed over whole and cached afterwards.
-    try std.testing.expect(full.content.len > @import("ccr.zig").max_output_bytes);
+    try std.testing.expect(full.output.len > @import("ccr.zig").max_output_bytes);
 }
 
 test "read returns every line when no explicit limit is supplied" {
@@ -359,8 +359,8 @@ test "read returns every line when no explicit limit is supplied" {
 
     const first = try readFilePage(io, a, path, .{});
     defer first.deinit(a);
-    try std.testing.expect(std.mem.startsWith(u8, first.content, "1:line 0\n"));
-    try std.testing.expectEqual(index, std.mem.count(u8, first.content, "\n"));
+    try std.testing.expect(std.mem.startsWith(u8, first.output, "1:line 0\n"));
+    try std.testing.expectEqual(index, std.mem.count(u8, first.output, "\n"));
 }
 
 test "read preserves a line longer than a page without splitting a character" {
@@ -377,9 +377,9 @@ test "read preserves a line longer than a page without splitting a character" {
 
     const result = try readFilePage(io, a, path, .{});
     defer result.deinit(a);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
-    try std.testing.expectEqual(buffer.items.len + 3, result.content.len);
-    try std.testing.expectEqualStrings(buffer.items, result.content[2 .. result.content.len - 1]);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.output));
+    try std.testing.expectEqual(buffer.items.len + 3, result.output.len);
+    try std.testing.expectEqualStrings(buffer.items, result.output[2 .. result.output.len - 1]);
 }
 
 test "read hands back the file's bytes as they are" {
@@ -397,7 +397,7 @@ test "read hands back the file's bytes as they are" {
 
     const result = try readFilePage(io, a, path, .{});
     defer result.deinit(a);
-    try std.testing.expectEqualStrings("1:\x1b[2Jred\xff\n2:second\n", result.content);
+    try std.testing.expectEqualStrings("1:\x1b[2Jred\xff\n2:second\n", result.output);
 }
 
 test "read missing file" {

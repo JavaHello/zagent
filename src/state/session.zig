@@ -4,7 +4,7 @@ const openai = @import("../model/openai.zig");
 const plan_mod = @import("plan.zig");
 const signals = @import("../util/signals.zig");
 const Message = openai.Message;
-// Persisted fields are required: old snapshot shapes are not migrated.
+// Core persisted fields are required; optional metadata can be added compatibly.
 const StoredMessage = struct {
     role: []const u8,
     content: ?[]const u8,
@@ -13,6 +13,7 @@ const StoredMessage = struct {
     tool_call_id: ?[]const u8,
     response_items: ?[]const u8,
     tool_status: ?@import("../tools/mod.zig").ToolStatus,
+    tool_ccr_id: ?@import("../tools/result.zig").CcrId = null,
 };
 /// The plan travels with the conversation: it is state of the session, not a
 /// file of its own, so the snapshot carries it next to the messages.
@@ -181,6 +182,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Loaded 
                 .termination = if (status.termination) |written| signals.canonical(written) else null,
             };
         }
+        message.tool_ccr_id = source.tool_ccr_id;
         message.role = if (std.mem.eql(u8, source.role, "user")) "user" else if (std.mem.eql(u8, source.role, "assistant")) "assistant" else if (std.mem.eql(u8, source.role, "tool")) "tool" else return error.InvalidSessionRole;
         if (pending) |calls| {
             if (!std.mem.eql(u8, message.role, "tool") or source.tool_call_id == null or !std.mem.eql(u8, calls[next_tool].id, source.tool_call_id.?)) return error.InvalidSessionToolSequence;
@@ -266,7 +268,7 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
     };
     var messages = [_]Message{
         .{ .role = "assistant", .content = null, .reasoning_content = "plan", .tool_calls = &calls, .tool_call_id = null, .response_items = "[{\"type\":\"reasoning\",\"id\":\"rs1\",\"summary\":[],\"encrypted_content\":\"opaque-token\"},{\"type\":\"function_call\",\"call_id\":\"1\",\"name\":\"shell\",\"arguments\":\"{}\"}]" },
-        .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true } },
+        .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true }, .tool_ccr_id = "abcdef012345".* },
         .{ .role = "tool", .content = @import("../tools/mod.zig").no_output, .reasoning_content = null, .tool_calls = null, .tool_call_id = "2", .tool_status = .{ .is_error = true, .termination = "SIGTERM" } },
     };
     try save(io, allocator, path, &messages, &plan);
@@ -278,6 +280,7 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
     try std.testing.expectEqualStrings("shell", loaded.messages.items[0].tool_calls.?[0].name);
     try std.testing.expectEqualStrings("done", loaded.messages.items[1].content.?);
     try std.testing.expectEqualDeep(messages[1].tool_status, loaded.messages.items[1].tool_status);
+    try std.testing.expectEqualDeep(messages[1].tool_ccr_id, loaded.messages.items[1].tool_ccr_id);
     // The signal that ended a call is part of the status, so a restored
     // conversation still shows how it ended.
     try std.testing.expectEqualDeep(messages[2].tool_status, loaded.messages.items[2].tool_status);

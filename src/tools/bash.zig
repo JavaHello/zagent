@@ -150,7 +150,7 @@ pub fn executeShellTimed(
         .env = env,
         .timeout_seconds = timeout_seconds,
     }, &collector) catch |err| return .{
-        .content = try std.fmt.allocPrint(allocator, "Error: the shell could not be run ({s}).", .{@errorName(err)}),
+        .output = try std.fmt.allocPrint(allocator, "Error: the shell could not be run ({s}).", .{@errorName(err)}),
         .is_error = true,
     };
 
@@ -159,7 +159,7 @@ pub fn executeShellTimed(
         // for taking too long, and a half-written answer would read as one the
         // command chose to stop at.
         return .{
-            .content = try std.fmt.allocPrint(allocator, "Tool timed out after {d}s.", .{timeout_seconds}),
+            .output = try std.fmt.allocPrint(allocator, "Tool timed out after {d}s.", .{timeout_seconds}),
             .is_error = true,
             .timed_out = true,
         };
@@ -169,7 +169,7 @@ pub fn executeShellTimed(
     const exit_code = shell.exitCode();
     const failed = exit_code == null or exit_code.? != 0;
     // How the command ended belongs to the result's status, not to its text:
-    // the model reads it in the header above the output and the terminal on
+    // the model reads it in JSON beside the output and the terminal on
     // the line under the call, so nothing the command printed is displaced and
     // nothing is said twice.
     const ending: ToolStatus = .{
@@ -224,8 +224,8 @@ test "a long output is handed over whole, and the tool adds nothing to it" {
         try std.testing.expect(!result.is_error);
         // Trimming belongs to the cache: this tool hands on what the command
         // printed, and says nothing about what became of it.
-        try std.testing.expectEqual(size, result.content.len);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "ccr") == null);
+        try std.testing.expectEqual(size, result.output.len);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "ccr") == null);
     }
 }
 
@@ -234,17 +234,17 @@ test "shell status survives empty output, stderr and signals" {
     // travels in the status beside it.
     const cases = [_]struct {
         command: []const u8,
-        content: ?[]const u8,
+        output: ?[]const u8,
         exit_code: ?u8,
         termination: ?[]const u8,
         is_error: bool,
     }{
-        .{ .command = "exit 0", .content = no_output, .exit_code = 0, .termination = null, .is_error = false },
-        .{ .command = "exit 42", .content = no_output, .exit_code = 42, .termination = null, .is_error = true },
-        .{ .command = "printf out; printf err >&2; exit 7", .content = "out\nstderr:\nerr", .exit_code = 7, .termination = null, .is_error = true },
-        .{ .command = "printf warning >&2", .content = "stderr:\nwarning", .exit_code = 0, .termination = null, .is_error = false },
-        .{ .command = "kill -TERM $$", .content = no_output, .exit_code = null, .termination = "SIGTERM", .is_error = true },
-        .{ .command = "printf '%50000s' ''; exit 9", .content = null, .exit_code = 9, .termination = null, .is_error = true },
+        .{ .command = "exit 0", .output = no_output, .exit_code = 0, .termination = null, .is_error = false },
+        .{ .command = "exit 42", .output = no_output, .exit_code = 42, .termination = null, .is_error = true },
+        .{ .command = "printf out; printf err >&2; exit 7", .output = "out\nstderr:\nerr", .exit_code = 7, .termination = null, .is_error = true },
+        .{ .command = "printf warning >&2", .output = "stderr:\nwarning", .exit_code = 0, .termination = null, .is_error = false },
+        .{ .command = "kill -TERM $$", .output = no_output, .exit_code = null, .termination = "SIGTERM", .is_error = true },
+        .{ .command = "printf '%50000s' ''; exit 9", .output = null, .exit_code = 9, .termination = null, .is_error = true },
     };
     for (cases) |case| {
         const result = try executeShell(std.testing.io, std.testing.allocator, case.command);
@@ -252,16 +252,16 @@ test "shell status survives empty output, stderr and signals" {
         try std.testing.expectEqual(case.is_error, result.is_error);
         try std.testing.expectEqual(case.exit_code, result.exit_code);
         try std.testing.expectEqualDeep(case.termination, result.termination);
-        if (case.content) |expected| try std.testing.expectEqualStrings(expected, result.content);
+        if (case.output) |expected| try std.testing.expectEqualStrings(expected, result.output);
         // Nothing the shell reports about itself is left in the text: the
         // model reads the ending from the status, not from a line it would
         // have to parse out of the output.
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "Exit code:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "Exit code:") == null);
     }
     // The output a command printed is not cut, whatever its size.
     const long = try executeShell(std.testing.io, std.testing.allocator, "printf '%50000s' ''");
     defer long.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 50000), long.content.len);
+    try std.testing.expectEqual(@as(usize, 50000), long.output.len);
     try std.testing.expect(!long.is_error and long.ccr_id == null);
 }
 
@@ -279,7 +279,7 @@ test "output is collected as the screen showed it, not as it was written" {
     for (cases) |case| {
         const result = try executeShell(std.testing.io, a, case.command);
         defer result.deinit(a);
-        try std.testing.expectEqualStrings(case.expected, result.content);
+        try std.testing.expectEqualStrings(case.expected, result.output);
     }
 }
 
@@ -294,12 +294,12 @@ test "both streams reach the result in full, stdout before stderr" {
     try std.testing.expect(result.is_error);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
     try std.testing.expect(result.ccr_id == null);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.output));
     // Nothing is missing from either end: no status line of the shell's own
     // comes before the output, and neither stream is cut short.
-    try std.testing.expect(std.mem.startsWith(u8, result.content, "START"));
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "OUT_END\nstderr:\nERR_START") != null);
-    try std.testing.expect(std.mem.endsWith(u8, result.content, "ERR_END"));
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "START"));
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "OUT_END\nstderr:\nERR_START") != null);
+    try std.testing.expect(std.mem.endsWith(u8, result.output, "ERR_END"));
 }
 
 test "a command that prints without end is ended by its deadline" {
@@ -309,5 +309,5 @@ test "a command that prints without end is ended by its deadline" {
     const result = try executeShellTimed(std.testing.io, a, "while :; do sleep 0.05; printf 'y\\n'; done", null, 1);
     defer result.deinit(a);
     try std.testing.expect(result.is_error and result.timed_out);
-    try std.testing.expectEqualStrings("Tool timed out after 1s.", result.content);
+    try std.testing.expectEqualStrings("Tool timed out after 1s.", result.output);
 }

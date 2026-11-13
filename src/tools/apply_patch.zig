@@ -53,7 +53,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
             // it is handed back as it is, so the two can be compared byte for
             // byte.
             return .{
-                .content = try std.fmt.allocPrint(allocator, "Error: {s}", .{message}),
+                .output = try std.fmt.allocPrint(allocator, "Error: {s}", .{message}),
                 .is_error = true,
             };
         },
@@ -81,7 +81,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
                 }
                 try aw.writer.writeByte(')');
             }
-            return .{ .content = try aw.toOwnedSlice(), .is_error = false };
+            return .{ .output = try aw.toOwnedSlice(), .is_error = false };
         },
     }
 }
@@ -128,8 +128,8 @@ test "apply patch changes the file and says what it changed" {
     defer result.deinit(allocator);
 
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "Applied 1 file: ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "note.txt (+1 -1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Applied 1 file: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "note.txt (+1 -1)") != null);
 }
 
 test "a rename is reported as one, with the name the file came from" {
@@ -162,7 +162,7 @@ test "a rename is reported as one, with the name the file came from" {
     const expected = try std.fmt.allocPrint(allocator, "Applied 1 file: {s}/renamed.txt (renamed from {s}/note.txt, +1 -1)", .{ dir, dir });
     defer allocator.free(expected);
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings(expected, result.content);
+    try std.testing.expectEqualStrings(expected, result.output);
 }
 
 test "a patch that does not fit is an error the model can act on" {
@@ -192,8 +192,8 @@ test "a patch that does not fit is an error the model can act on" {
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.startsWith(u8, result.content, "Error: "));
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "note.txt") != null);
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "Error: "));
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "note.txt") != null);
 
     // And nothing was written: the file is exactly as it was.
     const content = try tmp.dir.readFileAlloc(io, "note.txt", allocator, .limited(1024));

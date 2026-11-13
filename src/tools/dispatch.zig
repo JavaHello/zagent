@@ -108,7 +108,7 @@ test "global and local hooks nest, short circuit and propagate errors without cl
             return @ptrCast(@alignCast(ctx.hook_data.?));
         }
         fn value(ctx: tool.Context) !ToolResult {
-            return .{ .content = try ctx.allocator.dupe(u8, "result"), .is_error = false };
+            return .{ .output = try ctx.allocator.dupe(u8, "result"), .is_error = false };
         }
         fn outerBefore(ctx: tool.Context, name: []const u8, args: []const u8) !?ToolResult {
             const self = try state(ctx, name, args);
@@ -131,7 +131,7 @@ test "global and local hooks nest, short circuit and propagate errors without cl
             if (self.mode == .oversized) {
                 const content = try ctx.allocator.alloc(u8, @import("ccr.zig").max_output_bytes + 100);
                 @memset(content, 'x');
-                return .{ .content = content, .is_error = false };
+                return .{ .output = content, .is_error = false };
             }
             return value(ctx);
         }
@@ -156,10 +156,10 @@ test "global and local hooks nest, short circuit and propagate errors without cl
             }
             if (self.mode == .oversized) {
                 defer result.deinit(ctx.allocator);
-                try std.testing.expect(result.content.len > @import("ccr.zig").max_output_bytes);
+                try std.testing.expect(result.output.len > @import("ccr.zig").max_output_bytes);
                 try std.testing.expect(result.ccr_id == null and !result.is_error);
                 // The dispatch must preserve this complete oversized result.
-                return .{ .content = try ctx.allocator.dupe(u8, result.content), .is_error = false };
+                return .{ .output = try ctx.allocator.dupe(u8, result.output), .is_error = false };
             }
             return result;
         }
@@ -187,8 +187,8 @@ test "global and local hooks nest, short circuit and propagate errors without cl
             defer result.deinit(ctx.allocator);
             if (case.mode == .oversized) {
                 try std.testing.expect(result.ccr_id == null and !result.is_error);
-                try std.testing.expect(result.content.len > @import("ccr.zig").max_output_bytes);
-            } else try std.testing.expectEqualStrings("result", result.content);
+                try std.testing.expect(result.output.len > @import("ccr.zig").max_output_bytes);
+            } else try std.testing.expectEqualStrings("result", result.output);
         }
         try std.testing.expectEqualStrings(case.events, state.events.items);
     }
@@ -210,7 +210,7 @@ test "dynamic MCP prefix passes through global hooks without agent context" {
             const result = try outcome;
             errdefer result.deinit(ctx.allocator);
             try std.testing.expect(result.is_error);
-            try std.testing.expectEqualStrings("Error: this tool requires an agent context.", result.content);
+            try std.testing.expectEqualStrings("Error: this tool requires an agent context.", result.output);
             return result;
         }
     };
@@ -269,7 +269,7 @@ test "session and MCP tools require an agent context" {
         const result = try call(name, "{}");
         defer result.deinit(a);
         try std.testing.expect(result.is_error);
-        try std.testing.expectEqualStrings("Error: this tool requires an agent context.", result.content);
+        try std.testing.expectEqualStrings("Error: this tool requires an agent context.", result.output);
     }
 }
 
@@ -286,25 +286,25 @@ test "read dispatch forwards the page the caller asked for" {
     const full = try call("read", defaults);
     defer full.deinit(a);
     try std.testing.expect(!full.is_error);
-    try std.testing.expectEqualStrings("1:first\n2:second\n3:third\n", full.content);
+    try std.testing.expectEqualStrings("1:first\n2:second\n3:third\n", full.output);
     const args = try std.json.Stringify.valueAlloc(a, .{ .path = path, .offset = 2, .limit = 1 }, .{});
     defer a.free(args);
     const page = try call("read", args);
     defer page.deinit(a);
     try std.testing.expect(!page.is_error);
-    try std.testing.expectEqualStrings("2:second\n[Output truncated; continue with offset=3 (1-based line number).]", page.content);
+    try std.testing.expectEqualStrings("2:second\n[Output truncated; continue with offset=3 (1-based line number).]", page.output);
     const invalid = try std.json.Stringify.valueAlloc(a, .{ .path = path, .offset = 0 }, .{});
     defer a.free(invalid);
     const rejected = try call("read", invalid);
     defer rejected.deinit(a);
     try std.testing.expect(rejected.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, rejected.content, "offset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.output, "offset") != null);
     // Both advertised backend names reach their own tool.
     for ([_][]const u8{ "rg", "grep" }) |name| {
         const invalid_search = try call(name, "{\"pattern\":\"x\",\"max_matches\":0}");
         defer invalid_search.deinit(a);
         try std.testing.expect(invalid_search.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, invalid_search.content, "max_matches") != null);
+        try std.testing.expect(std.mem.indexOf(u8, invalid_search.output, "max_matches") != null);
     }
 }
 
@@ -314,7 +314,7 @@ test "ls and the searches refuse the offset paging they no longer take" {
         const result = try call(name, "{\"pattern\":\"x\",\"offset\":2}");
         defer result.deinit(a);
         try std.testing.expect(result.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "has no 'offset'") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "has no 'offset'") != null);
     }
     // The same call without it is dispatched as usual.
     const listed = try call("ls", "{\"limit\":1}");
@@ -341,7 +341,7 @@ test "write creates overwrites and rejects mixed modes; legacy names are removed
         defer a.free(actual);
         try std.testing.expectEqualStrings(content, actual);
     }
-    const mixed = try std.json.Stringify.valueAlloc(a, .{ .path = path, .content = "bad", .old_text = "old", .new_text = "new" }, .{});
+    const mixed = try std.json.Stringify.valueAlloc(a, .{ .path = path, .output = "bad", .old_text = "old", .new_text = "new" }, .{});
     defer a.free(mixed);
     const rejected = try call("write", mixed);
     defer rejected.deinit(a);
@@ -377,7 +377,7 @@ test "http dispatches to request argument validation" {
     const result = try call("http", "{}");
     defer result.deinit(a);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.startsWith(u8, result.content, "Error: http arguments are unusable"));
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "Error: http arguments are unusable"));
 }
 
 test "read write and ls operate on an existing file" {
@@ -392,7 +392,7 @@ test "read write and ls operate on an existing file" {
     defer a.free(args);
     const before = try call("read", args);
     defer before.deinit(a);
-    try std.testing.expectEqualStrings("1:before\n", before.content);
+    try std.testing.expectEqualStrings("1:before\n", before.output);
     const legacy = try call("write", args);
     defer legacy.deinit(a);
     try std.testing.expect(legacy.is_error);
@@ -401,13 +401,13 @@ test "read write and ls operate on an existing file" {
     try std.testing.expect(!edited.is_error);
     const after = try call("read", args);
     defer after.deinit(a);
-    try std.testing.expectEqualStrings("1:after\n", after.content);
+    try std.testing.expectEqualStrings("1:after\n", after.output);
     const dir_args = try std.json.Stringify.valueAlloc(a, .{ .path = std.fs.path.dirname(path).? }, .{});
     defer a.free(dir_args);
     const listed = try call("ls", dir_args);
     defer listed.deinit(a);
     try std.testing.expect(!listed.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, listed.content, "note.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.output, "note.txt") != null);
 }
 
 test "ls defaults to the current directory" {
@@ -418,7 +418,7 @@ test "ls defaults to the current directory" {
     const explicit = try call("ls", "{\"path\":\".\"}");
     defer explicit.deinit(a);
     try std.testing.expect(!explicit.is_error);
-    try std.testing.expectEqualStrings(explicit.content, result.content);
+    try std.testing.expectEqualStrings(explicit.output, result.output);
 }
 
 test "ls rejects invalid path arguments" {
@@ -427,7 +427,7 @@ test "ls rejects invalid path arguments" {
         const result = try call("ls", args);
         defer result.deinit(a);
         try std.testing.expect(result.is_error);
-        try std.testing.expect(std.mem.startsWith(u8, result.content, "Error: ls expects"));
+        try std.testing.expect(std.mem.startsWith(u8, result.output, "Error: ls expects"));
     }
 }
 
@@ -443,7 +443,7 @@ test "filesystem tools dispatch without legacy aliases" {
         const result = try call(name, "{\"path\":\"/zagent-missing-test-directory/file\",\"old_text\":\"old\",\"new_text\":\"new\"}");
         defer result.deinit(a);
         try std.testing.expect(result.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "Error opening") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "Error opening") != null);
     }
     for ([_][]const u8{ "rg", "fd", "grep", "find" }) |name| {
         const result = try call(name, "{}");
@@ -457,5 +457,5 @@ test "a shell call that asks for an impossible deadline is refused" {
     const result = try call("bash", "{\"command\":\"true\",\"timeout_seconds\":0}");
     defer result.deinit(a);
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.startsWith(u8, result.content, "Invalid timeout_seconds"));
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "Invalid timeout_seconds"));
 }

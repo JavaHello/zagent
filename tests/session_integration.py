@@ -65,14 +65,9 @@ try:
         def assert_failed_tool_status(body):
             output = next(m['output'] for m in body['input']
                           if m.get('type') == 'function_call_output')
-            header, content = output.split('\n', 1)
-            assert header.startswith('[tool_status ') and header.endswith(']'), output
-            assert json.loads(header[len('[tool_status '):-1]) == {
-                'is_error': True, 'exit_code': 42, 'timed_out': False,
-                'termination': None}, output
-            # How the command ended is in the header; its text is what the
-            # command printed.
-            assert content == '(no output)', content
+            assert json.loads(output) == {
+                'output': '', 'is_error': True, 'exit_code': 42,
+                'timed_out': False, 'termination': None, 'ccr_id': None}, output
 
         first = session_id(run('first-session-marker'))
         path = state / 'sessions' / f'{first}.json'
@@ -84,7 +79,7 @@ try:
             'termination': None}, saved_tool
         assert_failed_tool_status(requests[-1])
         assert any(message.get('role') == 'tool'
-                   and message.get('content') == '(no output)'
+                   and message.get('content') == ''
                    for message in saved['messages']), saved
         second = session_id(run(stdin='/new\n/session\n/quit\n'))
         assert second != first
@@ -102,7 +97,7 @@ try:
         assert '⚙ bash' in restored and 'execution-count' in restored, restored
         # The status is a line of its own and names the exit code, so the
         # result starts under it and the number is not read twice.
-        assert '✗ exit 42\n    (no output)' in restored, restored
+        assert '✗ exit 42\n' in restored, restored
         assert 'Exit code: 42' not in restored, restored
         assert 'Saved answer' in restored, restored
         assert len(requests) == before_requests
@@ -131,7 +126,7 @@ try:
             assert b'first-session-marker' in laid_out, visible
             assert b'execution-count' in laid_out, visible
             # The status is a line of its own and names the exit code.
-            assert '✗ exit 42\n    (no output)'.encode() in laid_out, visible
+            assert '✗ exit 42\n'.encode() in laid_out, visible
             assert b'Saved answer' in laid_out, visible
             # History is painted before the editor enters raw mode; wait for
             # its final prompt cursor before sending EOF.

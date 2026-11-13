@@ -55,9 +55,10 @@ def instructions(body):
 
 
 def status_of(output):
-    header, content = output.split('\n', 1)
-    assert header.startswith('[tool_status ') and header.endswith(']'), output
-    return json.loads(header[len('[tool_status '):-1])['is_error'], content
+    result = json.loads(output)
+    content = result.pop('output')
+    result.pop('ccr_id')
+    return result['is_error'], content
 
 
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)

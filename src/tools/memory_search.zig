@@ -23,17 +23,17 @@ pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
         query: []const u8,
         limit: usize = 5,
     }, self.allocator, arguments, .{}) catch {
-        return .{ .content = try self.allocator.dupe(u8, "Error: memory_search requires a query string and an optional integer limit (1-10)."), .is_error = true };
+        return .{ .output = try self.allocator.dupe(u8, "Error: memory_search requires a query string and an optional integer limit (1-10)."), .is_error = true };
     };
     defer parsed.deinit();
     const args = parsed.value;
     if (std.mem.trim(u8, args.query, " \t\r\n").len == 0 or args.query.len > 512 or
         !std.unicode.utf8ValidateSlice(args.query) or args.limit < 1 or args.limit > 10)
     {
-        return .{ .content = try self.allocator.dupe(u8, "Error: query must be non-empty UTF-8 (at most 512 bytes); limit must be 1-10."), .is_error = true };
+        return .{ .output = try self.allocator.dupe(u8, "Error: query must be non-empty UTF-8 (at most 512 bytes); limit must be 1-10."), .is_error = true };
     }
     return .{
-        .content = try self.memory.search(self.allocator, args.query, args.limit, memory.search_budget),
+        .output = try self.memory.search(self.allocator, args.query, args.limit, memory.search_budget),
         .is_error = !self.memory.enabled,
     };
 }

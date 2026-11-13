@@ -87,9 +87,7 @@ try:
         assert result.returncode == 0, result.stderr
         assert len(observed) == len(calls), (observed, result.stderr)
         for index, output in enumerate(observed):
-            prefix = output.split('\n', 1)[0]
-            assert prefix.startswith('[tool_status '), output
-            status = json.loads(prefix[len('[tool_status '):-1])
+            status = json.loads(output)
             assert status['is_error'] == (index in (0, 1, 2, 7, 10)), (index, output)
         assert (root / 'keep.txt').read_text() == 'original'
         for name in ('download.txt', 'gzip.txt', 'chunked-gzip.txt'):

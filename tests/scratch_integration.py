@@ -42,7 +42,7 @@ def turn(body):
     calls = [item for item in inputs[last_user:] if item.get('type') == 'function_call']
     outputs = [item['output'] for item in inputs if item.get('type') == 'function_call_output']
     for result in outputs:
-        status = json.loads(result.split('\n', 1)[0][len('[tool_status '):-1])
+        status = json.loads(result)
         assert not status['is_error'], result
     return inputs[last_user]['content'], calls, outputs
 
@@ -79,7 +79,7 @@ class API(http.server.BaseHTTPRequestHandler):
                 # /new emptied this process's directory; the path itself stays,
                 # because the system prompt names one path for the whole run.
                 assert 'task.sh' not in outputs[-1], outputs[-1]
-                assert '(no output)' in outputs[-1], outputs[-1]
+                assert json.loads(outputs[-1])['output'] == '', outputs[-1]
         index = len(requests)
         output = ([{'type': 'function_call', 'call_id': f'scratch-{index}',
                     'name': call[0], 'arguments': json.dumps(call[1])}]

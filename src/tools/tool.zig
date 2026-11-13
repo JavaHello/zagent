@@ -37,13 +37,13 @@ pub const Context = struct {
     /// The result a call gets when its arguments cannot be used. The tool
     /// writes the message: it is the one that knows what it needed.
     pub fn refuse(self: Context, message: []const u8) !ToolResult {
-        return .{ .content = try self.allocator.dupe(u8, message), .is_error = true };
+        return .{ .output = try self.allocator.dupe(u8, message), .is_error = true };
     }
 
     /// The same, built from a format string, for a refusal that names the
     /// value or the error it is refusing.
     pub fn refuseFmt(self: Context, comptime fmt: []const u8, args: anytype) !ToolResult {
-        return .{ .content = try std.fmt.allocPrint(self.allocator, fmt, args), .is_error = true };
+        return .{ .output = try std.fmt.allocPrint(self.allocator, fmt, args), .is_error = true };
     }
 
     /// The result a call gets when it still carries the `offset` paging
@@ -138,7 +138,7 @@ test "local hooks forward context and arguments, short circuit, recover and cons
             return null;
         }
         fn value(ctx: Context, text: []const u8) !ToolResult {
-            return .{ .content = try ctx.allocator.dupe(u8, text), .is_error = false };
+            return .{ .output = try ctx.allocator.dupe(u8, text), .is_error = false };
         }
         fn run(ctx: Context, args: []const u8) !ToolResult {
             const self = try state(ctx, "hook_test", args);
@@ -178,7 +178,7 @@ test "local hooks forward context and arguments, short circuit, recover and cons
         } else {
             const result = try outcome;
             defer result.deinit(ctx.allocator);
-            try std.testing.expectEqualStrings(case.text.?, result.content);
+            try std.testing.expectEqualStrings(case.text.?, result.output);
         }
         try std.testing.expectEqualStrings(case.events, state.events.items);
     }

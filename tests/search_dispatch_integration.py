@@ -13,9 +13,10 @@ BINARY = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 
 
 def tool_output(output):
-    header, separator, content = output.partition('\n')
-    assert separator and header.startswith('[tool_status ') and header.endswith(']'), output
-    return json.loads(header[len('[tool_status '):-1]), content
+    status = json.loads(output)
+    content = status.pop('output')
+    status.pop('ccr_id')
+    return status, content
 
 
 def exercise(root, workspace, executables, names):

@@ -59,12 +59,11 @@ cache-notice lines.
 The notice that spells those facts out is not part of the text: a `bash` result
 is what the command printed and nothing else, and the notice is written after
 the call returns, by the cache that kept the rest — the same one every tool's
-long result is given. A command that printed nothing answers `(no output)`, the
-one spelling every tool uses for it, because an empty message cannot be told
-apart from a call whose content went missing.
+long result is given. A command that printed nothing returns an empty output
+string; its status fields still describe how it ended.
 
 The result is what the command printed and nothing else. How it ended travels
-beside the text, in the status the model reads in the header above the output:
+beside the text, in the JSON status fields the model reads:
 `exit_code`, `timed_out`, and `termination` for a command a signal killed — the
 signal's name as a shell writes it, `SIGTERM`. A terminal draws those same
 fields on the line under the call — `✓ exit 0`, `✗ exit 42`, `✗ timed out`,
@@ -218,8 +217,10 @@ dropped and a line a carriage return redraws is flattened to what a terminal
 would have ended up showing. A result the tool marks as a failure stays an
 error, so the model can correct itself.
 
-Two things are added after a tool answers, and neither is the tool's text: the
-status header `[tool_status …]` above it, and the cache's notice at the end of a
-result whose output was too long to hand over whole. Both say something about
-the call rather than something the call said, which is why they are added by the
-layers that know it — the dispatch path and the cache — instead of by each tool.
+The model receives a JSON-serialized tool result with `output`, `is_error`,
+`exit_code`, `timed_out`, `termination`, and `ccr_id` fields. There is no status
+header. A silent tool has `output: ""`; status fields describe its outcome.
+`ccr_id` is a twelve-character hex string when the result names a cached entry,
+otherwise `null`; it is preserved alongside status even when output is a preview.
+The conversation protocol's `Message.content` field is unchanged.
+CCR may replace a long output with a preview and retrieval notice.

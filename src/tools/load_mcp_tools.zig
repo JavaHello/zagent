@@ -34,7 +34,7 @@ pub fn execute(self: *Registry, allocator: std.mem.Allocator, arguments_json: []
             return err;
         };
         const note = server.connection.?.instructions orelse "";
-        return .{ .is_error = false, .content = try std.fmt.allocPrint(
+        return .{ .is_error = false, .output = try std.fmt.allocPrint(
             allocator,
             "Loaded {d} tools from MCP server '{s}'. They are now available.\nService instructions:\n{s}",
             .{ server.tool_count, name.string, note },
@@ -44,5 +44,5 @@ pub fn execute(self: *Registry, allocator: std.mem.Allocator, arguments_json: []
 }
 
 fn errorResult(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !tool.ToolResult {
-    return .{ .content = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
+    return .{ .output = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
 }

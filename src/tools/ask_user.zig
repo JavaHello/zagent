@@ -43,12 +43,12 @@ fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
 /// special for this tool: it is answered like any other.
 fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     if (self.role == .subagent) return .{
-        .content = try self.allocator.dupe(u8, "No user is available to a sub-agent. Decide from what the task gives you, or report what blocks it."),
+        .output = try self.allocator.dupe(u8, "No user is available to a sub-agent. Decide from what the task gives you, or report what blocks it."),
         .is_error = true,
     };
     const questions = parseQuestions(self.allocator, arguments) catch {
         return .{
-            .content = try self.allocator.dupe(u8, "Error: ask_user needs a non-empty 'questions' array, each entry with a 'question' and a non-empty 'options' array"),
+            .output = try self.allocator.dupe(u8, "Error: ask_user needs a non-empty 'questions' array, each entry with a 'question' and a non-empty 'options' array"),
             .is_error = true,
         };
     };
@@ -208,12 +208,12 @@ fn answersResult(self: *Agent, questions: []const Question, replies: menu.Replie
     }
     // A dismissed question leaves the model a decision to make, which is what
     // an error result tells it: the same as a lone dismissed question.
-    return .{ .content = try aw.toOwnedSlice(), .is_error = dismissed };
+    return .{ .output = try aw.toOwnedSlice(), .is_error = dismissed };
 }
 
 fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option) !tool.ToolResult {
-    if (try menu.describeReply(self.allocator, reply, options)) |line| return .{ .content = line, .is_error = false };
-    return .{ .content = try self.allocator.dupe(u8, dismissed_question_message), .is_error = true };
+    if (try menu.describeReply(self.allocator, reply, options)) |line| return .{ .output = line, .is_error = false };
+    return .{ .output = try self.allocator.dupe(u8, dismissed_question_message), .is_error = true };
 }
 
 test "the call line names the questions it asks" {
@@ -315,7 +315,7 @@ test "several questions answer as one line each, and a dismissal is an error" {
     try std.testing.expectEqualStrings(
         "First? → User selected the recommended option: Beta\n" ++
             "Second? → " ++ dismissed_question_message ++ "\n",
-        result.content,
+        result.output,
     );
 
     // Answers to every question are not an error, and a lone question keeps the
@@ -328,10 +328,10 @@ test "several questions answer as one line each, and a dismissal is an error" {
     const full = try answersResult(&agent, questions.items, all);
     defer full.deinit(allocator);
     try std.testing.expect(!full.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "First? → User selected: Alpha") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "answered: my own words") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full.output, "First? → User selected: Alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full.output, "answered: my own words") != null);
 
     const single = try answersResult(&agent, questions.items[0..1], all);
     defer single.deinit(allocator);
-    try std.testing.expectEqualStrings("User selected: Alpha", single.content);
+    try std.testing.expectEqualStrings("User selected: Alpha", single.output);
 }

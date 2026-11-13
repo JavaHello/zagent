@@ -15,9 +15,9 @@ BINARY = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 
 
 def tool_output(output):
-    header, separator, content = output.partition('\n')
-    assert separator and header.startswith('[tool_status ') and header.endswith(']'), output
-    status = json.loads(header[len('[tool_status '):-1])
+    status = json.loads(output)
+    content = status.pop('output')
+    status.pop('ccr_id')
     assert set(status) == {'is_error', 'exit_code', 'timed_out', 'termination'}, status
     return status, content
 
@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert 'Replaced one exact text block' in observed[11], observed[11]
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
-    assert observed[9] == '(no output)', observed[9]
+    assert observed[9] == '', observed[9]
     # Host tools and local MCP startup need no isolation configuration.
     calls[:] = [
         ('bash', {'command': 'items=(hello world); [[ ${#items[@]} == 2 ]] && printf "%s" "${items[1]}"'}),

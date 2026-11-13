@@ -77,7 +77,7 @@ fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
 
 pub fn execute(self: *Agent, arguments: []const u8) anyerror!tool.ToolResult {
     if (self.role == .subagent) return .{
-        .content = try self.allocator.dupe(u8, "A sub-agent cannot start another sub-agent: do this task yourself and report back."),
+        .output = try self.allocator.dupe(u8, "A sub-agent cannot start another sub-agent: do this task yourself and report back."),
         .is_error = true,
     };
     const Arguments = struct {
@@ -90,24 +90,24 @@ pub fn execute(self: *Agent, arguments: []const u8) anyerror!tool.ToolResult {
     };
     const parsed = std.json.parseFromSlice(Arguments, self.allocator, arguments, .{}) catch {
         return .{
-            .content = try self.allocator.dupe(u8, "Error: subagent takes a 'task' string to start a run, or the 'id' of a saved run to let it carry on; it may also take 'title', 'context', 'self_check_seconds' (0-3600) and 'deadline_seconds' (1-86400)."),
+            .output = try self.allocator.dupe(u8, "Error: subagent takes a 'task' string to start a run, or the 'id' of a saved run to let it carry on; it may also take 'title', 'context', 'self_check_seconds' (0-3600) and 'deadline_seconds' (1-86400)."),
             .is_error = true,
         };
     };
     defer parsed.deinit();
     const self_check = parsed.value.self_check_seconds orelse prompt.default_subagent_self_check_seconds;
     if (self_check > prompt.max_subagent_self_check_seconds) return .{
-        .content = try std.fmt.allocPrint(self.allocator, "Error: self_check_seconds must be between 0 and {d}: it is how often the sub-agent is asked for a progress report, not a limit on the work.", .{prompt.max_subagent_self_check_seconds}),
+        .output = try std.fmt.allocPrint(self.allocator, "Error: self_check_seconds must be between 0 and {d}: it is how often the sub-agent is asked for a progress report, not a limit on the work.", .{prompt.max_subagent_self_check_seconds}),
         .is_error = true,
     };
     const deadline = parsed.value.deadline_seconds orelse prompt.default_subagent_deadline_seconds;
     if (deadline == 0 or deadline > prompt.max_subagent_deadline_seconds) return .{
-        .content = try std.fmt.allocPrint(self.allocator, "Error: deadline_seconds must be between 1 and {d}: it is when the sub-agent stops working and reports what is done and what is left.", .{prompt.max_subagent_deadline_seconds}),
+        .output = try std.fmt.allocPrint(self.allocator, "Error: deadline_seconds must be between 1 and {d}: it is when the sub-agent stops working and reports what is done and what is left.", .{prompt.max_subagent_deadline_seconds}),
         .is_error = true,
     };
     if (parsed.value.id) |id| {
         const child = self.findRun(id) orelse (self.restoreRun(id, self_check) catch |err| return .{
-            .content = if (err == error.FileNotFound)
+            .output = if (err == error.FileNotFound)
                 try std.fmt.allocPrint(self.allocator, "Error: no saved sub-agent has the id \"{s}\".", .{id})
             else
                 try std.fmt.allocPrint(self.allocator, "Error: could not restore sub-agent \"{s}\": {s}.", .{ id, @errorName(err) }),
@@ -117,21 +117,21 @@ pub fn execute(self: *Agent, arguments: []const u8) anyerror!tool.ToolResult {
     }
     const task = std.mem.trim(u8, parsed.value.task orelse "", " \t\r\n");
     if (task.len == 0 or task.len > prompt.max_subagent_task_bytes or !std.unicode.utf8ValidateSlice(task)) return .{
-        .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's task must be non-empty UTF-8 of at most {d} bytes: say what to do, and leave documents in files it can read. Pass the 'id' of a saved run instead to let it carry on.", .{prompt.max_subagent_task_bytes}),
+        .output = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's task must be non-empty UTF-8 of at most {d} bytes: say what to do, and leave documents in files it can read. Pass the 'id' of a saved run instead to let it carry on.", .{prompt.max_subagent_task_bytes}),
         .is_error = true,
     };
     const context: []const u8 = if (parsed.value.context) |value| std.mem.trim(u8, value, " \t\r\n") else "";
     if (context.len > prompt.max_subagent_context_bytes) return .{
-        .content = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's context must be at most {d} bytes; put longer material in a file and name the path.", .{prompt.max_subagent_context_bytes}),
+        .output = try std.fmt.allocPrint(self.allocator, "Error: the sub-agent's context must be at most {d} bytes; put longer material in a file and name the path.", .{prompt.max_subagent_context_bytes}),
         .is_error = true,
     };
     const title = std.mem.trim(u8, parsed.value.title orelse "", " \t\r\n");
     if (!validRunTitle(title)) return .{
-        .content = try std.fmt.allocPrint(self.allocator, "Error: the title must be one line of at most {d} Unicode characters: it is the summary the terminal shows while the run works, and the task itself says the rest. Leave it out to fall back to the task.", .{prompt.max_subagent_title_chars}),
+        .output = try std.fmt.allocPrint(self.allocator, "Error: the title must be one line of at most {d} Unicode characters: it is the summary the terminal shows while the run works, and the task itself says the rest. Leave it out to fall back to the task.", .{prompt.max_subagent_title_chars}),
         .is_error = true,
     };
     const child = self.startRun(task, context, title, self_check) catch |err| return .{
-        .content = try std.fmt.allocPrint(self.allocator, "The sub-agent could not start: {s}.", .{@errorName(err)}),
+        .output = try std.fmt.allocPrint(self.allocator, "The sub-agent could not start: {s}.", .{@errorName(err)}),
         .is_error = true,
     };
     return self.waitRun(child, self_check, deadline);

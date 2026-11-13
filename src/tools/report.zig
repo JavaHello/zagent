@@ -19,19 +19,19 @@ fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
 
 pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     const supervisor = self.supervisor orelse return .{
-        .content = try self.allocator.dupe(u8, "The report tool belongs to a sub-agent. On the terminal, answer the user instead."),
+        .output = try self.allocator.dupe(u8, "The report tool belongs to a sub-agent. On the terminal, answer the user instead."),
         .is_error = true,
     };
     const parsed = std.json.parseFromSlice(struct { summary: []const u8 }, self.allocator, arguments, .{}) catch {
         return .{
-            .content = try self.allocator.dupe(u8, "Error: report takes a 'summary' string: what is done, what you ran, what is left."),
+            .output = try self.allocator.dupe(u8, "Error: report takes a 'summary' string: what is done, what you ran, what is left."),
             .is_error = true,
         };
     };
     defer parsed.deinit();
     const summary = std.mem.trim(u8, parsed.value.summary, " \t\r\n");
     if (summary.len == 0 or !std.unicode.utf8ValidateSlice(summary)) return .{
-        .content = try self.allocator.dupe(u8, "Error: the report's summary must be non-empty UTF-8: say what is done, what you ran, and what is left."),
+        .output = try self.allocator.dupe(u8, "Error: the report's summary must be non-empty UTF-8: say what is done, what you ran, and what is left."),
         .is_error = true,
     };
     const report = if (summary.len > prompt.max_subagent_report_bytes)
@@ -42,7 +42,7 @@ pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     // and the task goes on, which is the whole of the exchange.
     supervisor.publish(report);
     return .{
-        .content = try self.allocator.dupe(u8, prompt.self_check_ack),
+        .output = try self.allocator.dupe(u8, prompt.self_check_ack),
         .is_error = false,
     };
 }

@@ -81,13 +81,13 @@ test "a search that matched nothing is an answer" {
     const searched = try grep(io, allocator, .{ .pattern = "nowhere", .path = dir, .glob = null, .ignore_case = false });
     defer searched.deinit(allocator);
     try std.testing.expect(!searched.is_error);
-    try std.testing.expectEqualStrings("(no matches)", searched.content);
+    try std.testing.expectEqualStrings("", searched.output);
 
     // find reports the same nothing with a zero exit and no output at all.
     const looked = try find(io, allocator, .{ .pattern = "*.nope", .path = dir });
     defer looked.deinit(allocator);
     try std.testing.expect(!looked.is_error);
-    try std.testing.expectEqualStrings("(no matches)", looked.content);
+    try std.testing.expectEqualStrings("", looked.output);
 }
 
 test "find returns the paths whose name matches" {
@@ -106,8 +106,8 @@ test "find returns the paths whose name matches" {
     defer result.deinit(allocator);
 
     try std.testing.expect(!result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "wanted.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "other.txt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "wanted.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "other.txt") == null);
 }
 
 test "a search that failed is an error, not an empty answer" {
@@ -120,7 +120,7 @@ test "a search that failed is an error, not an empty answer" {
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "stderr:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "stderr:") != null);
 
     // A path that does not exist is a failure for find too, even though fd
     // reports it with the exit code the content searches use for "no match".

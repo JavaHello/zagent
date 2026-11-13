@@ -965,9 +965,7 @@ pub fn renderCallResult(allocator: std.mem.Allocator, result_json: []const u8) !
         }
     }
 
-    if (!wrote) try w.writeAll("(the tool returned nothing)");
-
-    return .{ .content = try aw.toOwnedSlice(), .is_error = is_error };
+    return .{ .output = try aw.toOwnedSlice(), .is_error = is_error };
 }
 
 /// Write one content item, after `following` earlier ones. Returns whether
@@ -1055,7 +1053,7 @@ fn decodedSize(base64: []const u8) usize {
 }
 
 fn errorResult(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !tools.ToolResult {
-    return .{ .content = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
+    return .{ .output = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
 }
 
 /// How long a tool description is allowed to be. A server can send anything,
@@ -1702,7 +1700,7 @@ test "a text result is what the model reads" {
     );
     defer result.deinit(allocator);
 
-    try std.testing.expectEqualStrings("first\nsecond", result.content);
+    try std.testing.expectEqualStrings("first\nsecond", result.output);
     try std.testing.expect(!result.is_error);
 }
 
@@ -1714,7 +1712,7 @@ test "bytes are named rather than carried" {
     );
     defer result.deinit(allocator);
 
-    try std.testing.expectEqualStrings("look\n[image: image/png, 3 bytes]", result.content);
+    try std.testing.expectEqualStrings("look\n[image: image/png, 3 bytes]", result.output);
 }
 
 test "links, embedded resources and an unknown kind are all readable" {
@@ -1732,7 +1730,7 @@ test "links, embedded resources and an unknown kind are all readable" {
     // rest of a result that is still readable.
     try std.testing.expectEqualStrings(
         "[resource: file:///tmp/a.txt]\nbody\n[resource: file:///tmp/c.bin (application/pdf)]\n[blob content]",
-        result.content,
+        result.output,
     );
 }
 
@@ -1745,7 +1743,7 @@ test "a result the server marked as an error stays an error" {
 
     // A tool execution error is what the model can correct itself with.
     try std.testing.expect(result.is_error);
-    try std.testing.expectEqualStrings("Error: no such file", result.content);
+    try std.testing.expectEqualStrings("Error: no such file", result.output);
 }
 
 test "structured content stands in when there is no text" {
@@ -1755,7 +1753,7 @@ test "structured content stands in when there is no text" {
     );
     defer result.deinit(allocator);
 
-    try std.testing.expectEqualStrings("{\"count\":2}", result.content);
+    try std.testing.expectEqualStrings("{\"count\":2}", result.output);
 }
 
 test "a request for more input is explained rather than guessed at" {
@@ -1766,7 +1764,7 @@ test "a request for more input is explained rather than guessed at" {
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "multi-round-trip") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "multi-round-trip") != null);
 }
 
 test "an empty result says so" {
@@ -1777,7 +1775,7 @@ test "an empty result says so" {
     defer result.deinit(allocator);
 
     try std.testing.expect(!result.is_error);
-    try std.testing.expectEqualStrings("(the tool returned nothing)", result.content);
+    try std.testing.expectEqualStrings("", result.output);
 }
 
 test "mcp.json is read into servers" {
@@ -2085,7 +2083,7 @@ test "the shell server answers tools over stdio" {
 
     var rendered = try renderCallResult(allocator, response.result);
     defer rendered.deinit(allocator);
-    try std.testing.expectEqualStrings("echoed", rendered.content);
+    try std.testing.expectEqualStrings("echoed", rendered.output);
     try std.testing.expect(!rendered.is_error);
 }
 
@@ -2122,7 +2120,7 @@ test "a tool the registry does not have is named as such" {
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "mcp__nobody__nothing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "mcp__nobody__nothing") != null);
     // Nothing is advertised and nothing has a label: a name the model invented
     // is not a reason to write anything to the terminal.
     try std.testing.expectEqual(@as(usize, 0), registry.functionJson().len);
@@ -2145,7 +2143,7 @@ test "a server is given the variables its configuration adds" {
     // The variable reached the child, which means the environment the client
     // built for it carried both what it was configured with and what this
     // process already had.
-    try std.testing.expectEqualStrings("token=s3cret", rendered.content);
+    try std.testing.expectEqualStrings("token=s3cret", rendered.output);
 }
 
 test "the /mcp listing names the servers and what they brought" {
@@ -2267,7 +2265,7 @@ test "the registry connects what mcp.json names, end to end" {
     const loaded = try registry.loadTools(allocator, "{\"server\":\"demo\"}");
     defer loaded.deinit(allocator);
     try std.testing.expect(!loaded.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, loaded.content, "Say it back.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded.output, "Say it back.") != null);
     try std.testing.expectEqual(@as(usize, 2), registry.functionJson().len);
     try std.testing.expect(!registry.servers[1].loaded);
     try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[1], "\"name\":\"mcp__demo__echo\"") != null);
@@ -2284,6 +2282,6 @@ test "the registry connects what mcp.json names, end to end" {
     // And a call goes all the way out and back.
     const result = try registry.call(allocator, "mcp__demo__echo", "{\"text\":\"hi\"}");
     defer result.deinit(allocator);
-    try std.testing.expectEqualStrings("echoed", result.content);
+    try std.testing.expectEqualStrings("echoed", result.output);
     try std.testing.expect(!result.is_error);
 }

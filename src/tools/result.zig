@@ -1,5 +1,5 @@
 //! The shape of a tool result: the text a tool hands the agent, how the call
-//! ended, and the header the text is read under.
+//! ended, and the JSON object the model receives.
 //!
 //! Nothing is cleaned, clipped or cached here. A tool's text is the tool's own
 //! answer — a file's bytes, a program's output, a server's reply — and a model
@@ -14,19 +14,12 @@ const std = @import("std");
 pub const ccr_id_len: usize = 12;
 pub const CcrId = [ccr_id_len]u8;
 
-/// What a tool that was asked and had nothing to say hands back.
-///
-/// A result's content is the tool's own text and nothing else, so a silent
-/// answer would arrive as an empty message: the model could not tell a command
-/// that printed nothing from a call whose content went missing. Spelled once,
-/// here, so every tool with nothing to show says it the same way and a reader
-/// of the history recognises the tool's own words.
-pub const no_output = "(no output)";
+/// A silent tool returns an empty output string; status carries its outcome.
+pub const no_output = "";
 
 /// How a call ended, in the fields a reader needs to tell two of them apart.
-/// The content of a result is the tool's own text and nothing else, so the
-/// ending travels here: beside the text for the model, in a header above it,
-/// and under the call for the terminal.
+/// Output contains only the tool's text. Execution metadata travels beside
+/// it in JSON for the model and under the call for the terminal.
 pub const ToolStatus = struct {
     is_error: bool,
     /// The status the program chose, when it exited rather than being killed.
@@ -38,16 +31,13 @@ pub const ToolStatus = struct {
     termination: ?[]const u8 = null,
 };
 
-/// Status stays visible even when CCR caches the body. A result that was
-/// cached says so in its content, naming the entry `ccr_retrieve` reads back.
-pub fn formatToolOutput(allocator: std.mem.Allocator, status: ToolStatus, content: []const u8) ![]u8 {
-    const encoded = try std.json.Stringify.valueAlloc(allocator, status, .{});
-    defer allocator.free(encoded);
-    return std.fmt.allocPrint(allocator, "[tool_status {s}]\n{s}", .{ encoded, content });
+/// Serialize the complete result, including the CCR identity, for the model.
+pub fn formatToolOutput(allocator: std.mem.Allocator, result: ToolResult) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, result, .{});
 }
 
 pub const ToolResult = struct {
-    content: []const u8,
+    output: []const u8,
     is_error: bool,
     exit_code: ?u8 = null,
     timed_out: bool = false,
@@ -64,6 +54,18 @@ pub const ToolResult = struct {
     /// reason.
     ccr_id: ?CcrId = null,
 
+    /// A tool response is a single JSON object, not a status header and body.
+    pub fn jsonStringify(self: ToolResult, jw: anytype) !void {
+        try jw.write(.{
+            .output = self.output,
+            .is_error = self.is_error,
+            .exit_code = self.exit_code,
+            .timed_out = self.timed_out,
+            .termination = self.termination,
+            .ccr_id = if (self.ccr_id) |*id| @as(?[]const u8, id) else null,
+        });
+    }
+
     pub fn status(self: ToolResult) ToolStatus {
         return .{
             .is_error = self.is_error,
@@ -74,7 +76,7 @@ pub const ToolResult = struct {
     }
 
     pub fn deinit(self: ToolResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.content);
+        allocator.free(self.output);
     }
 };
 
@@ -82,7 +84,7 @@ pub const ToolResult = struct {
 /// the content unchanged, so only the status is added.
 pub fn ownedResult(content: []u8, status: ToolStatus) ToolResult {
     return .{
-        .content = content,
+        .output = content,
         .is_error = status.is_error,
         .exit_code = status.exit_code,
         .timed_out = status.timed_out,
@@ -91,7 +93,7 @@ pub fn ownedResult(content: []u8, status: ToolStatus) ToolResult {
 }
 
 pub fn toolError(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !ToolResult {
-    return .{ .content = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
+    return .{ .output = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
 }
 
 test "a result hands on the text it was given, whole and unchanged" {
@@ -105,23 +107,23 @@ test "a result hands on the text it was given, whole and unchanged" {
     // The result takes ownership of the text and frees it as its own.
     const result = ownedResult(text, .{ .is_error = false, .exit_code = 7, .timed_out = true });
     defer result.deinit(a);
-    try std.testing.expectEqual(text.ptr, result.content.ptr);
-    try std.testing.expectEqual(text.len, result.content.len);
+    try std.testing.expectEqual(text.ptr, result.output.ptr);
+    try std.testing.expectEqual(text.len, result.output.len);
     try std.testing.expect(!result.is_error and result.timed_out and result.ccr_id == null);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
 }
 
-test "the status header names every field and keeps markers out of it" {
+test "the JSON result names every field and keeps output separate" {
     const a = std.testing.allocator;
     const printed = try toolError(a, "Error: {s}", .{"nope"});
     defer printed.deinit(a);
     try std.testing.expect(printed.is_error and printed.ccr_id == null);
-    try std.testing.expectEqualStrings("Error: nope", printed.content);
-    const encoded = try formatToolOutput(a, .{ .is_error = true, .exit_code = 7, .timed_out = true }, "body");
+    try std.testing.expectEqualStrings("Error: nope", printed.output);
+    const encoded = try formatToolOutput(a, .{ .output = "body", .is_error = true, .exit_code = 7, .timed_out = true });
     defer a.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"exit_code\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"timed_out\":true") != null);
-    try std.testing.expect(std.mem.endsWith(u8, encoded, "\nbody"));
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"output\":\"body\"") != null);
 }
 
 test "a killed program says so in the status, not in its output" {
@@ -134,13 +136,16 @@ test "a killed program says so in the status, not in its output" {
         .termination = "SIGTERM",
     });
     defer result.deinit(a);
-    try std.testing.expectEqualStrings("(no output)", result.content);
+    try std.testing.expectEqualStrings("", result.output);
     try std.testing.expectEqualDeep(ToolStatus{
         .is_error = true,
         .termination = "SIGTERM",
     }, result.status());
-    const encoded = try formatToolOutput(a, result.status(), result.content);
+    const encoded = try formatToolOutput(a, result);
     defer a.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"termination\":\"SIGTERM\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"exit_code\":null") != null);
+    try std.testing.expectEqualStrings(
+        "{\"output\":\"\",\"is_error\":true,\"exit_code\":null,\"timed_out\":false,\"termination\":\"SIGTERM\",\"ccr_id\":null}",
+        encoded,
+    );
 }

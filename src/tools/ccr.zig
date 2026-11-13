@@ -242,20 +242,20 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []c
 
 /// Optional execution-after hook for any tool (including MCP). Install as
 /// Context.hooks.after or Tool.hooks.after; producers preserve complete output.
-/// Consumes outcome's content on success and failure.
+/// Consumes outcome's output on success and failure.
 pub fn afterExecute(ctx: tool.Context, _: []const u8, _: []const u8, outcome: anyerror!ToolResult) !ToolResult {
     var result = try outcome;
     // Already a preview of an entry, or a page read out of one: caching it
     // again would keep the stand-in instead of the text it names, and the model
     // would be handed a preview of a preview.
     if (result.ccr_id != null) return result;
-    if (result.content.len <= max_output_bytes) return result;
+    if (result.output.len <= max_output_bytes) return result;
     const dir = ctx.cache_dir orelse return result;
-    const saved = save(ctx.io, ctx.allocator, dir, result.content) catch return result;
-    const original = result.content;
+    const saved = save(ctx.io, ctx.allocator, dir, result.output) catch return result;
+    const original = result.output;
     defer ctx.allocator.free(original);
     const preview = headPreview(original, preview_room_bytes);
-    result.content = try std.fmt.allocPrint(ctx.allocator, "{s}\n[ccr {s}: {d} lines, {d} bytes. The beginning of it is shown here; call ccr_retrieve with id \"{s}\" to read the rest.]", .{ preview, saved.id, saved.lines, saved.bytes, saved.id });
+    result.output = try std.fmt.allocPrint(ctx.allocator, "{s}\n[ccr {s}: {d} lines, {d} bytes. The beginning of it is shown here; call ccr_retrieve with id \"{s}\" to read the rest.]", .{ preview, saved.id, saved.lines, saved.bytes, saved.id });
     result.ccr_id = saved.id;
     return result;
 }
@@ -479,7 +479,7 @@ fn queryPage(
         try aw.writer.print("[End of ccr {s}: {d} matching line(s) for \"{s}\".]", .{ id, matches, query });
     }
 
-    return .{ .content = try aw.toOwnedSlice(), .is_error = false };
+    return .{ .output = try aw.toOwnedSlice(), .is_error = false };
 }
 
 test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
@@ -495,10 +495,10 @@ test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
     const under = try a.alloc(u8, max_output_bytes);
     defer a.free(under);
     @memset(under, 'x');
-    const kept = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, under), .is_error = false });
+    const kept = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, under), .is_error = false });
     defer kept.deinit(a);
     try std.testing.expect(kept.ccr_id == null);
-    try std.testing.expectEqualStrings(under, kept.content);
+    try std.testing.expectEqualStrings(under, kept.output);
 
     // One byte more is cached, and what comes back is a preview under the
     // threshold that names the entry.
@@ -506,20 +506,20 @@ test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
     defer text.deinit();
     for (0..1200) |_| try text.writer.writeAll("payload line\n");
     try std.testing.expect(text.written().len > max_output_bytes);
-    const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = false });
+    const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = false });
     defer result.deinit(a);
     try std.testing.expect(result.ccr_id != null and !result.is_error);
-    try std.testing.expect(result.content.len < max_output_bytes);
-    const marker = std.mem.indexOf(u8, result.content, "\n[ccr ") orelse return error.MissingCacheId;
+    try std.testing.expect(result.output.len < max_output_bytes);
+    const marker = std.mem.indexOf(u8, result.output, "\n[ccr ") orelse return error.MissingCacheId;
     try std.testing.expect(marker <= preview_room_bytes);
     try std.testing.expect(marker > preview_room_bytes - 16);
-    try std.testing.expect(std.mem.startsWith(u8, result.content, "payload line\n"));
-    try std.testing.expect(std.mem.indexOf(u8, result.content[marker..], "ccr_retrieve") != null);
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "payload line\n"));
+    try std.testing.expect(std.mem.indexOf(u8, result.output[marker..], "ccr_retrieve") != null);
 
     // The same output again is the same entry, not a second copy of it.
-    const again = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = false });
+    const again = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = false });
     defer again.deinit(a);
-    try std.testing.expectEqualStrings(result.content, again.content);
+    try std.testing.expectEqualStrings(result.output, again.output);
     var entries = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
     defer entries.close(io);
     var iterator = entries.iterate();
@@ -546,9 +546,9 @@ test "a page read out of an entry is never cached again" {
     defer a.free(arguments);
 
     const page = try retrieve(io, a, dir, arguments);
-    try std.testing.expect(page.content.len > max_output_bytes);
+    try std.testing.expect(page.output.len > max_output_bytes);
     try std.testing.expectEqual(saved.id, page.ccr_id.?);
-    const page_text = try a.dupe(u8, page.content);
+    const page_text = try a.dupe(u8, page.output);
     defer a.free(page_text);
 
     // The page is handed to the hook as the call's result. It names its entry,
@@ -556,7 +556,7 @@ test "a page read out of an entry is never cached again" {
     const ctx: tool.Context = .{ .io = io, .allocator = a, .cache_dir = dir };
     const result = try afterExecute(ctx, "ccr_retrieve", arguments, page);
     defer result.deinit(a);
-    try std.testing.expectEqualStrings(page_text, result.content);
+    try std.testing.expectEqualStrings(page_text, result.output);
     try std.testing.expectEqual(saved.id, result.ccr_id.?);
 
     var entries = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
@@ -579,13 +579,13 @@ test "afterExecute caches materialized output, preserves status and retrieves th
     defer text.deinit();
     for (0..6000) |_| try text.writer.writeAll("payload\n");
     try text.writer.writeAll("uncut tail\n");
-    const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = true, .exit_code = 7, .timed_out = true });
+    const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = true, .exit_code = 7, .timed_out = true });
     defer result.deinit(a);
     try std.testing.expect(result.is_error and result.timed_out and result.ccr_id != null);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
-    try std.testing.expect(result.content.len < max_output_bytes);
-    const start = (std.mem.indexOf(u8, result.content, "[ccr ") orelse return error.MissingCacheId) + "[ccr ".len;
-    const id = result.content[start..][0..id_len];
+    try std.testing.expect(result.output.len < max_output_bytes);
+    const start = (std.mem.indexOf(u8, result.output, "[ccr ") orelse return error.MissingCacheId) + "[ccr ".len;
+    const id = result.output[start..][0..id_len];
     const path = try filePath(a, dir, id);
     defer a.free(path);
     const cached = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(100 * 1024));
@@ -596,7 +596,7 @@ test "afterExecute caches materialized output, preserves status and retrieves th
     const retrieved = try spec.execute(ctx, args);
     defer retrieved.deinit(a);
     try std.testing.expect(!retrieved.is_error);
-    try std.testing.expectEqualStrings("6001:uncut tail\n", retrieved.content);
+    try std.testing.expectEqualStrings("6001:uncut tail\n", retrieved.output);
 }
 
 test "afterExecute leaves short results and uncached fallbacks untouched and propagates errors" {
@@ -612,11 +612,11 @@ test "afterExecute leaves short results and uncached fallbacks untouched and pro
         for ([_]usize{ 5, max_output_bytes, max_output_bytes + 1 }) |len| {
             const content = try a.alloc(u8, len);
             @memset(content, 'x');
-            const original: ToolResult = .{ .content = content, .is_error = true, .exit_code = 9, .timed_out = true, .ccr_id = "0a0b0c0d0e0f".* };
+            const original: ToolResult = .{ .output = content, .is_error = true, .exit_code = 9, .timed_out = true, .ccr_id = "0a0b0c0d0e0f".* };
             const result = try afterExecute(.{ .io = io, .allocator = a, .cache_dir = dir }, "test", "{}", original);
             defer result.deinit(a);
-            try std.testing.expect(result.content.ptr == original.content.ptr);
-            try std.testing.expectEqualStrings(original.content, result.content);
+            try std.testing.expect(result.output.ptr == original.output.ptr);
+            try std.testing.expectEqualStrings(original.output, result.output);
             try std.testing.expectEqualDeep(original.status(), result.status());
         }
     }
@@ -654,14 +654,14 @@ test "cached output is read back in pages and by query" {
     try std.testing.expectEqual(saved.id, page.ccr_id.?);
     try std.testing.expectEqualStrings(
         "199:line 199\n200:line 200\n[Output truncated; continue with offset=201 (1-based line number).]",
-        page.content,
+        page.output,
     );
 
     const last = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"offset\":201}}", .{saved.id});
     defer a.free(last);
     const tail = try retrieve(io, a, base, last);
     defer tail.deinit(a);
-    try std.testing.expectEqualStrings("201:the last line has no terminator\n", tail.content);
+    try std.testing.expectEqualStrings("201:the last line has no terminator\n", tail.output);
     try std.testing.expectEqual(saved.id, tail.ccr_id.?);
 }
 
@@ -681,7 +681,7 @@ test "a query finds lines ignoring case and pages through the matches" {
     try std.testing.expect(!first.is_error and first.ccr_id != null);
     try std.testing.expectEqualStrings(
         "2:ERROR one\n[More matches; continue with offset=2 (a 1-based count of matching lines when 'query' is given).]",
-        first.content,
+        first.output,
     );
 
     const rest = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"query\":\"error\",\"offset\":2}}", .{saved.id});
@@ -690,7 +690,7 @@ test "a query finds lines ignoring case and pages through the matches" {
     defer second.deinit(a);
     const expected = try std.fmt.allocPrint(a, "4:Error two\n[End of ccr {s}: 2 matching line(s) for \"error\".]", .{saved.id});
     defer a.free(expected);
-    try std.testing.expectEqualStrings(expected, second.content);
+    try std.testing.expectEqualStrings(expected, second.output);
     try std.testing.expect(second.ccr_id != null);
 }
 
@@ -714,14 +714,14 @@ test "a missing entry, a wrong id and an unknown query each say what is wrong" {
         const result = try retrieve(io, a, base, arguments);
         defer result.deinit(a);
         try std.testing.expect(result.is_error);
-        try std.testing.expect(std.mem.indexOf(u8, result.content, "ccr_retrieve takes") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "ccr_retrieve takes") != null);
     }
 
     // Nothing was cached under this id in this run: the error says why.
     const missing = try retrieve(io, a, base, "{\"id\":\"deadbeef0123\"}");
     defer missing.deinit(a);
     try std.testing.expect(missing.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, missing.content, "no cached output with id 'deadbeef0123'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing.output, "no cached output with id 'deadbeef0123'") != null);
 
     // An id copied off a path, with its extension and in upper case, is read.
     const saved = try save(io, a, base, "all good\n");
@@ -731,14 +731,14 @@ test "a missing entry, a wrong id and an unknown query each say what is wrong" {
     defer a.free(copied);
     const page = try retrieve(io, a, base, copied);
     defer page.deinit(a);
-    try std.testing.expectEqualStrings("1:all good\n", page.content);
+    try std.testing.expectEqualStrings("1:all good\n", page.output);
 
     const nothing = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"query\":\"absent\"}}", .{saved.id});
     defer a.free(nothing);
     const none = try retrieve(io, a, base, nothing);
     defer none.deinit(a);
     try std.testing.expect(!none.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, none.content, "[No line of ccr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none.output, "[No line of ccr") != null);
 }
 
 test "an oversized matching line advances instead of repeating forever" {
@@ -756,8 +756,8 @@ test "an oversized matching line advances instead of repeating forever" {
     defer a.free(args);
     const page = try retrieve(io, a, dir, args);
     defer page.deinit(a);
-    try std.testing.expect(std.mem.indexOf(u8, page.content, "only its beginning") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page.content, "offset=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.output, "only its beginning") != null);
+    try std.testing.expect(std.mem.indexOf(u8, page.output, "offset=2") != null);
 }
 
 test "identical output is kept once and named after its content" {

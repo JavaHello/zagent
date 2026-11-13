@@ -187,6 +187,8 @@ pub const Message = struct {
     response_items: ?[]const u8 = null,
     /// Local execution metadata; null for non-tool messages.
     tool_status: ?search_tools.ToolStatus = null,
+    /// Cache identity is separate from status so replay preserves the full result.
+    tool_ccr_id: ?@import("../tools/result.zig").CcrId = null,
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         if (self.content) |c| allocator.free(c);
@@ -803,10 +805,15 @@ fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const Inpu
         if (std.mem.eql(u8, message.role, "tool")) {
             const call_id = message.tool_call_id orelse return error.MissingCallId;
             const content = message.content orelse "";
-            const output = if (message.tool_status) |status|
-                try search_tools.formatToolOutput(arena, status, content)
-            else
-                content;
+            const status: search_tools.ToolStatus = message.tool_status orelse .{ .is_error = false };
+            const output = try search_tools.formatToolOutput(arena, .{
+                .output = content,
+                .is_error = status.is_error,
+                .exit_code = status.exit_code,
+                .timed_out = status.timed_out,
+                .termination = status.termination,
+                .ccr_id = message.tool_ccr_id,
+            });
             try input.append(arena, .{ .output = .{ .call_id = call_id, .output = output } });
             continue;
         }
@@ -1314,7 +1321,7 @@ test "Responses request escapes strings and rejects malformed replay" {
     const messages = [_]Message{
         .{ .role = "user", .content = tricky, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
         .{ .role = "assistant", .content = tricky, .reasoning_content = tricky, .tool_calls = &calls, .tool_call_id = null },
-        .{ .role = "tool", .content = tricky, .reasoning_content = null, .tool_calls = null, .tool_call_id = tricky },
+        .{ .role = "tool", .content = tricky, .reasoning_content = null, .tool_calls = null, .tool_call_id = tricky, .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true }, .tool_ccr_id = "abcdef012345".* },
     };
     const encoded = try buildRequestWithToolSelection(a, tricky, &messages, 32, null, false, .{});
     defer a.free(encoded);
@@ -1342,7 +1349,15 @@ test "Responses request escapes strings and rejects malformed replay" {
     try std.testing.expectEqualStrings(tricky, items[1].content.?.string);
     try std.testing.expectEqualStrings(tricky, items[2].call_id.?);
     try std.testing.expectEqualStrings(tricky, items[2].name.?);
-    try std.testing.expectEqualStrings(tricky, items[3].output.?);
+    const tool_output = try std.json.parseFromSlice(std.json.Value, a, items[3].output.?, .{});
+    defer tool_output.deinit();
+    try std.testing.expectEqualStrings(tricky, tool_output.value.object.get("output").?.string);
+    try std.testing.expectEqualStrings("abcdef012345", tool_output.value.object.get("ccr_id").?.string);
+    try std.testing.expect(tool_output.value.object.get("is_error").?.bool);
+    try std.testing.expectEqual(@as(i64, 7), tool_output.value.object.get("exit_code").?.integer);
+    try std.testing.expect(tool_output.value.object.get("timed_out").?.bool);
+    try std.testing.expect(tool_output.value.object.get("termination").? == .null);
+    try std.testing.expect(tool_output.value.object.get("content") == null);
     try std.testing.expect(std.mem.indexOfScalar(u8, encoded, '\n') == null);
 
     // Replayed items must be a JSON array of objects, never a splice point.

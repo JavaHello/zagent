@@ -31,7 +31,7 @@ fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
 
 pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     if (self.role == .subagent) return .{
-        .content = try self.allocator.dupe(u8, "A sub-agent does not announce tasks: the agent that called you owns the terminal and the plan. Report back instead."),
+        .output = try self.allocator.dupe(u8, "A sub-agent does not announce tasks: the agent that called you owns the terminal and the plan. Report back instead."),
         .is_error = true,
     };
     const parsed = try std.json.parseFromSlice(struct { title: []const u8, description: []const u8 }, self.allocator, arguments, .{});
@@ -45,7 +45,7 @@ pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     self.current_task = owned;
     self.terminal_title.update("thinking…", self.current_task);
     try self.writeAnswer(description);
-    return .{ .content = try self.allocator.dupe(u8, "Task announced; the description is shown to the user."), .is_error = false };
+    return .{ .output = try self.allocator.dupe(u8, "Task announced; the description is shown to the user."), .is_error = false };
 }
 
 test "the call line names the task, not its JSON arguments" {

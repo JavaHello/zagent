@@ -47,7 +47,7 @@ pub fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, con
     try atomic.replace(io);
 
     return .{
-        .content = try std.fmt.allocPrint(allocator, "Successfully wrote {d} bytes to '{s}'", .{ content.len, path }),
+        .output = try std.fmt.allocPrint(allocator, "Successfully wrote {d} bytes to '{s}'", .{ content.len, path }),
         .is_error = false,
     };
 }

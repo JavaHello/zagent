@@ -76,7 +76,7 @@ try:
         assert relevant in results[0]
         assert 'No matching memories' in results[1]
         for index, output in enumerate(results):
-            status = json.loads(output.split('\n', 1)[0][len('[tool_status '):-1])
+            status = json.loads(output)
             assert status['is_error'] == (index in (2, 3, 4, 7)), (index, output)
         assert 'tmux new durable note' in results[6] and relevant not in results[6]
         assert not extractions, (extractions, result.stderr)

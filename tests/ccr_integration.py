@@ -25,9 +25,11 @@ seen = []
 
 
 def unpack(output):
-    header, content = output.split('\n', 1)
-    assert header.startswith('[tool_status ') and header.endswith(']'), output
-    return json.loads(header[len('[tool_status '):-1]), content
+    result = json.loads(output)
+    content = result.pop('output')
+    identifier = result.pop('ccr_id')
+    assert identifier is None or re.fullmatch(r'[0-9a-f]{12}', identifier), output
+    return result, content
 
 
 def cached(output, path, tag, expected):
@@ -41,6 +43,7 @@ def cached(output, path, tag, expected):
     match = re.search(r'\[ccr ([0-9a-f]+): 20000 lines, \d+ bytes\. The beginning of it is shown here;', content)
     assert match and 'ccr_retrieve' in content, content
     identifier = match[1]
+    assert json.loads(output)['ccr_id'] == identifier, output
     assert (path / 'ccr' / f'{identifier}.log').read_text() == expected
     return identifier
 

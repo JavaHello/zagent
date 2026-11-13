@@ -289,11 +289,6 @@ pub fn runSearchTimed(
         try aw.writer.writeAll("stderr: ");
         try aw.writer.writeAll(captured.stderr.items);
     }
-    if (aw.written().len == 0) {
-        // A search that matched nothing is the one thing this tool answers with
-        // no output at all. Any other silent exit is a failure, and says that.
-        try aw.writer.writeAll(if (is_error) result_mod.no_output else "(no matches)");
-    }
 
     return searchPage(allocator, aw.written(), !exit_one_is_no_match, .{
         .is_error = is_error,
@@ -305,8 +300,6 @@ pub fn runSearchTimed(
 }
 
 pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, status: ToolStatus) !ToolResult {
-    if (std.mem.eql(u8, output, "(no matches)"))
-        return ownedResult(try allocator.dupe(u8, output), status);
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(allocator);
     var it = std.mem.tokenizeScalar(u8, output, '\n');
@@ -344,7 +337,7 @@ test "search results sort names and preserve complete output and status" {
     const a = std.testing.allocator;
     const sorted = try searchPage(a, "z\na\nm\n", true, .{ .is_error = false, .exit_code = 0 });
     defer sorted.deinit(a);
-    try std.testing.expectEqualStrings("a\nm\nz\n", sorted.content);
+    try std.testing.expectEqualStrings("a\nm\nz\n", sorted.output);
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(a);
     const page_lines = @import("ccr.zig").page_room_bytes / "one matching line\n".len;
@@ -356,8 +349,8 @@ test "search results sort names and preserve complete output and status" {
     try std.testing.expect(page.is_error);
     try std.testing.expectEqual(@as(?u8, 2), page.exit_code);
     // The cut is reported and the call is narrowed; there is no cursor to resume.
-    try std.testing.expect(std.mem.indexOf(u8, page.content, "offset=") == null);
-    try std.testing.expectEqualStrings(data, page.content);
+    try std.testing.expect(std.mem.indexOf(u8, page.output, "offset=") == null);
+    try std.testing.expectEqualStrings(data, page.output);
 }
 
 test "a search program is only found where one can be run" {
@@ -425,5 +418,5 @@ test "a search that outruns the limit is refused with advice" {
     defer result.deinit(allocator);
 
     try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "Narrow it") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Narrow it") != null);
 }
