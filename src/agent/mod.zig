@@ -501,8 +501,8 @@ pub const Agent = struct {
                     for (calls) |call| try self.announceToolCall(call.name, call.arguments);
                 }
             } else if (std.mem.eql(u8, message.role, "tool")) {
-                if (message.content) |content| {
-                    try self.previewToolResult(content, message.tool_status orelse .{ .is_error = false }, false);
+                if (message.tool_result) |result| {
+                    try self.previewToolResult(result.output, result, false);
                 }
             }
         }
@@ -632,7 +632,8 @@ pub const Agent = struct {
                 errdefer self.allocator.free(id);
                 try self.history.append(self.allocator, .{
                     .role = "tool",
-                    .content = content,
+                    .content = null,
+                    .tool_result = .{ .output = content, .is_error = true },
                     .tool_call_id = id,
                     .reasoning_content = null,
                     .tool_calls = null,
@@ -1347,17 +1348,18 @@ pub const Agent = struct {
 
                     try self.history.append(self.allocator, .{
                         .role = "tool",
-                        .content = result_content,
+                        .content = null,
                         .reasoning_content = null,
                         .tool_calls = null,
                         .tool_call_id = call_id,
-                        .tool_status = .{
+                        .tool_result = .{
+                            .output = result_content,
                             .is_error = result.is_error,
                             .exit_code = result.exit_code,
                             .timed_out = result.timed_out,
                             .termination = result.termination,
+                            .ccr_id = result.ccr_id,
                         },
-                        .tool_ccr_id = result.ccr_id,
                     });
                     if (self.child_record != null) try self.checkpoint();
                 }
@@ -2515,7 +2517,7 @@ test "a self-check is kept in the child's record and the run goes on" {
     for (messages) |message| {
         if (std.mem.eql(u8, message.tool_call_id orelse "", "rep")) {
             reported = true;
-            try std.testing.expect(std.mem.indexOf(u8, message.content.?, "printed on the caller's terminal") != null);
+            try std.testing.expect(std.mem.indexOf(u8, message.tool_result.?.output, "printed on the caller's terminal") != null);
         }
         if (std.mem.eql(u8, message.tool_call_id orelse "", "pending")) worked_on = true;
     }

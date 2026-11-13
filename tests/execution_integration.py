@@ -124,7 +124,8 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     snapshot = json.loads(session_path.read_text())
     statuses, contents = zip(*(tool_output(output) for output in observed))
     observed[:] = contents
-    saved_statuses = [m['tool_status'] for m in snapshot['messages'] if m['role'] == 'tool']
+    saved_statuses = [tool_output(json.dumps(m['tool_result']))[0]
+                      for m in snapshot['messages'] if m['role'] == 'tool']
     assert saved_statuses == list(statuses[:len(calls)]), (saved_statuses, statuses)
     resumed_statuses = [tool_output(m['output'])[0] for m in resumed_request['input']
                        if m.get('type') == 'function_call_output']

@@ -69,17 +69,6 @@ pub fn toolError(allocator: std.mem.Allocator, comptime fmt: []const u8, args: a
     return .{ .output = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
 }
 
-test "historical metadata without output parses with an empty body" {
-    const parsed = try std.json.parseFromSlice(ToolResult, std.testing.allocator, "{\"is_error\":true,\"exit_code\":7,\"timed_out\":true,\"termination\":null}", .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("", parsed.value.output);
-    try std.testing.expect(parsed.value.is_error);
-    try std.testing.expectEqual(@as(?u8, 7), parsed.value.exit_code);
-    try std.testing.expect(parsed.value.timed_out);
-    try std.testing.expect(parsed.value.termination == null);
-    try std.testing.expect(parsed.value.ccr_id == null);
-}
-
 test "a result hands on the text it was given, whole and unchanged" {
     const a = std.testing.allocator;
     // Larger than anything a terminal preview would show, and carrying bytes a

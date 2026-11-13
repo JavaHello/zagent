@@ -151,7 +151,7 @@ pub fn deduplicateReadResult(
         for (messages, 0..) |message, index| {
             if (!std.mem.eql(u8, message.role, "tool")) continue;
             const id = message.tool_call_id orelse continue;
-            const previous_content = message.content orelse continue;
+            const previous_content = (message.tool_result orelse continue).output;
             // A duplicate marker cannot stand in for a full result.
             if (!std.mem.eql(u8, previous_content, content)) continue;
             var previous_index = index;
@@ -412,7 +412,7 @@ test "read deduplication compares effective arguments and contents only in live 
     var calls = [_]openai.ToolCallData{.{ .id = "original", .name = "read", .arguments = "{\"path\":\"a.zig\"}" }};
     const messages = [_]openai.Message{
         .{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = &calls, .tool_call_id = null },
-        .{ .role = "tool", .content = long_content, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original" },
+        .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original", .tool_result = .{ .output = long_content, .is_error = false } },
     };
     const duplicate = try deduplicateReadResult(a, &messages, "{ \"offset\": 1, \"path\": \"a.zig\" }", long_content);
     defer a.free(duplicate);
@@ -436,7 +436,7 @@ test "read deduplication compares effective arguments and contents only in live 
     // The original result is gone. A remaining marker is not a cache hit.
     const compacted = [_]openai.Message{
         messages[0],
-        .{ .role = "tool", .content = duplicate, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original" },
+        .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original", .tool_result = .{ .output = duplicate, .is_error = false } },
     };
     // Only a read repeats a read: the same arguments under another tool's
     // name say nothing about this page having been in the context.
@@ -459,7 +459,7 @@ test "read deduplication compares effective arguments and contents only in live 
     for ([_][]const u8{ "", "short", boundary }) |content| {
         const short_messages = [_]openai.Message{
             messages[0],
-            .{ .role = "tool", .content = content, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original" },
+            .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = "original", .tool_result = .{ .output = content, .is_error = false } },
         };
         const result = try deduplicateReadResult(a, &short_messages, calls[0].arguments, content);
         defer a.free(result);

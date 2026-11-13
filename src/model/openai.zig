@@ -185,13 +185,12 @@ pub const Message = struct {
     tool_call_id: ?[]const u8,
     /// Exact Responses output items, including encrypted reasoning.
     response_items: ?[]const u8 = null,
-    /// Local execution metadata; null for non-tool messages.
-    tool_status: ?search_tools.ToolResult = null,
-    /// Cache identity is separate from status so replay preserves the full result.
-    tool_ccr_id: ?@import("../tools/result.zig").CcrId = null,
+    /// Sole owner of tool output and execution metadata; content stays null.
+    tool_result: ?search_tools.ToolResult = null,
 
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         if (self.content) |c| allocator.free(c);
+        if (self.tool_result) |result| result.deinit(allocator);
         if (self.reasoning_content) |c| allocator.free(c);
         if (self.tool_calls) |calls| {
             for (calls) |call| call.deinit(allocator);
@@ -804,16 +803,8 @@ fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const Inpu
         }
         if (std.mem.eql(u8, message.role, "tool")) {
             const call_id = message.tool_call_id orelse return error.MissingCallId;
-            const content = message.content orelse "";
-            const status: search_tools.ToolResult = message.tool_status orelse .{ .is_error = false };
-            const output = try search_tools.formatToolOutput(arena, .{
-                .output = content,
-                .is_error = status.is_error,
-                .exit_code = status.exit_code,
-                .timed_out = status.timed_out,
-                .termination = status.termination,
-                .ccr_id = message.tool_ccr_id,
-            });
+            const result = message.tool_result orelse return error.MissingToolResult;
+            const output = try search_tools.formatToolOutput(arena, result);
             try input.append(arena, .{ .output = .{ .call_id = call_id, .output = output } });
             continue;
         }
@@ -1284,7 +1275,7 @@ test "Responses request uses typed items and flat non-strict function schemas" {
     const messages = [_]Message{
         .{ .role = "system", .content = "instructions", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
         .{ .role = "assistant", .content = "working", .reasoning_content = "legacy", .tool_calls = &calls, .tool_call_id = null },
-        .{ .role = "tool", .content = "result", .reasoning_content = null, .tool_calls = null, .tool_call_id = "call_1" },
+        .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = "call_1", .tool_result = .{ .output = "result", .is_error = false } },
     };
     const borrowed = [_][]const u8{"{\"type\":\"function\",\"function\":{\"name\":\"mcp__test__search\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}"};
     const encoded = try buildRequestWithToolSelection(a, "provider/model-name", &messages, 1234, .{ .extra = &borrowed }, false, .{});
@@ -1321,7 +1312,7 @@ test "Responses request escapes strings and rejects malformed replay" {
     const messages = [_]Message{
         .{ .role = "user", .content = tricky, .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
         .{ .role = "assistant", .content = tricky, .reasoning_content = tricky, .tool_calls = &calls, .tool_call_id = null },
-        .{ .role = "tool", .content = tricky, .reasoning_content = null, .tool_calls = null, .tool_call_id = tricky, .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true }, .tool_ccr_id = "abcdef012345".* },
+        .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = tricky, .tool_result = .{ .output = tricky, .is_error = true, .exit_code = 7, .timed_out = true, .ccr_id = "abcdef012345".* } },
     };
     const encoded = try buildRequestWithToolSelection(a, tricky, &messages, 32, null, false, .{});
     defer a.free(encoded);

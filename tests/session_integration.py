@@ -62,7 +62,7 @@ try:
         def session_id(output):
             return re.search(r'(?:Session\s+|Session: )([a-f0-9]{32})', output)[1]
 
-        def assert_failed_tool_status(body):
+        def assert_failed_tool_result(body):
             output = next(m['output'] for m in body['input']
                           if m.get('type') == 'function_call_output')
             assert json.loads(output) == {
@@ -74,12 +74,13 @@ try:
         old = path.read_bytes()
         saved = json.loads(old)
         saved_tool = next(m for m in saved['messages'] if m['role'] == 'tool')
-        assert saved_tool['tool_status'] == {
+        assert saved_tool['tool_result'] == {
+            'output': '', 'ccr_id': None,
             'is_error': True, 'exit_code': 42, 'timed_out': False,
             'termination': None}, saved_tool
-        assert_failed_tool_status(requests[-1])
+        assert_failed_tool_result(requests[-1])
         assert any(message.get('role') == 'tool'
-                   and message.get('content') == ''
+                   and message.get('content') is None
                    for message in saved['messages']), saved
         second = session_id(run(stdin='/new\n/session\n/quit\n'))
         assert second != first
@@ -156,7 +157,7 @@ try:
         assert session_id(resumed) == first
         assert 'first-session-marker' in json.dumps(requests[-1]), requests[-1]
         assert 'Saved answer' in json.dumps(requests[-1]), requests[-1]
-        assert_failed_tool_status(requests[-1])
+        assert_failed_tool_result(requests[-1])
         assert len(list(path.parent.glob('*.json'))) == 3
         run('--resume', first, stdin='/clear\n/quit\n')
         assert json.loads(path.read_text())['messages'] == []

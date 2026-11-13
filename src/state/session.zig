@@ -4,7 +4,7 @@ const openai = @import("../model/openai.zig");
 const plan_mod = @import("plan.zig");
 const signals = @import("../util/signals.zig");
 const Message = openai.Message;
-// Core persisted fields are required; optional metadata can be added compatibly.
+// Persist the current structure only; historical layouts are not supported.
 const StoredMessage = struct {
     role: []const u8,
     content: ?[]const u8,
@@ -12,8 +12,7 @@ const StoredMessage = struct {
     tool_calls: ?[]openai.ToolCallData,
     tool_call_id: ?[]const u8,
     response_items: ?[]const u8,
-    tool_status: ?@import("../tools/mod.zig").ToolResult,
-    tool_ccr_id: ?@import("../tools/result.zig").CcrId = null,
+    tool_result: ?@import("../tools/mod.zig").ToolResult,
 };
 /// The plan travels with the conversation: it is state of the session, not a
 /// file of its own, so the snapshot carries it next to the messages.
@@ -32,10 +31,8 @@ pub const Child = struct {
     title: []const u8,
     status: enum { running, interrupted, completed, failed } = .running,
 };
-/// Bumped when a stored field changes, so an older snapshot is refused instead
-/// of resumed with half its state. Three dropped `truncated` from a tool's
-/// status, which a cached result names with its `ccr` entry instead.
-const schema_version: u32 = 3;
+/// Only the current snapshot schema is accepted.
+const schema_version: u32 = 4;
 
 /// What a session holds: its messages and the plan of the work in progress.
 pub const Loaded = struct {
@@ -91,8 +88,8 @@ test "child pending tools become unknown outcomes and running becomes interrupte
     try std.testing.expect(loaded.child.?.status == .interrupted);
     try std.testing.expectEqual(@as(usize, 2), loaded.messages.items.len);
     try std.testing.expectEqualStrings("unknown", loaded.messages.items[1].tool_call_id.?);
-    try std.testing.expect(loaded.messages.items[1].tool_status.?.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, loaded.messages.items[1].content.?, "NOT replayed") != null);
+    try std.testing.expect(loaded.messages.items[1].tool_result.?.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, loaded.messages.items[1].tool_result.?.output, "NOT replayed") != null);
     try saveChild(io, a, path, loaded.messages.items, &plan, .{ .parent = "parent", .id = "s7", .title = "child title", .status = .completed });
     var again = try load(io, a, path);
     defer again.deinit(a);
@@ -171,19 +168,16 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Loaded 
     for (parsed.value.messages) |source| {
         var message: Message = .{ .role = undefined, .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null };
         errdefer message.deinit(allocator);
-        // Metadata owns no memory: leave output at its default empty string,
-        // rather than retaining text from the parsed snapshot. Resolve signal
-        // names through the static table for the same reason.
-        if (source.tool_status) |status| {
-            message.tool_status = .{
-                .is_error = status.is_error,
-                .exit_code = status.exit_code,
-                .timed_out = status.timed_out,
-                .termination = if (status.termination) |written| signals.canonical(written) else null,
-            };
+        if (source.tool_result) |result| {
+            const output = try allocator.dupe(u8, result.output);
+            message.tool_result = result;
+            message.tool_result.?.output = output;
+            message.tool_result.?.termination = if (result.termination) |written| signals.canonical(written) else null;
         }
-        message.tool_ccr_id = source.tool_ccr_id;
         message.role = if (std.mem.eql(u8, source.role, "user")) "user" else if (std.mem.eql(u8, source.role, "assistant")) "assistant" else if (std.mem.eql(u8, source.role, "tool")) "tool" else return error.InvalidSessionRole;
+        if (std.mem.eql(u8, message.role, "tool")) {
+            if (source.content != null or source.tool_result == null) return error.InvalidSessionToolResult;
+        } else if (source.tool_result != null) return error.InvalidSessionToolResult;
         if (pending) |calls| {
             if (!std.mem.eql(u8, message.role, "tool") or source.tool_call_id == null or !std.mem.eql(u8, calls[next_tool].id, source.tool_call_id.?)) return error.InvalidSessionToolSequence;
             next_tool += 1;
@@ -224,7 +218,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Loaded 
             errdefer allocator.free(content);
             const id = try allocator.dupe(u8, call.id);
             errdefer allocator.free(id);
-            try messages.append(allocator, .{ .role = "tool", .content = content, .reasoning_content = null, .tool_calls = null, .tool_call_id = id, .tool_status = .{ .is_error = true } });
+            try messages.append(allocator, .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = id, .tool_result = .{ .output = content, .is_error = true } });
         }
     }
     const plan = restored: {
@@ -268,27 +262,22 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
     };
     var messages = [_]Message{
         .{ .role = "assistant", .content = null, .reasoning_content = "plan", .tool_calls = &calls, .tool_call_id = null, .response_items = "[{\"type\":\"reasoning\",\"id\":\"rs1\",\"summary\":[],\"encrypted_content\":\"opaque-token\"},{\"type\":\"function_call\",\"call_id\":\"1\",\"name\":\"shell\",\"arguments\":\"{}\"}]" },
-        .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true }, .tool_ccr_id = "abcdef012345".* },
-        .{ .role = "tool", .content = @import("../tools/mod.zig").no_output, .reasoning_content = null, .tool_calls = null, .tool_call_id = "2", .tool_status = .{ .is_error = true, .termination = "SIGTERM" } },
+        .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_result = .{ .output = "done", .is_error = true, .exit_code = 7, .timed_out = true, .ccr_id = "abcdef012345".* } },
+        .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = "2", .tool_result = .{ .output = "", .is_error = true, .termination = "SIGTERM" } },
     };
-    // Even if a snapshot contains output in metadata, restoration uses content
-    // as the sole owned body and must not retain the parser's output slice.
-    messages[1].tool_status.?.output = "discard parsed metadata output";
     try save(io, allocator, path, &messages, &plan);
-    messages[1].tool_status.?.output = "";
     var loaded = try load(io, allocator, path);
     defer loaded.deinit(allocator);
-    try std.testing.expectEqualStrings("", loaded.messages.items[1].tool_status.?.output);
+    try std.testing.expect(loaded.messages.items[1].content == null);
     try std.testing.expectEqual(@as(usize, 3), loaded.messages.items.len);
     try std.testing.expectEqualStrings("plan", loaded.messages.items[0].reasoning_content.?);
     try std.testing.expectEqualStrings(messages[0].response_items.?, loaded.messages.items[0].response_items.?);
     try std.testing.expectEqualStrings("shell", loaded.messages.items[0].tool_calls.?[0].name);
-    try std.testing.expectEqualStrings("done", loaded.messages.items[1].content.?);
-    try std.testing.expectEqualDeep(messages[1].tool_status, loaded.messages.items[1].tool_status);
-    try std.testing.expectEqualDeep(messages[1].tool_ccr_id, loaded.messages.items[1].tool_ccr_id);
+    try std.testing.expectEqualStrings("done", loaded.messages.items[1].tool_result.?.output);
+    try std.testing.expectEqualDeep(messages[1].tool_result, loaded.messages.items[1].tool_result);
     // The signal that ended a call is part of the status, so a restored
     // conversation still shows how it ended.
-    try std.testing.expectEqualDeep(messages[2].tool_status, loaded.messages.items[2].tool_status);
+    try std.testing.expectEqualDeep(messages[2].tool_result, loaded.messages.items[2].tool_result);
     try std.testing.expectEqual(@as(usize, 2), loaded.plan.steps.items.len);
     try std.testing.expectEqual(plan_mod.Status.in_progress, loaded.plan.steps.items[1].status);
     try std.testing.expectEqualStrings("half way", loaded.plan.steps.items[1].note.?);
@@ -347,7 +336,7 @@ test "sessions reject incompatible versions and another workspace" {
         // A snapshot from before the plan was part of the session is refused,
         // not resumed without the state it never had.
         .{ .data = "{\"version\":1,\"workspace\":\"\",\"messages\":[]}", .expected = error.MissingField },
-        .{ .data = "{\"version\":3,\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .expected = error.SessionWorkspaceMismatch },
+        .{ .data = "{\"version\":4,\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .expected = error.SessionWorkspaceMismatch },
     };
     for (cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "session.json", .data = case.data });
@@ -396,8 +385,8 @@ test "sessions reject orphaned reordered and interrupted tool results" {
         .{ .id = "second", .name = "shell", .arguments = "{}" },
     };
     const assistant: Message = .{ .role = "assistant", .content = null, .reasoning_content = null, .tool_calls = &calls, .tool_call_id = null };
-    const first: Message = .{ .role = "tool", .content = "one", .reasoning_content = null, .tool_calls = null, .tool_call_id = "first" };
-    const second: Message = .{ .role = "tool", .content = "two", .reasoning_content = null, .tool_calls = null, .tool_call_id = "second" };
+    const first: Message = .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = "first", .tool_result = .{ .output = "one", .is_error = false } };
+    const second: Message = .{ .role = "tool", .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = "second", .tool_result = .{ .output = "two", .is_error = false } };
     var orphan = [_]Message{first};
     var reordered = [_]Message{ assistant, second, first };
     var interrupted = [_]Message{ assistant, first, .{ .role = "user", .content = "continue", .reasoning_content = null, .tool_calls = null, .tool_call_id = null } };
@@ -414,6 +403,14 @@ test "sessions reject orphaned reordered and interrupted tool results" {
     try std.testing.expectError(error.InvalidSessionRole, load(io, a, path));
 
     var valid = [_]Message{ assistant, first, second, .{ .role = "assistant", .content = "完成 ✓", .reasoning_content = null, .tool_calls = null, .tool_call_id = null } };
+    valid[1].content = "duplicate output";
+    try save(io, a, path, &valid, &plan);
+    try std.testing.expectError(error.InvalidSessionToolResult, load(io, a, path));
+    valid[1].content = null;
+    valid[1].tool_result = null;
+    try save(io, a, path, &valid, &plan);
+    try std.testing.expectError(error.InvalidSessionToolResult, load(io, a, path));
+    valid[1] = first;
     try save(io, a, path, &valid, &plan);
     var loaded = try load(io, a, path);
     defer loaded.deinit(a);
