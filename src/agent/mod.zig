@@ -2525,6 +2525,37 @@ test "a self-check asks the child for a report and the caller waits for the end"
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[3], "answer.") != null);
 }
 
+test "a self-check answered instead of reported ends the run" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    var silence = try Silence.init(std.testing.io);
+    defer silence.deinit(std.testing.io);
+
+    // The self-check asks for a report or an answer, and the child that means
+    // to stop answers: the run ends on that reply, as if it had finished, and
+    // the caller reads it back. Only three requests are made — the child never
+    // reaches another boundary.
+    const start =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"sub\",\"name\":\"subagent\",\"arguments\":\"{\\\"task\\\":\\\"split the files\\\",\\\"self_check_seconds\\\":0}\"}]}";
+    const stopped =
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Stopping here: two of four files split, the rest blocked on a missing schema.\"}]}]}";
+    var mock: MockTransport = .{ .replies = &.{ start, stopped, completed_answer } };
+    defer mock.deinit(allocator);
+    harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
+    try harness.agent.appendUserMessage("split the source tree");
+
+    try harness.agent.runToolLoop();
+    try std.testing.expectEqual(@as(usize, 3), mock.requests.items.len);
+    // The prompt the child was given at the boundary names the stop it took.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "check-in interval has passed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "answer with your final report now, and the run ends there") != null);
+    // The answer it stopped on is the caller's report, not the self-check.
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "Sub-agent report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "the rest blocked on a missing schema") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[2], "check-in interval has passed") == null);
+}
+
 test "a self-check of zero asks again at every boundary" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);

@@ -5,7 +5,7 @@ const tool = @import("tool.zig");
 
 pub const spec: tool.Tool = .{
     .name = "report",
-    .description = "Print a short progress report for the user and carry straight on. It is how a self-check is answered: the runtime asks for one at the interval the caller set, the report goes to the terminal, and the task continues — nothing comes back to you but the acknowledgement. Keep it to a status line: what is done, what you ran, what is left. Not the final answer.",
+    .description = "Print a short progress report for the user and carry straight on. It is how a self-check is answered by a sub-agent that is carrying on: the runtime asks for one at the interval the caller set, the report goes to the terminal, and the task continues — nothing comes back to you but the acknowledgement. Calling it is the choice to go on; to stop, answer with your final report instead. Keep it to a status line: what is done, what you ran, what is left. Not the final answer.",
     .parameters_json =
     \\{"type":"object","properties":{"summary":{"type":"string","description":"Short progress report: what you have done and changed, what you ran and what it printed, what is verified, and what is left"}},"required":["summary"]}
     ,

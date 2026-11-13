@@ -93,8 +93,13 @@ pub const max_subagent_report_bytes: usize = 8_000;
 /// What a self-check says to the sub-agent. It arrives at the same boundary as
 /// a line the user typed, and the report tool is how it is answered: the report
 /// is printed for the user, and the task goes on from there.
+///
+/// Answering is not the only way through a self-check, and this says so: the
+/// child that means to stop — the work done, or blocked with nothing further it
+/// can do — stops by not calling the report tool at all. Its answer is then the
+/// reply the run ends on, which is the only stop a child has.
 pub const self_check_prompt =
-    "Your caller's check-in interval has passed: this is a self-check. Call **report** with a short summary — what you have done and changed, what you ran and what it printed, what is verified, and what is left — and carry straight on with the task. Nobody answers that report: it is printed for the user, and what the caller reads in the end is your final answer.";
+    "Your caller's check-in interval has passed: this is a self-check. If you are carrying on, call **report** with a short summary — what you have done and changed, what you ran and what it printed, what is verified, and what is left — and go straight back to the task: nobody answers that report, it is printed for the user, and what the caller reads in the end is your final answer. If instead you mean to stop — the work is finished, or you are blocked and cannot go further — do not call **report** and do not start anything new: answer with your final report now, and the run ends there.";
 
 /// What the sub-agent is told when its deadline passes. The work ends here and
 /// the report does not: the caller reads back exactly the reply this asks for,
@@ -103,9 +108,9 @@ pub const deadline_prompt =
     "Your deadline has passed. Stop working now: start nothing new and run no further checks. Answer with your final report — what you changed and why, what you ran and what it printed, what is verified, and what is left undone. That reply is what the caller reads back, and the work it names as unfinished is what the report is for.";
 
 /// What the report tool hands back: an acknowledgement, not a decision. The
-/// child carries on either way, which is what makes a self-check free.
+/// report changed nothing, and calling it was the child's choice to carry on.
 pub const self_check_ack =
-    "The report was printed on the caller's terminal. It changed nothing: carry on with the task, and finish with your final report.";
+    "The report was printed on the caller's terminal. It changed nothing: carry on with the task, and finish with your final report. To stop instead, call nothing more — answer with your final report, and the run ends there.";
 
 pub const SYSTEM_PROMPT =
     \\You are zagent, a command-line AI assistant built with Zig. Be concise and direct.
@@ -201,7 +206,8 @@ pub fn buildSubagentPrompt(
             "- Do the work rather than describe it, and run the check the task asks for. Never claim a check you did not run.\n" ++
             "- Two clocks bound this run, and the runtime holds you to them. Every self-check interval it asks for a progress" ++
             " report: answer with **report** — a short summary, not the final one — and carry straight on, because nothing" ++
-            " comes back from it. At the deadline it stops you: write the final report then, at once.\n" ++
+            " comes back from it. To stop there instead, do not report at all: answer with your final report and the run ends." ++
+            " At the deadline it stops you: write the final report then, at once.\n" ++
             "- Work at the pace the deadline allows. What the caller reads is the report you write when you finish or when" ++
             " the deadline passes, so name what is still undone there instead of starting work you cannot finish.\n",
     );

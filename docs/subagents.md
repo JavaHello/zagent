@@ -30,6 +30,12 @@ The model that started the run waits once and reads once. There is no verdict to
 give, no run to resume and no mid-run stop to ask for: the call returns when the
 child is done or its deadline has passed.
 
+A self-check is not a command to keep going. The child that means to stop — the
+task finished, or blocked with nothing further it can do — stops there by not
+calling `report`: it answers with its final report instead, the run ends on that
+answer, and that answer is what the caller reads. Only Esc ends a run the child
+itself would have carried on.
+
 ## What the child has
 
 The child gets its own system prompt and its own
