@@ -114,7 +114,7 @@ src/
   util/          — Small shared modules
     text.zig     — Text helpers that are about bytes: compile-time repetition
     terminal/    — Everything printed from text this program did not write
-      ansi.zig   — Recognising the ANSI/VT sequences a terminal acts on
+      ansi.zig   — Recognising the ANSI/VT sequences and character sets a terminal acts on
       sanitize.zig — UTF-8, control bytes and one-line flattening
       normalize.zig — CR redraws, blank-line runs and the line they leave
   editor/        — Line editing, history, popup and raw terminal handling

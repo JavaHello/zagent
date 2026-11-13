@@ -8,15 +8,79 @@
 //! fence — a fence is not a licence to pass escapes through.
 //!
 //! What a sequence *is* belongs to `ansi.zig`; this file walks the text and
-//! decides what reaches the writer. What is left once the escapes are gone — a
-//! carriage return redrawing a line, runs of blank lines — is `normalize.zig`.
+//! decides what reaches the writer — including which character set the bytes
+//! are drawn from, so that a tree drawn with `ESC ( 0` reads as the corners the
+//! screen showed. What is left once the escapes are gone — a carriage return
+//! redrawing a line, runs of blank lines — is `normalize.zig`.
 
 const std = @import("std");
 const ansi = @import("ansi.zig");
 
+/// Which set the bytes of a stream are drawn from, as far as reading the text
+/// back is concerned.
+///
+/// A designation (`ESC ( 0`) puts a set in a slot, SI and SO choose between the
+/// first two, and while the line-drawing set is chosen the bytes 0x5f..0x7e are
+/// the corners and lines of a tree rather than letters. Reading them as letters
+/// is what makes a build summary say `mq run test`; translating them says what
+/// the terminal that was sent them showed.
+const Charset = struct {
+    /// The set each of G0 and G1 holds; 'B' is ASCII, which is what a stream
+    /// that designates nothing uses.
+    sets: [2]u8 = .{ 'B', 'B' },
+    /// SO was read last, so G1 is in force rather than G0.
+    shifted: bool = false,
+
+    /// Note a designation, if that is what `sequence` is.
+    fn designate(self: *Charset, sequence: []const u8) void {
+        const named = ansi.designation(sequence) orelse return;
+        switch (named.slot) {
+            '(' => self.sets[0] = named.set,
+            ')' => self.sets[1] = named.set,
+            // G2 and G3 are not reached by a shift, so nothing here depends on
+            // them.
+            else => {},
+        }
+    }
+
+    /// Note a shift between the two slots. SI and SO are not characters: a
+    /// terminal shows nothing for them.
+    fn shift(self: *Charset, byte: u8) void {
+        switch (byte) {
+            0x0e => self.shifted = true, // SO: G1
+            0x0f => self.shifted = false, // SI: G0
+            else => {},
+        }
+    }
+
+    /// What the set in force draws `byte` with, when it draws it with anything.
+    fn glyph(self: Charset, byte: u8) ?[]const u8 {
+        if (self.sets[@intFromBool(self.shifted)] != '0') return null;
+        return ansi.graphicsGlyph(byte);
+    }
+};
+
+/// Write `byte` the way the set in force draws it, answering whether the set had
+/// anything to say about it: a byte the line-drawing set covers becomes its
+/// glyph, and a shift between the slots is no character at all.
+fn writeInCharset(w: *std.Io.Writer, charset: *Charset, byte: u8) !bool {
+    switch (byte) {
+        0x0e, 0x0f => {
+            charset.shift(byte);
+            return true;
+        },
+        else => {},
+    }
+    const glyph = charset.glyph(byte) orelse return false;
+    try w.writeAll(glyph);
+    return true;
+}
+
 /// Write `raw` with everything a terminal would act on removed or escaped:
 /// escape sequences are dropped, other control bytes become spaces, and bytes
-/// that are not valid UTF-8 are rendered as `\xNN`.
+/// that are not valid UTF-8 are rendered as `\xNN`. A byte a designated
+/// character set draws with is written as the character the screen showed
+/// instead of the letter it is.
 ///
 /// Newline, carriage return and tab are the exceptions, and pass through:
 /// callers' own line and column handling is built on them, and tool output that
@@ -26,16 +90,30 @@ const ansi = @import("ansi.zig");
 /// taken out rather than escaped, so a caller can draw styled output from text
 /// it does not trust without a stray ESC ending the styling early.
 pub fn writeSanitized(w: *std.Io.Writer, raw: []const u8) !void {
+    var charset: Charset = .{};
+    try writeSanitizedIn(w, &charset, raw);
+}
+
+/// `writeSanitized` for text that arrives in pieces that must be read as one:
+/// the character set in force at the end of a piece is the one the next begins
+/// in.
+fn writeSanitizedIn(w: *std.Io.Writer, charset: *Charset, raw: []const u8) !void {
     var i: usize = 0;
     while (i < raw.len) {
         const byte = raw[i];
 
         if (byte == 0x1b) {
+            const start = i;
             i = ansi.skipAnsiEscape(raw, i);
+            charset.designate(raw[start..i]);
             continue;
         }
 
         if (byte < 0x80) {
+            if (try writeInCharset(w, charset, byte)) {
+                i += 1;
+                continue;
+            }
             try w.writeByte(if (ansi.isPrintable(byte)) byte else ' ');
             i += 1;
             continue;
@@ -60,18 +138,19 @@ pub fn writeSanitized(w: *std.Io.Writer, raw: []const u8) !void {
 /// one of them and cut in two by a newline inside it would be read as two
 /// unrelated lines, one of which says nothing.
 pub fn writeOnOneLine(w: *std.Io.Writer, raw: []const u8) !void {
+    var charset: Charset = .{};
     var start: usize = 0;
     var i: usize = 0;
     while (i < raw.len) : (i += 1) {
         const byte = raw[i];
         if (byte != '\n' and byte != '\r' and byte != '\t') continue;
-        try writeSanitized(w, raw[start..i]);
+        try writeSanitizedIn(w, &charset, raw[start..i]);
         try w.writeByte(' ');
         // A CRLF is one line ending, not two.
         if (byte == '\r' and i + 1 < raw.len and raw[i + 1] == '\n') i += 1;
         start = i + 1;
     }
-    try writeSanitized(w, raw[start..]);
+    try writeSanitizedIn(w, &charset, raw[start..]);
 }
 
 /// The length of the UTF-8 character at `raw[start]`, or null when the bytes
@@ -97,6 +176,13 @@ pub const Chunked = struct {
     /// The beginning of a character whose remaining bytes have not arrived.
     carry: [4]u8 = undefined,
     carry_len: usize = 0,
+    /// The bytes of the escape sequence being read, so that the one naming a
+    /// character set is recognised when its end arrives: a designation is only
+    /// known once its final byte has been seen.
+    sequence: [8]u8 = undefined,
+    sequence_len: usize = 0,
+    /// The set the bytes in force are drawn from, which outlives a chunk.
+    charset: Charset = .{},
 
     pub fn feed(self: *Chunked, w: *std.Io.Writer, raw: []const u8) !void {
         var i: usize = try self.completeCarry(w, raw);
@@ -108,18 +194,32 @@ pub const Chunked = struct {
             // does not know is dropped whole, the way `ansi.skipAnsiEscape`
             // drops it.
             if (self.state != .text) {
+                if (self.sequence_len < self.sequence.len) {
+                    self.sequence[self.sequence_len] = byte;
+                    self.sequence_len += 1;
+                }
                 self.state = ansi.advance(self.state, byte);
+                if (self.state == .text) {
+                    self.charset.designate(self.sequence[0..self.sequence_len]);
+                    self.sequence_len = 0;
+                }
                 i += 1;
                 continue;
             }
 
             if (byte == 0x1b) {
                 self.state = .escape;
+                self.sequence[0] = byte;
+                self.sequence_len = 1;
                 i += 1;
                 continue;
             }
 
             if (byte < 0x80) {
+                if (try writeInCharset(w, &self.charset, byte)) {
+                    i += 1;
+                    continue;
+                }
                 try w.writeByte(if (ansi.isPrintable(byte)) byte else ' ');
                 i += 1;
                 continue;
@@ -193,13 +293,16 @@ pub const Chunked = struct {
         }
         self.carry_len = 0;
         self.state = .text;
+        self.sequence_len = 0;
     }
 };
 
 const expectEqualStrings = std.testing.expectEqualStrings;
 
 test "chunked sanitising matches a whole-text pass at every split" {
-    const fixture = "plain \x1b[32mgreen\x1b[0m 你好 ok\xff \x1b]52;c;aGk=\x07end\r\n\x7f!";
+    const fixture = "plain \x1b[32mgreen\x1b[0m 你好 ok\xff \x1b]52;c;aGk=\x07end" ++
+        "\x1b(0mq\x1b(B \x1b#8 \x1b%G \x1b$(C \x1bPq#0;2\x1b\\ \x1b_Gf=100\x1b\\ \x1b^p\x1b\\" ++
+        " \x1b)0\x0eq\x0fq\x1b)0x\x1b(B\r\n\x7f!";
     const a = std.testing.allocator;
 
     var whole: std.Io.Writer.Allocating = .init(a);
@@ -255,6 +358,50 @@ test "writeSanitized escapes what is not text and keeps what is" {
     try expectEqualStrings("ok \\xFF   \xe4\xbd\xa0\xe5\xa5\xbd\ttail", aw.written());
 }
 
+test "a designation draws with its own set and keeps none of its bytes" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    // `zig build --summary all` draws its tree with the line-drawing set: ESC
+    // ( 0 selects it and ESC ( B selects ASCII again. Read back, the line says
+    // what the terminal showed — a corner, a line — and neither of the
+    // sequences appears in it: without that reading it is `0mqB run test`.
+    try writeSanitized(&aw.writer, "\x1b(0mq\x1b(B install zagent cached\n");
+    try expectEqualStrings("└─ install zagent cached\n", aw.written());
+
+    // A branch, a tee and a vertical line: the three a summary's tree is made
+    // of.
+    try writeSanitized(&aw.writer, "\x1b(0tq\x1b(B run\x1b(0x\x1b(B body\n");
+    try expectEqualStrings("└─ install zagent cached\n├─ run│ body\n", aw.written());
+}
+
+test "a set this file does not read leaves its bytes alone" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    // ESC ( A names the United Kingdom set, which differs from ASCII in one
+    // character: the bytes after it are the letters they look like, and this
+    // file does not pretend to know better.
+    try writeSanitized(&aw.writer, "\x1b(Aq\x1b(Bq\n");
+    try expectEqualStrings("qq\n", aw.written());
+}
+
+test "SI and SO choose between the two slots" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    // G1 holds the drawing set and G0 the ASCII one; a shift is not a
+    // character, and which slot is in force decides what `q` is.
+    try writeSanitized(&aw.writer, "\x1b)0q\x0eq\x0fq\n");
+    try expectEqualStrings("q─q\n", aw.written());
+}
+
+test "a string control is dropped with the payload it carries" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    // A sixel picture and a graphics command are data for the terminal, not
+    // text, so none of what they carry reaches the result.
+    try writeSanitized(&aw.writer, "a\x1bPq#0;2;0;0;0\x1b\\b\x1b_Gf=100;AAAA\x1b\\c");
+    try expectEqualStrings("abc", aw.written());
+}
+
 test "writeSanitized drops an escape that would restyle the caller's output" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
@@ -276,4 +423,10 @@ test "writeOnOneLine flattens line endings and tabs into one line" {
     defer aw.deinit();
     try writeOnOneLine(&aw.writer, "one\ntwo\r\nthree\tfour \x1b[31mred\x1b[0m");
     try expectEqualStrings("one two three four red", aw.written());
+
+    // The set in force carries across the pieces a line ending splits the text
+    // into, so a tree flattened onto one line keeps the corners it was drawn
+    // with.
+    try writeOnOneLine(&aw.writer, "\n\x1b(0tq\x1b(Brun\x1b(0mq\x1b(B\nleaf");
+    try expectEqualStrings("one two three four red ├─run└─ leaf", aw.written());
 }

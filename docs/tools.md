@@ -213,9 +213,12 @@ is guarded where the preview is written instead, so a result cannot move the
 cursor or clear the screen it is shown on.
 
 `bash` is the exception: its body is a program's own, so escape sequences are
-dropped and a line a carriage return redraws is flattened to what a terminal
-would have ended up showing. A result the tool marks as a failure stays an
-error, so the model can correct itself.
+dropped, a line a carriage return redraws is flattened to what a terminal would
+have ended up showing, and a tree drawn with the terminal's line-drawing set
+keeps the corners it showed. A sequence is measured to its real end, so a
+character set designation takes the bytes it names with it rather than leaving
+them in the text. A result the tool marks as a failure stays an error, so the
+model can correct itself.
 
 The model receives a JSON-serialized tool result with `output`, `is_error`,
 `exit_code`, `timed_out`, `termination`, and `ccr_id` fields. There is no status
