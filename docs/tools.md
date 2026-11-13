@@ -46,7 +46,10 @@ not outlive the call. Background processes are not kept across calls.
 
 Output larger than 8 KiB (8192 bytes) is cached in the current run's scratch
 folder. The result keeps the exit status and up to the last 40 lines / 4 KiB,
-then names a cache ID, the total line count and the size in bytes.
+then names a cache ID, the total line count and the size in bytes. The result
+carries that ID, and a result that already names an entry is never cached again:
+what is handed to the model is always an entry's own text, never a preview of a
+preview.
 Stdout is followed by stderr under a `stderr:` label. Counts refer to this
 normalized, combined text, not the exit-status or cache-notice lines. The entry
 is written as the output arrives and holds at most 64 MiB, so a command that
@@ -142,15 +145,18 @@ page by page. This is the same cache `bash` writes to, and an entry is named
 after its content, so identical output is kept once however often it is
 produced.
 
-- `read` pages a file and names the `offset` the next page starts at, and a page
-  stays under the threshold, so reading a cached entry back never caches a page
-  of it again.
+- A result carries the ID of the entry it stands for, and a result that already
+  names one is never cached again: a preview, or a page read back out of an
+  entry, is handed on as it is instead of becoming a preview of a preview.
+- `read` pages a file and names the `offset` the next page starts at, so a page
+  the model is walking through says where it stopped.
 - `ls` and the searches stop short of the limit and say so, so the model
   narrows the call rather than reading a cut answer as a complete one.
 - `bash` starts caching at 8 KiB as the output arrives and returns a tail
   preview plus a cache ID, so output it already holds is not written twice.
 - An `http` response, an `apply_patch` summary, an MCP server's answer and
-  anything else that large is cached the same way.
+  anything else that large is cached the same way. A [sub-agent's](subagents.md#not-cached)
+  report is the one exception: it reaches its caller whole at any size.
 
 No tool description quotes the number: the limit lives in the code, not in the
 prompt.

@@ -109,10 +109,10 @@ pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, p
         const entry = entries.items[index];
         try aw.writer.writeAll(entry);
     }
-    const truncated = has_more or index < entries.items.len;
-    if (truncated) try aw.writer.writeAll("[More entries than listed; narrow 'path' or raise 'limit' to see the rest.]\n");
+    const capped = has_more or index < entries.items.len;
+    if (capped) try aw.writer.writeAll("[More entries than listed; narrow 'path' or raise 'limit' to see the rest.]\n");
     if (aw.written().len == 0) try aw.writer.writeAll("(no entries)");
-    return .{ .content = try aw.toOwnedSlice(), .is_error = false, .truncated = truncated };
+    return .{ .content = try aw.toOwnedSlice(), .is_error = false };
 }
 
 test "ls is sorted, capped by limit, and says when entries were left out" {
@@ -126,13 +126,11 @@ test "ls is sorted, capped by limit, and says when entries were left out" {
     defer a.free(path);
     const capped = try listDirPage(io, a, path, .{ .limit = 2 });
     defer capped.deinit(a);
-    try std.testing.expect(capped.truncated);
     try std.testing.expect(std.mem.startsWith(u8, capped.content, "a\tf\nm\tf\n"));
     // There is no cursor to continue from: the call is narrowed instead.
     try std.testing.expect(std.mem.indexOf(u8, capped.content, "offset") == null);
     try std.testing.expect(std.mem.indexOf(u8, capped.content, "More entries") != null);
     const all = try listDirPage(io, a, path, .{ .limit = 1000 });
     defer all.deinit(a);
-    try std.testing.expect(!all.truncated);
     try std.testing.expectEqualStrings("a\tf\nm\tf\nz\tf\n", all.content);
 }

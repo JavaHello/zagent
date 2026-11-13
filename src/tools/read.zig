@@ -7,8 +7,6 @@ const tool = @import("tool.zig");
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
 const finalizeToolContent = result_mod.finalizeToolContent;
-const max_output_bytes = result_mod.max_output_bytes;
-const page_room_bytes = result_mod.page_room_bytes;
 const optionalUnsigned = args_mod.optionalUnsigned;
 
 /// One page of a file: where it starts, and how many lines it may hold.
@@ -124,7 +122,6 @@ fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     return .{
         .content = try deduplicateReadResult(ctx.allocator, history(ctx), arguments, result.content),
         .is_error = false,
-        .truncated = result.truncated,
     };
 }
 
@@ -271,10 +268,9 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
         return .{
             .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ body_text, next }),
             .is_error = false,
-            .truncated = true,
         };
     }
-    return .{ .content = normalized, .is_error = false, .truncated = false };
+    return .{ .content = normalized, .is_error = false };
 }
 
 test "read takes a 1-based offset and a line limit" {
@@ -321,12 +317,11 @@ test "read streams a page from deep in a large file" {
         "2:one\n3:two\n[Output truncated; continue with offset=4 (1-based line number).]",
         page.content,
     );
-    try std.testing.expect(page.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, page.content, "continue with offset=4") != null);
 
     const tail = try readFilePage(io, a, path, .{ .offset = 4 });
     defer tail.deinit(a);
     try std.testing.expectEqualStrings("4:last\n", tail.content);
-    try std.testing.expect(!tail.truncated);
 
     // A page past the last line has nothing to show, and says so.
     const beyond = try readFilePage(io, a, path, .{ .offset = 5 });
@@ -337,11 +332,11 @@ test "read streams a page from deep in a large file" {
     const full = try readFile(io, a, path);
     defer full.deinit(a);
     try std.testing.expect(!full.is_error);
-    try std.testing.expect(!full.truncated);
     try std.testing.expect(std.mem.startsWith(u8, full.content, "1:xxx"));
     try std.testing.expect(std.mem.indexOf(u8, full.content, "4:last") != null);
-    // CCR, not the file reader, owns the presentation budget.
-    try std.testing.expect(full.content.len > max_output_bytes);
+    // The cache, not the file reader, owns the presentation budget: a read of
+    // a large file is handed over whole and cached afterwards.
+    try std.testing.expect(full.content.len > @import("ccr.zig").max_output_bytes);
 }
 
 test "read returns every line when no explicit limit is supplied" {
@@ -354,14 +349,14 @@ test "read returns every line when no explicit limit is supplied" {
     // More lines than one page holds, so the first page has to stop and say
     // where the next one starts.
     var index: usize = 0;
-    while (buffer.items.len <= page_room_bytes * 2) : (index += 1) try buffer.print(a, "line {d}\n", .{index});
+    const page_bytes = @import("ccr.zig").page_room_bytes;
+    while (buffer.items.len <= page_bytes * 2) : (index += 1) try buffer.print(a, "line {d}\n", .{index});
     try tmp.dir.writeFile(io, .{ .sub_path = "lines.txt", .data = buffer.items });
     const path = try tmp.dir.realPathFileAlloc(io, "lines.txt", a);
     defer a.free(path);
 
     const first = try readFilePage(io, a, path, .{});
     defer first.deinit(a);
-    try std.testing.expect(!first.truncated);
     try std.testing.expect(std.mem.startsWith(u8, first.content, "1:line 0\n"));
     try std.testing.expectEqual(index, std.mem.count(u8, first.content, "\n"));
 }
@@ -373,14 +368,13 @@ test "read preserves a line longer than a page without splitting a character" {
     defer tmp.cleanup();
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(a);
-    while (buffer.items.len <= page_room_bytes) try buffer.appendSlice(a, "你");
+    while (buffer.items.len <= @import("ccr.zig").page_room_bytes) try buffer.appendSlice(a, "你");
     try tmp.dir.writeFile(io, .{ .sub_path = "utf8", .data = buffer.items });
     const path = try tmp.dir.realPathFileAlloc(io, "utf8", a);
     defer a.free(path);
 
     const result = try readFilePage(io, a, path, .{});
     defer result.deinit(a);
-    try std.testing.expect(!result.truncated);
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
     try std.testing.expectEqual(buffer.items.len + 3, result.content.len);
     try std.testing.expectEqualStrings(buffer.items, result.content[2 .. result.content.len - 1]);

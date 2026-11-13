@@ -5,7 +5,7 @@
 //! Each tool keeps its implementation, its arguments and its tests together —
 //! `bash.zig`, `read.zig`, `write.zig`, `edit.zig`, `apply_patch.zig`, `ls.zig`, `rg.zig`, `grep.zig`,
 //! `fd.zig`, `find.zig`, `http.zig` — over a small shared floor: `result.zig`
-//! for the shape and size of a result, `progress.zig` for the progress labels,
+//! for the shape of a result, `progress.zig` for the progress labels,
 //! `args.zig` for reading a call's JSON arguments, `search.zig` for what the
 //! four search tools have in common, and `util.zig` for a handful of helpers.
 //! `ccr.zig` is the cache a tool's output is kept in when it is too long for one
@@ -45,11 +45,11 @@ pub const Hooks = tool_mod.Hooks;
 /// Send one call to the built-in tool that answers it.
 pub const execute = dispatch.execute;
 
-// The shape of a tool result and the one size limit it is held to.
+// The shape of a tool result, and the sizes the cache keeps it to.
 pub const ToolStatus = result_mod.ToolStatus;
 pub const ToolResult = result_mod.ToolResult;
-pub const max_output_bytes = result_mod.max_output_bytes;
-pub const page_room_bytes = result_mod.page_room_bytes;
+pub const max_output_bytes = ccr.max_output_bytes;
+pub const page_room_bytes = ccr.page_room_bytes;
 pub const formatToolOutput = result_mod.formatToolOutput;
 pub const finalizeResult = result_mod.finalizeResult;
 

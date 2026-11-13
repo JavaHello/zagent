@@ -83,8 +83,9 @@ one line.
 
 A sub-agent's report is never replaced by a `ccr` stand-in: it is the one text
 the caller verifies the work from, and a preview plus a cache id would hide
-exactly what it needs. Nothing a sub-agent runs on its own side is cached
-either, since that transcript never reaches the caller.
+exactly what it needs. Everything the sub-agent runs on its own side is cached
+as usual, though — in that child's own scratch directory, read back by the child
+with `ccr_retrieve`, never shown to the caller, and deleted with the child.
 
 ## Cost
 

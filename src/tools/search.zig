@@ -9,7 +9,6 @@ const ToolStatus = result_mod.ToolStatus;
 const toolError = result_mod.toolError;
 const normalizeToolText = result_mod.normalizeToolText;
 const finalizeResult = result_mod.finalizeResult;
-const page_room_bytes = result_mod.page_room_bytes;
 const lessString = util.lessString;
 const fixturePath = util.fixturePath;
 const optionalUnsigned = args_mod.optionalUnsigned;
@@ -349,7 +348,7 @@ test "search results sort names and preserve complete output and status" {
     try std.testing.expectEqualStrings("a\nm\nz\n", sorted.content);
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(a);
-    const page_lines = page_room_bytes / "one matching line\n".len;
+    const page_lines = @import("ccr.zig").page_room_bytes / "one matching line\n".len;
     while (buffer.items.len < (page_lines + 100) * "one matching line\n".len)
         try buffer.appendSlice(a, "one matching line\n");
     const data = buffer.items;
@@ -357,7 +356,6 @@ test "search results sort names and preserve complete output and status" {
     defer page.deinit(a);
     try std.testing.expect(page.is_error);
     try std.testing.expectEqual(@as(?u8, 2), page.exit_code);
-    try std.testing.expect(!page.truncated);
     // The cut is reported and the call is narrowed; there is no cursor to resume.
     try std.testing.expect(std.mem.indexOf(u8, page.content, "offset=") == null);
     try std.testing.expectEqualStrings(data, page.content);

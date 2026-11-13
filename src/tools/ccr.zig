@@ -22,7 +22,6 @@ const util = @import("util.zig");
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
 const finalizeToolContent = result_mod.finalizeToolContent;
-const page_room_bytes = result_mod.page_room_bytes;
 const optionalUnsigned = args_mod.optionalUnsigned;
 const truncateUtf8 = util.truncateUtf8;
 
@@ -33,11 +32,26 @@ pub const dir_name = "ccr";
 
 /// How long an id is, in hex characters: the first six bytes of the entry's
 /// SHA-256, so the same output always takes the same name. Long enough that two
-/// entries of one session do not meet, short enough to be quoted in a result.
-pub const id_len = 12;
+/// entries of one session do not meet, short enough to be quoted in a result —
+/// and the width of the id a result carries, so a preview and the entry it
+/// names are the same value.
+pub const id_len = result_mod.ccr_id_len;
 /// Random bytes behind the name an entry is created with, before its content is
 /// known: `id_len` hex characters.
 const id_bytes = id_len / 2;
+
+/// The threshold: a result larger than this is kept under this run's scratch
+/// directory, and the model is handed a preview of it instead. It is a rule of
+/// the cache, not a limit a tool holds its result to — a producer hands over
+/// its complete output and the hook decides what to do with it.
+pub const max_output_bytes: usize = 8 * 1024;
+/// The preview a cached result is handed in place of its body: enough to tell
+/// what the output is about, small enough that caching an 8 KiB result is worth
+/// the call it costs.
+pub const preview_room_bytes: usize = 4 * 1024;
+/// What one page of a result may take. It stays under `max_output_bytes`, so
+/// reading a cached entry back never caches the page it was read into.
+pub const page_room_bytes: usize = max_output_bytes - 512;
 
 /// A line longer than this is not matched against a query and not shown: the
 /// tool is for reading command output, and a single line that big is one the
@@ -242,14 +256,18 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []c
 /// Consumes outcome's content on success and failure.
 pub fn afterExecute(ctx: tool.Context, _: []const u8, _: []const u8, outcome: anyerror!ToolResult) !ToolResult {
     var result = try outcome;
-    if (result.content.len <= result_mod.max_output_bytes) return result;
+    // Already a preview of an entry, or a page read out of one: caching it
+    // again would keep the stand-in instead of the text it names, and the model
+    // would be handed a preview of a preview.
+    if (result.ccr_id != null) return result;
+    if (result.content.len <= max_output_bytes) return result;
     const dir = ctx.cache_dir orelse return result;
     const saved = save(ctx.io, ctx.allocator, dir, result.content) catch return result;
     const original = result.content;
     defer ctx.allocator.free(original);
-    const preview = headPreview(original, result_mod.preview_room_bytes);
+    const preview = headPreview(original, preview_room_bytes);
     result.content = try std.fmt.allocPrint(ctx.allocator, "{s}\n[ccr {s}: {d} lines, {d} bytes. The beginning of it is shown here; call ccr_retrieve with id \"{s}\" to read the rest.]", .{ preview, saved.id, saved.lines, saved.bytes, saved.id });
-    result.truncated = true;
+    result.ccr_id = saved.id;
     return result;
 }
 
@@ -359,8 +377,15 @@ pub fn retrieve(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, argum
         file.close(io);
     }
 
-    if (args.query) |query| return queryPage(io, allocator, path, args.id, query, args.offset, args.limit);
-    return read.readFilePage(io, allocator, path, .{ .offset = args.offset, .limit = args.limit });
+    var page = if (args.query) |query|
+        try queryPage(io, allocator, path, args.id, query, args.offset, args.limit)
+    else
+        try read.readFilePage(io, allocator, path, .{ .offset = args.offset, .limit = args.limit });
+    // The page came out of this entry, not out of a tool: naming it keeps the
+    // page from being cached as though it were fresh output.
+    if (page.ccr_id == null and args.id.len == result_mod.ccr_id_len)
+        page.ccr_id = args.id[0..result_mod.ccr_id_len].*;
+    return page;
 }
 
 /// The first place `needle` appears in `haystack`, ignoring ASCII case. A model
@@ -468,7 +493,6 @@ fn queryPage(
     return .{
         .content = try finalizeToolContent(allocator, aw.written()),
         .is_error = false,
-        .truncated = resumes_at != null,
     };
 }
 
@@ -482,12 +506,12 @@ test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
     const ctx: tool.Context = .{ .io = io, .allocator = a, .cache_dir = dir };
 
     // A result of exactly the threshold is small enough to be shown whole.
-    const under = try a.alloc(u8, result_mod.max_output_bytes);
+    const under = try a.alloc(u8, max_output_bytes);
     defer a.free(under);
     @memset(under, 'x');
     const kept = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, under), .is_error = false });
     defer kept.deinit(a);
-    try std.testing.expect(!kept.truncated);
+    try std.testing.expect(kept.ccr_id == null);
     try std.testing.expectEqualStrings(under, kept.content);
 
     // One byte more is cached, and what comes back is a preview under the
@@ -495,14 +519,14 @@ test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
     var text: std.Io.Writer.Allocating = .init(a);
     defer text.deinit();
     for (0..1200) |_| try text.writer.writeAll("payload line\n");
-    try std.testing.expect(text.written().len > result_mod.max_output_bytes);
+    try std.testing.expect(text.written().len > max_output_bytes);
     const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = false });
     defer result.deinit(a);
-    try std.testing.expect(result.truncated and !result.is_error);
-    try std.testing.expect(result.content.len < result_mod.max_output_bytes);
+    try std.testing.expect(result.ccr_id != null and !result.is_error);
+    try std.testing.expect(result.content.len < max_output_bytes);
     const marker = std.mem.indexOf(u8, result.content, "\n[ccr ") orelse return error.MissingCacheId;
-    try std.testing.expect(marker <= result_mod.preview_room_bytes);
-    try std.testing.expect(marker > result_mod.preview_room_bytes - 16);
+    try std.testing.expect(marker <= preview_room_bytes);
+    try std.testing.expect(marker > preview_room_bytes - 16);
     try std.testing.expect(std.mem.startsWith(u8, result.content, "payload line\n"));
     try std.testing.expect(std.mem.indexOf(u8, result.content[marker..], "ccr_retrieve") != null);
 
@@ -510,6 +534,45 @@ test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
     const again = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = false });
     defer again.deinit(a);
     try std.testing.expectEqualStrings(result.content, again.content);
+    var entries = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
+    defer entries.close(io);
+    var iterator = entries.iterate();
+    var files: usize = 0;
+    while (try iterator.next(io)) |_| files += 1;
+    try std.testing.expectEqual(@as(usize, 1), files);
+}
+
+test "a page read out of an entry is never cached again" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+
+    // An entry far past the threshold, read back in one page: the page itself
+    // is larger than a result may carry, which is what the cache used to grab.
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    for (0..12_000) |index| try text.writer.print("payload line {d}\n", .{index});
+    const saved = try save(io, a, dir, text.written());
+    const arguments = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\"}}", .{saved.id});
+    defer a.free(arguments);
+
+    const page = try retrieve(io, a, dir, arguments);
+    try std.testing.expect(page.content.len > max_output_bytes);
+    try std.testing.expectEqual(saved.id, page.ccr_id.?);
+    const page_text = try a.dupe(u8, page.content);
+    defer a.free(page_text);
+
+    // The page is handed to the hook as the call's result. It names its entry,
+    // so it is passed on whole rather than kept as a second entry.
+    const ctx: tool.Context = .{ .io = io, .allocator = a, .cache_dir = dir };
+    const result = try afterExecute(ctx, "ccr_retrieve", arguments, page);
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings(page_text, result.content);
+    try std.testing.expectEqual(saved.id, result.ccr_id.?);
+
     var entries = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
     defer entries.close(io);
     var iterator = entries.iterate();
@@ -532,9 +595,9 @@ test "afterExecute caches materialized output, preserves status and retrieves th
     try text.writer.writeAll("uncut tail\n");
     const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = true, .exit_code = 7, .timed_out = true });
     defer result.deinit(a);
-    try std.testing.expect(result.is_error and result.timed_out and result.truncated);
+    try std.testing.expect(result.is_error and result.timed_out and result.ccr_id != null);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
-    try std.testing.expect(result.content.len < result_mod.max_output_bytes);
+    try std.testing.expect(result.content.len < max_output_bytes);
     const start = (std.mem.indexOf(u8, result.content, "[ccr ") orelse return error.MissingCacheId) + "[ccr ".len;
     const id = result.content[start..][0..id_len];
     const path = try filePath(a, dir, id);
@@ -560,10 +623,10 @@ test "afterExecute leaves short results and uncached fallbacks untouched and pro
     defer a.free(invalid_dir);
     // A regular file is a deterministic save failure even when running as root.
     for ([_]?[]const u8{ null, invalid_dir }) |dir| {
-        for ([_]usize{ 5, result_mod.max_output_bytes, result_mod.max_output_bytes + 1 }) |len| {
+        for ([_]usize{ 5, max_output_bytes, max_output_bytes + 1 }) |len| {
             const content = try a.alloc(u8, len);
             @memset(content, 'x');
-            const original: ToolResult = .{ .content = content, .is_error = true, .exit_code = 9, .timed_out = true, .truncated = true };
+            const original: ToolResult = .{ .content = content, .is_error = true, .exit_code = 9, .timed_out = true, .ccr_id = "0a0b0c0d0e0f".* };
             const result = try afterExecute(.{ .io = io, .allocator = a, .cache_dir = dir }, "test", "{}", original);
             defer result.deinit(a);
             try std.testing.expect(result.content.ptr == original.content.ptr);
@@ -600,7 +663,9 @@ test "cached output is read back in pages and by query" {
     const page = try retrieve(io, a, base, arguments);
     defer page.deinit(a);
     try std.testing.expect(!page.is_error);
-    try std.testing.expect(page.truncated);
+    // The page names the entry it came out of, which is what keeps it from
+    // being cached again as though it were fresh output.
+    try std.testing.expectEqual(saved.id, page.ccr_id.?);
     try std.testing.expectEqualStrings(
         "199:line 199\n200:line 200\n[Output truncated; continue with offset=201 (1-based line number).]",
         page.content,
@@ -611,7 +676,7 @@ test "cached output is read back in pages and by query" {
     const tail = try retrieve(io, a, base, last);
     defer tail.deinit(a);
     try std.testing.expectEqualStrings("201:the last line has no terminator\n", tail.content);
-    try std.testing.expect(!tail.truncated);
+    try std.testing.expectEqual(saved.id, tail.ccr_id.?);
 }
 
 test "a query finds lines ignoring case and pages through the matches" {
@@ -627,7 +692,7 @@ test "a query finds lines ignoring case and pages through the matches" {
     defer a.free(found);
     const first = try retrieve(io, a, base, found);
     defer first.deinit(a);
-    try std.testing.expect(!first.is_error and first.truncated);
+    try std.testing.expect(!first.is_error and first.ccr_id != null);
     try std.testing.expectEqualStrings(
         "2:ERROR one\n[More matches; continue with offset=2 (a 1-based count of matching lines when 'query' is given).]",
         first.content,
@@ -640,7 +705,7 @@ test "a query finds lines ignoring case and pages through the matches" {
     const expected = try std.fmt.allocPrint(a, "4:Error two\n[End of ccr {s}: 2 matching line(s) for \"error\".]", .{saved.id});
     defer a.free(expected);
     try std.testing.expectEqualStrings(expected, second.content);
-    try std.testing.expect(!second.truncated);
+    try std.testing.expect(second.ccr_id != null);
 }
 
 test "a missing entry, a wrong id and an unknown query each say what is wrong" {
@@ -705,7 +770,6 @@ test "an oversized matching line advances instead of repeating forever" {
     defer a.free(args);
     const page = try retrieve(io, a, dir, args);
     defer page.deinit(a);
-    try std.testing.expect(page.truncated);
     try std.testing.expect(std.mem.indexOf(u8, page.content, "only its beginning") != null);
     try std.testing.expect(std.mem.indexOf(u8, page.content, "offset=2") != null);
 }

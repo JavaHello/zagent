@@ -333,7 +333,6 @@ pub fn executeShellTimed(
         return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
-            .truncated = false,
         });
     }
 
@@ -354,11 +353,14 @@ pub fn executeShellTimed(
             "[This command printed more than {d} MiB; the rest is not cached and was not kept.]",
             .{cache_max_bytes / (1024 * 1024)},
         );
-        return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
+        var result = finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
-            .truncated = true,
         });
+        // The preview names the entry, and the entry is what the model reads
+        // back: `ccr` leaves a result that already names one alone.
+        result.ccr_id = entry.id;
+        return result;
     }
 
     if (collector.cache_error) |err| {
@@ -371,7 +373,6 @@ pub fn executeShellTimed(
         return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
-            .truncated = true,
         });
     }
 
@@ -384,7 +385,6 @@ pub fn executeShellTimed(
     return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
         .is_error = true,
         .exit_code = exit_code,
-        .truncated = true,
     });
 }
 
@@ -447,7 +447,7 @@ test "cache threshold is strictly greater than eight KiB and large outputs survi
         const result = try executeShellWithEnv(io, a, command, null, dir);
         defer result.deinit(a);
         try std.testing.expect(!result.is_error);
-        try std.testing.expectEqual(size > cache_threshold_bytes, result.truncated);
+        try std.testing.expectEqual(size > cache_threshold_bytes, result.ccr_id != null);
         const marker = std.mem.indexOf(u8, result.content, "[ccr ");
         try std.testing.expectEqual(size > cache_threshold_bytes, marker != null);
         if (marker) |start| {
@@ -476,14 +476,14 @@ test "shell status survives empty output, stderr, signals and truncation" {
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.is_error, result.is_error);
         try std.testing.expect(std.mem.startsWith(u8, result.content, case.prefix));
-        try std.testing.expect(result.content.len <= result_mod.max_output_bytes);
+        try std.testing.expect(result.content.len <= ccr.max_output_bytes);
     }
     // Without a cache the rest is out of reach, so the cut is reported as a
     // failure that names what was dropped.
     const long = try executeShell(std.testing.io, std.testing.allocator, "printf '%50000s' ''");
     defer long.deinit(std.testing.allocator);
-    try std.testing.expect(long.content.len <= result_mod.max_output_bytes);
-    try std.testing.expect(long.is_error and long.truncated);
+    try std.testing.expect(long.content.len <= ccr.max_output_bytes);
+    try std.testing.expect(long.is_error and long.ccr_id == null);
     try std.testing.expect(std.mem.indexOf(u8, long.content, "Output cut") != null);
 }
 
@@ -527,8 +527,8 @@ test "long output is cached and the result names the id it is read back with" {
     defer result.deinit(a);
     try std.testing.expect(result.is_error);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
-    try std.testing.expect(result.truncated);
-    try std.testing.expect(result.content.len <= result_mod.max_output_bytes);
+    try std.testing.expect(result.ccr_id != null);
+    try std.testing.expect(result.content.len <= ccr.max_output_bytes);
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
     try std.testing.expect(std.mem.startsWith(u8, result.content, "Exit code: 7\n"));
     try std.testing.expect(std.mem.indexOf(u8, result.content, "ERR_END") != null);

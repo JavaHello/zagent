@@ -1310,7 +1310,7 @@ pub const Agent = struct {
                         .is_error = result.is_error,
                         .exit_code = result.exit_code,
                         .timed_out = result.timed_out,
-                        .truncated = result.truncated,
+                        .ccr_id = if (result.ccr_id) |*id| id else null,
                         .ms = tool_started.untilNow(self.io, .awake).toMilliseconds(),
                     });
                     defer result.deinit(self.allocator);
@@ -1665,15 +1665,13 @@ pub const Agent = struct {
     /// preview lands on a cleared line whatever the call did.
     fn afterToolCall(ctx: tools.Context, name: []const u8, arguments: []const u8, outcome: anyerror!tools.ToolResult) !tools.ToolResult {
         if (ctx.agent) |self| self.tool_ui.spinner.stop();
-        if (ctx.agent) |self| {
-            // A sub-agent's report is not something to cache: it is the one
-            // thing the caller reads back from a run, and swapping it for a
-            // preview plus an id would hide exactly the text it has to verify.
-            // The same goes for everything a sub-agent itself runs — that
-            // transcript never reaches the caller, so nothing would ever read
-            // its entries back.
-            if (self.role == .subagent or std.mem.eql(u8, name, "subagent")) return outcome;
-        }
+        // A sub-agent's report is not something to cache: it is the one thing
+        // the caller reads back from a run, and swapping it for a preview plus
+        // an id would hide exactly the text it has to verify. Everything else
+        // is cached as usual — including what a sub-agent runs on its own side,
+        // which is cached in that child's scratch directory, read back by the
+        // child through `ccr_retrieve`, and deleted with the child.
+        if (std.mem.eql(u8, name, "subagent")) return outcome;
         return @import("../tools/ccr.zig").afterExecute(ctx, name, arguments, outcome);
     }
 
@@ -2487,6 +2485,57 @@ test "a subagent runs its own turn and reports back" {
     const parent = mock.requests.items[2];
     try std.testing.expect(std.mem.indexOf(u8, parent, "Sub-agent report") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent, "answer.") != null);
+}
+
+test "a sub-agent's own results are cached and its report never is" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const harness = try TestHarness.init(a, io);
+    defer harness.deinit(a);
+    var silence = try Silence.init(io);
+    defer silence.deinit(io);
+
+    const dir = try tools.ccrDirPath(a, harness.agent.scratch.path);
+    defer a.free(dir);
+    const ctx: tools.Context = .{
+        .io = io,
+        .allocator = a,
+        .env = harness.agent.tool_env,
+        .cache_dir = dir,
+        .agent = &harness.agent,
+    };
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    for (0..1200) |_| try text.writer.writeAll("payload line\n");
+    const long = text.written();
+    try std.testing.expect(long.len > tools.max_output_bytes);
+
+    // The report is the one text the caller verifies the work from: it reaches
+    // the caller whole, at any size, with no preview and no cache id.
+    const report = try Agent.afterToolCall(ctx, "subagent", "{}", .{ .content = try a.dupe(u8, long), .is_error = false });
+    defer report.deinit(a);
+    try std.testing.expectEqualStrings(long, report.content);
+    try std.testing.expect(report.ccr_id == null and !report.is_error);
+
+    // What the sub-agent runs itself goes through the cache like any other
+    // agent's result: it is kept in the child's own scratch directory, and the
+    // preview names the entry the child reads back with `ccr_retrieve`.
+    harness.agent.role = .subagent;
+    defer harness.agent.role = .main;
+    const own = try Agent.afterToolCall(ctx, "read", "{}", .{ .content = try a.dupe(u8, long), .is_error = false });
+    defer own.deinit(a);
+    try std.testing.expect(own.ccr_id != null and !own.is_error);
+    try std.testing.expect(own.content.len < long.len);
+    const marker = std.mem.indexOf(u8, own.content, "[ccr ") orelse return error.MissingCacheId;
+    try std.testing.expect(std.mem.indexOf(u8, own.content[marker..], "ccr_retrieve") != null);
+
+    // The entry holds the whole result, so the child can page through it.
+    const id = own.content[marker + "[ccr ".len ..][0..@import("../tools/ccr.zig").id_len];
+    const path = try std.fmt.allocPrint(a, "{s}/{s}.log", .{ dir, id });
+    defer a.free(path);
+    const cached = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(long.len + 1));
+    defer a.free(cached);
+    try std.testing.expectEqualStrings(long, cached);
 }
 
 test "a self-check asks the child for a report and the caller waits for the end" {

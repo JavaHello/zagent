@@ -382,7 +382,7 @@ fn perform(allocator: std.mem.Allocator, deadline: *Deadline, request: HttpReque
         try aw.writer.writeAll("(empty body)");
     }
 
-    return finalizeResult(allocator, aw.written(), .{ .is_error = http_error, .truncated = false });
+    return finalizeResult(allocator, aw.written(), .{ .is_error = http_error });
 }
 
 /// Write the status line and every response header. Takes the head's parts

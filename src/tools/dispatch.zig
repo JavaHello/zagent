@@ -129,7 +129,7 @@ test "global and local hooks nest, short circuit and propagate errors without cl
             try self.events.append(ctx.allocator, 'R');
             if (self.mode == .run_error) return error.RunFailed;
             if (self.mode == .oversized) {
-                const content = try ctx.allocator.alloc(u8, @import("result.zig").max_output_bytes + 100);
+                const content = try ctx.allocator.alloc(u8, @import("ccr.zig").max_output_bytes + 100);
                 @memset(content, 'x');
                 return .{ .content = content, .is_error = false };
             }
@@ -156,8 +156,8 @@ test "global and local hooks nest, short circuit and propagate errors without cl
             }
             if (self.mode == .oversized) {
                 defer result.deinit(ctx.allocator);
-                try std.testing.expect(result.content.len > @import("result.zig").max_output_bytes);
-                try std.testing.expect(!result.truncated and !result.is_error);
+                try std.testing.expect(result.content.len > @import("ccr.zig").max_output_bytes);
+                try std.testing.expect(result.ccr_id == null and !result.is_error);
                 // The dispatch must preserve this complete oversized result.
                 return .{ .content = try ctx.allocator.dupe(u8, result.content), .is_error = false };
             }
@@ -186,8 +186,8 @@ test "global and local hooks nest, short circuit and propagate errors without cl
             const result = try outcome;
             defer result.deinit(ctx.allocator);
             if (case.mode == .oversized) {
-                try std.testing.expect(!result.truncated and !result.is_error);
-                try std.testing.expect(result.content.len > @import("result.zig").max_output_bytes);
+                try std.testing.expect(result.ccr_id == null and !result.is_error);
+                try std.testing.expect(result.content.len > @import("ccr.zig").max_output_bytes);
             } else try std.testing.expectEqualStrings("result", result.content);
         }
         try std.testing.expectEqualStrings(case.events, state.events.items);

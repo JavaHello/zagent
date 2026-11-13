@@ -18,7 +18,7 @@ def tool_output(output):
     header, separator, content = output.partition('\n')
     assert separator and header.startswith('[tool_status ') and header.endswith(']'), output
     status = json.loads(header[len('[tool_status '):-1])
-    assert set(status) == {'is_error', 'exit_code', 'timed_out', 'truncated'}, status
+    assert set(status) == {'is_error', 'exit_code', 'timed_out'}, status
     return status, content
 
 
@@ -131,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert resumed_statuses == saved_statuses, (resumed_statuses, saved_statuses)
     assert statuses[10]['is_error'] and statuses[10]['timed_out'], statuses[10]
     assert statuses[9] == {'is_error': False, 'exit_code': 0,
-                           'timed_out': False, 'truncated': False}, statuses[9]
+                           'timed_out': False}, statuses[9]
     assert statuses[12]['is_error'], statuses[12]
     # All model responses retain their exact replay items; no preflight runs.
     assert all(m['response_items'] for m in snapshot['messages']

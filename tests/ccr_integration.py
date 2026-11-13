@@ -33,7 +33,8 @@ def unpack(output):
 def cached(output, path, tag, expected):
     status, content = unpack(output)
     assert not status['is_error'] and status['exit_code'] == 0, output
-    assert status['truncated'], status
+    # A cached result says so by naming its entry; there is no truncation flag.
+    assert set(status) == {'is_error', 'exit_code', 'timed_out'}, status
     assert f'{tag}-19999 payload' in content and f'{tag}-00000 payload' not in content, content
     match = re.search(r'\[ccr ([0-9a-f]+): 20000 lines,', content)
     assert match, content

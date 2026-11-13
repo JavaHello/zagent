@@ -287,7 +287,12 @@ fn writeResultNode(w: *std.Io.Writer, arena: std.mem.Allocator, event: std.json.
         .preview = preview(string(event, "content")),
         .open = failed,
     });
-    if (boolean(event, "truncated")) try hint(w, "The tool cut this result down to its size limit before returning it.");
+    const ccr_id = string(event, "ccr_id");
+    if (ccr_id.len > 0) {
+        // The result stands for an entry: the report says which, and how the
+        // rest of it is read back.
+        try hint(w, try std.fmt.allocPrint(arena, "The result stands for cache entry {s}: the whole of it is read back with ccr_retrieve.", .{ccr_id}));
+    } else if (boolean(event, "truncated")) try hint(w, "The tool cut this result down to its size limit before returning it.");
     if (boolean(event, "content_truncated")) try hint(w, "The result was longer than the trace keeps; its opening is shown.");
     try block(w, arena, "Output", string(event, "content"), false);
     try nodeEnd(w, true);

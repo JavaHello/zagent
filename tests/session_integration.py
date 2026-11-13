@@ -68,7 +68,7 @@ try:
             header, content = output.split('\n', 1)
             assert header.startswith('[tool_status ') and header.endswith(']'), output
             assert json.loads(header[len('[tool_status '):-1]) == {
-                'is_error': True, 'exit_code': 42, 'timed_out': False, 'truncated': False}, output
+                'is_error': True, 'exit_code': 42, 'timed_out': False}, output
             assert content == 'Exit code: 42\n(no output)', content
 
         first = session_id(run('first-session-marker'))
@@ -77,7 +77,7 @@ try:
         saved = json.loads(old)
         saved_tool = next(m for m in saved['messages'] if m['role'] == 'tool')
         assert saved_tool['tool_status'] == {
-            'is_error': True, 'exit_code': 42, 'timed_out': False, 'truncated': False}, saved_tool
+            'is_error': True, 'exit_code': 42, 'timed_out': False}, saved_tool
         assert_failed_tool_status(requests[-1])
         assert any(message.get('role') == 'tool'
                    and message.get('content') == 'Exit code: 42\n(no output)'

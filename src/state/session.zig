@@ -30,9 +30,10 @@ pub const Child = struct {
     title: []const u8,
     status: enum { running, interrupted, completed, failed } = .running,
 };
-/// Bumped when a field is added, so an older snapshot is refused instead of
-/// resumed with half its state.
-const schema_version: u32 = 2;
+/// Bumped when a stored field changes, so an older snapshot is refused instead
+/// of resumed with half its state. Three dropped `truncated` from a tool's
+/// status, which a cached result names with its `ccr` entry instead.
+const schema_version: u32 = 3;
 
 /// What a session holds: its messages and the plan of the work in progress.
 pub const Loaded = struct {
@@ -251,7 +252,7 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
     var calls = [_]openai.ToolCallData{.{ .id = "1", .name = "shell", .arguments = "{}" }};
     var messages = [_]Message{
         .{ .role = "assistant", .content = null, .reasoning_content = "plan", .tool_calls = &calls, .tool_call_id = null, .response_items = "[{\"type\":\"reasoning\",\"id\":\"rs1\",\"summary\":[],\"encrypted_content\":\"opaque-token\"},{\"type\":\"function_call\",\"call_id\":\"1\",\"name\":\"shell\",\"arguments\":\"{}\"}]" },
-        .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true, .truncated = true } },
+        .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true } },
     };
     try save(io, allocator, path, &messages, &plan);
     var loaded = try load(io, allocator, path);
@@ -271,14 +272,22 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
 
 test "snapshots reject removed fields and require the current schema" {
     const a = std.testing.allocator;
+    // A status no longer carries `truncated`: an old one is refused rather
+    // than read as a status that never said where the rest of its result went.
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(
+        @import("../tools/mod.zig").ToolStatus,
+        a,
+        "{\"is_error\":false,\"exit_code\":null,\"timed_out\":false,\"truncated\":true}",
+        .{},
+    ));
     try std.testing.expectError(error.MissingField, std.json.parseFromSlice(StoredMessage, a, "{\"role\":\"tool\",\"content\":\"old\",\"reasoning_content\":null,\"tool_calls\":null,\"tool_call_id\":\"1\"}", .{}));
-    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Snapshot, a, "{\"version\":2,\"workspace\":\"\",\"messages\":[],\"plan\":[],\"scratch_dirs\":[]}", .{}));
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Snapshot, a, "{\"version\":3,\"workspace\":\"\",\"messages\":[],\"plan\":[],\"scratch_dirs\":[]}", .{}));
     // Replaced plan enum values are not migrated or silently discarded.
     inline for (.{ "active", "done" }) |status| {
-        try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(Snapshot, a, "{\"version\":2,\"workspace\":\"\",\"messages\":[],\"plan\":[{\"title\":\"old step\",\"status\":\"" ++ status ++ "\"}]}", .{}));
+        try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(Snapshot, a, "{\"version\":3,\"workspace\":\"\",\"messages\":[],\"plan\":[{\"title\":\"old step\",\"status\":\"" ++ status ++ "\"}]}", .{}));
     }
     try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .{}));
-    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"version\":2,\"workspace\":\"\",\"messages\":[]}", .{}));
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Snapshot, a, "{\"version\":3,\"workspace\":\"\",\"messages\":[]}", .{}));
 }
 
 test "a missing session starts empty but malformed JSON is rejected" {
@@ -308,11 +317,11 @@ test "sessions reject incompatible versions and another workspace" {
     const path = try std.fs.path.join(a, &.{ directory, "session.json" });
     defer a.free(path);
     const cases = [_]struct { data: []const u8, expected: anyerror }{
-        .{ .data = "{\"version\":3,\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .expected = error.UnsupportedSessionVersion },
+        .{ .data = "{\"version\":2,\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .expected = error.UnsupportedSessionVersion },
         // A snapshot from before the plan was part of the session is refused,
         // not resumed without the state it never had.
         .{ .data = "{\"version\":1,\"workspace\":\"\",\"messages\":[]}", .expected = error.MissingField },
-        .{ .data = "{\"version\":2,\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .expected = error.SessionWorkspaceMismatch },
+        .{ .data = "{\"version\":3,\"workspace\":\"\",\"messages\":[],\"plan\":[]}", .expected = error.SessionWorkspaceMismatch },
     };
     for (cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "session.json", .data = case.data });
