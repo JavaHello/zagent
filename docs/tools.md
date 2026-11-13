@@ -44,16 +44,24 @@ The call returns the merged output and the exit status. A command that runs past
 the deadline is terminated with its process group, so a background child does
 not outlive the call. Background processes are not kept across calls.
 
-Output larger than 8 KiB (8192 bytes) is cached in the current run's scratch
-folder. The result keeps the exit status and up to the last 40 lines / 4 KiB,
-then names a cache ID, the total line count and the size in bytes. The result
-carries that ID, and a result that already names an entry is never cached again:
-what is handed to the model is always an entry's own text, never a preview of a
-preview. Stdout is followed by stderr under a `stderr:` label. Counts refer to
-this normalized, combined text, not the cache-notice lines. The entry is written
-as the output arrives and holds at most 64 MiB, so a command that prints without
-end is bounded by the deadline and by that size; past it the rest is read and
-counted but not kept, and the result says so.
+The whole of the output is handed over: nothing is trimmed on the way out, so
+the collector holds what the machine can hold, and a command that prints without
+end is ended by the deadline rather than by a limit on what it may say. What is
+too long to show is kept by the cache every tool's long result goes through: an
+output larger than 8 KiB (8192 bytes) is written to the current run's scratch
+folder, and the result keeps up to its first 4 KiB with the entry, its line
+count and its size in bytes, beside the text. A result that already names an
+entry is never cached again: what is handed to the model is always an entry's
+own text, never a preview of a preview. Stdout is followed by stderr under a
+`stderr:` label, and the counts refer to this normalized, combined text, not the
+cache-notice lines.
+
+The notice that spells those facts out is not part of the text: a `bash` result
+is what the command printed and nothing else, and the notice is written after
+the call returns, by the cache that kept the rest — the same one every tool's
+long result is given. A command that printed nothing answers `(no output)`, the
+one spelling every tool uses for it, because an empty message cannot be told
+apart from a call whose content went missing.
 
 The result is what the command printed and nothing else. How it ended travels
 beside the text, in the status the model reads in the header above the output:
@@ -61,8 +69,8 @@ beside the text, in the status the model reads in the header above the output:
 signal's name as a shell writes it, `SIGTERM`. A terminal draws those same
 fields on the line under the call — `✓ exit 0`, `✗ exit 42`, `✗ timed out`,
 `✗ SIGTERM` — so the ending is stated once, in the same place, for both readers,
-and never as the first line of the output, where the tail of a clipped result
-could not carry it.
+and never as the first line of the output, where a cached result's preview
+would not carry it.
 
 ## `ccr_retrieve`
 
@@ -174,7 +182,9 @@ the result keeps the first whole lines up to 4 KiB and then names the cache ID,
 the line count and the size in bytes, and `ccr_retrieve` reads the rest back
 page by page. This is the same cache `bash` writes to, and an entry is named
 after its content, so identical output is kept once however often it is
-produced.
+produced. One notice says all this, whatever produced the output: it is written
+by the cache after the call returns, so no tool's text carries a description of
+another tool's arguments.
 
 - A result carries the ID of the entry it stands for, and a result that already
   names one is never cached again: a preview, or a page read back out of an
@@ -183,8 +193,10 @@ produced.
   the model is walking through says where it stopped.
 - `ls` and the searches stop short of the limit and say so, so the model
   narrows the call rather than reading a cut answer as a complete one.
-- `bash` starts caching at 8 KiB as the output arrives and returns a tail
-  preview plus a cache ID, so output it already holds is not written twice.
+- `bash` hands over everything the command printed, however much that is: the
+  collector holds it, and the cache keeps what is too long to show. It is a
+  tool like any other here — no private limit, no cache of its own, and no
+  notice of its own to write.
 - An `http` response, an `apply_patch` summary, an MCP server's answer and
   anything else that large is cached the same way. A [sub-agent's](subagents.md#not-cached)
   report is the one exception: it reaches its caller whole at any size.
@@ -205,3 +217,9 @@ cursor or clear the screen it is shown on.
 dropped and a line a carriage return redraws is flattened to what a terminal
 would have ended up showing. A result the tool marks as a failure stays an
 error, so the model can correct itself.
+
+Two things are added after a tool answers, and neither is the tool's text: the
+status header `[tool_status …]` above it, and the cache's notice at the end of a
+result whose output was too long to hand over whole. Both say something about
+the call rather than something the call said, which is why they are added by the
+layers that know it — the dispatch path and the cache — instead of by each tool.

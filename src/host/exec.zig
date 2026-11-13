@@ -1,12 +1,12 @@
 //! Running a host program while it is still running.
 //!
 //! A tool that runs another program — `bash`, the searches — reads what it says
-//! as it arrives rather than waiting for it to finish: a command that prints
-//! without end must not be able to fill this process's memory, and one that
-//! hangs must not be able to hold the session. So the output goes to a sink as
-//! it comes off the pipes, the deadline is set once for the whole run, and when
-//! it passes the program's whole process group is killed — background children
-//! included, which is what a plain `kill` of the program would leave behind.
+//! as it arrives rather than waiting for it to finish: what a program prints is
+//! the sink's to keep or drop, chunk by chunk, and one that hangs must not be
+//! able to hold the session. So the output goes to a sink as it comes off the
+//! pipes, the deadline is set once for the whole run, and when it passes the
+//! program's whole process group is killed — background children included,
+//! which is what a plain `kill` of the program would leave behind.
 const std = @import("std");
 const signals = @import("../util/signals.zig");
 

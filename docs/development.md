@@ -79,7 +79,7 @@ src/
     http.zig     — http
     search.zig   — What the four search tools share: backends, arguments, paging
     result.zig   — The shape of a result: its text, status and header
-    ccr.zig      — The output cache: its sizes, a preview and its id, and ccr_retrieve
+    ccr.zig      — The output cache: its sizes, the notice a cut result ends with, a preview and its id, and ccr_retrieve
     dispatch.zig — Sending one call to the tool that answers it, statically, in this process
     args.zig     — Reading a call's JSON arguments
     progress.zig — The label shown while a tool runs
@@ -194,10 +194,12 @@ its announcement line and starts the animation that owns the line while it
 runs; the context after hook gives that line back and then calls
 `ccr.afterExecute`, which caches materialized output past 8 KiB (including MCP
 output) under an id named after the content's SHA-256, so the same output is
-kept once, and returns a 4 KiB preview with that `ccr_retrieve` id. Dispatch itself applies
-no size limit, so no cache directory or a cache-write failure leaves the
-complete result as it is. Bash keeps its streaming CCR cache so it need not
-materialize arbitrarily large output. Because the animation is started
+kept once, and returns a 4 KiB preview with that `ccr_retrieve` id. No tool
+caches its own output or knows where an oversized answer goes: a producer hands
+over the whole of what it has, and the one hook says what became of it, so a
+tool never describes another tool's arguments or another one's limits. Dispatch
+itself applies no size limit, so no cache directory or a cache-write failure
+leaves the complete result as it is. Because the animation is started
 in one hook and stopped in the other, both live on the agent whose terminal it
 is, and a call is shown the same way whatever tool answers it — there is no
 class of quiet calls the UI skips.

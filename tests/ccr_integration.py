@@ -35,9 +35,11 @@ def cached(output, path, tag, expected):
     assert not status['is_error'] and status['exit_code'] == 0, output
     # A cached result says so by naming its entry; there is no truncation flag.
     assert set(status) == {'is_error', 'exit_code', 'timed_out', 'termination'}, status
-    assert f'{tag}-19999 payload' in content and f'{tag}-00000 payload' not in content, content
-    match = re.search(r'\[ccr ([0-9a-f]+): 20000 lines,', content)
-    assert match, content
+    assert f'{tag}-00000 payload' in content and f'{tag}-19000 payload' not in content, content
+    # The notice is the cache's, not the command's: bash hands on everything the
+    # command printed, and `ccr` keeps what is too long to show and says so.
+    match = re.search(r'\[ccr ([0-9a-f]+): 20000 lines, \d+ bytes\. The beginning of it is shown here;', content)
+    assert match and 'ccr_retrieve' in content, content
     identifier = match[1]
     assert (path / 'ccr' / f'{identifier}.log').read_text() == expected
     return identifier

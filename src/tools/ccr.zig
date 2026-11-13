@@ -88,13 +88,12 @@ pub fn countLines(text: []const u8) usize {
     return lines;
 }
 
-/// An entry written while the output that fills it is still arriving.
+/// An entry written in pieces, then named after what it holds.
 ///
-/// A command's output is streamed into the cache as it comes off the pipe, so
-/// the copy on disk costs this process nothing to hold. The line and byte
+/// The text is not kept in this process to be counted later: the line and byte
 /// counts are kept as it is written, which is what a result naming the entry
-/// reports. The content is hashed on the way in, so an entry can be renamed
-/// after what it holds once it is closed.
+/// reports, and the content is hashed on the way in, so the entry can be
+/// renamed after it once it is closed.
 pub const Stream = struct {
     file: std.Io.File,
     /// Owned; freed by `deinit`.
@@ -154,14 +153,6 @@ pub const Stream = struct {
             else => return self.id,
         };
         return id;
-    }
-
-    /// Give up on the entry: the output it holds is not worth reading back —
-    /// the run passed its deadline, so there is no result to name it in.
-    pub fn abandon(self: *Stream, io: std.Io, allocator: std.mem.Allocator) void {
-        self.close(io);
-        if (self.path.len > 0) std.Io.Dir.deleteFileAbsolute(io, self.path) catch {};
-        self.deinit(io, allocator);
     }
 
     /// Release the entry's file and name. Safe after `finish`, and called
@@ -249,8 +240,7 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []c
     return stream.finish(io);
 }
 
-/// Optional execution-after hook for any tool (including MCP). Unlike bash's
-/// streaming cache this handles already-materialized results. Install as
+/// Optional execution-after hook for any tool (including MCP). Install as
 /// Context.hooks.after or Tool.hooks.after; producers preserve complete output.
 /// Consumes outcome's content on success and failure.
 pub fn afterExecute(ctx: tool.Context, _: []const u8, _: []const u8, outcome: anyerror!ToolResult) !ToolResult {
@@ -843,20 +833,4 @@ test "an entry written as the output arrives counts what a whole text would" {
     const kept = try file_reader.interface.allocRemaining(a, .limited(4096));
     defer a.free(kept);
     try std.testing.expectEqualStrings(whole.items, kept);
-}
-
-test "an abandoned entry leaves nothing behind" {
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(dir);
-
-    var stream = try createStream(io, a, dir);
-    const path = try filePath(a, dir, &stream.id);
-    defer a.free(path);
-    try stream.write(io, "half an answer");
-    stream.abandon(io, a);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, path, .{}));
 }

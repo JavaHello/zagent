@@ -56,9 +56,9 @@ pub const ToolResult = struct {
     /// result — see `ToolStatus.termination`. Null for a tool that ran nothing
     /// and for a program that chose its own exit status.
     termination: ?[]const u8 = null,
-    /// The entry this content is a preview of, when it is one: `bash` names the
-    /// entry it kept a long output in, and `ccr` names the one it just wrote.
-    /// A result that already carries an id is never cached again — keeping a
+    /// The entry this content stands for, when it stands for one: `ccr` names
+    /// the entry it just wrote, in place of a body too long to hand over. A
+    /// result that already carries an id is never cached again — keeping a
     /// preview would store the stand-in instead of the text it names — and
     /// `ccr_retrieve` marks each page with the entry it came from for the same
     /// reason.
