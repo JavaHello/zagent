@@ -192,7 +192,7 @@ Agent does its terminal work for a call in these hooks rather than around the
 dispatch. The context before hook names the call in the terminal title, writes
 its announcement line and starts the animation that owns the line while it
 runs; the context after hook gives that line back and then calls
-`ccr.afterExecute`, which caches materialized output past 8 KiB (including MCP
+`ccr.cacheOversizedOutput`, which caches materialized output past 8 KiB (including MCP
 output) under an id named after the content's SHA-256, so the same output is
 kept once, and returns a 4 KiB preview with that `ccr_retrieve` id. No tool
 caches its own output or knows where an oversized answer goes: a producer hands

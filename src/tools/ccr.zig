@@ -243,7 +243,7 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []c
 /// Optional execution-after hook for any tool (including MCP). Install as
 /// Context.hooks.after or Tool.hooks.after; producers preserve complete output.
 /// Consumes outcome's output on success and failure.
-pub fn afterExecute(ctx: tool.Context, _: []const u8, _: []const u8, outcome: anyerror!ToolResult) !ToolResult {
+pub fn cacheOversizedOutput(ctx: tool.Context, _: []const u8, _: []const u8, outcome: anyerror!ToolResult) !ToolResult {
     var result = try outcome;
     // Already a preview of an entry, or a page read out of one: caching it
     // again would keep the stand-in instead of the text it names, and the model
@@ -482,7 +482,7 @@ fn queryPage(
     return .{ .output = try aw.toOwnedSlice(), .is_error = false };
 }
 
-test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
+test "cacheOversizedOutput caches a result past 8 KiB and keeps a 4 KiB beginning" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -495,7 +495,7 @@ test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
     const under = try a.alloc(u8, max_output_bytes);
     defer a.free(under);
     @memset(under, 'x');
-    const kept = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, under), .is_error = false });
+    const kept = try cacheOversizedOutput(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, under), .is_error = false });
     defer kept.deinit(a);
     try std.testing.expect(kept.ccr_id == null);
     try std.testing.expectEqualStrings(under, kept.output);
@@ -506,7 +506,7 @@ test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
     defer text.deinit();
     for (0..1200) |_| try text.writer.writeAll("payload line\n");
     try std.testing.expect(text.written().len > max_output_bytes);
-    const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = false });
+    const result = try cacheOversizedOutput(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = false });
     defer result.deinit(a);
     try std.testing.expect(result.ccr_id != null and !result.is_error);
     try std.testing.expect(result.output.len < max_output_bytes);
@@ -517,7 +517,7 @@ test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
     try std.testing.expect(std.mem.indexOf(u8, result.output[marker..], "ccr_retrieve") != null);
 
     // The same output again is the same entry, not a second copy of it.
-    const again = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = false });
+    const again = try cacheOversizedOutput(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = false });
     defer again.deinit(a);
     try std.testing.expectEqualStrings(result.output, again.output);
     var entries = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
@@ -554,7 +554,7 @@ test "a page read out of an entry is never cached again" {
     // The page is handed to the hook as the call's result. It names its entry,
     // so it is passed on whole rather than kept as a second entry.
     const ctx: tool.Context = .{ .io = io, .allocator = a, .cache_dir = dir };
-    const result = try afterExecute(ctx, "ccr_retrieve", arguments, page);
+    const result = try cacheOversizedOutput(ctx, "ccr_retrieve", arguments, page);
     defer result.deinit(a);
     try std.testing.expectEqualStrings(page_text, result.output);
     try std.testing.expectEqual(saved.id, result.ccr_id.?);
@@ -567,7 +567,7 @@ test "a page read out of an entry is never cached again" {
     try std.testing.expectEqual(@as(usize, 1), files);
 }
 
-test "afterExecute caches materialized output, preserves status and retrieves the tail" {
+test "cacheOversizedOutput caches materialized output, preserves status and retrieves the tail" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -579,7 +579,7 @@ test "afterExecute caches materialized output, preserves status and retrieves th
     defer text.deinit();
     for (0..6000) |_| try text.writer.writeAll("payload\n");
     try text.writer.writeAll("uncut tail\n");
-    const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = true, .exit_code = 7, .timed_out = true });
+    const result = try cacheOversizedOutput(ctx, "mcp_dynamic", "{}", .{ .output = try a.dupe(u8, text.written()), .is_error = true, .exit_code = 7, .timed_out = true });
     defer result.deinit(a);
     try std.testing.expect(result.is_error and result.timed_out and result.ccr_id != null);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
@@ -599,7 +599,7 @@ test "afterExecute caches materialized output, preserves status and retrieves th
     try std.testing.expectEqualStrings("6001:uncut tail\n", retrieved.output);
 }
 
-test "afterExecute leaves short results and uncached fallbacks untouched and propagates errors" {
+test "cacheOversizedOutput leaves short results and uncached fallbacks untouched and propagates errors" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -613,7 +613,7 @@ test "afterExecute leaves short results and uncached fallbacks untouched and pro
             const content = try a.alloc(u8, len);
             @memset(content, 'x');
             const original: ToolResult = .{ .output = content, .is_error = true, .exit_code = 9, .timed_out = true, .ccr_id = "0a0b0c0d0e0f".* };
-            const result = try afterExecute(.{ .io = io, .allocator = a, .cache_dir = dir }, "test", "{}", original);
+            const result = try cacheOversizedOutput(.{ .io = io, .allocator = a, .cache_dir = dir }, "test", "{}", original);
             defer result.deinit(a);
             try std.testing.expect(result.output.ptr == original.output.ptr);
             try std.testing.expectEqualStrings(original.output, result.output);
@@ -624,7 +624,7 @@ test "afterExecute leaves short results and uncached fallbacks untouched and pro
             try std.testing.expectEqualDeep(original.ccr_id, result.ccr_id);
         }
     }
-    try std.testing.expectError(error.RunFailed, afterExecute(.{ .io = io, .allocator = a }, "test", "{}", error.RunFailed));
+    try std.testing.expectError(error.RunFailed, cacheOversizedOutput(.{ .io = io, .allocator = a }, "test", "{}", error.RunFailed));
 }
 
 test "cached output is read back in pages and by query" {

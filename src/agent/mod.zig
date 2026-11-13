@@ -1714,7 +1714,7 @@ pub const Agent = struct {
         // which is cached in that child's scratch directory, read back by the
         // child through `ccr_retrieve`, and deleted with the child.
         if (std.mem.eql(u8, name, "subagent")) return outcome;
-        return @import("../tools/ccr.zig").afterExecute(ctx, name, arguments, outcome);
+        return @import("../tools/ccr.zig").cacheOversizedOutput(ctx, name, arguments, outcome);
     }
 
     /// Start the animation for the call in progress, if the tool has a label
