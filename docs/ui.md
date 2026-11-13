@@ -199,16 +199,15 @@ single-query mode and render on stderr.
 
 ## Thinking
 
-While the model reasons, what it is thinking scrolls in a panel of its own: five
-rows between the status line and the prompt, dim, taking the newest text and
-letting the oldest rows go as it arrives. The panel is a window, not a record —
-nothing of it joins the conversation. It stays for about three seconds of the
-answer, so the rows that led there can still be read, and then closes, leaving
-one line behind:
+While the model reasons, what it is thinking scrolls in a panel of its own: one
+row between the status line and the prompt, dim, always showing the newest text
+and letting the row before it go as more arrives. The panel is a window, not a
+record — nothing of it joins the conversation. It stays for about three seconds
+of the answer, so the thought that led there can still be read, and then closes,
+leaving one line behind:
 
 ```
   ⠋ thinking… 4s · in 8120 · out 0
-  I need both files named, so the listing comes first, then the answer.
   Both of them end in .zig, and the question says list, not read.
 
   Assistant

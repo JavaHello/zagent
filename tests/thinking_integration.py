@@ -91,7 +91,7 @@ try:
                    AI_URL=f'http://127.0.0.1:{server.server_port}/v1')
         trust_workspace(directory, env)
         master, slave = pty.openpty()
-        # 24 rows: the log keeps 17, the status line one and the panel five.
+        # 24 rows: the log keeps the rest, the status line one and the panel one.
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
         original = termios.tcgetattr(slave)
         process = subprocess.Popen([str(binary)], cwd=directory, env=env,
@@ -117,16 +117,17 @@ try:
             until('✻ Thought for'.encode())
             reported_at = time.monotonic()
             assert reported_at - first_answer_at < 2.5, 'duration was not shown when thinking ended'
-            # With the five-row panel open, the status bar is on row 18.
+            # With the one-row panel open, the status bar is on row 22.
             raw = bytes(transcript)
             duration_at = raw.index('✻ Thought for'.encode())
             positions = re.findall(rb'\x1b\[(\d+)(?:;\d+)?H', raw[:duration_at])
-            assert positions[-1] == b'18', 'duration missing from status bar'
+            assert positions[-1] == b'22', 'duration missing from status bar'
 
             plain = ansi.sub(b'', bytes(transcript))
             folded_index = plain.index('✻ Thought for'.encode())
             # The reasoning was on the screen while it was being written, a
-            # piece at a time, and all of it before the fold.
+            # piece at a time, and all of it before the fold. The panel shows
+            # the newest row, so each piece is overwritten by the next one.
             for chunk in reasoning:
                 assert chunk.strip().encode() in plain[:folded_index], plain[:folded_index]
             assert b'Assistant' in plain, plain

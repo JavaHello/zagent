@@ -40,7 +40,7 @@ between runs.
 - **Completion judged by the model** — a final answer ends the turn; the model
   must verify its work and say what is unfinished.
   [Completion status](docs/agent-loop.md#completion-status)
-- **Thinking panel** — the model's reasoning scrolls in five dim rows above the
+- **Thinking panel** — the model's reasoning scrolls in one dim row above the
   prompt while it thinks, stays a few seconds into the answer, then folds into
   one line. [Thinking](docs/ui.md#thinking)
 - **Live progress** — waiting, running a tool and watching a sub-agent each get

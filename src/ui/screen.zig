@@ -37,10 +37,12 @@ const selection = @import("selection.zig");
 /// whole life of a long-running session.
 pub const max_transcript_bytes: usize = 8 * 1024 * 1024;
 
-/// Rows the live thinking panel takes above the prompt. Small on purpose: it is
+/// Rows the live thinking panel takes above the prompt. One on purpose: it is
 /// a window onto reasoning that is still being written, not a transcript, and
-/// the rows it takes are rows the conversation gives up while it is open.
-pub const thinking_panel_rows: usize = 5;
+/// the row it takes is a row the conversation gives up while it is open. The
+/// newest row of the thought is the one shown, so the panel reads as a single
+/// line that scrolls under the model's pen.
+pub const thinking_panel_rows: usize = 1;
 
 /// How much reasoning text the panel keeps to scroll through. Only the last
 /// panelful is ever visible, so a bounded tail is all a long thought costs.
@@ -628,8 +630,8 @@ pub const Screen = struct {
         defer lines.deinit(self.allocator);
 
         // The window shows the newest rows; the rest scroll off the top. Blank
-        // rows were dropped by the wrapper, since in five rows an empty one is
-        // a row of the model's thought that is not shown.
+        // rows were dropped by the wrapper, since in one row an empty one is a
+        // row of the model's thought that is not shown.
         const shown = @min(rows, lines.items.len);
         const first = lines.items.len - shown;
         const top = self.thinkingTop();
@@ -1686,20 +1688,20 @@ test "the thinking panel keeps only the rows the window can spare" {
     try expectEqual(@as(usize, 24), s.inputTop());
 
     s.thinking_rows = thinking_panel_rows;
-    try expectEqual(@as(usize, 5), s.thinkingRows());
-    try expectEqual(@as(usize, 17), s.logBottom());
-    try expectEqual(@as(usize, 18), s.statusRow());
-    try expectEqual(@as(usize, 19), s.thinkingTop());
+    try expectEqual(@as(usize, 1), s.thinkingRows());
+    try expectEqual(@as(usize, 21), s.logBottom());
+    try expectEqual(@as(usize, 22), s.statusRow());
+    try expectEqual(@as(usize, 23), s.thinkingTop());
     try expectEqual(@as(usize, 24), s.inputTop());
 
     // A short window gives the panel what is left over, down to nothing: the
     // status line and one row of conversation always stay.
     s.rows = 8;
-    try expectEqual(@as(usize, 5), s.thinkingRows());
-    try expectEqual(@as(usize, 1), s.logBottom());
+    try expectEqual(@as(usize, 1), s.thinkingRows());
+    try expectEqual(@as(usize, 5), s.logBottom());
     s.rows = 5;
-    try expectEqual(@as(usize, 2), s.thinkingRows());
-    try expectEqual(@as(usize, 1), s.logBottom());
+    try expectEqual(@as(usize, 1), s.thinkingRows());
+    try expectEqual(@as(usize, 2), s.logBottom());
     s.rows = 3;
     try expectEqual(@as(usize, 0), s.thinkingRows());
     try expectEqual(@as(usize, 1), s.logBottom());
@@ -1707,9 +1709,9 @@ test "the thinking panel keeps only the rows the window can spare" {
 
     // A taller editor pushes the panel up with it rather than under the prompt.
     s.input_rows = 6;
-    try expectEqual(@as(usize, 5), s.thinkingRows());
+    try expectEqual(@as(usize, 1), s.thinkingRows());
     try expectEqual(@as(usize, 19), s.inputTop());
-    try expectEqual(@as(usize, 12), s.logBottom());
+    try expectEqual(@as(usize, 16), s.logBottom());
 }
 
 test "reasoning is drawn in the panel and never in the conversation" {
@@ -1777,9 +1779,9 @@ test "the panel scrolls to the newest reasoning and skips blank rows" {
     try s.reserveInput(1, false);
     const drawn = try readOutput(tmp.dir, a);
     defer a.free(drawn);
-    // Five rows: the newest five pieces of thought, with the blanks dropped.
-    try std.testing.expect(std.mem.indexOf(u8, drawn, "three") != null);
+    // One row: the newest piece of thought, with the blanks dropped before it.
     try std.testing.expect(std.mem.indexOf(u8, drawn, "seven") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawn, "six") == null);
     try std.testing.expect(std.mem.indexOf(u8, drawn, "two") == null);
     try std.testing.expect(std.mem.indexOf(u8, drawn, "one") == null);
 
@@ -1838,13 +1840,13 @@ test "completed thinking stays in status through delayed and immediate panel clo
     s.publishThinking("the reasoning that led here");
     try std.testing.expect(try s.drain());
     try s.reserveInput(1, false);
-    try std.testing.expectEqual(@as(usize, 5), s.thinkingRows());
+    try std.testing.expectEqual(@as(usize, 1), s.thinkingRows());
 
     // The answer has begun, and the panel is to stay for a while longer.
     const summary = "✻ Thought for 1.2s";
     s.scheduleThinkingCloseAfter(summary, 60_000);
     try std.testing.expect(try s.drain());
-    try std.testing.expectEqual(@as(usize, 5), s.thinkingRows());
+    try std.testing.expectEqual(@as(usize, 1), s.thinkingRows());
     var buf: [512]u8 = undefined;
     var status = std.Io.Writer.fixed(&buf);
     try s.writeStatus(&status);

@@ -1954,7 +1954,7 @@ pub const Agent = struct {
 /// outlives the request it belongs to.
 ///
 /// The panel outlives the start of the answer by a few seconds, so the last
-/// rows of reasoning can be read while the answer is written; the screen times
+/// row of reasoning can be read while the answer is written; the screen times
 /// that close, and every other close here is immediate.
 ///
 /// A run with no screen, and a sub-agent, have none of this: the deltas are
@@ -2182,7 +2182,7 @@ const AnswerStream = struct {
             // ready; stop it before anything else is written.
             if (self.spin) |spin| spin.stop();
             // The answer begins where the reasoning ends. The panel is given
-            // its delay rather than folded away at once, so the rows that led
+            // its delay rather than folded away at once, so the row that led
             // here can still be read; its line is written when it closes.
             self.agent.thinking.deferClose(self.agent);
             try self.agent.answerHeader();
