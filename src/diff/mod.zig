@@ -1545,8 +1545,7 @@ pub fn render(w: *std.Io.Writer, patch_text: []const u8) !void {
     // it was left out, rather than trailing off as though that were all of it.
     // One line per newline, plus the last line when the text does not end in
     // one — which is the same walk the loop below makes.
-    const total = std.mem.count(u8, patch_text, "\n") +
-        @intFromBool(patch_text.len > 0 and !std.mem.endsWith(u8, patch_text, "\n"));
+    const total = lineCount(patch_text);
 
     var it = std.mem.splitScalar(u8, patch_text, '\n');
     var drawn: usize = 0;
@@ -1554,7 +1553,7 @@ pub fn render(w: *std.Io.Writer, patch_text: []const u8) !void {
     while (it.next()) |raw| {
         if (raw.len == 0 and it.peek() == null) break; // the text's own last newline
         if (drawn == render_max_lines) {
-            try w.print("{s}  … {d} more line(s) of the diff are not shown{s}\n", .{ sgr.DIM, total - drawn, sgr.RESET });
+            try noteWithheld(w, total - drawn);
             break;
         }
         drawn += 1;
@@ -1562,22 +1561,103 @@ pub fn render(w: *std.Io.Writer, patch_text: []const u8) !void {
         // One trailing carriage return, and only one: a CRLF patch would
         // otherwise leave each line's `\r` to return the cursor to the start
         // of the line as it is printed.
-        const line = if (std.mem.endsWith(u8, raw, "\r")) raw[0 .. raw.len - 1] else raw;
-        const style = lineStyle(line);
-
-        try w.writeAll("  ");
-        if (style.len != 0) try w.writeAll(style);
-
-        // Cut on a codepoint boundary: half of a UTF-8 sequence would be
-        // printed as an escape, which is noise rather than a shorter line.
-        var cut = @min(line.len, render_max_line_bytes);
-        while (cut > 0 and cut < line.len and !std.unicode.utf8ValidateSlice(line[0..cut])) cut -= 1;
-        try sanitize.writeSanitized(w, line[0..cut]);
-        if (cut < line.len) try w.writeAll("…");
-
-        if (style.len != 0) try w.writeAll(sgr.RESET);
-        try w.writeByte('\n');
+        const line = stripCarriageReturn(raw);
+        try drawLine(w, null, line, lineStyle(line));
     }
+}
+
+/// Draw one block edit the way a patch is drawn, without a patch to read it
+/// from: the two headers name the file, the hunk header gives the line the old
+/// text starts at when `start` says where it is, and each block takes the
+/// colour its lines would have in a patch — the text that leaves faint red,
+/// the text that arrives green.
+///
+/// This is the shape of the `edit` tool's call: its arguments are two blocks of
+/// exact text, and neither the JSON they arrive in nor a one-line summary of it
+/// says what the file loses and gains. A diff says both, in the colours a
+/// reader already reads changes in.
+pub fn renderEdit(w: *std.Io.Writer, path: []const u8, start: ?usize, old_text: []const u8, new_text: []const u8) !void {
+    const removed = lineCount(old_text);
+    const added = lineCount(new_text);
+    const head: usize = 2 + @as(usize, @intFromBool(start != null));
+
+    // The headers of a diff this long are never the part to cut, so what the
+    // terminal's budget has left goes to the two blocks — half each when the
+    // whole change does not fit, because a long removal must not be what hides
+    // the lines that arrive in its place.
+    const budget = render_max_lines -| head;
+    const removed_shown = @min(removed, if (removed + added <= budget) budget else budget / 2);
+    const added_shown = @min(added, budget - removed_shown);
+
+    try writeHeader(w, "--- ", path);
+    try writeHeader(w, "+++ ", path);
+    if (start) |first| try w.print("  " ++ sgr.CYAN ++ "@@ -{d},{d} +{d},{d} @@" ++ sgr.RESET ++ "\n", .{ first, removed, first, added });
+    try writeBlock(w, '-', old_text, sgr.DIM ++ sgr.RED, removed_shown);
+    try writeBlock(w, '+', new_text, sgr.GREEN, added_shown);
+}
+
+fn writeHeader(w: *std.Io.Writer, marker: []const u8, path: []const u8) !void {
+    try w.writeAll("  ");
+    try w.writeAll(sgr.BOLD);
+    try w.writeAll(marker);
+    // The path is model output: it stays on the header's one line, and an
+    // escape sequence in it is text rather than a colour of its own.
+    try sanitize.writeOnOneLine(w, path);
+    try w.writeAll(sgr.RESET ++ "\n");
+}
+
+/// Draw up to `shown` lines of one block, under the marker that makes each of
+/// them a removal or an addition, and say how many of the block's lines were
+/// held back.
+fn writeBlock(w: *std.Io.Writer, marker: u8, text: []const u8, style: []const u8, shown: usize) !void {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var drawn: usize = 0;
+    while (drawn < shown) : (drawn += 1) {
+        const raw = it.next() orelse break;
+        if (raw.len == 0 and it.peek() == null) break; // the block's own last newline
+        try drawLine(w, marker, stripCarriageReturn(raw), style);
+    }
+    const lines = lineCount(text);
+    if (lines > drawn) try noteWithheld(w, lines - drawn);
+}
+
+/// Say how much of a preview the terminal's cap held back. It is drawn rather
+/// than left out so that a cut change does not read as the whole change.
+fn noteWithheld(w: *std.Io.Writer, count: usize) !void {
+    try w.print("{s}  … {d} more line(s) of the diff are not shown{s}\n", .{ sgr.DIM, count, sgr.RESET });
+}
+
+/// Draw one line of a preview: indented under the call it belongs to, in
+/// `style` when it has one, cut where one line's share of it ends, and with
+/// nothing a terminal would act on in it.
+///
+/// A patch's lines arrive with their own marker; a block of raw text is given
+/// one here, which is why it is optional.
+fn drawLine(w: *std.Io.Writer, marker: ?u8, line: []const u8, style: []const u8) !void {
+    try w.writeAll("  ");
+    if (style.len != 0) try w.writeAll(style);
+    if (marker) |mark| try w.writeByte(mark);
+
+    // Cut on a codepoint boundary: half of a UTF-8 sequence would be
+    // printed as an escape, which is noise rather than a shorter line.
+    var cut = @min(line.len, render_max_line_bytes);
+    while (cut > 0 and cut < line.len and !std.unicode.utf8ValidateSlice(line[0..cut])) cut -= 1;
+    try sanitize.writeSanitized(w, line[0..cut]);
+    if (cut < line.len) try w.writeAll("…");
+
+    if (style.len != 0) try w.writeAll(sgr.RESET);
+    try w.writeByte('\n');
+}
+
+fn stripCarriageReturn(line: []const u8) []const u8 {
+    return if (std.mem.endsWith(u8, line, "\r")) line[0 .. line.len - 1] else line;
+}
+
+/// The lines `text` holds, by the same walk the drawing makes: one per newline,
+/// plus the last line when the text does not end in one.
+fn lineCount(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    return std.mem.count(u8, text, "\n") + @intFromBool(!std.mem.endsWith(u8, text, "\n"));
 }
 
 /// The colour one line of a patch is drawn in, or an empty slice for plain.
@@ -2748,6 +2828,86 @@ test "a patch too long for the terminal is cut where it says it was" {
     try testing.expect(std.mem.endsWith(u8, drawn, "10 more line(s) of the diff are not shown" ++ sgr.RESET ++ "\n"));
     try testing.expect(std.mem.indexOf(u8, drawn, "+line 0" ++ sgr.RESET) != null);
     try testing.expect(std.mem.indexOf(u8, drawn, "+line 400" ++ sgr.RESET) == null);
+}
+
+test "an edit is drawn as the diff it makes, from the line it starts on" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try renderEdit(&aw.writer, "src/note.txt", 3, "gone\nkept\n", "added\n");
+
+    try testing.expectEqualStrings(
+        "  " ++ sgr.BOLD ++ "--- src/note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.BOLD ++ "+++ src/note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.CYAN ++ "@@ -3,2 +3,1 @@" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ sgr.RED ++ "-gone" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ sgr.RED ++ "-kept" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.GREEN ++ "+added" ++ sgr.RESET ++ "\n",
+        aw.written(),
+    );
+}
+
+test "an edit whose line is unknown is drawn without a hunk header" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    // The old text is not in the file, or the file is gone: what the call would
+    // change is still the thing to show, and the two blocks are all it can say.
+    try renderEdit(&aw.writer, "note.txt", null, "one", "two\nthree");
+
+    try testing.expectEqualStrings(
+        "  " ++ sgr.BOLD ++ "--- note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.BOLD ++ "+++ note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ sgr.RED ++ "-one" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.GREEN ++ "+two" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.GREEN ++ "+three" ++ sgr.RESET ++ "\n",
+        aw.written(),
+    );
+
+    // A replacement that removes everything still says how much it removed.
+    aw.clearRetainingCapacity();
+    try renderEdit(&aw.writer, "note.txt", 1, "one\n", "");
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "@@ -1,1 +1,0 @@") != null);
+    try testing.expect(std.mem.endsWith(u8, aw.written(), "-one" ++ sgr.RESET ++ "\n"));
+}
+
+test "a drawn edit carries nothing a terminal would act on, path included" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try renderEdit(&aw.writer, "a\x1b[2Jb\nc.txt", 1, "-old \x1b[31mred", "+new \xff");
+
+    // The path stays on the header's line, and an escape inside either block is
+    // text: it can neither move the cursor nor end the colour early.
+    try testing.expectEqualStrings(
+        "  " ++ sgr.BOLD ++ "--- ab c.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.BOLD ++ "+++ ab c.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.CYAN ++ "@@ -1,1 +1,1 @@" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ sgr.RED ++ "--old red" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.GREEN ++ "++new \\xFF" ++ sgr.RESET ++ "\n",
+        aw.written(),
+    );
+}
+
+test "an edit too long for the terminal is cut at both ends of itself" {
+    const allocator = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    var old: std.Io.Writer.Allocating = .init(allocator);
+    defer old.deinit();
+    for (0..render_max_lines) |i| try old.writer.print("line {d}\n", .{i});
+
+    try renderEdit(&aw.writer, "note.txt", 1, old.written(), "one");
+
+    // The budget goes to the two blocks rather than to the removals alone, so
+    // the line that arrives is drawn and the removal says where it stopped.
+    const drawn = aw.written();
+    try testing.expect(std.mem.indexOf(u8, drawn, "@@ -1,400 +1,1 @@") != null);
+    try testing.expect(std.mem.indexOf(u8, drawn, "-line 197" ++ sgr.RESET) != null);
+    try testing.expect(std.mem.indexOf(u8, drawn, "-line 198" ++ sgr.RESET) == null);
+    try testing.expect(std.mem.indexOf(u8, drawn, "  … 202 more line(s) of the diff are not shown") != null);
+    try testing.expect(std.mem.indexOf(u8, drawn, "+one" ++ sgr.RESET ++ "\n") != null);
 }
 
 test "a quoted name is unquoted to its bytes, and a header's timestamp is not part of it" {

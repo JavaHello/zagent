@@ -129,6 +129,25 @@ may be empty to delete the matched block.
 
 An edit is atomic and keeps the file's permissions.
 
+The call is drawn as the diff it makes, at the line the old text starts on:
+
+```
+❯ rename the greeting in greet.txt to hello
+  ⚙ edit
+  --- greet.txt
+  +++ greet.txt
+  @@ -2,1 +2,1 @@
+  -beta
+  +hello
+  ✓ Replaced one exact text block in 'greet.txt' (17 -> 18 bytes)
+```
+
+The line number is counted in the file when the file can be read and still
+holds that text, and left out of the header when it cannot: what the call asks
+for is still the change, and the result below it says why nothing was changed.
+Added and removed lines take the same colours as a patch; see
+[Patching](patching.md#patching-code).
+
 ## `ls`
 
 Lists a directory. The listing stops short of the output limit and says so

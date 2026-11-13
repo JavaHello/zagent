@@ -245,6 +245,11 @@ test "presentation callbacks belong to tool specs and preserve fallback" {
     const patch = presentation("apply_patch").?;
     try std.testing.expect(patch.summary_block);
     try std.testing.expect(!try patch.summary.?(ctx, &out.writer, "{}"));
+    // An edit's arguments are two blocks of exact text, so its call is drawn as
+    // the diff it makes rather than as one line of escaped JSON.
+    const block_edit = presentation("edit").?;
+    try std.testing.expect(block_edit.summary_block);
+    try std.testing.expect(!try block_edit.summary.?(ctx, &out.writer, "{}"));
     try std.testing.expect(presentation("subagent").?.delegated);
     try std.testing.expect(presentation("bash").?.summary == null);
     // Every call is shown on the terminal, so the two session tools whose
