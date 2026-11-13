@@ -76,7 +76,10 @@ src/
     grep.zig     — grep
     fd.zig       — fd
     find.zig     — find
-    http.zig     — http
+    web_fetch.zig — web_fetch: a page read as text, or saved to a file
+    web_search.zig — web_search: a query and its results
+    web.zig      — The HTTP client both web tools ask through, and its deadline
+    html.zig     — HTML read as text: markdown for a page, a fragment for a title
     search.zig   — What the four search tools share: backends, arguments, paging
     result.zig   — The shape of a result: its text, status and header
     ccr.zig      — The output cache: its sizes, the notice a cut result ends with, a preview and its id, and ccr_retrieve

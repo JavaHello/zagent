@@ -22,7 +22,8 @@ const rg = @import("rg.zig");
 const grep = @import("grep.zig");
 const fd = @import("fd.zig");
 const find = @import("find.zig");
-const http = @import("http.zig");
+const web_fetch = @import("web_fetch.zig");
+const web_search = @import("web_search.zig");
 const ccr = @import("ccr.zig");
 
 const ToolResult = tool.ToolResult;
@@ -39,7 +40,8 @@ pub const all = [_]tool.Tool{
     grep.spec,
     fd.spec,
     find.spec,
-    http.spec,
+    web_fetch.spec,
+    web_search.spec,
     ccr.spec,
     @import("memory_search.zig").spec,
     @import("memory_save.zig").spec,
@@ -349,7 +351,7 @@ test "write creates overwrites and rejects mixed modes; legacy names are removed
     const unchanged = try tmp.dir.readFileAlloc(io, "new.txt", a, .limited(1024));
     defer a.free(unchanged);
     try std.testing.expectEqualStrings("", unchanged);
-    for ([_][]const u8{ "shell", "read_file", "write_file", "edit_file", "list_dir", "http_request" }) |name| {
+    for ([_][]const u8{ "shell", "read_file", "write_file", "edit_file", "list_dir", "http", "http_request" }) |name| {
         try std.testing.expectError(error.UnknownTool, call(name, "{}"));
     }
 }
@@ -372,12 +374,17 @@ test "write and edit reject missing or mixed arguments" {
     }
 }
 
-test "http dispatches to request argument validation" {
+test "the web tools dispatch to their argument validation" {
     const a = std.testing.allocator;
-    const result = try call("http", "{}");
-    defer result.deinit(a);
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.startsWith(u8, result.output, "Error: http arguments are unusable"));
+    const fetch = try call("web_fetch", "{}");
+    defer fetch.deinit(a);
+    try std.testing.expect(fetch.is_error);
+    try std.testing.expect(std.mem.startsWith(u8, fetch.output, "Error: web_fetch arguments are unusable"));
+
+    const search = try call("web_search", "{}");
+    defer search.deinit(a);
+    try std.testing.expect(search.is_error);
+    try std.testing.expect(std.mem.startsWith(u8, search.output, "Error: web_search arguments are unusable"));
 }
 
 test "read write and ls operate on an existing file" {

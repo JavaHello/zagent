@@ -78,7 +78,8 @@ pub const rg = hostDefinition(dispatch.specOf("rg"));
 pub const fd = hostDefinition(dispatch.specOf("fd"));
 pub const grep = hostDefinition(dispatch.specOf("grep"));
 pub const find = hostDefinition(dispatch.specOf("find"));
-pub const http = hostDefinition(dispatch.specOf("http"));
+pub const web_fetch = hostDefinition(dispatch.specOf("web_fetch"));
+pub const web_search = hostDefinition(dispatch.specOf("web_search"));
 
 // Session tools use the same specs as dispatch, while their implementations
 // delegate the session-state work to Agent.
@@ -101,9 +102,10 @@ pub const load_mcp_tools = hostDefinition(dispatch.specOf("load_mcp_tools"));
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash, read,     write,  edit,         apply_patch, ls,
-    rg,            fd,   grep,     find,   http,         ask_user,    memory_save,
-    announce_task, plan, subagent, report, ccr_retrieve,
+    memory_search, bash,         read,        write,         edit, apply_patch,
+    ls,            rg,           fd,          grep,          find, web_fetch,
+    web_search,    ask_user,     memory_save, announce_task, plan, subagent,
+    report,        ccr_retrieve,
 };
 
 test "write and edit have separate required arguments" {

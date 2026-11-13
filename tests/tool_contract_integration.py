@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""HTTP error/download contracts and exact durable-memory edits."""
+"""web_fetch contracts for statuses, compressed and cut bodies, and page text,
+and exact durable-memory edits."""
 import gzip
 import http.server
 import json
@@ -14,6 +15,9 @@ binary = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
 observed = []
 calls = []
 
+PAGE = (b'<html><head><title>Contract Page</title><style>b{}</style></head>'
+        b'<body><h1>Heading</h1><p>Body text with a <a href="/more">link</a>.</p>'
+        b'<script>var hidden = "script text";</script></body></html>')
 
 class API(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
@@ -22,16 +26,21 @@ class API(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         status = 404 if self.path == '/missing' else 200
         content = b'not found' if status == 404 else b'downloaded'
+        content_type = 'text/plain'
+        if self.path == '/page':
+            content, content_type = PAGE, 'text/html; charset=utf-8'
         compressed = self.path in ('/gzip', '/chunked-gzip')
         chunked = self.path in ('/chunked-gzip', '/partial-chunked')
         if compressed:
             content = gzip.compress(content)
         self.send_response(status)
+        self.send_header('Content-Type', content_type)
         if compressed:
             self.send_header('Content-Encoding', 'gzip')
         if chunked:
             self.send_header('Transfer-Encoding', 'chunked')
         else:
+            # A length the server then breaks short of is what `/partial` is.
             self.send_header('Content-Length', str(100 if self.path == '/partial' else len(content)))
         self.end_headers()
         if chunked:
@@ -57,26 +66,26 @@ class API(http.server.BaseHTTPRequestHandler):
                 {'type': 'output_text', 'text': 'Done'}]}]
         send_response(self, body, {'status': 'completed', 'output': output})
 
-
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), API)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
     with tempfile.TemporaryDirectory(prefix='zagent-tool-contract-') as directory:
-        root = Path(directory)
-        (root / 'keep.txt').write_text('original')
         base = f'http://127.0.0.1:{server.server_port}'
         calls.extend([
-            ('http', {'url': base + '/missing'}),
-            ('http', {'url': base + '/missing', 'save_to': 'keep.txt'}),
-            ('http', {'url': base + '/partial', 'save_to': 'keep.txt'}),
-            ('http', {'url': base + '/ok', 'save_to': 'download.txt'}),
+            # A status that is not 2xx comes back as an error result, with the
+            # status line and the page the server sent with it.
+            ('web_fetch', {'url': base + '/missing'}),
+            ('web_fetch', {'url': base + '/page'}),
+            ('web_fetch', {'url': base + '/ok'}),
+            ('web_fetch', {'url': base + '/gzip'}),
+            ('web_fetch', {'url': base + '/chunked-gzip'}),
+            # A body that stops before the length it promised is a failure.
+            ('web_fetch', {'url': base + '/partial'}),
+            ('web_fetch', {'url': base + '/partial-chunked'}),
             ('memory_save', {'text': 'use old compiler'}),
             ('memory_save', {'action': 'replace', 'old_text': 'use old compiler', 'text': 'use Zig 0.17.1'}),
             ('memory_save', {'action': 'delete', 'text': 'use Zig 0.17.1'}),
             ('memory_save', {'action': 'delete', 'text': 'use old compiler'}),
-            ('http', {'url': base + '/gzip', 'save_to': 'gzip.txt'}),
-            ('http', {'url': base + '/chunked-gzip', 'save_to': 'chunked-gzip.txt'}),
-            ('http', {'url': base + '/partial-chunked', 'save_to': 'keep.txt'}),
         ])
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'AI_URL': base + '/v1', 'AI_MODEL': 'mock',
@@ -88,15 +97,27 @@ try:
         assert len(observed) == len(calls), (observed, result.stderr)
         for index, output in enumerate(observed):
             status = json.loads(output)
-            assert status['is_error'] == (index in (0, 1, 2, 7, 10)), (index, output)
-        assert (root / 'keep.txt').read_text() == 'original'
-        for name in ('download.txt', 'gzip.txt', 'chunked-gzip.txt'):
-            assert (root / name).read_bytes() == b'downloaded'
-        assert 'Memory replace: use Zig 0.17.1' in observed[5]
-        assert 'Memory delete: use Zig 0.17.1' in observed[6]
-        assert 'MemoryNotFound' in observed[7]
+            assert status['is_error'] == (index in (0, 5, 6, 10)), (index, output)
+
+        missing = json.loads(observed[0])['output']
+        assert '404 Not Found' in missing, missing
+        assert 'not found' in missing, missing
+
+        # A page is read as text: its title, its heading and its words, without
+        # the markup, the style or the script that carried them.
+        page = json.loads(observed[1])['output']
+        assert page == '# Contract Page\n\n# Heading\n\nBody text with a [link](%s/more).\n' % base, page
+
+        # A compressed body is decompressed, chunked or not, and a plain body is
+        # handed over as it was written.
+        for index in (2, 3, 4):
+            assert json.loads(observed[index])['output'] == 'downloaded', observed[index]
+
+        assert 'Memory replace: use Zig 0.17.1' in observed[8]
+        assert 'Memory delete: use Zig 0.17.1' in observed[9]
+        assert 'MemoryNotFound' in observed[10]
 finally:
     server.shutdown()
     server.server_close()
 
-print('PASS: HTTP errors, atomic downloads, and exact memory replacement/deletion')
+print('PASS: web_fetch statuses, compressed and cut bodies, page text, and exact memory edits')

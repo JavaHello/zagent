@@ -1771,6 +1771,17 @@ pub const Agent = struct {
         self.tool_ui.spinner = spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options);
     }
 
+    /// The endpoints the web tools ask, as this session's configuration
+    /// resolved them: a tool with none of its own keeps its built-in behaviour.
+    fn webEndpoints(self: *const Agent) tools.WebConfig {
+        return .{
+            .search_url = self.config.web_search_url,
+            .search_key = self.config.web_search_key,
+            .fetch_url = self.config.web_fetch_url,
+            .fetch_key = self.config.web_fetch_key,
+        };
+    }
+
     /// Run one tool call. Everything the user sees of the call — its line in
     /// the title, its announcement, the animation while it runs, and the
     /// preview of what it returned — happens here and in the hooks this
@@ -1785,6 +1796,7 @@ pub const Agent = struct {
             .cache_dir = cache_dir,
             .hooks = .{ .before = beforeToolCall, .after = afterToolCall },
             .agent = self,
+            .web = self.webEndpoints(),
         };
         // Dispatch applies the shared size limit after execution hooks. The UI
         // only previews the result the tool returned, guarded as it prints.

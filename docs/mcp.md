@@ -91,9 +91,11 @@ and what each brought.
   that did start, and every other entry is still read.
 - **Timeouts.** A subprocess server is read with a deadline, and a request that
   runs out of time is reported to the model as a failed call. `std.http` has no
-  read timeout, so an HTTP server that takes a request and never answers holds
-  the agent until it is interrupted — the same limitation `http` has, see
-  [HTTP requests](http.md).
+  read timeout of its own, so an HTTP server that takes a request and never
+  answers holds the agent until it is interrupted. The web tools carry their own
+  deadline for exactly this reason, see
+  [Web search and fetching](web.md#five-behaviours-worth-knowing); an MCP HTTP
+  transport has none.
 - **Not implemented.** Servers may ask the client for something mid-call
   (elicitation, sampling, a root list); zagent reports that as a failed call
   saying so. The tool list is also a snapshot from startup: a server that

@@ -43,6 +43,10 @@ const ConfigFile = struct {
     prompt_cache_retention: ?[]u8 = null,
     max_tokens: ?u32 = null,
     debug: ?bool = null,
+    web_search_url: ?[]u8 = null,
+    web_search_key: ?[]u8 = null,
+    web_fetch_url: ?[]u8 = null,
+    web_fetch_key: ?[]u8 = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
         if (self.provider) |value| allocator.free(value);
@@ -53,6 +57,10 @@ const ConfigFile = struct {
         if (self.service_tier) |value| allocator.free(value);
         if (self.thinking) |value| allocator.free(value);
         if (self.prompt_cache_retention) |value| allocator.free(value);
+        if (self.web_search_url) |value| allocator.free(value);
+        if (self.web_search_key) |value| allocator.free(value);
+        if (self.web_fetch_url) |value| allocator.free(value);
+        if (self.web_fetch_key) |value| allocator.free(value);
         self.* = .{};
     }
 };
@@ -183,6 +191,14 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_DEBUG")) {
         config.debug = flagValue(value);
+    } else if (std.ascii.eqlIgnoreCase(key, "WEB_SEARCH_URL")) {
+        try setString(allocator, &config.web_search_url, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "WEB_SEARCH_KEY")) {
+        try setString(allocator, &config.web_search_key, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "WEB_FETCH_URL")) {
+        try setString(allocator, &config.web_fetch_url, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "WEB_FETCH_KEY")) {
+        try setString(allocator, &config.web_fetch_key, value);
     }
 }
 
@@ -403,6 +419,17 @@ fn resolve(
             return error.InvalidPromptCacheRetention;
     }
 
+    // The web tools' own endpoints: unset leaves each of them on the behaviour
+    // it has without a service.
+    const web_search_url = try resolveOptionalSetting(allocator, env, "WEB_SEARCH_URL", &file_config.web_search_url);
+    errdefer if (web_search_url) |value| allocator.free(value);
+    const web_search_key = try resolveOptionalSetting(allocator, env, "WEB_SEARCH_KEY", &file_config.web_search_key);
+    errdefer if (web_search_key) |value| allocator.free(value);
+    const web_fetch_url = try resolveOptionalSetting(allocator, env, "WEB_FETCH_URL", &file_config.web_fetch_url);
+    errdefer if (web_fetch_url) |value| allocator.free(value);
+    const web_fetch_key = try resolveOptionalSetting(allocator, env, "WEB_FETCH_KEY", &file_config.web_fetch_key);
+    errdefer if (web_fetch_key) |value| allocator.free(value);
+
     const api_key = blk: {
         // AI_KEY is the provider-agnostic spelling and wins outright.
         if (try firstEnv(allocator, env, &.{"AI_KEY"})) |value| break :blk value;
@@ -444,6 +471,10 @@ fn resolve(
         .max_tokens = max_tokens,
         .provider = selected_provider,
         .debug = debug,
+        .web_search_url = web_search_url,
+        .web_search_key = web_search_key,
+        .web_fetch_url = web_fetch_url,
+        .web_fetch_key = web_fetch_key,
     };
 }
 
@@ -467,6 +498,14 @@ pub const Config = struct {
     /// Whether to record a debug trace and render its report. `--debug` on the
     /// command line turns it on as well; nothing here can turn it off.
     debug: bool = false,
+    /// Where `web_search` sends a query, and the key the service wants; null
+    /// searches DuckDuckGo's own results page.
+    web_search_url: ?[]const u8 = null,
+    web_search_key: ?[]const u8 = null,
+    /// Where `web_fetch` asks for a page, and the key the service wants; null
+    /// fetches the page itself and reads it as text.
+    web_fetch_url: ?[]const u8 = null,
+    web_fetch_key: ?[]const u8 = null,
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !Config {
         var file_config = try loadConfigFile(io, allocator, env);
@@ -483,6 +522,10 @@ pub const Config = struct {
 
     pub fn deinit(self: Config) void {
         if (self.codex_auth_path) |path| self.allocator.free(path);
+        if (self.web_search_url) |value| self.allocator.free(value);
+        if (self.web_search_key) |value| self.allocator.free(value);
+        if (self.web_fetch_url) |value| self.allocator.free(value);
+        if (self.web_fetch_key) |value| self.allocator.free(value);
         if (self.reasoning_effort) |value| self.allocator.free(value);
         if (self.service_tier) |value| self.allocator.free(value);
         if (self.prompt_cache_retention) |value| self.allocator.free(value);
@@ -516,6 +559,10 @@ fn checkApplyAllocationFailures(allocator: std.mem.Allocator) !void {
         .{ "AI_KEY", "key" },
         .{ "AI_URL", "https://example.test/v1" },
         .{ "AI_MODEL", "model" },
+        .{ "WEB_SEARCH_URL", "https://search.test/?q={query}" },
+        .{ "WEB_SEARCH_KEY", "search-key" },
+        .{ "WEB_FETCH_URL", "https://reader.test/" },
+        .{ "WEB_FETCH_KEY", "fetch-key" },
         // Replacing a value already set is a separate path: the old string is
         // released once the new one exists.
         .{ "AI_PROVIDER", "openai" },

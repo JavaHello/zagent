@@ -14,10 +14,10 @@ between runs.
   `fg` redraws the whole record. [Details](docs/ui.md)
 - **Single-query mode** — pass a question directly as a CLI argument
 - **Tool use** — the agent runs tools to do the work: `bash`, `read`, `write`, `edit`,
-  `apply_patch`, `ls`, `rg`/`grep`, `fd`/`find`, `http`, `ask_user`, `plan`,
-  `memory_save`/`memory_search` and `announce_task`.
+  `apply_patch`, `ls`, `rg`/`grep`, `fd`/`find`, `web_search`, `web_fetch`,
+  `ask_user`, `plan`, `memory_save`/`memory_search` and `announce_task`.
   [Tools](docs/tools.md) · [Searching](docs/searching.md) ·
-  [Patching](docs/patching.md) · [HTTP](docs/http.md)
+  [Patching](docs/patching.md) · [Web search and fetching](docs/web.md)
 - **Multi-turn tool chaining** — the agent loops until the task is complete.
   [The agent loop](docs/agent-loop.md)
 - **Sub-agents** — hand one self-contained task to a second agent and watch it:
@@ -117,7 +117,7 @@ endpoint. Automatic server-side caching may work without it.
 See [the example config](zagent.example.conf).
 
 Read/search pages hold about 7.5 KiB, and any tool result larger than 8 KiB —
-shell output, an HTTP body, an MCP answer — is cached in the run's scratch folder
+shell output, a fetched page, an MCP answer — is cached in the run's scratch folder
 and replaced by a 4 KiB preview naming a cache ID that `ccr_retrieve` reads back.
 Cached output is named after its content, so identical output is kept once. Long
 shell output keeps both ends of stdout and stderr and marks omitted content. Redirect large output
@@ -168,7 +168,7 @@ before pointing it at anything unfamiliar.
 | [Tools](docs/tools.md) | The built-in tool set and the result limits |
 | [Searching](docs/searching.md) | `rg`, `grep`, `fd`, `find` |
 | [Patching](docs/patching.md) | `apply_patch` and unified diffs |
-| [HTTP requests](docs/http.md) | The `http` tool |
+| [Web search and fetching](docs/web.md) | The `web_search` and `web_fetch` tools |
 | [Sub-agents](docs/subagents.md) | A second agent, its self-checks and its deadline |
 | [MCP servers](docs/mcp.md) | `mcp.json` and lazy tool loading |
 | [Debug tracing](docs/debug.md) | `--debug`: every step, and the HTML report of a run |

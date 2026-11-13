@@ -12,9 +12,9 @@
   的输入历史；`Ctrl+Z` 挂起、`fg` 重绘整屏。[说明](docs/ui.md)
 - **单次查询** — 直接把问题作为命令行参数传入
 - **工具调用** — `bash`、`read`、`write`（整文件写入）、`edit`（精确替换）、`apply_patch`、`ls`、`rg`/`grep`、
-  `fd`/`find`、`http`、`ask_user`、`plan`、`memory_save`/`memory_search`、
+  `fd`/`find`、`web_search`、`web_fetch`、`ask_user`、`plan`、`memory_save`/`memory_search`、
   `announce_task`。[工具](docs/tools.md) · [搜索](docs/searching.md) ·
-  [补丁](docs/patching.md) · [HTTP](docs/http.md)
+  [补丁](docs/patching.md) · [网络搜索与抓取](docs/web.md)
 - **多轮工具链** — 模型循环调用工具直到任务完成。[代理循环](docs/agent-loop.md)
 - **子 agent** — 把一件自足的任务交给同一个进程里的第二个 agent，并「看着」它：
   每隔一段自检时间在终端打一份进度报告，到期限就停下并说明做完了什么、还剩什么。
@@ -103,7 +103,7 @@ zagent
 兼容端点启用前需确认支持该字段；不设置它也可能自动缓存。
 参见[配置示例](zagent.example.conf)。
 
-读取／搜索每页约 7.5 KiB；任何超过 8 KiB 的工具结果（命令输出、HTTP 响应体、MCP 返回）
+读取／搜索每页约 7.5 KiB；任何超过 8 KiB 的工具结果（命令输出、抓取的网页、MCP 返回）
 都会缓存到本次运行的 scratch 目录，只返回 4 KiB 预览和一个缓存 ID，其余用 `ccr_retrieve` 分页读取。
 缓存文件按内容 SHA-256 命名，同样的内容只保留一份，长任务不会堆出重复文件。
 长命令输出分别保留 stdout、stderr 的头尾，并标明中间省略；需要中间内容时，主动将输出重定向到文件后分页读取。
@@ -153,7 +153,7 @@ Enter 提交，Alt+Enter 或 Ctrl+J 换行，`Ctrl+Z` 挂起，`Ctrl+D` 退出�
 | [Tools](docs/tools.md) | 内置工具集合与结果长度限制 |
 | [Searching](docs/searching.md) | `rg`、`grep`、`fd`、`find` |
 | [Patching](docs/patching.md) | `apply_patch` 与 unified diff |
-| [HTTP requests](docs/http.md) | `http` 工具 |
+| [Web search and fetching](docs/web.md) | `web_search`、`web_fetch` 工具 |
 | [Sub-agents](docs/subagents.md) | 子 agent、自检与期限 |
 | [MCP servers](docs/mcp.md) | `mcp.json` 与工具懒加载 |
 | [Debug tracing](docs/debug.md) | `--debug`：每一步记录与 HTML 报告 |

@@ -17,7 +17,8 @@ answer with the result — until the task is done, see
 | `apply_patch` | Apply a Git unified diff | [Patching](patching.md) |
 | `rg` / `grep` | Search file contents | [Searching](searching.md) |
 | `fd` / `find` | Find files by name | [Searching](searching.md) |
-| `http` | Fetch a URL or call an API | [HTTP requests](http.md) |
+| `web_search` | Search the web | [Web search and fetching](web.md) |
+| `web_fetch` | Fetch a page as text | [Web search and fetching](web.md) |
 | `ask_user` | Put one or more questions to you as a menu | [Interface](ui.md#choices) |
 | `plan` | Keep the checklist of the work in progress | [Plan](plan.md) |
 | `memory_save`, `memory_search` | Save and recall durable notes | [Memory](memory.md) |
@@ -196,7 +197,7 @@ another tool's arguments.
   collector holds it, and the cache keeps what is too long to show. It is a
   tool like any other here — no private limit, no cache of its own, and no
   notice of its own to write.
-- An `http` response, an `apply_patch` summary, an MCP server's answer and
+- A fetched page, an `apply_patch` summary, an MCP server's answer and
   anything else that large is cached the same way. A [sub-agent's](subagents.md#not-cached)
   report is the one exception: it reaches its caller whole at any size.
 

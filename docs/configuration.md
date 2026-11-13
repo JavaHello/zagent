@@ -11,8 +11,8 @@ The file is read from:
 - `~/.config/zagent` (fallback)
 
 It holds `key=value` lines, and comments start with `#`. The keys are the
-`AI_*` names below, and an environment variable always overrides the same key
-from the file.
+`AI_*` and `WEB_*` names below, and an environment variable always overrides
+the same key from the file.
 
 The file sits next to two neighbours: `mcp.json`, which describes MCP servers
 (see [MCP servers](mcp.md)), and `codex-auth.json`, which holds ChatGPT
@@ -37,11 +37,24 @@ and `mcp.example.json` shows every member an MCP entry takes.
 | `AI_THINKING`       | `enabled` for `deepseek` and `openai-compatible`, otherwise omitted | `thinking` switch: `enabled`, `disabled`, or `omit` |
 | `AI_MEMORY_FILE`    | Global workspace state: `memory.md` | Override where the notes are stored             |
 | `AI_DEBUG`          | *(unset)*                           | Any value but `0`/`false`/`off`/`no` records a debug trace; see [Debug tracing](debug.md) |
+| `WEB_SEARCH_URL`    | *(unset — DuckDuckGo)*              | Endpoint `web_search` puts a query to, with `{query}` and `{limit}` filled in |
+| `WEB_SEARCH_KEY`    | *(unset)*                           | Sent to that endpoint as `Authorization: Bearer` |
+| `WEB_FETCH_URL`     | *(unset — the page itself)*         | Fetch service `web_fetch` asks for a page, with `{url}` filled in or the address appended |
+| `WEB_FETCH_KEY`     | *(unset)*                           | Sent to that service as `Authorization: Bearer` |
 
 Provider-specific API keys (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) are read from
 the environment; use `AI_KEY` in the config file when you want one key for
 every provider. An explicit value always wins over the provider preset —
 see [Precedence](providers.md#precedence).
+
+## The web tools' services
+
+`WEB_SEARCH_URL` and `WEB_FETCH_URL` are the endpoints `web_search` and
+`web_fetch` ask instead of their built-in behaviour; left unset, a search goes
+to DuckDuckGo's own results page and a page is fetched and read as text here.
+Both take a key as a bearer token. See
+[Web search and fetching](web.md) for the placeholders and the shapes of answer
+each of them reads.
 
 ## Output budget and truncation
 

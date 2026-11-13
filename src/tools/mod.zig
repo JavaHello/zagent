@@ -4,10 +4,12 @@
 //!
 //! Each tool keeps its implementation, its arguments and its tests together —
 //! `bash.zig`, `read.zig`, `write.zig`, `edit.zig`, `apply_patch.zig`, `ls.zig`, `rg.zig`, `grep.zig`,
-//! `fd.zig`, `find.zig`, `http.zig` — over a small shared floor: `result.zig`
+//! `fd.zig`, `find.zig`, `web_fetch.zig`, `web_search.zig` — over a small shared floor: `result.zig`
 //! for the shape of a result, `progress.zig` for the progress labels,
 //! `args.zig` for reading a call's JSON arguments, `search.zig` for what the
-//! four search tools have in common, and `util.zig` for a handful of helpers.
+//! four search tools have in common, `web.zig` for the one HTTP client both web
+//! tools ask through, `html.zig` for reading a page as text, and `util.zig` for
+//! a handful of helpers.
 //! `ccr.zig` is the cache a tool's output is kept in when it is too long for one
 //! result, and the `ccr_retrieve` tool that reads it back.
 //!
@@ -34,7 +36,10 @@ const grep_mod = @import("grep.zig");
 const rg_mod = @import("rg.zig");
 const find_mod = @import("find.zig");
 const fd_mod = @import("fd.zig");
-const http = @import("http.zig");
+const web = @import("web.zig");
+const html = @import("html.zig");
+const web_fetch = @import("web_fetch.zig");
+const web_search = @import("web_search.zig");
 const ccr = @import("ccr.zig");
 
 /// What a built-in tool is, and what one is given besides its arguments.
@@ -100,10 +105,15 @@ pub const find = find_mod.find;
 pub const fdArgv = fd_mod.fdArgv;
 pub const fd = fd_mod.fd;
 
-// http
-pub const HttpRequest = http.HttpRequest;
-pub const parseHttpRequest = http.parseHttpRequest;
-pub const httpRequest = http.httpRequest;
+// web: the client both web tools ask through, the page reader it hands a
+// document to, and the specs of the two tools themselves.
+pub const WebConfig = tool_mod.Web;
+pub const webRequest = web.get;
+pub const webTimeoutSeconds = web.timeout_seconds;
+pub const webMaxBodyBytes = web.max_body_bytes;
+pub const htmlToText = html.toText;
+pub const webFetchSpec = web_fetch.spec;
+pub const webSearchSpec = web_search.spec;
 
 test {
     _ = @import("schema.zig");

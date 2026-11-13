@@ -21,7 +21,7 @@ overview.
 | [Tools](tools.md) | The built-in tool set, `bash`, `read`, `write`, `edit`, `ls`, and the result limits |
 | [Searching](searching.md) | `rg`, `grep`, `fd`, `find` and how the programs are selected |
 | [Patching](patching.md) | `apply_patch`, Git unified diffs, permissions and renames |
-| [HTTP requests](http.md) | The `http` tool, downloads, redirects and limits |
+| [Web search and fetching](web.md) | The `web_search` and `web_fetch` tools, their services, redirects and limits |
 | [Sub-agents](subagents.md) | Handing a task to a second agent, its self-checks and deadline |
 | [MCP servers](mcp.md) | `mcp.json`, lazy tool loading and the protocol zagent speaks |
 | [Debug tracing](debug.md) | `--debug`: every request, response and tool call, and the HTML report of a run |

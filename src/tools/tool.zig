@@ -16,6 +16,19 @@ const result_mod = @import("result.zig");
 
 pub const ToolResult = result_mod.ToolResult;
 
+/// The endpoints the web tools ask, as the configuration resolved them. A tool
+/// with no URL keeps its built-in behaviour.
+pub const Web = struct {
+    /// Where `web_search` sends a query; null searches DuckDuckGo's own page.
+    search_url: ?[]const u8 = null,
+    /// Sent as the bearer token of a search request, when the service wants one.
+    search_key: ?[]const u8 = null,
+    /// Where `web_fetch` asks for a page; null fetches the page itself.
+    fetch_url: ?[]const u8 = null,
+    /// Sent as the bearer token of a fetch request, when the service wants one.
+    fetch_key: ?[]const u8 = null,
+};
+
 /// What a tool is given besides its JSON arguments: IO, allocation, program
 /// environment and optional agent state for session tools such as subagent.
 pub const Context = struct {
@@ -33,6 +46,8 @@ pub const Context = struct {
     hooks: Hooks = .{},
     /// Optional caller-owned state for hooks; never retained by dispatch.
     hook_data: ?*anyopaque = null,
+    /// The endpoints the web tools ask, as the configuration resolved them.
+    web: Web = .{},
 
     /// The result a call gets when its arguments cannot be used. The tool
     /// writes the message: it is the one that knows what it needed.

@@ -26,7 +26,7 @@ test "search registration follows installed backends and advertises renamed file
             }
         }
         try std.testing.expect(!names.contains("http_request"));
-        for ([_][]const u8{ "read", "write", "edit", "ls", "apply_patch", "http", "ccr_retrieve" }) |name| {
+        for ([_][]const u8{ "read", "write", "edit", "ls", "apply_patch", "web_fetch", "web_search", "ccr_retrieve" }) |name| {
             try std.testing.expect(names.contains(name));
         }
         for ([_][]const u8{ "read_file", "write_file", "edit_file", "list_dir" }) |name| {
@@ -55,8 +55,8 @@ test "omitted names drop from the startup defaults and search selection still ap
         for (parsed.value.object.get("tools").?.array.items) |tool| {
             try names.put(tool.object.get("name").?.string, {});
         }
-        try std.testing.expectEqual(@as(usize, 12), names.count());
-        for ([_][]const u8{ "memory_search", "bash", "read", "write", "edit", "apply_patch", "ls", "http", "report", "ccr_retrieve" }) |name| {
+        try std.testing.expectEqual(@as(usize, 13), names.count());
+        for ([_][]const u8{ "memory_search", "bash", "read", "write", "edit", "apply_patch", "ls", "web_fetch", "web_search", "report", "ccr_retrieve" }) |name| {
             try std.testing.expect(names.contains(name));
         }
         for (omit) |name| try std.testing.expect(!names.contains(name));
