@@ -617,7 +617,11 @@ test "afterExecute leaves short results and uncached fallbacks untouched and pro
             defer result.deinit(a);
             try std.testing.expect(result.output.ptr == original.output.ptr);
             try std.testing.expectEqualStrings(original.output, result.output);
-            try std.testing.expectEqualDeep(original.status(), result.status());
+            try std.testing.expectEqual(original.is_error, result.is_error);
+            try std.testing.expectEqual(original.exit_code, result.exit_code);
+            try std.testing.expectEqual(original.timed_out, result.timed_out);
+            try std.testing.expectEqualDeep(original.termination, result.termination);
+            try std.testing.expectEqualDeep(original.ccr_id, result.ccr_id);
         }
     }
     try std.testing.expectError(error.RunFailed, afterExecute(.{ .io = io, .allocator = a }, "test", "{}", error.RunFailed));

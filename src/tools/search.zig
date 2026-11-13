@@ -5,7 +5,6 @@ const util = @import("util.zig");
 const host_exec = @import("../host/exec.zig");
 
 const ToolResult = result_mod.ToolResult;
-const ToolStatus = result_mod.ToolStatus;
 const toolError = result_mod.toolError;
 const ownedResult = result_mod.ownedResult;
 const lessString = util.lessString;
@@ -299,7 +298,7 @@ pub fn runSearchTimed(
     });
 }
 
-pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, status: ToolStatus) !ToolResult {
+pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, status: ToolResult) !ToolResult {
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(allocator);
     var it = std.mem.tokenizeScalar(u8, output, '\n');

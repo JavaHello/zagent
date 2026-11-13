@@ -46,7 +46,6 @@ pub const Hooks = tool_mod.Hooks;
 pub const execute = dispatch.execute;
 
 // The shape of a tool result, and the sizes the cache keeps it to.
-pub const ToolStatus = result_mod.ToolStatus;
 pub const ToolResult = result_mod.ToolResult;
 pub const max_output_bytes = ccr.max_output_bytes;
 pub const page_room_bytes = ccr.page_room_bytes;

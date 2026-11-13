@@ -74,7 +74,7 @@ pub const Outcome = struct {
     exit_code: ?u8 = null,
     timed_out: bool = false,
     /// The signal that ended the program a tool ran, when it did not exit of
-    /// its own accord; see `ToolStatus.termination`.
+    /// its own accord; see `ToolResult.termination`.
     termination: ?[]const u8 = null,
     /// The `ccr` entry this result is a preview of, when it is one: the report
     /// names it, because that is where the rest of the output went.

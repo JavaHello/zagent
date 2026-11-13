@@ -59,7 +59,7 @@ const subagent_omitted = agent_prompt.subagent_omitted;
 /// so — then the result on the line after it, at the column where that status
 /// line's own text would have started. A result that printed nothing is its
 /// status line, not a status and a blank line beneath it.
-fn writeResultPreview(w: *std.Io.Writer, body: []const u8, status: tools.ToolStatus) std.Io.Writer.Error!void {
+fn writeResultPreview(w: *std.Io.Writer, body: []const u8, status: tools.ToolResult) std.Io.Writer.Error!void {
     try w.writeAll(if (status.is_error) RED ++ layout.indent ++ "✗" else DIM ++ layout.indent ++ "✓");
     // The way the call ended belongs on the status line, next to the glyph that
     // already says whether it succeeded: a timeout, a killed program and a
@@ -1351,7 +1351,12 @@ pub const Agent = struct {
                         .reasoning_content = null,
                         .tool_calls = null,
                         .tool_call_id = call_id,
-                        .tool_status = result.status(),
+                        .tool_status = .{
+                            .is_error = result.is_error,
+                            .exit_code = result.exit_code,
+                            .timed_out = result.timed_out,
+                            .termination = result.termination,
+                        },
                         .tool_ccr_id = result.ccr_id,
                     });
                     if (self.child_record != null) try self.checkpoint();
@@ -1759,7 +1764,7 @@ pub const Agent = struct {
         const result = try tools.execute(ctx, call.name, call.arguments);
         errdefer result.deinit(self.allocator);
         const presentation = @import("../tools/dispatch.zig").presentation(call.name);
-        try self.previewToolResult(result.output, result.status(), if (presentation) |spec| spec.delegated else false);
+        try self.previewToolResult(result.output, result, if (presentation) |spec| spec.delegated else false);
         return result;
     }
 
@@ -1795,7 +1800,7 @@ pub const Agent = struct {
     /// any of their text is read. The text under it is the tool's own, whole
     /// and unchanged: a tool reports how it ended beside its text, not inside
     /// it, so there is nothing here to leave out.
-    fn previewToolResult(self: *Agent, content: []const u8, status: tools.ToolStatus, delegated: bool) !void {
+    fn previewToolResult(self: *Agent, content: []const u8, status: tools.ToolResult, delegated: bool) !void {
         if (self.capture != null) {
             const parent = self.parent orelse return;
             parent.tool_ui.spinner.stop();

@@ -7,7 +7,6 @@ const normalize = @import("../util/terminal/normalize.zig");
 const host_exec = @import("../host/exec.zig");
 
 const ToolResult = result_mod.ToolResult;
-const ToolStatus = result_mod.ToolStatus;
 const ownedResult = result_mod.ownedResult;
 const no_output = result_mod.no_output;
 
@@ -172,7 +171,7 @@ pub fn executeShellTimed(
     // the model reads it in JSON beside the output and the terminal on
     // the line under the call, so nothing the command printed is displaced and
     // nothing is said twice.
-    const ending: ToolStatus = .{
+    const ending: ToolResult = .{
         .is_error = failed,
         .exit_code = exit_code,
         .termination = shell.termination(),

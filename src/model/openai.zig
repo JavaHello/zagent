@@ -186,7 +186,7 @@ pub const Message = struct {
     /// Exact Responses output items, including encrypted reasoning.
     response_items: ?[]const u8 = null,
     /// Local execution metadata; null for non-tool messages.
-    tool_status: ?search_tools.ToolStatus = null,
+    tool_status: ?search_tools.ToolResult = null,
     /// Cache identity is separate from status so replay preserves the full result.
     tool_ccr_id: ?@import("../tools/result.zig").CcrId = null,
 
@@ -805,7 +805,7 @@ fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const Inpu
         if (std.mem.eql(u8, message.role, "tool")) {
             const call_id = message.tool_call_id orelse return error.MissingCallId;
             const content = message.content orelse "";
-            const status: search_tools.ToolStatus = message.tool_status orelse .{ .is_error = false };
+            const status: search_tools.ToolResult = message.tool_status orelse .{ .is_error = false };
             const output = try search_tools.formatToolOutput(arena, .{
                 .output = content,
                 .is_error = status.is_error,

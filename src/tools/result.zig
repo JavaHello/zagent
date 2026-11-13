@@ -17,33 +17,19 @@ pub const CcrId = [ccr_id_len]u8;
 /// A silent tool returns an empty output string; status carries its outcome.
 pub const no_output = "";
 
-/// How a call ended, in the fields a reader needs to tell two of them apart.
-/// Output contains only the tool's text. Execution metadata travels beside
-/// it in JSON for the model and under the call for the terminal.
-pub const ToolStatus = struct {
-    is_error: bool,
-    /// The status the program chose, when it exited rather than being killed.
-    exit_code: ?u8 = null,
-    timed_out: bool = false,
-    /// The signal that ended the program when it did not exit — `SIGTERM` — so
-    /// a command killed from outside is not left reading as a plain failure.
-    /// Null whenever there is an `exit_code`, which says the same thing better.
-    termination: ?[]const u8 = null,
-};
-
 /// Serialize the complete result, including the CCR identity, for the model.
 pub fn formatToolOutput(allocator: std.mem.Allocator, result: ToolResult) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, result, .{});
 }
 
 pub const ToolResult = struct {
-    output: []const u8,
+    output: []const u8 = "",
     is_error: bool,
     exit_code: ?u8 = null,
     timed_out: bool = false,
     /// The signal that ended the program, for a tool that ran one: a name from
     /// the table in `util/signals.zig`, never owned and never freed with the
-    /// result — see `ToolStatus.termination`. Null for a tool that ran nothing
+    /// result. Null for a tool that ran nothing
     /// and for a program that chose its own exit status.
     termination: ?[]const u8 = null,
     /// The entry this content stands for, when it stands for one: `ccr` names
@@ -66,15 +52,6 @@ pub const ToolResult = struct {
         });
     }
 
-    pub fn status(self: ToolResult) ToolStatus {
-        return .{
-            .is_error = self.is_error,
-            .exit_code = self.exit_code,
-            .timed_out = self.timed_out,
-            .termination = self.termination,
-        };
-    }
-
     pub fn deinit(self: ToolResult, allocator: std.mem.Allocator) void {
         allocator.free(self.output);
     }
@@ -82,18 +59,25 @@ pub const ToolResult = struct {
 
 /// A result from text the caller already owns and hands over: the text becomes
 /// the content unchanged, so only the status is added.
-pub fn ownedResult(content: []u8, status: ToolStatus) ToolResult {
-    return .{
-        .output = content,
-        .is_error = status.is_error,
-        .exit_code = status.exit_code,
-        .timed_out = status.timed_out,
-        .termination = status.termination,
-    };
+pub fn ownedResult(content: []u8, status: ToolResult) ToolResult {
+    var result = status;
+    result.output = content;
+    return result;
 }
 
 pub fn toolError(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !ToolResult {
     return .{ .output = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
+}
+
+test "historical metadata without output parses with an empty body" {
+    const parsed = try std.json.parseFromSlice(ToolResult, std.testing.allocator, "{\"is_error\":true,\"exit_code\":7,\"timed_out\":true,\"termination\":null}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("", parsed.value.output);
+    try std.testing.expect(parsed.value.is_error);
+    try std.testing.expectEqual(@as(?u8, 7), parsed.value.exit_code);
+    try std.testing.expect(parsed.value.timed_out);
+    try std.testing.expect(parsed.value.termination == null);
+    try std.testing.expect(parsed.value.ccr_id == null);
 }
 
 test "a result hands on the text it was given, whole and unchanged" {
@@ -137,10 +121,11 @@ test "a killed program says so in the status, not in its output" {
     });
     defer result.deinit(a);
     try std.testing.expectEqualStrings("", result.output);
-    try std.testing.expectEqualDeep(ToolStatus{
-        .is_error = true,
-        .termination = "SIGTERM",
-    }, result.status());
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqual(@as(?u8, null), result.exit_code);
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expectEqualStrings("SIGTERM", result.termination.?);
+    try std.testing.expectEqual(@as(?CcrId, null), result.ccr_id);
     const encoded = try formatToolOutput(a, result);
     defer a.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"termination\":\"SIGTERM\"") != null);

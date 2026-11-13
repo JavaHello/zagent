@@ -12,7 +12,7 @@ const StoredMessage = struct {
     tool_calls: ?[]openai.ToolCallData,
     tool_call_id: ?[]const u8,
     response_items: ?[]const u8,
-    tool_status: ?@import("../tools/mod.zig").ToolStatus,
+    tool_status: ?@import("../tools/mod.zig").ToolResult,
     tool_ccr_id: ?@import("../tools/result.zig").CcrId = null,
 };
 /// The plan travels with the conversation: it is state of the session, not a
@@ -171,9 +171,9 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Loaded 
     for (parsed.value.messages) |source| {
         var message: Message = .{ .role = undefined, .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null };
         errdefer message.deinit(allocator);
-        // A status holds no memory: the signal a call ended with is a name from
-        // the table in `util/signals.zig`, so the one written down is looked up
-        // there rather than copied out of the parsed snapshot.
+        // Metadata owns no memory: leave output at its default empty string,
+        // rather than retaining text from the parsed snapshot. Resolve signal
+        // names through the static table for the same reason.
         if (source.tool_status) |status| {
             message.tool_status = .{
                 .is_error = status.is_error,
@@ -271,9 +271,14 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
         .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true }, .tool_ccr_id = "abcdef012345".* },
         .{ .role = "tool", .content = @import("../tools/mod.zig").no_output, .reasoning_content = null, .tool_calls = null, .tool_call_id = "2", .tool_status = .{ .is_error = true, .termination = "SIGTERM" } },
     };
+    // Even if a snapshot contains output in metadata, restoration uses content
+    // as the sole owned body and must not retain the parser's output slice.
+    messages[1].tool_status.?.output = "discard parsed metadata output";
     try save(io, allocator, path, &messages, &plan);
+    messages[1].tool_status.?.output = "";
     var loaded = try load(io, allocator, path);
     defer loaded.deinit(allocator);
+    try std.testing.expectEqualStrings("", loaded.messages.items[1].tool_status.?.output);
     try std.testing.expectEqual(@as(usize, 3), loaded.messages.items.len);
     try std.testing.expectEqualStrings("plan", loaded.messages.items[0].reasoning_content.?);
     try std.testing.expectEqualStrings(messages[0].response_items.?, loaded.messages.items[0].response_items.?);
@@ -296,7 +301,7 @@ test "snapshots reject removed fields and require the current schema" {
     // A status no longer carries `truncated`: an old one is refused rather
     // than read as a status that never said where the rest of its result went.
     try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(
-        @import("../tools/mod.zig").ToolStatus,
+        @import("../tools/mod.zig").ToolResult,
         a,
         "{\"is_error\":false,\"exit_code\":null,\"timed_out\":false,\"truncated\":true}",
         .{},
