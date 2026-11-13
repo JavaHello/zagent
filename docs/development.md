@@ -186,8 +186,9 @@ Agent does its terminal work for a call in these hooks rather than around the
 dispatch. The context before hook names the call in the terminal title, writes
 its announcement line and starts the animation that owns the line while it
 runs; the context after hook gives that line back and then calls
-`ccr.afterExecute`, which caches oversized materialized output (including MCP
-output) and returns a preview with a `ccr_retrieve` id. Dispatch itself applies
+`ccr.afterExecute`, which caches materialized output past 8 KiB (including MCP
+output) under an id named after the content's SHA-256, so the same output is
+kept once, and returns a 4 KiB preview with that `ccr_retrieve` id. Dispatch itself applies
 no size limit, so no cache directory or a cache-write failure leaves the
 complete result as it is. Bash keeps its streaming CCR cache so it need not
 materialize arbitrarily large output. Because the animation is started

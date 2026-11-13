@@ -47,5 +47,5 @@ fn errorResult(allocator: std.mem.Allocator, comptime fmt: []const u8, args: any
     const raw = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(raw);
     const tools = @import("mod.zig");
-    return tools.finalizeResultLimited(allocator, raw, .{ .is_error = true }, tools.max_output_bytes);
+    return tools.finalizeResult(allocator, raw, .{ .is_error = true });
 }

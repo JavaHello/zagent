@@ -5,6 +5,10 @@
 //! the model is handed the last lines of it plus an id. `ccr_retrieve` pages
 //! that file the way `read` pages a source file, or finds lines in it by query.
 //!
+//! An entry is named after its content, so a large task that caches the same
+//! output twice — a command rerun, a page read again, a file read again — keeps
+//! one file and answers both calls with the same id.
+//!
 //! The cache is as temporary as the run: it lives under the scratch directory,
 //! which `/new` empties and the process removes on exit. An id from an earlier
 //! session therefore names nothing, and the tool says so rather than guessing.
@@ -27,9 +31,12 @@ const truncateUtf8 = util.truncateUtf8;
 /// the run that wrote it.
 pub const dir_name = "ccr";
 
-/// How long an id is, in hex characters: six random bytes. Long enough that two
+/// How long an id is, in hex characters: the first six bytes of the entry's
+/// SHA-256, so the same output always takes the same name. Long enough that two
 /// entries of one session do not meet, short enough to be quoted in a result.
 pub const id_len = 12;
+/// Random bytes behind the name an entry is created with, before its content is
+/// known: `id_len` hex characters.
 const id_bytes = id_len / 2;
 
 /// A line longer than this is not matched against a query and not shown: the
@@ -73,12 +80,14 @@ pub fn countLines(text: []const u8) usize {
 /// A command's output is streamed into the cache as it comes off the pipe, so
 /// the copy on disk costs this process nothing to hold. The line and byte
 /// counts are kept as it is written, which is what a result naming the entry
-/// reports.
+/// reports. The content is hashed on the way in, so an entry can be renamed
+/// after what it holds once it is closed.
 pub const Stream = struct {
     file: std.Io.File,
     /// Owned; freed by `deinit`.
     path: []u8,
     id: [id_len]u8,
+    hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
     bytes: usize = 0,
     newlines: usize = 0,
     last_byte: u8 = 0,
@@ -91,17 +100,47 @@ pub const Stream = struct {
         for (data) |byte| {
             if (byte == '\n') self.newlines += 1;
         }
+        self.hash.update(data);
         self.bytes += data.len;
         self.last_byte = data[data.len - 1];
     }
 
     /// Close the entry and answer what it holds. A line count is the one
     /// `countLines` would give for the same text: a trailing terminator ends
-    /// the last line rather than starting an empty one.
+    /// the last line rather than starting an empty one. The id is the one its
+    /// content gives it, which is the name it is kept under.
     pub fn finish(self: *Stream, io: std.Io) Saved {
         self.close(io);
         const lines = self.newlines + @intFromBool(self.bytes > 0 and self.last_byte != '\n');
-        return .{ .id = self.id, .lines = lines, .bytes = self.bytes };
+        return .{ .id = self.contentName(io), .lines = lines, .bytes = self.bytes };
+    }
+
+    /// Rename the closed entry after its content — the first `id_len` hex
+    /// characters of its SHA-256 — and answer the id it is read back with. An
+    /// entry that finds another of the same content already under that name is
+    /// the duplicate of it and is dropped, which is what keeps one file per
+    /// distinct output however many calls produce it. Renaming is best effort:
+    /// an entry that cannot take the content name keeps the unique one it was
+    /// created with, rather than its content being lost.
+    fn contentName(self: *Stream, io: std.Io) [id_len]u8 {
+        const dir = std.fs.path.dirname(self.path) orelse return self.id;
+        const id: [id_len]u8 = std.fmt.bytesToHex(self.hash.finalResult(), .lower)[0..id_len].*;
+        var name: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const target = std.fmt.bufPrint(&name, "{s}/{s}.log", .{ dir, id }) catch return self.id;
+        const cwd = std.Io.Dir.cwd();
+        cwd.renamePreserve(self.path, cwd, target, io) catch |err| switch (err) {
+            // The name is taken. With the same content behind it this entry is
+            // the copy, and the one already there answers for both.
+            error.PathAlreadyExists => {
+                if (sameContent(io, self.path, target)) {
+                    std.Io.Dir.deleteFileAbsolute(io, self.path) catch {};
+                    return id;
+                }
+                return self.id;
+            },
+            else => return self.id,
+        };
+        return id;
     }
 
     /// Give up on the entry: the output it holds is not worth reading back —
@@ -129,9 +168,37 @@ pub const Stream = struct {
     }
 };
 
-/// Start an entry under `dir`, whose name is reserved before anything is
-/// written so two runs cannot take the same id. The directory is created on
-/// first use, so a run that never prints that much never leaves one behind.
+/// Whether two entries hold the same bytes: their sizes first, then their
+/// content in chunks, stopping at the first difference. A shared prefix of a
+/// digest is not proof enough to answer one entry's name with another's content.
+fn sameContent(io: std.Io, first_path: []const u8, second_path: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    const first_stat = cwd.statFile(io, first_path, .{}) catch return false;
+    const second_stat = cwd.statFile(io, second_path, .{}) catch return false;
+    if (first_stat.size != second_stat.size) return false;
+    const first = std.Io.Dir.openFileAbsolute(io, first_path, .{}) catch return false;
+    defer first.close(io);
+    const second = std.Io.Dir.openFileAbsolute(io, second_path, .{}) catch return false;
+    defer second.close(io);
+    var first_buf: [8 * 1024]u8 = undefined;
+    var second_buf: [8 * 1024]u8 = undefined;
+    var first_reader = first.reader(io, &first_buf);
+    var second_reader = second.reader(io, &second_buf);
+    var first_chunk: [4 * 1024]u8 = undefined;
+    var second_chunk: [4 * 1024]u8 = undefined;
+    while (true) {
+        const first_len = first_reader.interface.readSliceShort(&first_chunk) catch return false;
+        const second_len = second_reader.interface.readSliceShort(&second_chunk) catch return false;
+        if (first_len != second_len) return false;
+        if (first_len == 0) return true;
+        if (!std.mem.eql(u8, first_chunk[0..first_len], second_chunk[0..second_len])) return false;
+    }
+}
+
+/// Start an entry under `dir`. Its name is reserved before anything is written
+/// so that two entries being written at once cannot take the same one; `finish`
+/// renames what it holds after its content. The directory is created on first
+/// use, so a run that never prints that much never leaves one behind.
 pub fn createStream(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) !Stream {
     std.Io.Dir.createDirAbsolute(io, dir, .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -158,7 +225,9 @@ pub fn createStream(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) !
     return error.CacheIdCollision;
 }
 
-/// Keep `text` under `dir` and report the id it can be read back with.
+/// Keep `text` under `dir` and report the id it can be read back with. Saving
+/// the same text again — or finding another entry already holding it — answers
+/// with the same id and keeps one copy.
 pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []const u8) !Saved {
     var stream = try createStream(io, allocator, dir);
     defer stream.deinit(io, allocator);
@@ -178,10 +247,21 @@ pub fn afterExecute(ctx: tool.Context, _: []const u8, _: []const u8, outcome: an
     const saved = save(ctx.io, ctx.allocator, dir, result.content) catch return result;
     const original = result.content;
     defer ctx.allocator.free(original);
-    const preview = truncateUtf8(original, page_room_bytes);
-    result.content = try std.fmt.allocPrint(ctx.allocator, "{s}\n[ccr {s}: {d} lines, {d} bytes. Call ccr_retrieve with id \"{s}\" to read the full output.]", .{ preview, saved.id, saved.lines, saved.bytes, saved.id });
+    const preview = headPreview(original, result_mod.preview_room_bytes);
+    result.content = try std.fmt.allocPrint(ctx.allocator, "{s}\n[ccr {s}: {d} lines, {d} bytes. The beginning of it is shown here; call ccr_retrieve with id \"{s}\" to read the rest.]", .{ preview, saved.id, saved.lines, saved.bytes, saved.id });
     result.truncated = true;
     return result;
+}
+
+/// The beginning of `text` a preview can hold: whole lines where there are
+/// any, and a cut on a UTF-8 boundary when one line fills the whole budget.
+fn headPreview(text: []const u8, budget: usize) []const u8 {
+    if (text.len <= budget) return text;
+    const window = text[0..budget];
+    if (std.mem.lastIndexOfScalar(u8, window, '\n')) |end| {
+        if (end + 1 > budget / 2) return window[0 .. end + 1];
+    }
+    return truncateUtf8(text, budget);
 }
 
 /// What one `ccr_retrieve` call asks for. `offset` counts lines, or matching
@@ -200,7 +280,7 @@ pub const RetrieveArgs = struct {
 
 /// The message a call gets when it cannot be read as a `ccr_retrieve` call.
 pub const invalid_arguments =
-    "Error: ccr_retrieve takes the hex 'id' a cached result named, plus an optional 1-based 'offset', an optional 'limit' of lines, and an optional 'query' string to find lines case-insensitively. Run the command again to cache its output under a new id.";
+    "Error: ccr_retrieve takes the hex 'id' a cached result named, plus an optional 1-based 'offset', an optional 'limit' of lines, and an optional 'query' string to find lines case-insensitively. Run the call again to cache its output.";
 
 /// A call's id as the file name it stands for: trimmed, with the `.log` a model
 /// may copy off a path removed, in lower case, and refused unless it is hex.
@@ -238,10 +318,10 @@ pub fn parseArgs(allocator: std.mem.Allocator, arguments: []const u8) !RetrieveA
     };
 }
 
-/// The ccr_retrieve tool: read back what a long `bash` output was cached as.
+/// The ccr_retrieve tool: read back what a long result was cached as.
 pub const spec: tool.Tool = .{
     .name = "ccr_retrieve",
-    .description = "Read back the cached output of a long command. A bash result that was too long for one result names an id and how many lines and bytes it holds; call this with that id to page through it, or with a query to find the lines that contain text (ignoring case). Without a query, offset is a 1-based line number and limit a count of lines, and the page names the offset the next one starts at; with a query, offset counts matching lines.",
+    .description = "Read back cached output: the whole of a command's or a tool's result when that result was too long for one. It names an id and how many lines and bytes it holds; call this with that id to page through it, or with a query to find the lines that contain text (ignoring case). Without a query, offset is a 1-based line number and limit a count of lines, and the page names the offset the next one starts at; with a query, offset counts matching lines.",
     .parameters_json =
     \\{"type":"object","properties":{"id":{"type":"string","description":"The hex id a cached result named"},"offset":{"type":"integer","minimum":1,"description":"1-based first line, or first matching line when query is given; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to return; defaults to as many as the page holds"},"query":{"type":"string","description":"Only the lines containing this text, matched without regard to case"}},"required":["id"],"additionalProperties":false}
     ,
@@ -271,7 +351,7 @@ pub fn retrieve(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, argum
         const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return toolError(
                 allocator,
-                "Error: no cached output with id '{s}'. Cached output lives only in this run's scratch directory: `/new` empties it and the end of the run removes it, so an id from earlier names nothing. Run the command again to cache it under a new id.",
+                "Error: no cached output with id '{s}'. Cached output lives only in this run's scratch directory: `/new` empties it and the end of the run removes it, so an id from earlier names nothing. Run the call again to cache its output.",
                 .{args.id},
             ),
             else => |other| return toolError(allocator, "Error opening ccr {s}: {s}", .{ args.id, @errorName(other) }),
@@ -390,6 +470,52 @@ fn queryPage(
         .is_error = false,
         .truncated = resumes_at != null,
     };
+}
+
+test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const ctx: tool.Context = .{ .io = io, .allocator = a, .cache_dir = dir };
+
+    // A result of exactly the threshold is small enough to be shown whole.
+    const under = try a.alloc(u8, result_mod.max_output_bytes);
+    defer a.free(under);
+    @memset(under, 'x');
+    const kept = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, under), .is_error = false });
+    defer kept.deinit(a);
+    try std.testing.expect(!kept.truncated);
+    try std.testing.expectEqualStrings(under, kept.content);
+
+    // One byte more is cached, and what comes back is a preview under the
+    // threshold that names the entry.
+    var text: std.Io.Writer.Allocating = .init(a);
+    defer text.deinit();
+    for (0..1200) |_| try text.writer.writeAll("payload line\n");
+    try std.testing.expect(text.written().len > result_mod.max_output_bytes);
+    const result = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = false });
+    defer result.deinit(a);
+    try std.testing.expect(result.truncated and !result.is_error);
+    try std.testing.expect(result.content.len < result_mod.max_output_bytes);
+    const marker = std.mem.indexOf(u8, result.content, "\n[ccr ") orelse return error.MissingCacheId;
+    try std.testing.expect(marker <= result_mod.preview_room_bytes);
+    try std.testing.expect(marker > result_mod.preview_room_bytes - 16);
+    try std.testing.expect(std.mem.startsWith(u8, result.content, "payload line\n"));
+    try std.testing.expect(std.mem.indexOf(u8, result.content[marker..], "ccr_retrieve") != null);
+
+    // The same output again is the same entry, not a second copy of it.
+    const again = try afterExecute(ctx, "mcp_dynamic", "{}", .{ .content = try a.dupe(u8, text.written()), .is_error = false });
+    defer again.deinit(a);
+    try std.testing.expectEqualStrings(result.content, again.content);
+    var entries = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
+    defer entries.close(io);
+    var iterator = entries.iterate();
+    var files: usize = 0;
+    while (try iterator.next(io)) |_| files += 1;
+    try std.testing.expectEqual(@as(usize, 1), files);
 }
 
 test "afterExecute caches materialized output, preserves status and retrieves the tail" {
@@ -584,19 +710,40 @@ test "an oversized matching line advances instead of repeating forever" {
     try std.testing.expect(std.mem.indexOf(u8, page.content, "offset=2") != null);
 }
 
-test "saving identical output always reserves a new entry" {
+test "identical output is kept once and named after its content" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(dir);
-    var ids: [64][id_len]u8 = undefined;
-    for (&ids, 0..) |*id, index| {
+
+    // The same text cached many times over — the way a large task reruns a
+    // command or reads a page again — is one entry, under one id.
+    var first: [id_len]u8 = undefined;
+    for (0..8) |index| {
         const saved = try save(io, a, dir, "same output\n");
-        for (ids[0..index]) |prior| try std.testing.expect(!std.mem.eql(u8, &prior, &saved.id));
-        id.* = saved.id;
+        try std.testing.expectEqual(@as(usize, 1), saved.lines);
+        if (index == 0) first = saved.id else try std.testing.expectEqualStrings(&first, &saved.id);
     }
+    var entries = try std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true });
+    defer entries.close(io);
+    var iterator = entries.iterate();
+    var files: usize = 0;
+    while (try iterator.next(io)) |entry| {
+        try std.testing.expectEqualStrings(&first, entry.name[0..id_len]);
+        files += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), files);
+    const name = try std.fmt.allocPrint(a, "{s}.log", .{first});
+    defer a.free(name);
+    const cached = try entries.readFileAlloc(io, name, a, .limited(1024));
+    defer a.free(cached);
+    try std.testing.expectEqualStrings("same output\n", cached);
+
+    // Different output takes a name of its own rather than joining it.
+    const other = try save(io, a, dir, "other output\n");
+    try std.testing.expect(!std.mem.eql(u8, &first, &other.id));
 }
 
 test "line counting ends with the last line, not after it" {

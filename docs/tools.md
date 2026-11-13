@@ -46,7 +46,7 @@ not outlive the call. Background processes are not kept across calls.
 
 Output larger than 8 KiB (8192 bytes) is cached in the current run's scratch
 folder. The result keeps the exit status and up to the last 40 lines / 4 KiB,
-then names a unique cache ID, the total line count and the size in bytes.
+then names a cache ID, the total line count and the size in bytes.
 Stdout is followed by stderr under a `stderr:` label. Counts refer to this
 normalized, combined text, not the exit-status or cache-notice lines. The entry
 is written as the output arrives and holds at most 64 MiB, so a command that
@@ -55,11 +55,11 @@ is read and counted but not kept, and the result says so.
 
 ## `ccr_retrieve`
 
-Read cached command output without rerunning the command.
+Read cached output without rerunning the call that produced it.
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `id` | yes | Cache ID returned by `bash` |
+| `id` | yes | Cache ID a cached result named |
 | `query` | no | Literal substring filter, ignoring ASCII case |
 | `offset` | no | 1-based first line, or first matching line with `query`; default 1 |
 | `limit` | no | Positive number of lines; defaults to the page capacity |
@@ -68,7 +68,9 @@ For example, `{"id":"012345abcdef","query":"error","offset":1,"limit":20}`
 returns matching lines with their original line numbers. A partial page tells
 you the next offset. Cache entries are private to each agent's scratch folder;
 `/new` and process exit remove them, and resuming a conversation does not
-restore old cache entries.
+restore old cache entries. An entry is named after its content, so caching the
+same output twice — a command rerun, a page read again — is one file answered
+by one ID, and a long task does not fill the folder with copies.
 
 ## `read`
 
@@ -133,15 +135,22 @@ rather than cutting a name in half, and honours `limit`.
 
 ## Output limit
 
-One tool result is held to 12 KiB.
+A tool result larger than 8 KiB is cached in the current run's scratch folder:
+the result keeps the first whole lines up to 4 KiB and then names the cache ID,
+the line count and the size in bytes, and `ccr_retrieve` reads the rest back
+page by page. This is the same cache `bash` writes to, and an entry is named
+after its content, so identical output is kept once however often it is
+produced.
 
-- `read` pages a file and names the `offset` the next page starts at.
+- `read` pages a file and names the `offset` the next page starts at, and a page
+  stays under the threshold, so reading a cached entry back never caches a page
+  of it again.
 - `ls` and the searches stop short of the limit and say so, so the model
   narrows the call rather than reading a cut answer as a complete one.
-- `bash` caches output above 8 KiB and returns a tail preview plus a cache ID.
-- An `http` response that runs past the result limit is cut and marked truncated.
-- Anything else that still lands over it, an MCP server's answer included, comes
-  back cut at the limit and reported as an error naming it.
+- `bash` starts caching at 8 KiB as the output arrives and returns a tail
+  preview plus a cache ID, so output it already holds is not written twice.
+- An `http` response, an `apply_patch` summary, an MCP server's answer and
+  anything else that large is cached the same way.
 
 No tool description quotes the number: the limit lives in the code, not in the
 prompt.

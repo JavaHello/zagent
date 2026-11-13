@@ -113,9 +113,11 @@ on a compatible endpoint. Use a stable, non-secret key, not a secret or a new ra
 value each turn. Automatic server-side caching may work without either field.
 See [the example config](zagent.example.conf).
 
-Read/search pages and shell output use an approximately 12 KiB default budget;
-individual tool results still have a 40 KiB hard limit. Long shell output keeps
-both ends of stdout and stderr and marks omitted content. Redirect large output
+Read/search pages hold about 7.5 KiB, and any tool result larger than 8 KiB —
+shell output, an HTTP body, an MCP answer — is cached in the run's scratch folder
+and replaced by a 4 KiB preview naming a cache ID that `ccr_retrieve` reads back.
+Cached output is named after its content, so identical output is kept once. Long
+shell output keeps both ends of stdout and stderr and marks omitted content. Redirect large output
 to a file and read pages when the omitted middle matters. Debug request events
 include input bytes, tool schema bytes and a SHA-256 tool-set fingerprint; turn
 summaries distinguish missing cache reports from a reported zero.

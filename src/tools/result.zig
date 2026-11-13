@@ -31,12 +31,18 @@ pub const ToolResult = struct {
     }
 };
 
-/// CCR's cache threshold, not a tool-result size limit.
-pub const max_output_bytes: usize = 40 * 1024;
-/// CCR page and bash streaming-preview budgets. Producers must not clip their
-/// complete results to these sizes before the CCR hook can cache them.
-pub const default_output_bytes: usize = 12 * 1024;
-pub const page_room_bytes: usize = default_output_bytes - 256;
+/// CCR's cache threshold: a result larger than this is kept under this run's
+/// scratch directory, and the model is handed a preview of it instead. Not a
+/// tool-result size limit — producers hand over their complete output and the
+/// hook decides.
+pub const max_output_bytes: usize = 8 * 1024;
+/// The preview a cached result is handed in place of its body: enough to tell
+/// what the output is about, small enough that caching an 8 KiB result is worth
+/// the call it costs.
+pub const preview_room_bytes: usize = 4 * 1024;
+/// What one page of a result may take. It stays under `max_output_bytes`, so
+/// reading a cached entry back never caches the page it was read into.
+pub const page_room_bytes: usize = max_output_bytes - 512;
 
 pub fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return normalizeToolText(allocator, raw);
@@ -57,19 +63,6 @@ pub fn finalizeNormalizedResultOwned(normalized: []u8, status: ToolStatus) ToolR
     };
 }
 
-/// Compatibility wrappers; the old byte budget no longer clips tool output.
-pub fn finalizeResultLimited(allocator: std.mem.Allocator, raw: []const u8, status: ToolStatus, _: usize) !ToolResult {
-    return finalizeResult(allocator, raw, status);
-}
-
-pub fn finalizeNormalizedResultOwnedLimited(_: std.mem.Allocator, normalized: []u8, status: ToolStatus, _: usize) !ToolResult {
-    return finalizeNormalizedResultOwned(normalized, status);
-}
-
-pub fn finalizeToolContentLimited(allocator: std.mem.Allocator, raw: []const u8, _: usize) ![]u8 {
-    return normalizeToolText(allocator, raw);
-}
-
 /// Strip terminal control sequences and escape invalid text without clipping.
 pub fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -88,12 +81,12 @@ test "finalization preserves complete oversized results and status for CCR" {
     const raw = try a.alloc(u8, max_output_bytes + 512);
     defer a.free(raw);
     @memset(raw, 'x');
-    const result = try finalizeResultLimited(a, raw, .{ .is_error = false, .exit_code = 7, .timed_out = true }, 32);
+    const result = try finalizeResult(a, raw, .{ .is_error = false, .exit_code = 7, .timed_out = true });
     defer result.deinit(a);
     try std.testing.expectEqualStrings(raw, result.content);
     try std.testing.expect(!result.is_error and !result.truncated and result.timed_out);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
-    const content = try finalizeToolContentLimited(a, raw, 1);
+    const content = try finalizeToolContent(a, raw);
     defer a.free(content);
     try std.testing.expectEqualStrings(raw, content);
 }
@@ -102,7 +95,7 @@ test "owned finalization transfers the full allocation and preserves explicit pa
     const a = std.testing.allocator;
     const normalized = try a.alloc(u8, max_output_bytes + 1);
     @memset(normalized, 'x');
-    const result = try finalizeNormalizedResultOwnedLimited(a, normalized, .{ .is_error = false, .truncated = true }, 0);
+    const result = finalizeNormalizedResultOwned(normalized, .{ .is_error = false, .truncated = true });
     defer result.deinit(a);
     try std.testing.expectEqual(normalized.ptr, result.content.ptr);
     try std.testing.expectEqual(normalized.len, result.content.len);

@@ -49,4 +49,4 @@ command line. Search `path` globs expand safely without executing shell code.
   `+`, `?`, `|` and `()` are operators, as they are in `rg`. More advanced
   regex syntax can differ between the two programs.
 
-See also [Tools](tools.md) for the 40 KiB result limit and `read` paging.
+See also [Tools](tools.md) for the 8 KiB cache threshold and `read` paging.

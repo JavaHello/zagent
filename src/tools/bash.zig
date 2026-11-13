@@ -7,8 +7,7 @@ const sanitize = @import("../util/text.zig");
 const host_exec = @import("../host/exec.zig");
 
 const ToolResult = result_mod.ToolResult;
-const finalizeNormalizedResultOwnedLimited = result_mod.finalizeNormalizedResultOwnedLimited;
-const max_output_bytes = result_mod.default_output_bytes;
+const finalizeNormalizedResultOwned = result_mod.finalizeNormalizedResultOwned;
 
 /// How many lines of a long output the preview keeps. Enough for the end of a
 /// build to be read at a glance, few enough that the result stays a summary:
@@ -298,11 +297,11 @@ pub fn executeShellTimed(
         } else {
             try aw.writer.writeAll(collector.head.items);
         }
-        return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
+        return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
             .truncated = false,
-        }, max_output_bytes);
+        });
     }
 
     // Too long for one result. The tail is what the model needs first — the end
@@ -322,11 +321,11 @@ pub fn executeShellTimed(
             "[This command printed more than {d} MiB; the rest is not cached and was not kept.]",
             .{cache_max_bytes / (1024 * 1024)},
         );
-        return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
+        return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
             .truncated = true,
-        }, max_output_bytes);
+        });
     }
 
     if (collector.cache_error) |err| {
@@ -336,11 +335,11 @@ pub fn executeShellTimed(
             "[Output cut here: {d} lines, {d} bytes of output, and this run could not cache the rest ({s}). Redirect long output to a file and read it in pages.]",
             .{ countedLines(collector.bytes, collector.newlines, collector.last_byte), collector.bytes, @errorName(err) },
         );
-        return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
+        return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
             .truncated = true,
-        }, max_output_bytes);
+        });
     }
 
     // No cache was offered: the rest of this output is not reachable, so the
@@ -349,11 +348,11 @@ pub fn executeShellTimed(
         "[Output cut: {d} lines, {d} bytes, only the last lines shown. Redirect long output to a file and read it in pages.]",
         .{ countedLines(collector.bytes, collector.newlines, collector.last_byte), collector.bytes },
     );
-    return finalizeNormalizedResultOwnedLimited(allocator, try aw.toOwnedSlice(), .{
+    return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
         .is_error = true,
         .exit_code = exit_code,
         .truncated = true,
-    }, max_output_bytes);
+    });
 }
 
 /// The bash tool: one command, one deadline, and the cache a long output is
@@ -444,13 +443,13 @@ test "shell status survives empty output, stderr, signals and truncation" {
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.is_error, result.is_error);
         try std.testing.expect(std.mem.startsWith(u8, result.content, case.prefix));
-        try std.testing.expect(result.content.len <= max_output_bytes);
+        try std.testing.expect(result.content.len <= result_mod.max_output_bytes);
     }
     // Without a cache the rest is out of reach, so the cut is reported as a
     // failure that names what was dropped.
     const long = try executeShell(std.testing.io, std.testing.allocator, "printf '%50000s' ''");
     defer long.deinit(std.testing.allocator);
-    try std.testing.expect(long.content.len <= max_output_bytes);
+    try std.testing.expect(long.content.len <= result_mod.max_output_bytes);
     try std.testing.expect(long.is_error and long.truncated);
     try std.testing.expect(std.mem.indexOf(u8, long.content, "Output cut") != null);
 }
@@ -478,7 +477,7 @@ test "long output is cached and the result names the id it is read back with" {
     try std.testing.expect(result.is_error);
     try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
     try std.testing.expect(result.truncated);
-    try std.testing.expect(result.content.len <= max_output_bytes);
+    try std.testing.expect(result.content.len <= result_mod.max_output_bytes);
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
     try std.testing.expect(std.mem.startsWith(u8, result.content, "Exit code: 7\n"));
     try std.testing.expect(std.mem.indexOf(u8, result.content, "ERR_END") != null);

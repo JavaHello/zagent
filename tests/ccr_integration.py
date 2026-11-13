@@ -11,8 +11,13 @@ import threading
 from mock_api import send_response, trust_workspace
 
 BINARY = Path(__file__).resolve().parents[1] / 'zig-out/bin/zagent'
+# The sub-agent prints lines of its own: the same output in two runs would be
+# cached under the same content-named id in each, which is what the isolation
+# check below must not be confused by.
 COMMAND = "python3 -c 'for i in range(20000): print(\"ROW-%05d payload\" % i)'"
+CHILD_COMMAND = "python3 -c 'for i in range(20000): print(\"KID-%05d payload\" % i)'"
 EXPECTED = ''.join(f'ROW-{i:05d} payload\n' for i in range(20000))
+CHILD_EXPECTED = ''.join(f'KID-{i:05d} payload\n' for i in range(20000))
 ids = {}
 paths = {}
 errors = []
@@ -25,15 +30,15 @@ def unpack(output):
     return json.loads(header[len('[tool_status '):-1]), content
 
 
-def cached(output, path):
+def cached(output, path, tag, expected):
     status, content = unpack(output)
     assert not status['is_error'] and status['exit_code'] == 0, output
     assert status['truncated'], status
-    assert 'ROW-19999 payload' in content and 'ROW-00000 payload' not in content, content
+    assert f'{tag}-19999 payload' in content and f'{tag}-00000 payload' not in content, content
     match = re.search(r'\[ccr ([0-9a-f]+): 20000 lines,', content)
     assert match, content
     identifier = match[1]
-    assert (path / 'ccr' / f'{identifier}.log').read_text() == EXPECTED
+    assert (path / 'ccr' / f'{identifier}.log').read_text() == expected
     return identifier
 
 
@@ -59,22 +64,23 @@ def dispatch(body):
         status, content = unpack(results[-1])
         assert status['is_error'] and 'no cached output' in content, results[-1]
         return None
+    tag, expected = ('KID', CHILD_EXPECTED) if role == 'child' else ('ROW', EXPECTED)
     if count == 0:
         if role == 'child':
             assert path != paths['parent']
-        return 'bash', {'command': COMMAND}
+        return 'bash', {'command': CHILD_COMMAND if role == 'child' else COMMAND}
     if count == 1:
-        ids[role] = cached(results[-1], path)
+        ids[role] = cached(results[-1], path, tag, expected)
         return 'ccr_retrieve', {'id': ids[role], 'offset': 1, 'limit': 2}
     if count == 2:
         status, content = unpack(results[-1])
         assert not status['is_error'], results[-1]
-        assert '1:ROW-00000 payload' in content and '2:ROW-00001 payload' in content, content
-        assert 'ROW-00002' not in content, content
-        return 'ccr_retrieve', {'id': ids[role], 'query': 'row-12345', 'limit': 2}
+        assert f'1:{tag}-00000 payload' in content and f'2:{tag}-00001 payload' in content, content
+        assert f'{tag}-00002' not in content, content
+        return 'ccr_retrieve', {'id': ids[role], 'query': f'{tag.lower()}-12345', 'limit': 2}
     if count == 3:
         status, content = unpack(results[-1])
-        assert not status['is_error'] and '12346:ROW-12345 payload' in content, results[-1]
+        assert not status['is_error'] and f'12346:{tag}-12345 payload' in content, results[-1]
         if role == 'parent':
             return 'subagent', {'task': 'Generate a long bash result, retrieve it, and report.', 'title': 'Cache child output'}
         # The child cannot read its parent's cache, even knowing its id.

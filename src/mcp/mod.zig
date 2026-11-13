@@ -967,7 +967,7 @@ pub fn renderCallResult(allocator: std.mem.Allocator, result_json: []const u8) !
 
     if (!wrote) try w.writeAll("(the tool returned nothing)");
 
-    return tools.finalizeResultLimited(allocator, aw.written(), .{ .is_error = is_error }, tools.max_output_bytes);
+    return tools.finalizeResult(allocator, aw.written(), .{ .is_error = is_error });
 }
 
 /// Write one content item, after `following` earlier ones. Returns whether
@@ -1057,7 +1057,7 @@ fn decodedSize(base64: []const u8) usize {
 fn errorResult(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !tools.ToolResult {
     const raw = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(raw);
-    return tools.finalizeResultLimited(allocator, raw, .{ .is_error = true }, tools.max_output_bytes);
+    return tools.finalizeResult(allocator, raw, .{ .is_error = true });
 }
 
 /// How long a tool description is allowed to be. A server can send anything,

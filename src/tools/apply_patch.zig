@@ -6,8 +6,7 @@ const args_mod = @import("args.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
-const finalizeResultLimited = result_mod.finalizeResultLimited;
-const max_output_bytes = result_mod.max_output_bytes;
+const finalizeResult = result_mod.finalizeResult;
 const fixturePath = util.fixturePath;
 
 /// The apply_patch tool: change files by applying a unified diff to them.
@@ -55,7 +54,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
             defer allocator.free(content);
             // Sanitised like any other result: the message quotes lines of the
             // patch, which the model wrote.
-            return finalizeResultLimited(allocator, content, .{ .is_error = true }, max_output_bytes);
+            return finalizeResult(allocator, content, .{ .is_error = true });
         },
         .applied => |stats| {
             var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -81,7 +80,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
                 }
                 try aw.writer.writeByte(')');
             }
-            return finalizeResultLimited(allocator, aw.written(), .{ .is_error = false }, max_output_bytes);
+            return finalizeResult(allocator, aw.written(), .{ .is_error = false });
         },
     }
 }

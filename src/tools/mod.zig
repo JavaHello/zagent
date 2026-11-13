@@ -8,8 +8,8 @@
 //! for the shape and size of a result, `progress.zig` for the progress labels,
 //! `args.zig` for reading a call's JSON arguments, `search.zig` for what the
 //! four search tools have in common, and `util.zig` for a handful of helpers.
-//! `ccr.zig` is the cache a command's output is kept in when it is too long for
-//! one result, and the `ccr_retrieve` tool that reads it back.
+//! `ccr.zig` is the cache a tool's output is kept in when it is too long for one
+//! result, and the `ccr_retrieve` tool that reads it back.
 //!
 //! `tool.zig` says what a built-in tool is — its name, description, argument
 //! schema, progress label and the `run` that parses its arguments and does the
@@ -51,8 +51,7 @@ pub const ToolResult = result_mod.ToolResult;
 pub const max_output_bytes = result_mod.max_output_bytes;
 pub const page_room_bytes = result_mod.page_room_bytes;
 pub const formatToolOutput = result_mod.formatToolOutput;
-pub const finalizeResultLimited = result_mod.finalizeResultLimited;
-pub const finalizeToolContentLimited = result_mod.finalizeToolContentLimited;
+pub const finalizeResult = result_mod.finalizeResult;
 
 // What the terminal shows while a tool runs.
 pub const progressLabel = progress.progressLabel;

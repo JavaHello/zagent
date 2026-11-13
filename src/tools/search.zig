@@ -8,8 +8,7 @@ const ToolResult = result_mod.ToolResult;
 const ToolStatus = result_mod.ToolStatus;
 const toolError = result_mod.toolError;
 const normalizeToolText = result_mod.normalizeToolText;
-const finalizeResultLimited = result_mod.finalizeResultLimited;
-const max_output_bytes = result_mod.max_output_bytes;
+const finalizeResult = result_mod.finalizeResult;
 const page_room_bytes = result_mod.page_room_bytes;
 const lessString = util.lessString;
 const fixturePath = util.fixturePath;
@@ -309,7 +308,7 @@ pub fn runSearchTimed(
 
 pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, status: ToolStatus) !ToolResult {
     if (std.mem.eql(u8, output, "(no matches)"))
-        return finalizeResultLimited(allocator, output, status, max_output_bytes);
+        return finalizeResult(allocator, output, status);
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(allocator);
     var it = std.mem.tokenizeScalar(u8, output, '\n');
@@ -321,7 +320,7 @@ pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, 
     while (index < lines.items.len) : (index += 1) {
         try aw.writer.print("{s}\n", .{lines.items[index]});
     }
-    return finalizeResultLimited(allocator, aw.written(), status, max_output_bytes);
+    return finalizeResult(allocator, aw.written(), status);
 }
 
 pub fn runContentSearch(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, args: GrepArgs) !ToolResult {
