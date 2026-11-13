@@ -5,8 +5,10 @@ run, the results are sent back, and this repeats until it answers without asking
 for a tool. Every turn starts with an [announced task](ui.md#task-announcement)
 and, when the work has more than a few steps, a [plan](plan.md).
 
-`AI_MAX_ITERATIONS` (default 200) bounds the loop. Reaching it returns an error
-instead of reporting completion.
+Nothing caps the number of requests in a turn: the loop ends when the model
+answers without asking for a tool. A turn that never gets there goes on until
+something interrupts it: Esc at the terminal, or the stop a sub-agent's caller
+asks for.
 
 Tools run on the host in this process; the ones that start a program (`bash`,
 the searches) carry the deadline, output bound and process-group cleanup
@@ -27,7 +29,7 @@ answer. Answer text is not parsed as a completion protocol. Blocked, failed,
 waiting-for-input and paused turns each read differently on the screen, and
 none of them prints `Task completed`.
 
-Transport errors, truncation and iteration limits still return errors.
+Transport errors and truncation still return errors.
 
 ## Retries and truncation
 

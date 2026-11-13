@@ -93,7 +93,7 @@ try:
     with tempfile.TemporaryDirectory(prefix='zagent-checkin-') as directory:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'TERM': 'dumb', 'AI_URL': f'http://127.0.0.1:{server.server_port}/v1',
-               'AI_MODEL': 'mock', 'AI_KEY': 'test', 'AI_MAX_ITERATIONS': '12'}
+               'AI_MODEL': 'mock', 'AI_KEY': 'test'}
         state = trust_workspace(directory, env)
 
         result = subprocess.run([str(binary), 'Split the tools'], cwd=directory, env=env,

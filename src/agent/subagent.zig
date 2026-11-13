@@ -1,7 +1,7 @@
 //! The handshake between the agent that handed a task over and the agent that
 //! took it.
 //!
-//! A sub-agent is not bounded by an iteration budget or a clock. It is bounded
+//! A sub-agent is not bounded by a count of requests or by a clock. It is bounded
 //! by its caller looking at it: the caller picks how long the child works
 //! before it is asked for a progress report, reads that report, and then either
 //! lets the child carry on or stops it. This file is the state both sides share

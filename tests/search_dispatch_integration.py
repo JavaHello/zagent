@@ -50,7 +50,7 @@ def exercise(root, workspace, executables, names):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     env = {'PATH': str(executables), 'HOME': str(root), 'XDG_CONFIG_HOME': str(root),
            'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_MODEL': 'test-model',
-           'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '20'}
+           'AI_KEY': 'local-test'}
     trust_workspace(workspace, env)
     try:
         result = subprocess.run([str(BINARY), 'Search the workspace'], cwd=workspace, env=env,

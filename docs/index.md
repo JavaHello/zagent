@@ -17,7 +17,7 @@ overview.
 
 | Page | Covers |
 |------|--------|
-| [The agent loop](agent-loop.md) | Tool chaining, how a turn ends, iteration limit, retries |
+| [The agent loop](agent-loop.md) | Tool chaining, how a turn ends, retries |
 | [Tools](tools.md) | The built-in tool set, `bash`, `read`, `write`, `edit`, `ls`, and the result limits |
 | [Searching](searching.md) | `rg`, `grep`, `fd`, `find` and how the programs are selected |
 | [Patching](patching.md) | `apply_patch`, Git unified diffs, permissions and renames |

@@ -145,7 +145,7 @@ Enter 提交，Alt+Enter 或 Ctrl+J 换行，`Ctrl+Z` 挂起，`Ctrl+D` 退出�
 | [Providers](docs/providers.md) | 预设、自动选择、任意 Responses 兼容端点 |
 | [ChatGPT / Codex](docs/codex.md) | 订阅登录、模型、额度、凭据 |
 | [Interface](docs/ui.md) | 全屏会话、命令、历史、补全、菜单、渲染 |
-| [The agent loop](docs/agent-loop.md) | 工具链、完成判断、迭代上限 |
+| [The agent loop](docs/agent-loop.md) | 工具链、完成判断、轮次如何结束 |
 | [Tools](docs/tools.md) | 内置工具集合与结果长度限制 |
 | [Searching](docs/searching.md) | `rg`、`grep`、`fd`、`find` |
 | [Patching](docs/patching.md) | `apply_patch` 与 unified diff |

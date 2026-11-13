@@ -55,10 +55,6 @@ pub const Agent = struct {
     io: std.Io,
     client: openai.Client,
     history: std.ArrayList(Message),
-    /// How many requests one turn may make. Null for a sub-agent, which has no
-    /// budget of its own: its caller watches it instead, and decides whether it
-    /// goes on.
-    max_iterations: ?u32,
     /// The terminal ask_user and the choice menus read from.
     linenoise: *Linenoise,
     form_context: ?*anyopaque = null,
@@ -272,7 +268,6 @@ pub const Agent = struct {
             .io = io,
             .client = client,
             .history = history,
-            .max_iterations = if (interactive) config.max_iterations else null,
             .linenoise = linenoise,
             .search = search,
             .tool_env = env,
@@ -355,7 +350,6 @@ pub const Agent = struct {
             .provider = if (self.config.provider) |selected| selected.name() else "",
             .base_url = self.config.base_url,
             .max_tokens = self.config.max_tokens,
-            .max_iterations = self.config.max_iterations,
         });
     }
 
@@ -761,7 +755,7 @@ pub const Agent = struct {
     /// is a report and not a claim of completion — the caller verifies the work
     /// before marking a step done.
     ///
-    /// It has no iteration budget and no deadline. What bounds it is this call:
+    /// It has no deadline of its own. What bounds it is this call:
     /// after `checkin_seconds` the sub-agent is asked for a progress report
     /// through its `report` tool, the run pauses there, and the report comes
     /// back as the tool result. The caller then lets it carry on with its `id`,
@@ -1082,8 +1076,7 @@ pub const Agent = struct {
         self.terminal_title.update("thinking…", self.current_task);
 
         try self.checkInterrupted();
-        const turn = try self.runToolLoop();
-        if (!turn.completed) return error.IterationLimitReached;
+        try self.runToolLoop();
     }
 
     /// Send the conversation and wait, with the progress line animated for the
@@ -1118,17 +1111,12 @@ pub const Agent = struct {
         try self.emit(std.Io.File.stderr(), RED ++ "  ✗ {s}\n" ++ RESET, .{message});
     }
 
-    const Turn = struct {
-        /// How many tool calls the model made before its final answer.
-        tool_calls: usize,
-        /// False when the iteration budget ran out before an answer.
-        completed: bool,
-    };
-
-    /// Run the tool-call loop until the model answers or the iteration budget
-    /// runs out. The answer is printed and kept in the history.
-    fn runToolLoop(self: *Agent) !Turn {
-        var turn: Turn = .{ .tool_calls = 0, .completed = false };
+    /// Run the tool-call loop until the model answers. Nothing counts the
+    /// requests: a turn ends when the model stops asking for tools, and a turn
+    /// that never gets there is ended by its caller's interrupt. The answer is
+    /// printed and kept in the history.
+    fn runToolLoop(self: *Agent) !void {
+        var made: usize = 0;
         var iteration: usize = 0;
         // Text from replies that the token limit cut short. It is held back
         // until the answer is complete, so the pieces print as the one reply
@@ -1147,9 +1135,9 @@ pub const Agent = struct {
         // reply turned into a tool call, so no transport scaffolding is kept.
         var continuation_start: ?usize = null;
 
-        // A sub-agent's turn ends when its caller stops it, not when a budget
-        // runs out, so the loop has no count of its own there.
-        while (self.max_iterations == null or iteration < self.max_iterations.?) : (iteration += 1) {
+        // The requests are numbered for the record, not capped: what ends this
+        // loop is the model's answer or the caller's interrupt.
+        while (true) : (iteration += 1) {
             // Requests are numbered from one in the record, so "request #2"
             // means the second one of this turn, whichever agent made it.
             self.trace_iteration = iteration + 1;
@@ -1292,7 +1280,7 @@ pub const Agent = struct {
                 // the next round starts the text the caller reads back.
                 if (self.capture) |sink| self.capture_mark = sink.items.len;
                 try self.checkpoint();
-                turn.tool_calls += tool_calls.len;
+                made += tool_calls.len;
                 // Continue: call API again with tool results
             } else {
                 // Final answer
@@ -1345,32 +1333,17 @@ pub const Agent = struct {
                 // this task too. Keep the turn open so the request after the
                 // answer acts on it, rather than handing it to a new task.
                 if (try self.injectSteering()) {
-                    turn.completed = false;
                     stream.reopen();
                     continue;
                 }
-                turn.completed = true;
                 break;
             }
         }
 
-        if (self.max_iterations) |max| {
-            if (iteration == max) {
-                // Keep whatever the cut-off replies had produced, but not the
-                // prompts that asked for it.
-                try self.settleContinuations(&continuation_start, carried.items, null);
-                stream.flushPending() catch {};
-                try self.emit(std.Io.File.stderr(), RED ++ "Error: reached maximum tool call iterations ({d})\n" ++ RESET, .{max});
-                if (self.trace) |trace| trace.note(self.traceCtx(), "error", "the iteration limit was reached; the turn ends without an answer");
-            }
-        }
-
         if (self.trace) |trace| trace.turn(self.traceCtx(), .{
-            .completed = turn.completed,
-            .tool_calls = turn.tool_calls,
+            .tool_calls = made,
             .ms = if (self.query_started) |started| started.untilNow(self.io, .awake).toMilliseconds() else 0,
         });
-        return turn;
     }
 
     /// Put one form of questions to the user and take its answers. A single
@@ -2262,8 +2235,7 @@ test "main model announces the task through a built-in call without planning req
     defer mock.deinit(allocator);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("不要把这段原文直接放到标题上");
-    const turn = try harness.agent.runToolLoop();
-    try std.testing.expect(turn.completed);
+    try harness.agent.runToolLoop();
     try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
     try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
     for (mock.requests.items) |body| {
@@ -2384,8 +2356,7 @@ test "a subagent runs its own turn and reports back" {
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("delegate the counting");
 
-    const turn = try harness.agent.runToolLoop();
-    try std.testing.expect(turn.completed);
+    try harness.agent.runToolLoop();
     // One request per agent: the parent asks, the sub-agent answers, the parent
     // answers with that report in hand.
     try std.testing.expectEqual(@as(usize, 3), mock.requests.items.len);
@@ -2426,8 +2397,7 @@ test "a check-in returns a progress report and the caller stops the run" {
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("split the source tree");
 
-    const turn = try harness.agent.runToolLoop();
-    try std.testing.expect(turn.completed);
+    try harness.agent.runToolLoop();
     try std.testing.expectEqual(@as(usize, 5), mock.requests.items.len);
 
     // The child's first request carries the check-in as a line of its
@@ -2465,8 +2435,7 @@ test "a resume lets the sub-agent carry on, and it is checked again" {
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("split the source tree");
 
-    const turn = try harness.agent.runToolLoop();
-    try std.testing.expect(turn.completed);
+    try harness.agent.runToolLoop();
     try std.testing.expectEqual(@as(usize, 5), mock.requests.items.len);
 
     // The resume names the run, and the child reads the verdict as permission
@@ -2614,8 +2583,7 @@ test "a subagent cannot start another one" {
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("delegate twice");
 
-    const turn = try harness.agent.runToolLoop();
-    try std.testing.expect(turn.completed);
+    try harness.agent.runToolLoop();
     try std.testing.expectEqual(@as(usize, 4), mock.requests.items.len);
     // The refusal reaches the sub-agent as a tool result, so it finishes its own
     // task instead of starting a third agent.
@@ -2641,11 +2609,10 @@ test "a line typed while the task runs joins the next request instead of a new t
     defer mock.deinit(allocator);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
     try harness.agent.appendUserMessage("Do the task");
-    const turn = try harness.agent.runToolLoop();
+    try harness.agent.runToolLoop();
 
     // One task, not two: the reply that follows the tool result is the only
     // answer, and it was asked for with the line the user typed.
-    try std.testing.expect(turn.completed);
     try std.testing.expectEqual(@as(usize, 2), mock.requests.items.len);
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[0], "also update the docs") == null);
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "function_call_output") != null);
@@ -2698,14 +2665,13 @@ test "a truncated reply is continued and kept as one message" {
     defer mock.deinit(allocator);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
 
-    const turn = try blk: {
+    try blk: {
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
         try harness.agent.appendUserMessage("Do the task");
         break :blk harness.agent.runToolLoop();
     };
 
-    try std.testing.expect(turn.completed);
     // The default budget is already on the growth cap, so truncation is
     // answered by a continuation rather than by a larger request.
     try std.testing.expectEqualSlices(u32, &[_]u32{ 8192, 8192 }, mock.budgets.items);
@@ -2728,14 +2694,13 @@ test "a truncated tool call is retried in smaller steps without a dangling promp
     defer mock.deinit(allocator);
     harness.agent.client.transport = .{ .context = &mock, .send = MockTransport.send };
 
-    const turn = try blk: {
+    try blk: {
         var quiet = try Silence.init(std.testing.io);
         defer quiet.deinit(std.testing.io);
         try harness.agent.appendUserMessage("Do the task");
         break :blk harness.agent.runToolLoop();
     };
 
-    try std.testing.expect(turn.completed);
     try std.testing.expectEqualSlices(u32, &[_]u32{ 8192, 8192 }, mock.budgets.items);
     try std.testing.expect(std.mem.indexOf(u8, mock.requests.items[1], "Try again in smaller steps") != null);
     try std.testing.expectEqual(@as(usize, 3), harness.agent.history.items.len);

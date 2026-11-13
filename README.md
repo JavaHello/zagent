@@ -159,7 +159,7 @@ before pointing it at anything unfamiliar.
 | [Providers](docs/providers.md) | Presets, autodetection, any Responses-compatible endpoint |
 | [ChatGPT / Codex](docs/codex.md) | Subscription login, models, quotas, credentials |
 | [Interface](docs/ui.md) | Full-screen session, commands, history, popups, menus, rendering |
-| [The agent loop](docs/agent-loop.md) | Tool chaining, completion, iteration limit |
+| [The agent loop](docs/agent-loop.md) | Tool chaining, completion, how a turn ends |
 | [Tools](docs/tools.md) | The built-in tool set and the result limits |
 | [Searching](docs/searching.md) | `rg`, `grep`, `fd`, `find` |
 | [Patching](docs/patching.md) | `apply_patch` and unified diffs |

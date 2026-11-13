@@ -44,7 +44,6 @@ pub const Run = struct {
     provider: []const u8 = "",
     base_url: []const u8 = "",
     max_tokens: u32 = 0,
-    max_iterations: u32 = 0,
 };
 
 pub const Call = struct {
@@ -79,7 +78,6 @@ pub const Outcome = struct {
 };
 
 pub const Turn = struct {
-    completed: bool,
     tool_calls: usize,
     ms: i64,
 };
@@ -165,7 +163,6 @@ pub const Trace = struct {
             .provider = info.provider,
             .base_url = info.base_url,
             .max_tokens = info.max_tokens,
-            .max_iterations = info.max_iterations,
         });
     }
 
@@ -363,7 +360,6 @@ pub const Trace = struct {
             .at = self.wall(),
             .agent = ctx.agent,
             .iter = ctx.iteration,
-            .completed = summary.completed,
             .tool_calls = summary.tool_calls,
             .ms = summary.ms,
         });

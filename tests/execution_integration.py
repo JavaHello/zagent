@@ -101,7 +101,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     threading.Thread(target=server.serve_forever, daemon=True).start()
     env = {'PATH': '/usr/bin:/bin', 'HOME': str(root), 'XDG_CONFIG_HOME': str(root),
            'AI_URL': f'http://127.0.0.1:{server.server_port}/v1', 'AI_MODEL': 'test-model',
-           'AI_KEY': 'local-test', 'AI_MAX_ITERATIONS': '20',
+           'AI_KEY': 'local-test',
            'DEEPSEEK_API_KEY': 'must-not-reach-tools', 'OPENAI_API_KEY': 'must-not-reach-tools',
            'PRIVATE_SENTINEL': 'must-not-reach-tools'}
     state = trust_workspace(workspace, env)
@@ -109,26 +109,24 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
         result = subprocess.run([str(live_binary), 'Exercise the tools'], cwd=workspace, env=env,
                                 text=True, capture_output=True, timeout=120)
         session_path, = (state / 'sessions').glob('*.json')
+        resumed_started = len(requests)
         resumed = subprocess.run([str(live_binary), '--resume', session_path.stem,
                                   'Continue the saved conversation'], cwd=workspace, env=env,
                                  text=True, capture_output=True, timeout=120)
-        limited_env = dict(env, AI_MAX_ITERATIONS='1')
-        limited = subprocess.run([str(live_binary), 'Reach the iteration limit'], cwd=workspace, env=limited_env,
-                                 text=True, capture_output=True, timeout=120)
     finally:
         server.shutdown()
+    resumed_request = requests[resumed_started]
     assert result.returncode == 0, result.stderr
     assert result.stdout == 'BOUNDARY_TEST_COMPLETE\n', result.stderr
     assert resumed.returncode == 0, resumed.stderr
     assert len(observed) == len(calls) + 1, observed
-    assert len([m for m in requests[-2]['input'] if m.get('role') == 'user']) == 2
-    assert limited.returncode != 0 and 'IterationLimitReached' in limited.stderr
+    assert len([m for m in resumed_request['input'] if m.get('role') == 'user']) == 2
     snapshot = json.loads(session_path.read_text())
     statuses, contents = zip(*(tool_output(output) for output in observed))
     observed[:] = contents
     saved_statuses = [m['tool_status'] for m in snapshot['messages'] if m['role'] == 'tool']
     assert saved_statuses == list(statuses[:len(calls)]), (saved_statuses, statuses)
-    resumed_statuses = [tool_output(m['output'])[0] for m in requests[-2]['input']
+    resumed_statuses = [tool_output(m['output'])[0] for m in resumed_request['input']
                        if m.get('type') == 'function_call_output']
     assert resumed_statuses == saved_statuses, (resumed_statuses, saved_statuses)
     assert statuses[10]['is_error'] and statuses[10]['timed_out'], statuses[10]
@@ -138,7 +136,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     # All model responses retain their exact replay items; no preflight runs.
     assert all(m['response_items'] for m in snapshot['messages']
                if m['role'] == 'assistant')
-    assert any(i.get('type') == 'reasoning' for i in requests[-2]['input'])
+    assert any(i.get('type') == 'reasoning' for i in resumed_request['input'])
     assert snapshot['workspace'] == os.path.realpath(str(workspace))
     assert len(snapshot['messages']) == 2 * len(calls) + 4
     assert 'ENV_INHERITED' in observed[0], observed[0]

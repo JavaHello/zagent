@@ -32,7 +32,6 @@ and `mcp.example.json` shows every member an MCP entry takes.
 | `AI_URL`            | `https://api.openai.com/v1`         | API base URL, without `/responses`              |
 | `AI_MODEL`          | `gpt-4o-mini`                       | Model name, sent unchanged                      |
 | `AI_MAX_TOKENS`     | `8192`                              | Initial output token budget per response        |
-| `AI_MAX_ITERATIONS` | `200`                               | Maximum tool-call loop iterations per turn      |
 | `AI_REASONING_EFFORT` | *(unset)*                         | Codex only: sent as `reasoning.effort`          |
 | `AI_SERVICE_TIER`   | *(unset)*                           | Codex only: sent as `service_tier`              |
 | `AI_MEMORY_FILE`    | Global workspace state: `memory.md` | Override where the notes are stored             |
@@ -63,8 +62,8 @@ produced.
 ## Retries
 
 Transient network errors and HTTP 408/429/500/502/503/504 responses are retried
-up to three attempts. Exhausted tool iterations, and output still cut off after
-bounded continuations, return an error instead of reporting completion.
+up to three attempts. Output still cut off after bounded continuations returns
+an error instead of reporting completion.
 
 ## Session and workspace state
 

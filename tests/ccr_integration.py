@@ -118,7 +118,7 @@ try:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'TMPDIR': str(scratch), 'TERM': 'dumb',
                'AI_URL': f'http://127.0.0.1:{server.server_port}/v1',
-               'AI_MODEL': 'mock', 'AI_KEY': 'test', 'AI_MAX_ITERATIONS': '12'}
+               'AI_MODEL': 'mock', 'AI_KEY': 'test'}
         trust_workspace(directory, env)
         result = subprocess.run([str(BINARY)], cwd=directory, env=env,
                                 input='cache output\n/new\nafter reset\n/quit\n',

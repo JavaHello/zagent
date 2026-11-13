@@ -123,7 +123,6 @@ fn writeRun(w: *std.Io.Writer, run: std.json.Value) !void {
     try fact(w, "workspace", string(run, "workspace"));
     try fact(w, "scratch", string(run, "scratch"));
     if (integer(run, "max_tokens")) |limit| try number(w, "output budget", limit, "");
-    if (integer(run, "max_iterations")) |limit| try number(w, "iteration limit", limit, "");
     try w.writeAll("</dl>\n</section>\n");
 }
 
@@ -319,7 +318,6 @@ fn writeNoteNode(w: *std.Io.Writer, arena: std.mem.Allocator, event: std.json.Va
 }
 
 fn writeTurnNode(w: *std.Io.Writer, arena: std.mem.Allocator, event: std.json.Value) !void {
-    const completed = boolean(event, "completed");
     const meta = try std.fmt.allocPrint(arena, "{s} · {d} tool calls · {d} ms", .{
         string(event, "agent"),
         integer(event, "tool_calls") orelse 0,
@@ -327,9 +325,8 @@ fn writeTurnNode(w: *std.Io.Writer, arena: std.mem.Allocator, event: std.json.Va
     });
     try nodeStart(w, event, .{
         .label = "TURN",
-        .title = if (completed) "Turn finished" else "Turn stopped before an answer",
+        .title = "Turn finished",
         .meta = meta,
-        .open = !completed,
         .detail = false,
     });
     try nodeEnd(w, false);
@@ -660,7 +657,7 @@ test "the report turns events into a flowchart that keeps their payloads" {
         \\{"event":"tool_call","seq":4,"t":31,"agent":"main","iter":1,"name":"bash","call_id":"c1","args":"{\"command\":\"echo hi\"}","args_bytes":20}
         \\{"event":"tool_result","seq":5,"t":40,"agent":"main","iter":1,"name":"bash","call_id":"c1","ms":9,"is_error":false,"exit_code":0,"content":"hi\n","bytes":3}
         \\{"event":"failure","seq":6,"t":41,"agent":"main","message":"ApiError","raw":"{\"error\":\"nope\"}"}
-        \\{"event":"turn","seq":7,"t":42,"agent":"main","completed":true,"tool_calls":1,"ms":42}
+        \\{"event":"turn","seq":7,"t":42,"agent":"main","tool_calls":1,"ms":42}
     ;
     const html = try render(std.testing.allocator, jsonl);
     defer std.testing.allocator.free(html);

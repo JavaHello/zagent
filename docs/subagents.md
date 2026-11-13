@@ -11,7 +11,7 @@ search, repeated trial runs, one independent block of edits.
 
 ## Watching a run
 
-A sub-agent has no iteration budget and no deadline of its own: what bounds it
+A sub-agent has no deadline of its own: what bounds it
 is being watched. The model picks how long it works before a check-in
 (`checkin_seconds`, default 300). At that check-in the run pauses, the child is
 asked for a progress report through its `report` tool, and the report comes back

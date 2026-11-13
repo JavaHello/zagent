@@ -11,7 +11,6 @@ pub const max_output_tokens_ceiling: u32 = 8192;
 /// Initial budget per response. Only an endpoint that accepts more than the
 /// ceiling needs a larger value, which `AI_MAX_TOKENS` still provides.
 const default_max_tokens: u32 = max_output_tokens_ceiling;
-const default_max_iterations: u32 = 200;
 
 const ConfigFile = struct {
     provider: ?[]u8 = null,
@@ -23,7 +22,6 @@ const ConfigFile = struct {
     prompt_cache_key: ?[]u8 = null,
     prompt_cache_retention: ?[]u8 = null,
     max_tokens: ?u32 = null,
-    max_iterations: ?u32 = null,
     debug: ?bool = null,
 
     pub fn deinit(self: *ConfigFile, allocator: std.mem.Allocator) void {
@@ -163,8 +161,6 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         try setString(allocator, &config.prompt_cache_retention, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
         config.max_tokens = std.fmt.parseInt(u32, value, 10) catch default_max_tokens;
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_ITERATIONS")) {
-        config.max_iterations = std.fmt.parseInt(u32, value, 10) catch default_max_iterations;
     } else if (std.ascii.eqlIgnoreCase(key, "AI_DEBUG")) {
         config.debug = flagValue(value);
     }
@@ -387,13 +383,6 @@ fn resolve(
         file_config.max_tokens,
         default_max_tokens,
     );
-    const max_iterations = try resolveU32(
-        allocator,
-        env,
-        &.{"AI_MAX_ITERATIONS"},
-        file_config.max_iterations,
-        default_max_iterations,
-    );
 
     // The environment wins over the file, as it does for every other setting:
     // `AI_DEBUG=0 zagent --debug` is a trace anyway, because the flag is read
@@ -410,7 +399,6 @@ fn resolve(
         .prompt_cache_key = prompt_cache_key,
         .prompt_cache_retention = prompt_cache_retention,
         .max_tokens = max_tokens,
-        .max_iterations = max_iterations,
         .provider = selected_provider,
         .debug = debug,
     };
@@ -427,7 +415,6 @@ pub const Config = struct {
     /// Only "in_memory" and "24h" are accepted; null leaves server defaults.
     prompt_cache_retention: ?[]const u8 = null,
     max_tokens: u32,
-    max_iterations: u32,
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
     codex_auth_path: ?[]const u8 = null,
@@ -606,7 +593,6 @@ test "config defaults" {
     try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
     try std.testing.expectEqualStrings("", config.api_key);
     try std.testing.expectEqual(@as(u32, 8192), config.max_tokens);
-    try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
 }
 
 test "removed presentation, compaction and memory settings are ignored" {
@@ -616,6 +602,7 @@ test "removed presentation, compaction and memory settings are ignored" {
         .{ "AI_COMPACT_KEEP", "1" },
         .{ "AI_MEMORY", "false" },
         .{ "AI_MEMORY_AUTO", "false" },
+        .{ "AI_MAX_ITERATIONS", "5" },
     };
     var env = try testEnv(allocator, pairs);
     defer env.deinit();
@@ -624,11 +611,11 @@ test "removed presentation, compaction and memory settings are ignored" {
     const config = try resolve(allocator, &file_config, &env);
     defer config.deinit();
     try std.testing.expectEqual(@as(u32, 8192), config.max_tokens);
-    try std.testing.expectEqual(@as(u32, 200), config.max_iterations);
     try std.testing.expect(!@hasField(Config, "markdown"));
     try std.testing.expect(!@hasField(Config, "compact_keep"));
     try std.testing.expect(!@hasField(Config, "memory"));
     try std.testing.expect(!@hasField(Config, "memory_auto"));
+    try std.testing.expect(!@hasField(Config, "max_iterations"));
 }
 
 test "debug tracing is a switch the file and the environment can both set" {
@@ -1059,14 +1046,13 @@ test "a config file key disables autodetection" {
     try std.testing.expectEqualStrings("sk-file", config.api_key);
 }
 
-test "max tokens and iterations prefer the environment" {
+test "max tokens prefer the environment" {
     const allocator = std.testing.allocator;
     var env = try testEnv(allocator, &.{.{ "AI_MAX_TOKENS", "1234" }});
     defer env.deinit();
 
     var file_config = try testFile(allocator, &.{
         .{ "AI_MAX_TOKENS", "77" },
-        .{ "AI_MAX_ITERATIONS", "5" },
     });
     defer file_config.deinit(allocator);
 
@@ -1074,7 +1060,6 @@ test "max tokens and iterations prefer the environment" {
     defer config.deinit();
 
     try std.testing.expectEqual(@as(u32, 1234), config.max_tokens);
-    try std.testing.expectEqual(@as(u32, 5), config.max_iterations);
 }
 
 test "the config is read from the path itself or from a config file inside it" {
@@ -1126,11 +1111,9 @@ test "provider neutral settings win independently of obsolete environment aliase
         .{ "AI_URL", "https://example.test/v1///" },
         .{ "AI_MODEL", "current-model" },
         .{ "AI_MAX_TOKENS", "1024" },
-        .{ "AI_MAX_ITERATIONS", "12" },
         .{ "OPENAI_BASE_URL", "https://obsolete.test" },
         .{ "OPENAI_MODEL", "obsolete-model" },
         .{ "OPENAI_MAX_TOKENS", "1" },
-        .{ "OPENAI_MAX_ITERATIONS", "1" },
     });
     defer env.deinit();
     var file_config = ConfigFile{};
@@ -1140,7 +1123,6 @@ test "provider neutral settings win independently of obsolete environment aliase
     try std.testing.expectEqualStrings("https://example.test/v1", config.base_url);
     try std.testing.expectEqualStrings("current-model", config.model);
     try std.testing.expectEqual(@as(u32, 1024), config.max_tokens);
-    try std.testing.expectEqual(@as(u32, 12), config.max_iterations);
 }
 
 test "obsolete config names do not populate current settings" {
@@ -1151,7 +1133,6 @@ test "obsolete config names do not populate current settings" {
         .{ "OPENAI_BASE_URL", "https://obsolete.test" },
         .{ "OPENAI_MODEL", "old-model" },
         .{ "OPENAI_MAX_TOKENS", "1" },
-        .{ "OPENAI_MAX_ITERATIONS", "1" },
     });
     defer file_config.deinit(allocator);
     try std.testing.expect(file_config.provider == null);
@@ -1159,7 +1140,6 @@ test "obsolete config names do not populate current settings" {
     try std.testing.expect(file_config.base_url == null);
     try std.testing.expect(file_config.model == null);
     try std.testing.expect(file_config.max_tokens == null);
-    try std.testing.expect(file_config.max_iterations == null);
 }
 
 test "obsolete environment settings cannot override config values" {
@@ -1168,14 +1148,12 @@ test "obsolete environment settings cannot override config values" {
         .{ "OPENAI_BASE_URL", "https://obsolete.test" },
         .{ "OPENAI_MODEL", "old-model" },
         .{ "OPENAI_MAX_TOKENS", "1" },
-        .{ "OPENAI_MAX_ITERATIONS", "1" },
     });
     defer env.deinit();
     var file_config = try testFile(allocator, &.{
         .{ "AI_URL", "https://current.test/v1" },
         .{ "AI_MODEL", "current-model" },
         .{ "AI_MAX_TOKENS", "2048" },
-        .{ "AI_MAX_ITERATIONS", "10" },
     });
     defer file_config.deinit(allocator);
     const config = try resolve(allocator, &file_config, &env);
@@ -1183,5 +1161,4 @@ test "obsolete environment settings cannot override config values" {
     try std.testing.expectEqualStrings("https://current.test/v1", config.base_url);
     try std.testing.expectEqualStrings("current-model", config.model);
     try std.testing.expectEqual(@as(u32, 2048), config.max_tokens);
-    try std.testing.expectEqual(@as(u32, 10), config.max_iterations);
 }

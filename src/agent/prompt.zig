@@ -13,7 +13,7 @@ const sgr = @import("../ui/style.zig");
 /// How many times one reply may be continued after the output limit cut it
 /// short. Each continuation buys another full budget of text, so a handful is
 /// enough for any answer a person will read; the cap stops a model that never
-/// reaches a stopping point from spending the iteration budget on one turn.
+/// reaches a stopping point from continuing the same turn forever.
 pub const max_continuations: usize = 8;
 
 /// How often a reply that produced no text at all is re-asked with a request to
@@ -65,7 +65,7 @@ pub const max_subagent_title_chars: usize = 79;
 
 /// How long a sub-agent works before its caller is asked to look at it. The
 /// caller chooses this when it hands the task over — that choice is what bounds
-/// a sub-agent, which has no iteration or time limit of its own. Zero asks for
+/// a sub-agent, which has no time limit of its own. Zero asks for
 /// the report at the next request boundary, which is as soon as there is one.
 pub const default_subagent_checkin_seconds: u32 = 300;
 pub const max_subagent_checkin_seconds: u32 = 3_600;
