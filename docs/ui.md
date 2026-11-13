@@ -24,7 +24,8 @@ the shell's own scrollback comes back untouched when zagent exits.
 
 ❯ list all .zig files in the current directory
   ⚙ bash {"command":"find . -name '*.zig' -type f"}
-  ✓ ./src/agent/mod.zig
+  ✓ exit 0
+    ./src/agent/mod.zig
     ./src/model/config.zig
     ./src/tools/bash.zig
     ...
@@ -40,12 +41,16 @@ the shell's own scrollback comes back untouched when zagent exits.
 ```
 
 Everything the conversation shows starts two columns in. The call's `⚙` sits at
-that margin, the result under it follows the `✓` and its continuation lines line
-up under the result's own text, and the answer's header and body take the same
-margin — so a paragraph, a list, a fence and a table all hang off the same left
-edge. The prompt's `❯` is the one thing at column zero: it is the left anchor
-the rest is read against. A command's listing (`/help`, `/memory`, `/plan`,
-`/mcp`) is written at the margin too.
+that margin, and the line under it is the status — `✓` or `✗`, then how the
+call ended when the result says so: `✓ exit 0`, `✗ exit 42`, `✗ timed out`,
+`✗ SIGTERM`. So every result is read the same way whatever the tool printed:
+what a call did is known before any of its text is, and nothing the tool said
+shares that line. The result itself begins on the line after the status, laid
+out where that line's text starts, and the answer's header and body take the
+same margin — so a paragraph, a list, a fence and a table all hang off the same
+left edge. The prompt's `❯` is the one thing at column zero: it is the left
+anchor the rest is read against. A command's listing (`/help`, `/memory`,
+`/plan`, `/mcp`) is written at the margin too.
 
 The margin is applied as the text is produced, not as it is drawn, so it is a
 terminal's layout only: what a pipe or a file receives is untouched.

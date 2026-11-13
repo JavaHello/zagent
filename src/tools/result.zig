@@ -14,10 +14,19 @@ const std = @import("std");
 pub const ccr_id_len: usize = 12;
 pub const CcrId = [ccr_id_len]u8;
 
+/// How a call ended, in the fields a reader needs to tell two of them apart.
+/// The content of a result is the tool's own text and nothing else, so the
+/// ending travels here: beside the text for the model, in a header above it,
+/// and under the call for the terminal.
 pub const ToolStatus = struct {
     is_error: bool,
+    /// The status the program chose, when it exited rather than being killed.
     exit_code: ?u8 = null,
     timed_out: bool = false,
+    /// The signal that ended the program when it did not exit — `SIGTERM` — so
+    /// a command killed from outside is not left reading as a plain failure.
+    /// Null whenever there is an `exit_code`, which says the same thing better.
+    termination: ?[]const u8 = null,
 };
 
 /// Status stays visible even when CCR caches the body. A result that was
@@ -33,6 +42,11 @@ pub const ToolResult = struct {
     is_error: bool,
     exit_code: ?u8 = null,
     timed_out: bool = false,
+    /// The signal that ended the program, for a tool that ran one: a name from
+    /// the table in `util/signals.zig`, never owned and never freed with the
+    /// result — see `ToolStatus.termination`. Null for a tool that ran nothing
+    /// and for a program that chose its own exit status.
+    termination: ?[]const u8 = null,
     /// The entry this content is a preview of, when it is one: `bash` names the
     /// entry it kept a long output in, and `ccr` names the one it just wrote.
     /// A result that already carries an id is never cached again — keeping a
@@ -42,7 +56,12 @@ pub const ToolResult = struct {
     ccr_id: ?CcrId = null,
 
     pub fn status(self: ToolResult) ToolStatus {
-        return .{ .is_error = self.is_error, .exit_code = self.exit_code, .timed_out = self.timed_out };
+        return .{
+            .is_error = self.is_error,
+            .exit_code = self.exit_code,
+            .timed_out = self.timed_out,
+            .termination = self.termination,
+        };
     }
 
     pub fn deinit(self: ToolResult, allocator: std.mem.Allocator) void {
@@ -58,6 +77,7 @@ pub fn ownedResult(content: []u8, status: ToolStatus) ToolResult {
         .is_error = status.is_error,
         .exit_code = status.exit_code,
         .timed_out = status.timed_out,
+        .termination = status.termination,
     };
 }
 
@@ -93,4 +113,25 @@ test "the status header names every field and keeps markers out of it" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"exit_code\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"timed_out\":true") != null);
     try std.testing.expect(std.mem.endsWith(u8, encoded, "\nbody"));
+}
+
+test "a killed program says so in the status, not in its output" {
+    const a = std.testing.allocator;
+    // The content is the program's own text — what it printed, or that it
+    // printed nothing — and the signal that ended it travels beside it, where
+    // every reader of the status can find it.
+    const result = ownedResult(try a.dupe(u8, "(no output)"), .{
+        .is_error = true,
+        .termination = "SIGTERM",
+    });
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("(no output)", result.content);
+    try std.testing.expectEqualDeep(ToolStatus{
+        .is_error = true,
+        .termination = "SIGTERM",
+    }, result.status());
+    const encoded = try formatToolOutput(a, result.status(), result.content);
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"termination\":\"SIGTERM\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"exit_code\":null") != null);
 }

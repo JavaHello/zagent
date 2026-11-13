@@ -73,6 +73,9 @@ pub const Outcome = struct {
     is_error: bool = false,
     exit_code: ?u8 = null,
     timed_out: bool = false,
+    /// The signal that ended the program a tool ran, when it did not exit of
+    /// its own accord; see `ToolStatus.termination`.
+    termination: ?[]const u8 = null,
     /// The `ccr` entry this result is a preview of, when it is one: the report
     /// names it, because that is where the rest of the output went.
     ccr_id: ?[]const u8 = null,
@@ -329,6 +332,7 @@ pub const Trace = struct {
             .is_error = outcome.is_error,
             .exit_code = outcome.exit_code,
             .timed_out = outcome.timed_out,
+            .termination = outcome.termination,
             .ccr_id = outcome.ccr_id,
             .content = slice.text,
             .bytes = slice.bytes,

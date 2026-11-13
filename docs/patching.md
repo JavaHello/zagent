@@ -15,7 +15,8 @@ terminal's own red and green:
   -beta
   +hello
    gamma
-  ✓ Applied 1 file: greet.txt (+1 -1)
+  ✓
+    Applied 1 file: greet.txt (+1 -1)
 ```
 
 | Argument | Required | Description                                        |

@@ -68,8 +68,11 @@ try:
             header, content = output.split('\n', 1)
             assert header.startswith('[tool_status ') and header.endswith(']'), output
             assert json.loads(header[len('[tool_status '):-1]) == {
-                'is_error': True, 'exit_code': 42, 'timed_out': False}, output
-            assert content == 'Exit code: 42\n(no output)', content
+                'is_error': True, 'exit_code': 42, 'timed_out': False,
+                'termination': None}, output
+            # How the command ended is in the header; its text is what the
+            # command printed.
+            assert content == '(no output)', content
 
         first = session_id(run('first-session-marker'))
         path = state / 'sessions' / f'{first}.json'
@@ -77,12 +80,12 @@ try:
         saved = json.loads(old)
         saved_tool = next(m for m in saved['messages'] if m['role'] == 'tool')
         assert saved_tool['tool_status'] == {
-            'is_error': True, 'exit_code': 42, 'timed_out': False}, saved_tool
+            'is_error': True, 'exit_code': 42, 'timed_out': False,
+            'termination': None}, saved_tool
         assert_failed_tool_status(requests[-1])
         assert any(message.get('role') == 'tool'
-                   and message.get('content') == 'Exit code: 42\n(no output)'
+                   and message.get('content') == '(no output)'
                    for message in saved['messages']), saved
-        assert 'Exit code: 42' in json.dumps(requests[-1]), requests[-1]
         second = session_id(run(stdin='/new\n/session\n/quit\n'))
         assert second != first
         assert path.read_bytes() == old
@@ -97,7 +100,10 @@ try:
         assert 'Restored session history' in restored, restored
         assert '❯ first-session-marker' in restored, restored
         assert '⚙ bash' in restored and 'execution-count' in restored, restored
-        assert '✗ Exit code: 42' in restored, restored
+        # The status is a line of its own and names the exit code, so the
+        # result starts under it and the number is not read twice.
+        assert '✗ exit 42\n    (no output)' in restored, restored
+        assert 'Exit code: 42' not in restored, restored
         assert 'Saved answer' in restored, restored
         assert len(requests) == before_requests
         assert path.read_bytes() == old
@@ -119,10 +125,14 @@ try:
                 if select.select([master], [], [], .1)[0]:
                     transcript.extend(os.read(master, 65536))
             visible = ansi.sub(b'', transcript)
-            assert b'first-session-marker' in visible, visible
-            assert b'execution-count' in visible, visible
-            assert '✗ Exit code: 42'.encode() in visible, visible
-            assert b'Saved answer' in visible, visible
+            # The pty turns every newline into CRLF; the layout is read without
+            # the carriage returns so the lines can be compared as written.
+            laid_out = visible.replace(b'\r', b'')
+            assert b'first-session-marker' in laid_out, visible
+            assert b'execution-count' in laid_out, visible
+            # The status is a line of its own and names the exit code.
+            assert '✗ exit 42\n    (no output)'.encode() in laid_out, visible
+            assert b'Saved answer' in laid_out, visible
             # History is painted before the editor enters raw mode; wait for
             # its final prompt cursor before sending EOF.
             while b'\x1b[50;3H\x1b[?25h' not in transcript:
@@ -151,7 +161,6 @@ try:
         assert session_id(resumed) == first
         assert 'first-session-marker' in json.dumps(requests[-1]), requests[-1]
         assert 'Saved answer' in json.dumps(requests[-1]), requests[-1]
-        assert 'Exit code: 42' in json.dumps(requests[-1]), requests[-1]
         assert_failed_tool_status(requests[-1])
         assert len(list(path.parent.glob('*.json'))) == 3
         run('--resume', first, stdin='/clear\n/quit\n')

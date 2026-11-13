@@ -54,6 +54,30 @@ const buildSystemPrompt = agent_prompt.buildSystemPrompt;
 const buildSubagentPrompt = agent_prompt.buildSubagentPrompt;
 const subagent_omitted = agent_prompt.subagent_omitted;
 
+/// The lines a terminal sees of one tool result: the status on the first line
+/// under the call — `✓`, `✗`, and how the call ended where the result says
+/// so — then the result on the line after it, at the column where that status
+/// line's own text would have started. A result that printed nothing is its
+/// status line, not a status and a blank line beneath it.
+fn writeResultPreview(w: *std.Io.Writer, body: []const u8, status: tools.ToolStatus) std.Io.Writer.Error!void {
+    try w.writeAll(if (status.is_error) RED ++ layout.indent ++ "✗" else DIM ++ layout.indent ++ "✓");
+    // The way the call ended belongs on the status line, next to the glyph that
+    // already says whether it succeeded: a timeout, a killed program and a
+    // failed one all read as `✗`, and how it ended is the part nobody can guess.
+    if (status.timed_out) {
+        try w.writeAll(" timed out");
+    } else if (status.exit_code) |code| {
+        try w.print(" exit {d}", .{code});
+    } else if (status.termination) |termination| {
+        try w.print(" {s}", .{termination});
+    }
+    if (body.len > 0) {
+        try w.writeByte('\n');
+        try layout.writeBlock(w, body, layout.after_glyph, layout.after_glyph);
+    }
+    try w.writeAll("\n" ++ RESET);
+}
+
 pub const Agent = struct {
     interrupted: std.atomic.Value(bool) = .init(false),
     allocator: std.mem.Allocator,
@@ -478,8 +502,7 @@ pub const Agent = struct {
                 }
             } else if (std.mem.eql(u8, message.role, "tool")) {
                 if (message.content) |content| {
-                    const is_error = if (message.tool_status) |status| status.is_error else false;
-                    try self.previewToolResult(content, is_error);
+                    try self.previewToolResult(content, message.tool_status orelse .{ .is_error = false });
                 }
             }
         }
@@ -1311,6 +1334,7 @@ pub const Agent = struct {
                         .is_error = result.is_error,
                         .exit_code = result.exit_code,
                         .timed_out = result.timed_out,
+                        .termination = result.termination,
                         .ccr_id = if (result.ccr_id) |*id| id else null,
                         .ms = tool_started.untilNow(self.io, .awake).toMilliseconds(),
                     });
@@ -1724,7 +1748,7 @@ pub const Agent = struct {
         // only previews the result the tool returned, guarded as it prints.
         const result = try tools.execute(ctx, call.name, call.arguments);
         errdefer result.deinit(self.allocator);
-        try self.previewToolResult(result.content, result.is_error);
+        try self.previewToolResult(result.content, result.status());
         return result;
     }
 
@@ -1752,16 +1776,20 @@ pub const Agent = struct {
 
     /// Use the same result preview for live execution and restored messages.
     ///
-    /// The result follows the marker on the call's own line, and every line
-    /// after the first is moved under that text: a preview that began at the
-    /// margin and continued at column zero would read as a different block from
-    /// the one it belongs to.
-    fn previewToolResult(self: *Agent, content: []const u8, is_error: bool) !void {
+    /// The status is the whole of the first line under the call — `✓` or `✗`
+    /// and, when the result has one, the exit code, the signal or the timeout —
+    /// and the result begins on the line after it. So the first line of every
+    /// result reads the same way whatever the tool printed: a one-line `read`
+    /// and a failed `bash` are told apart at the glyph, at the margin, before
+    /// any of their text is read. The text under it is the tool's own, whole
+    /// and unchanged: a tool reports how it ended beside its text, not inside
+    /// it, so there is nothing here to leave out.
+    fn previewToolResult(self: *Agent, content: []const u8, status: tools.ToolStatus) !void {
         if (self.capture != null) return;
         // An error is shown whole, because its message is the point of it — but
         // a result cut at the size limit is large even as an error, so even
         // that one keeps to a readable share of the terminal.
-        const preview_len = if (is_error)
+        const preview_len = if (status.is_error)
             @min(content.len, error_preview_max)
         else
             @min(content.len, 200);
@@ -1771,13 +1799,7 @@ pub const Agent = struct {
         if (content.len > preview_len) try body.writer.writeAll("...");
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        try layout.writeBlock(
-            &aw.writer,
-            body.written(),
-            if (is_error) RED ++ layout.indent ++ "✗ " else DIM ++ layout.indent ++ "✓ ",
-            layout.after_glyph,
-        );
-        try aw.writer.writeAll("\n" ++ RESET);
+        try writeResultPreview(&aw.writer, body.written(), status);
         try self.emit(std.Io.File.stderr(), "{s}", .{aw.written()});
     }
 
@@ -2969,4 +2991,46 @@ test "a reply that never stops truncating is given up on and still kept" {
     for (0..max_continuations + 1) |index| {
         try std.testing.expectEqualStrings("Half an ", answer[index * "Half an ".len ..][0.."Half an ".len]);
     }
+}
+
+test "a result's status is a line of its own, with the result under it" {
+    const a = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    // The status line carries how the call ended, and nothing the tool printed
+    // shares it; the lines after it start where that line's own text would
+    // have — under the glyph, not at the margin the glyph sits on.
+    try writeResultPreview(&aw.writer, "one\ntwo", .{ .is_error = false, .exit_code = 0 });
+    try std.testing.expectEqualStrings(
+        DIM ++ "  ✓ exit 0\n    one\n    two\n" ++ RESET,
+        aw.written(),
+    );
+    aw.clearRetainingCapacity();
+    try writeResultPreview(&aw.writer, "Error: no such file", .{ .is_error = true });
+    try std.testing.expectEqualStrings(RED ++ "  ✗\n    Error: no such file\n" ++ RESET, aw.written());
+    aw.clearRetainingCapacity();
+    try writeResultPreview(&aw.writer, "Tool timed out after 5s.", .{
+        .is_error = true,
+        .timed_out = true,
+    });
+    try std.testing.expectEqualStrings(
+        RED ++ "  ✗ timed out\n    Tool timed out after 5s.\n" ++ RESET,
+        aw.written(),
+    );
+    // A result that printed nothing is the status line alone.
+    aw.clearRetainingCapacity();
+    try writeResultPreview(&aw.writer, "", .{ .is_error = false, .exit_code = 0 });
+    try std.testing.expectEqualStrings(DIM ++ "  ✓ exit 0\n" ++ RESET, aw.written());
+    // A program killed from outside says which signal did it: the status line
+    // is the only place the ending is written, so it has to be able to say
+    // everything the shell would have.
+    aw.clearRetainingCapacity();
+    try writeResultPreview(&aw.writer, "(no output)", .{
+        .is_error = true,
+        .termination = "SIGTERM",
+    });
+    try std.testing.expectEqualStrings(
+        RED ++ "  ✗ SIGTERM\n    (no output)\n" ++ RESET,
+        aw.written(),
+    );
 }

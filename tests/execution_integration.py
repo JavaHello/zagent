@@ -18,7 +18,7 @@ def tool_output(output):
     header, separator, content = output.partition('\n')
     assert separator and header.startswith('[tool_status ') and header.endswith(']'), output
     status = json.loads(header[len('[tool_status '):-1])
-    assert set(status) == {'is_error', 'exit_code', 'timed_out'}, status
+    assert set(status) == {'is_error', 'exit_code', 'timed_out', 'termination'}, status
     return status, content
 
 
@@ -131,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert resumed_statuses == saved_statuses, (resumed_statuses, saved_statuses)
     assert statuses[10]['is_error'] and statuses[10]['timed_out'], statuses[10]
     assert statuses[9] == {'is_error': False, 'exit_code': 0,
-                           'timed_out': False}, statuses[9]
+                           'timed_out': False, 'termination': None}, statuses[9]
     assert statuses[12]['is_error'], statuses[12]
     # All model responses retain their exact replay items; no preflight runs.
     assert all(m['response_items'] for m in snapshot['messages']
@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert 'Replaced one exact text block' in observed[11], observed[11]
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
-    assert observed[9] == 'Exit code: 0\n(no output)', observed[9]
+    assert observed[9] == '(no output)', observed[9]
     # Host tools and local MCP startup need no isolation configuration.
     calls[:] = [
         ('bash', {'command': 'items=(hello world); [[ ${#items[@]} == 2 ]] && printf "%s" "${items[1]}"'}),
@@ -179,7 +179,7 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     observed[:] = host_contents
     assert all(s['exit_code'] == 0 and not s['is_error'] for s in host_statuses[:2]), host_statuses
     assert not host_statuses[2]['is_error'] and host_statuses[2]['exit_code'] == 0, host_statuses[2]
-    assert observed[:2] == ['Exit code: 0\nworld', 'Exit code: 0\nBASH_ONLY\n'], observed
+    assert observed[:2] == ['world', 'BASH_ONLY\n'], observed
     assert 'HOST_EXECUTION' in observed[2], observed
     assert (workspace / 'MCP_STARTED').read_text() == env['PRIVATE_SENTINEL']
     tool_names = [t['name'] for t in requests[0]['tools']]

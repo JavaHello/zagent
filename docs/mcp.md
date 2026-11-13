@@ -56,9 +56,11 @@ starting it.
 
 ❯ what is in /tmp?
   ⚙ load_mcp_tools {"server":"filesystem"}
-  ✓ Loaded 11 tools from MCP server 'filesystem'.
+  ✓
+    Loaded 11 tools from MCP server 'filesystem'.
   ⚙ mcp__filesystem__list_directory {"path":"/tmp"}
-  ✓ [FILE] notes.md
+  ✓
+    [FILE] notes.md
     [DIR] projects
 ```
 

@@ -2,6 +2,7 @@
 const std = @import("std");
 const openai = @import("../model/openai.zig");
 const plan_mod = @import("plan.zig");
+const signals = @import("../util/signals.zig");
 const Message = openai.Message;
 // Persisted fields are required: old snapshot shapes are not migrated.
 const StoredMessage = struct {
@@ -169,7 +170,17 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Loaded 
     for (parsed.value.messages) |source| {
         var message: Message = .{ .role = undefined, .content = null, .reasoning_content = null, .tool_calls = null, .tool_call_id = null };
         errdefer message.deinit(allocator);
-        message.tool_status = source.tool_status;
+        // A status holds no memory: the signal a call ended with is a name from
+        // the table in `util/signals.zig`, so the one written down is looked up
+        // there rather than copied out of the parsed snapshot.
+        if (source.tool_status) |status| {
+            message.tool_status = .{
+                .is_error = status.is_error,
+                .exit_code = status.exit_code,
+                .timed_out = status.timed_out,
+                .termination = if (status.termination) |written| signals.canonical(written) else null,
+            };
+        }
         message.role = if (std.mem.eql(u8, source.role, "user")) "user" else if (std.mem.eql(u8, source.role, "assistant")) "assistant" else if (std.mem.eql(u8, source.role, "tool")) "tool" else return error.InvalidSessionRole;
         if (pending) |calls| {
             if (!std.mem.eql(u8, message.role, "tool") or source.tool_call_id == null or !std.mem.eql(u8, calls[next_tool].id, source.tool_call_id.?)) return error.InvalidSessionToolSequence;
@@ -249,20 +260,27 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
         .{ .title = "read the code", .status = .completed },
         .{ .title = "write the module", .status = .in_progress, .note = "half way" },
     });
-    var calls = [_]openai.ToolCallData{.{ .id = "1", .name = "shell", .arguments = "{}" }};
+    var calls = [_]openai.ToolCallData{
+        .{ .id = "1", .name = "shell", .arguments = "{}" },
+        .{ .id = "2", .name = "bash", .arguments = "{}" },
+    };
     var messages = [_]Message{
         .{ .role = "assistant", .content = null, .reasoning_content = "plan", .tool_calls = &calls, .tool_call_id = null, .response_items = "[{\"type\":\"reasoning\",\"id\":\"rs1\",\"summary\":[],\"encrypted_content\":\"opaque-token\"},{\"type\":\"function_call\",\"call_id\":\"1\",\"name\":\"shell\",\"arguments\":\"{}\"}]" },
         .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true } },
+        .{ .role = "tool", .content = "(no output)", .reasoning_content = null, .tool_calls = null, .tool_call_id = "2", .tool_status = .{ .is_error = true, .termination = "SIGTERM" } },
     };
     try save(io, allocator, path, &messages, &plan);
     var loaded = try load(io, allocator, path);
     defer loaded.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), loaded.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), loaded.messages.items.len);
     try std.testing.expectEqualStrings("plan", loaded.messages.items[0].reasoning_content.?);
     try std.testing.expectEqualStrings(messages[0].response_items.?, loaded.messages.items[0].response_items.?);
     try std.testing.expectEqualStrings("shell", loaded.messages.items[0].tool_calls.?[0].name);
     try std.testing.expectEqualStrings("done", loaded.messages.items[1].content.?);
     try std.testing.expectEqualDeep(messages[1].tool_status, loaded.messages.items[1].tool_status);
+    // The signal that ended a call is part of the status, so a restored
+    // conversation still shows how it ended.
+    try std.testing.expectEqualDeep(messages[2].tool_status, loaded.messages.items[2].tool_status);
     try std.testing.expectEqual(@as(usize, 2), loaded.plan.steps.items.len);
     try std.testing.expectEqual(plan_mod.Status.in_progress, loaded.plan.steps.items[1].status);
     try std.testing.expectEqualStrings("half way", loaded.plan.steps.items[1].note.?);

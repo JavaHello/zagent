@@ -6,7 +6,8 @@ status line, the response headers, and the body:
 ```
 ❯ fetch https://httpbin.org/json and tell me the content type
   ⚙ http {"url":"https://httpbin.org/json"}
-  ✓ HTTP/1.1 200 OK
+  ✓
+    HTTP/1.1 200 OK
     Date: Mon, 28 Sep 2026 06:21:24 GMT
     Content-Type: application/json
     Content-Length: 429

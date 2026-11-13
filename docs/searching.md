@@ -6,7 +6,8 @@ Four independent tools cover searching: `rg` and `grep` search file contents,
 ```
 ❯ where is progressLabel defined?
   ⚙ rg {"pattern":"fn progressLabel"}
-  ✓ ./src/tools/progress.zig:11:pub fn progressLabel(name: []const u8) ?[]const u8 {
+  ✓
+    ./src/tools/progress.zig:11:pub fn progressLabel(name: []const u8) ?[]const u8 {
     ./src/tools/progress.zig:38:        const label = progressLabel(name) orelse return error.TestUnexpectedResult;
 ```
 

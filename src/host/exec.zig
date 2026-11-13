@@ -8,6 +8,7 @@
 //! it passes the program's whole process group is killed — background children
 //! included, which is what a plain `kill` of the program would leave behind.
 const std = @import("std");
+const signals = @import("../util/signals.zig");
 
 /// Which of a program's two output streams a chunk came from.
 pub const Stream = enum(u1) { stdout, stderr };
@@ -26,7 +27,32 @@ pub const Run = struct {
             else => null,
         };
     }
+
+    /// The signal that ended the program, named as a shell names it, when it
+    /// did not exit of its own accord. Null for a program that exited: its
+    /// status is what ended it, and `exitCode` says so.
+    pub fn termination(self: Run) ?[]const u8 {
+        return switch (self.term) {
+            .exited => null,
+            .signal => |signal| signals.name(signal),
+            .stopped => |signal| signals.name(signal),
+            .unknown => signals.fallback,
+        };
+    }
 };
+
+test "a run that is killed names the signal that killed it" {
+    // A program that exited chose its own status: there is no signal to name,
+    // and the status is what says how it ended.
+    const exited: Run = .{ .term = .{ .exited = 3 } };
+    try std.testing.expect(exited.termination() == null);
+    try std.testing.expectEqual(@as(?u8, 3), exited.exitCode());
+    // A program killed from outside is named the way the shell that ran it
+    // would have named it.
+    const killed: Run = .{ .term = .{ .signal = .TERM } };
+    try std.testing.expectEqualStrings("SIGTERM", killed.termination().?);
+    try std.testing.expect(killed.exitCode() == null);
+}
 
 pub const Options = struct {
     argv: []const []const u8,

@@ -8,6 +8,7 @@ const normalize = @import("../util/terminal/normalize.zig");
 const host_exec = @import("../host/exec.zig");
 
 const ToolResult = result_mod.ToolResult;
+const ToolStatus = result_mod.ToolStatus;
 const ownedResult = result_mod.ownedResult;
 
 /// How many lines of a long output the preview keeps. Enough for the end of a
@@ -313,16 +314,18 @@ pub fn executeShellTimed(
     const saved = try collector.finish(io);
     const exit_code = shell.exitCode();
     const failed = exit_code == null or exit_code.? != 0;
+    // How the command ended belongs to the result's status, not to its text:
+    // the model reads it in the header above the output and the terminal on
+    // the line under the call, so nothing the command printed is displaced and
+    // nothing is said twice.
+    const ending: ToolStatus = .{
+        .is_error = failed,
+        .exit_code = exit_code,
+        .termination = shell.termination(),
+    };
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    // Content is sent to the model and persisted in session history. Keep
-    // status first so a preview of long command output cannot hide it.
-    if (exit_code) |code| {
-        try aw.writer.print("Exit code: {d}\n", .{code});
-    } else {
-        try aw.writer.print("Exit code: unavailable (termination: {any})\n", .{shell.term});
-    }
 
     if (!collector.overflowed) {
         if (collector.bytes == 0) {
@@ -330,10 +333,7 @@ pub fn executeShellTimed(
         } else {
             try aw.writer.writeAll(collector.head.items);
         }
-        return ownedResult(try aw.toOwnedSlice(), .{
-            .is_error = failed,
-            .exit_code = exit_code,
-        });
+        return ownedResult(try aw.toOwnedSlice(), ending);
     }
 
     // Too long for one result. The tail is what the model needs first — the end
@@ -353,10 +353,7 @@ pub fn executeShellTimed(
             "[This command printed more than {d} MiB; the rest is not cached and was not kept.]",
             .{cache_max_bytes / (1024 * 1024)},
         );
-        var result = ownedResult(try aw.toOwnedSlice(), .{
-            .is_error = failed,
-            .exit_code = exit_code,
-        });
+        var result = ownedResult(try aw.toOwnedSlice(), ending);
         // The preview names the entry, and the entry is what the model reads
         // back: `ccr` leaves a result that already names one alone.
         result.ccr_id = entry.id;
@@ -370,10 +367,7 @@ pub fn executeShellTimed(
             "[Output cut here: {d} lines, {d} bytes of output, and this run could not cache the rest ({s}). Redirect long output to a file and read it in pages.]",
             .{ countedLines(collector.bytes, collector.newlines, collector.last_byte), collector.bytes, @errorName(err) },
         );
-        return ownedResult(try aw.toOwnedSlice(), .{
-            .is_error = failed,
-            .exit_code = exit_code,
-        });
+        return ownedResult(try aw.toOwnedSlice(), ending);
     }
 
     // No cache was offered: the rest of this output is not reachable, so the
@@ -385,6 +379,7 @@ pub fn executeShellTimed(
     return ownedResult(try aw.toOwnedSlice(), .{
         .is_error = true,
         .exit_code = exit_code,
+        .termination = ending.termination,
     });
 }
 
@@ -463,20 +458,34 @@ test "cache threshold is strictly greater than eight KiB and large outputs survi
 }
 
 test "shell status survives empty output, stderr, signals and truncation" {
-    const cases = [_]struct { command: []const u8, prefix: []const u8, is_error: bool }{
-        .{ .command = "exit 0", .prefix = "Exit code: 0\n(no output)", .is_error = false },
-        .{ .command = "exit 42", .prefix = "Exit code: 42\n(no output)", .is_error = true },
-        .{ .command = "printf out; printf err >&2; exit 7", .prefix = "Exit code: 7\nout\nstderr:\nerr", .is_error = true },
-        .{ .command = "printf warning >&2", .prefix = "Exit code: 0\nstderr:\nwarning", .is_error = false },
-        .{ .command = "kill -TERM $$", .prefix = "Exit code: unavailable (termination: ", .is_error = true },
-        .{ .command = "printf '%50000s' ''; exit 9", .prefix = "Exit code: 9\n", .is_error = true },
+    // The content is what the command printed and nothing else; how it ended
+    // travels in the status beside it.
+    const cases = [_]struct {
+        command: []const u8,
+        content: ?[]const u8,
+        exit_code: ?u8,
+        termination: ?[]const u8,
+        is_error: bool,
+    }{
+        .{ .command = "exit 0", .content = "(no output)", .exit_code = 0, .termination = null, .is_error = false },
+        .{ .command = "exit 42", .content = "(no output)", .exit_code = 42, .termination = null, .is_error = true },
+        .{ .command = "printf out; printf err >&2; exit 7", .content = "out\nstderr:\nerr", .exit_code = 7, .termination = null, .is_error = true },
+        .{ .command = "printf warning >&2", .content = "stderr:\nwarning", .exit_code = 0, .termination = null, .is_error = false },
+        .{ .command = "kill -TERM $$", .content = "(no output)", .exit_code = null, .termination = "SIGTERM", .is_error = true },
+        .{ .command = "printf '%50000s' ''; exit 9", .content = null, .exit_code = 9, .termination = null, .is_error = true },
     };
     for (cases) |case| {
         const result = try executeShell(std.testing.io, std.testing.allocator, case.command);
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.is_error, result.is_error);
-        try std.testing.expect(std.mem.startsWith(u8, result.content, case.prefix));
+        try std.testing.expectEqual(case.exit_code, result.exit_code);
+        try std.testing.expectEqualDeep(case.termination, result.termination);
+        if (case.content) |expected| try std.testing.expectEqualStrings(expected, result.content);
         try std.testing.expect(result.content.len <= ccr.max_output_bytes);
+        // Nothing the shell reports about itself is left in the text: the
+        // model reads the ending from the status, not from a line it would
+        // have to parse out of the output.
+        try std.testing.expect(std.mem.indexOf(u8, result.content, "Exit code:") == null);
     }
     // Without a cache the rest is out of reach, so the cut is reported as a
     // failure that names what was dropped.
@@ -492,11 +501,11 @@ test "output is collected as the screen showed it, not as it was written" {
     const cases = [_]struct { command: []const u8, expected: []const u8 }{
         // A progress bar redrawn in place: one line per redraw would be lines
         // of stale percentages read back as if they had all been printed.
-        .{ .command = "printf 'one\\rtwo\\rdone\\n'", .expected = "Exit code: 0\ndone\n" },
+        .{ .command = "printf 'one\\rtwo\\rdone\\n'", .expected = "done\n" },
         // A carriage return that ends the line is a line ending like any other.
-        .{ .command = "printf 'one\\r\\ntwo\\r\\n'", .expected = "Exit code: 0\none\ntwo\n" },
+        .{ .command = "printf 'one\\r\\ntwo\\r\\n'", .expected = "one\ntwo\n" },
         // Blank lines are layout; more than one of them in a row is not.
-        .{ .command = "printf 'a\\n\\n\\n\\nb\\n'", .expected = "Exit code: 0\na\n\nb\n" },
+        .{ .command = "printf 'a\\n\\n\\n\\nb\\n'", .expected = "a\n\nb\n" },
     };
     for (cases) |case| {
         const result = try executeShell(std.testing.io, a, case.command);
@@ -530,7 +539,9 @@ test "long output is cached and the result names the id it is read back with" {
     try std.testing.expect(result.ccr_id != null);
     try std.testing.expect(result.content.len <= ccr.max_output_bytes);
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
-    try std.testing.expect(std.mem.startsWith(u8, result.content, "Exit code: 7\n"));
+    // The tail of the output begins the content: no status line of the shell's
+    // own comes before it.
+    try std.testing.expect(!std.mem.startsWith(u8, result.content, "Exit code"));
     try std.testing.expect(std.mem.indexOf(u8, result.content, "ERR_END") != null);
 
     // The line the model reads names the id, the size and the retrieval tool;

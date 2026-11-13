@@ -279,6 +279,8 @@ fn writeResultNode(w: *std.Io.Writer, arena: std.mem.Allocator, event: std.json.
     if (failed) try meta_aw.writer.writeAll(" · error");
     if (integer(event, "exit_code")) |code| try meta_aw.writer.print(" · exit {d}", .{code});
     if (boolean(event, "timed_out")) try meta_aw.writer.writeAll(" · timed out");
+    const termination = string(event, "termination");
+    if (termination.len > 0) try meta_aw.writer.print(" · {s}", .{termination});
 
     try nodeStart(w, event, .{
         .label = if (failed) "TOOL ERROR" else "TOOL RESULT",

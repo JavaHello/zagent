@@ -298,6 +298,9 @@ pub fn runSearchTimed(
     return searchPage(allocator, aw.written(), !exit_one_is_no_match, .{
         .is_error = is_error,
         .exit_code = exit_code,
+        // A search program killed from outside says which signal did it, the
+        // same way a shell command does: `null` above only says it did not exit.
+        .termination = run.termination(),
     });
 }
 

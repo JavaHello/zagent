@@ -49,12 +49,20 @@ folder. The result keeps the exit status and up to the last 40 lines / 4 KiB,
 then names a cache ID, the total line count and the size in bytes. The result
 carries that ID, and a result that already names an entry is never cached again:
 what is handed to the model is always an entry's own text, never a preview of a
-preview.
-Stdout is followed by stderr under a `stderr:` label. Counts refer to this
-normalized, combined text, not the exit-status or cache-notice lines. The entry
-is written as the output arrives and holds at most 64 MiB, so a command that
-prints without end is bounded by the deadline and by that size; past it the rest
-is read and counted but not kept, and the result says so.
+preview. Stdout is followed by stderr under a `stderr:` label. Counts refer to
+this normalized, combined text, not the cache-notice lines. The entry is written
+as the output arrives and holds at most 64 MiB, so a command that prints without
+end is bounded by the deadline and by that size; past it the rest is read and
+counted but not kept, and the result says so.
+
+The result is what the command printed and nothing else. How it ended travels
+beside the text, in the status the model reads in the header above the output:
+`exit_code`, `timed_out`, and `termination` for a command a signal killed — the
+signal's name as a shell writes it, `SIGTERM`. A terminal draws those same
+fields on the line under the call — `✓ exit 0`, `✗ exit 42`, `✗ timed out`,
+`✗ SIGTERM` — so the ending is stated once, in the same place, for both readers,
+and never as the first line of the output, where the tail of a clipped result
+could not carry it.
 
 ## `ccr_retrieve`
 
@@ -139,7 +147,8 @@ The call is drawn as the diff it makes, at the line the old text starts on:
   @@ -2,1 +2,1 @@
   -beta
   +hello
-  ✓ Replaced one exact text block in 'greet.txt' (17 -> 18 bytes)
+  ✓
+    Replaced one exact text block in 'greet.txt' (17 -> 18 bytes)
 ```
 
 The line number is counted in the file when the file can be read and still
