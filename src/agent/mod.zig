@@ -175,6 +175,10 @@ pub const Agent = struct {
     /// screen. Null for a single query: answers then go straight to stdout, so
     /// `zagent "q" > notes.md` stays clean.
     screen: ?*Screen = null,
+    /// What the model is thinking while it thinks it. The reasoning is shown in
+    /// a panel the screen keeps above the prompt, and the turn keeps one line
+    /// of it, written when the panel closes.
+    thinking: Thinking = .{},
     /// The MCP servers and the tools they brought. Borrowed rather than owned:
     /// whoever started the agent outlives it, and the agent only reads this and
     /// calls through it.
@@ -641,6 +645,9 @@ pub const Agent = struct {
             }
             break;
         }
+        // The work was stopped, so nothing of it stays on the screen waiting
+        // out the panel's delay.
+        self.thinking.close(self);
         self.terminal_title.update("ready", self.current_task);
         try self.checkpoint();
     }
@@ -1196,6 +1203,10 @@ pub const Agent = struct {
     /// that never gets there is ended by its caller's interrupt. The answer is
     /// printed and kept in the history.
     fn runToolLoop(self: *Agent) !void {
+        // However the turn ends — an answer, a tool call, a failure, Esc — the
+        // panel the reasoning was shown in is closed here, and the one line the
+        // conversation keeps of it is written before anything that follows.
+        defer self.thinking.close(self);
         var made: usize = 0;
         var iteration: usize = 0;
         // Text from replies that the token limit cut short. It is held back
@@ -1238,10 +1249,17 @@ pub const Agent = struct {
                 // the next request to answer.
                 self.settleContinuations(&continuation_start, carried.items, null) catch {};
                 stream.flushPending() catch {};
+                // The reasoning stops where the request did, before the line
+                // that says it failed.
+                self.thinking.close(self);
                 try self.emit(std.Io.File.stderr(), RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
                 return err;
             };
             defer response.deinit(self.allocator);
+            // A response that asks for a tool has no answer text to fold the
+            // panel in front of, and the call line must not be written under
+            // reasoning that has already finished.
+            self.thinking.close(self);
 
             if (std.mem.eql(u8, response.finish_reason, "length")) {
                 // The client already retried with a larger budget where its
@@ -1929,6 +1947,95 @@ pub const Agent = struct {
     }
 };
 
+/// The chain of thought while the model produces it.
+///
+/// The reasoning is not part of the answer and is never kept: it is shown in a
+/// panel the full-screen layout holds open above the prompt, and when the panel
+/// closes the conversation keeps one line — how long the model thought for.
+/// That is the whole of what a turn records about it, which is why no buffer
+/// here outlives the request it belongs to.
+///
+/// The panel outlives the start of the answer by a few seconds, so the last
+/// rows of reasoning can be read while the answer is written; the screen times
+/// that close, and every other close here is immediate.
+///
+/// A run with no screen, and a sub-agent, have none of this: the deltas are
+/// dropped, because there is no panel to scroll them in and printing them would
+/// put narration where the answer belongs.
+const Thinking = struct {
+    /// Set when the first delta of this thought arrived. Cleared when the panel
+    /// was handed to the screen to close, which is not necessarily closed yet.
+    /// Null also means "nothing to close".
+    started: ?std.Io.Timestamp = null,
+
+    fn feed(self: *Thinking, agent: *Agent, delta: []const u8) void {
+        if (delta.len == 0) return;
+        const screen = agent.screen orelse return;
+        if (agent.capture != null or !screen.isActive()) return;
+        if (self.started == null) self.started = std.Io.Timestamp.now(agent.io, .awake);
+        screen.publishThinking(delta);
+    }
+
+    /// The answer has begun: ask the screen to keep the panel for a moment and
+    /// then close it, saying how long the model thought. The last rows of
+    /// reasoning are what led to the answer, and they are read while the first
+    /// of it is written.
+    ///
+    /// The close is the screen's to perform because this thread is busy
+    /// streaming; once it is asked for, this turn has nothing left to say about
+    /// the panel.
+    fn deferClose(self: *Thinking, agent: *Agent) void {
+        const started = self.started orelse return;
+        self.started = null;
+        const screen = agent.screen orelse return;
+        if (!screen.isActive()) return;
+        var buf: [96]u8 = undefined;
+        const line = thoughtLine(started, agent, &buf) orelse return;
+        screen.scheduleThinkingClose(line);
+    }
+
+    /// Close the panel at once, whatever was asked for earlier: before a call
+    /// line or an error that must not be written under it, at the end of the
+    /// turn, and when the user stops the work. Nothing of a finished turn sits
+    /// on the screen waiting for a delay that no longer means anything.
+    fn close(self: *Thinking, agent: *Agent) void {
+        const started = self.started orelse {
+            // The panel may be one the screen is holding open to close on its
+            // own; hiding it writes the line that was prepared for it.
+            if (agent.screen) |screen| {
+                if (screen.isActive()) screen.hideThinking();
+            }
+            return;
+        };
+        self.started = null;
+        closeNow(started, agent) catch {};
+    }
+
+    fn closeNow(started: std.Io.Timestamp, agent: *Agent) !void {
+        const screen = agent.screen orelse return;
+        if (!screen.isActive()) return;
+        screen.hideThinking();
+        var buf: [96]u8 = undefined;
+        const line = thoughtLine(started, agent, &buf) orelse return;
+        try screen.writeLog(line);
+    }
+};
+
+/// One line saying how long the model thought, in the shape the conversation
+/// uses for everything else it reports about a turn.
+fn thoughtLine(started: std.Io.Timestamp, agent: *Agent, buf: []u8) ?[]const u8 {
+    const elapsed_ms = started.untilNow(agent.io, .awake).toMilliseconds();
+    if (elapsed_ms >= 10 * std.time.ms_per_s) {
+        return std.fmt.bufPrint(buf, DIM ++ layout.indent ++ "✻ Thought for {d}s\n" ++ RESET, .{
+            @divTrunc(elapsed_ms, std.time.ms_per_s),
+        }) catch null;
+    }
+    return std.fmt.bufPrint(buf, DIM ++ layout.indent ++ "✻ Thought for {d}.{d}s\n" ++ RESET, .{
+        @divTrunc(elapsed_ms, std.time.ms_per_s),
+        @divTrunc(@mod(elapsed_ms, std.time.ms_per_s), 100),
+    }) catch null;
+}
+
 /// The host UI's state for the tool call being answered.
 ///
 /// The animation is started in the context's before hook and stopped in its
@@ -2058,12 +2165,17 @@ const AnswerStream = struct {
     }
 
     fn sink(self: *AnswerStream) openai.StreamSink {
-        return .{ .context = self, .onText = onText };
+        return .{ .context = self, .onText = onText, .onReasoning = onReasoning };
     }
 
     fn onText(context: *anyopaque, delta: []const u8) void {
         const self: *AnswerStream = @ptrCast(@alignCast(context));
         self.feed(delta) catch {};
+    }
+
+    fn onReasoning(context: *anyopaque, delta: []const u8) void {
+        const self: *AnswerStream = @ptrCast(@alignCast(context));
+        self.agent.thinking.feed(self.agent, delta);
     }
 
     fn feed(self: *AnswerStream, delta: []const u8) !void {
@@ -2073,6 +2185,10 @@ const AnswerStream = struct {
             // The spinner owns the terminal's line until the first text is
             // ready; stop it before anything else is written.
             if (self.spin) |spin| spin.stop();
+            // The answer begins where the reasoning ends. The panel is given
+            // its delay rather than folded away at once, so the rows that led
+            // here can still be read; its line is written when it closes.
+            self.agent.thinking.deferClose(self.agent);
             try self.agent.answerHeader();
         }
         try self.pending.appendSlice(self.allocator, delta);

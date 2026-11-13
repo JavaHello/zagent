@@ -37,6 +37,24 @@ const selection = @import("selection.zig");
 /// whole life of a long-running session.
 pub const max_transcript_bytes: usize = 8 * 1024 * 1024;
 
+/// Rows the live thinking panel takes above the prompt. Small on purpose: it is
+/// a window onto reasoning that is still being written, not a transcript, and
+/// the rows it takes are rows the conversation gives up while it is open.
+pub const thinking_panel_rows: usize = 5;
+
+/// How much reasoning text the panel keeps to scroll through. Only the last
+/// panelful is ever visible, so a bounded tail is all a long thought costs.
+const thinking_capacity_bytes: usize = 4096;
+
+/// How long the panel stays once the answer has begun. The reasoning is what
+/// led to the answer, and its last rows are worth reading before the rows go
+/// back to the conversation.
+pub const thinking_linger_ms: i64 = 3000;
+
+/// The panel's left margin, so what the model is thinking lines up with the
+/// conversation it is thinking about.
+const thinking_indent = "  ";
+
 pub const Screen = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -72,6 +90,28 @@ pub const Screen = struct {
     pending_progress: [256]u8 = undefined,
     pending_progress_len: usize = 0,
     progress_changed: bool = false,
+    /// Rows reserved above the prompt for the live thinking panel, zero when
+    /// nothing is being narrated. Read through `thinkingRows`, which clamps it
+    /// to what the window can spare.
+    thinking_rows: usize = 0,
+    /// The reasoning text as it is drawn. Only the tail is kept.
+    thinking: std.ArrayList(u8) = .empty,
+    /// Where a worker publishes reasoning as it arrives. The foreground moves
+    /// it into `thinking` and draws it, the way the progress line is published:
+    /// a worker never writes to the terminal itself.
+    pending_thinking: std.ArrayList(u8) = .empty,
+    /// Rows the worker asked for, applied by the next drain.
+    pending_thinking_rows: usize = 0,
+    thinking_dirty: bool = false,
+    /// When a close asked for with a delay was requested, and how long it may
+    /// wait. The foreground performs it: the worker that asked is still
+    /// streaming the answer it began with.
+    thinking_close_started: ?std.Io.Timestamp = null,
+    thinking_close_delay_ms: i64 = 0,
+    /// The line to leave in the panel's place, built when the close was asked
+    /// for so that the foreground only has to write it.
+    thinking_summary: [128]u8 = undefined,
+    thinking_summary_len: usize = 0,
     anchor: ?usize = null,
     anchor_end: usize = 0,
     selection_start: usize = 0,
@@ -179,6 +219,92 @@ pub const Screen = struct {
         self.progress_changed = true;
     }
 
+    /// Publish the chain of thought as it is streamed, opening the panel it is
+    /// shown in. Called from the request's own thread, so it only appends to a
+    /// buffer; the foreground wraps and draws it.
+    ///
+    /// Control characters are dropped: the text is the model's, and a stray
+    /// escape sequence in it would move the cursor the layout depends on.
+    pub fn publishThinking(self: *Screen, delta: []const u8) void {
+        if (!self.active or delta.len == 0) return;
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        // Reasoning that arrives while a close is pending belongs to a new
+        // thought and takes the panel over: the delayed close is called off
+        // rather than pulling the rows out from under it. Only a turn that
+        // reasons twice in a row can see this, and the line the first thought
+        // would have left is not worth a panel that cannot be read.
+        self.thinking_close_started = null;
+        self.thinking_summary_len = 0;
+        for (delta) |byte| {
+            if (byte < 0x20 and byte != '\n') {
+                if (byte == '\t') self.pending_thinking.appendSlice(self.allocator, "    ") catch return;
+                continue;
+            }
+            self.pending_thinking.append(self.allocator, byte) catch return;
+        }
+        // The panel only ever shows its last rows, so the buffer keeps a tail
+        // and no more.
+        trimThinking(&self.pending_thinking);
+        self.pending_thinking_rows = thinking_panel_rows;
+    }
+
+    /// Close the panel now: the rows go back to the conversation. A close that
+    /// was scheduled earlier happens here rather than later, and leaves its
+    /// line, so the reasoning is never thrown away without a trace.
+    pub fn hideThinking(self: *Screen) void {
+        if (!self.active) return;
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        // A close that was already scheduled leaves its line here, ahead of
+        // whatever the caller writes next — the error, the call it made.
+        if (self.thinking_close_started != null) {
+            const summary = self.thinking_summary[0..self.thinking_summary_len];
+            if (summary.len > 0) self.queued.insertSlice(self.allocator, 0, summary) catch {};
+            self.thinking_close_started = null;
+            self.thinking_summary_len = 0;
+            self.thinking_close_delay_ms = 0;
+        }
+        self.pending_thinking_rows = 0;
+        self.pending_thinking.clearRetainingCapacity();
+    }
+
+    /// Keep the panel open a while longer and then close it, leaving `summary`
+    /// in the conversation where it was.
+    ///
+    /// The close is timed by the foreground, which is the only side that is not
+    /// busy: the answer is streaming on the thread that asked for this.
+    pub fn scheduleThinkingClose(self: *Screen, summary: []const u8) void {
+        self.scheduleThinkingCloseAfter(summary, thinking_linger_ms);
+    }
+
+    fn scheduleThinkingCloseAfter(self: *Screen, summary: []const u8, delay_ms: i64) void {
+        if (!self.active or self.thinking_rows == 0) return;
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        const len = @min(summary.len, self.thinking_summary.len);
+        @memcpy(self.thinking_summary[0..len], summary[0..len]);
+        self.thinking_summary_len = len;
+        self.thinking_close_delay_ms = delay_ms;
+        self.thinking_close_started = std.Io.Timestamp.now(self.io, .awake);
+    }
+
+    /// Perform a close that was asked for, writing the line it leaves. Called
+    /// and only called with the queue mutex held.
+    fn settleThinkingLocked(self: *Screen) void {
+        const summary = self.thinking_summary[0..self.thinking_summary_len];
+        if (summary.len > 0) self.queued.appendSlice(self.allocator, summary) catch {};
+        self.thinking_summary_len = 0;
+        self.thinking_close_started = null;
+        self.thinking_close_delay_ms = 0;
+        self.pending_thinking_rows = 0;
+        self.thinking_rows = 0;
+        self.thinking.clearRetainingCapacity();
+        self.pending_thinking.clearRetainingCapacity();
+        self.thinking_dirty = false;
+        self.dirty = true;
+    }
+
     /// Drop the oldest whole lines once the transcript outgrows its bound.
     /// Everything that points into the transcript moves with it; a selection
     /// or drag whose text was dropped collapses instead of pointing at bytes
@@ -222,6 +348,29 @@ pub const Screen = struct {
             @memcpy(self.progress[0..self.progress_len], self.pending_progress[0..self.progress_len]);
             self.progress_changed = false;
             self.status_dirty = true;
+        }
+        // A close the worker asked for happens here, on the only side that is
+        // not writing the answer.
+        if (self.thinking_close_started) |started| {
+            if (started.untilNow(self.io, .awake).toMilliseconds() >= self.thinking_close_delay_ms) {
+                self.settleThinkingLocked();
+                changed = true;
+            }
+        }
+        // The published reasoning is taken before the height is compared: a
+        // panel that opened or closed moves the log's bottom row, which is what
+        // makes the next layout draw the whole conversation again.
+        if (self.pending_thinking_rows != self.thinking_rows) {
+            self.thinking_rows = self.pending_thinking_rows;
+            if (self.thinking_rows == 0) self.thinking.clearRetainingCapacity();
+            changed = true;
+        }
+        if (self.pending_thinking.items.len > 0) {
+            self.thinking.appendSlice(self.allocator, self.pending_thinking.items) catch {};
+            self.pending_thinking.clearRetainingCapacity();
+            trimThinking(&self.thinking);
+            self.thinking_dirty = true;
+            changed = true;
         }
         if (old_bottom != self.logBottom()) self.dirty = true;
         if (self.queued.items.len == 0) return changed;
@@ -272,6 +421,8 @@ pub const Screen = struct {
         if (self.active) self.leave();
         self.transcript.deinit(self.allocator);
         self.queued.deinit(self.allocator);
+        self.thinking.deinit(self.allocator);
+        self.pending_thinking.deinit(self.allocator);
     }
 
     pub fn isActive(self: *const Screen) bool {
@@ -327,6 +478,9 @@ pub const Screen = struct {
         } else {
             try self.appendLog();
             if (self.status_dirty) try self.repaintStatus();
+            // A full replay has already drawn the panel with everything else;
+            // only the reasoning written since then is left to paint.
+            if (self.thinking_dirty) try self.repaintThinking();
         }
         self.syncSignals();
     }
@@ -404,6 +558,15 @@ pub const Screen = struct {
         self.progress_len = 0;
         self.pending_progress_len = 0;
         self.progress_changed = false;
+        // The panel belonged to the conversation being left like everything
+        // else on the screen, and its rows go back to the log.
+        self.thinking.clearRetainingCapacity();
+        self.pending_thinking.clearRetainingCapacity();
+        self.thinking_rows = 0;
+        self.pending_thinking_rows = 0;
+        self.thinking_dirty = false;
+        self.thinking_close_started = null;
+        self.thinking_summary_len = 0;
         self.notice_len = 0;
         self.notice_started = null;
         self.status_dirty = true;
@@ -417,7 +580,7 @@ pub const Screen = struct {
         var w = std.Io.Writer.fixed(&buf);
         if (!self.editor_frame) try w.writeAll(SYNC_BEGIN);
         try w.writeAll(HIDE_CURSOR);
-        try w.print(ansi.ROW_START ++ ansi.CLEAR_LINE, .{self.logBottom() + 1});
+        try w.print(ansi.ROW_START ++ ansi.CLEAR_LINE, .{self.statusRow()});
         try self.writeStatus(&w);
         // The editor owns the visible cursor. Keep it hidden at the log
         // position until refreshBottom has redrawn and positioned the input.
@@ -439,10 +602,61 @@ pub const Screen = struct {
         const gap: usize = if (progress_width > 0) 1 else 0;
         if (notice.len > 0 and progress_width + gap + notice_width <= self.cols) {
             try w.writeAll(RESET);
-            try w.print(ansi.CURSOR_POSITION, .{ self.logBottom() + 1, self.cols - notice_width + 1 });
+            try w.print(ansi.CURSOR_POSITION, .{ self.statusRow(), self.cols - notice_width + 1 });
             try w.writeAll(notice);
         }
         try w.writeAll(RESET);
+    }
+
+    /// Draw the thinking panel: its rows cleared, the newest reasoning at the
+    /// bottom of the window, the way a terminal scrolls.
+    ///
+    /// Nothing of the panel goes into the transcript. It is a window onto the
+    /// reasoning while it is being written, and the row the turn keeps of it is
+    /// the one line the caller writes when it closes.
+    fn writeThinking(self: *Screen, w: *std.Io.Writer) !void {
+        const rows = self.thinkingRows();
+        if (rows == 0) return;
+        try w.writeAll(RESET);
+        const width = term.usableWidth(self.cols) -| thinking_indent.len;
+        var lines = try wrapThinking(self.allocator, self.thinking.items, @max(width, 8));
+        defer lines.deinit(self.allocator);
+
+        // The window shows the newest rows; the rest scroll off the top. Blank
+        // rows were dropped by the wrapper, since in five rows an empty one is
+        // a row of the model's thought that is not shown.
+        const shown = @min(rows, lines.items.len);
+        const first = lines.items.len - shown;
+        const top = self.thinkingTop();
+        var row: usize = 0;
+        while (row + shown < rows) : (row += 1) {
+            try w.print(ansi.ROW_START ++ ansi.CLEAR_LINE, .{top + row});
+        }
+        for (lines.items[first..]) |line| {
+            try w.print(ansi.ROW_START ++ ansi.CLEAR_LINE, .{top + row});
+            try w.writeAll(ansi.DIM ++ thinking_indent);
+            try w.writeAll(line);
+            try w.writeAll(RESET);
+            row += 1;
+        }
+    }
+
+    /// Redraw the panel alone, leaving the conversation as it is. Reasoned text
+    /// arrives in bursts, so this is what the layout runs on every wake-up
+    /// while the model thinks.
+    fn repaintThinking(self: *Screen) !void {
+        if (!self.active or self.thinkingRows() == 0) return;
+        if (!self.editor_frame) try self.out.writeStreamingAll(self.io, SYNC_BEGIN);
+        defer if (!self.editor_frame) self.out.writeStreamingAll(self.io, SYNC_END) catch {};
+        var buf: [8192]u8 = undefined;
+        var fw = self.out.writerStreaming(self.io, &buf);
+        const w = &fw.interface;
+        try w.writeAll(HIDE_CURSOR);
+        try self.writeThinking(w);
+        // The cursor belongs at the log's end until the editor draws the input.
+        try w.writeAll(RESTORE_CURSOR);
+        try w.flush();
+        self.thinking_dirty = false;
     }
 
     /// Stream new bytes into the existing scrolling region. Full replay is
@@ -544,11 +758,13 @@ pub const Screen = struct {
         try w.writeAll(SAVE_CURSOR);
         try w.print(ansi.ROW_START ++ ansi.CLEAR_SCREEN_END, .{top});
         try self.writeStatus(w);
+        try self.writeThinking(w);
         try w.writeAll(RESTORE_CURSOR);
         try w.flush();
 
         self.dirty = false;
         self.status_dirty = false;
+        self.thinking_dirty = false;
         self.rendered_len = self.transcript.items.len;
         self.syncSignals();
     }
@@ -577,12 +793,36 @@ pub const Screen = struct {
     }
 
     fn logBottom(self: *const Screen) usize {
-        const reserved = self.input_rows + 1;
+        const reserved = self.usableInputRows() + self.thinkingRows() + 1;
         return self.rows -| @min(reserved, self.rows -| 1);
     }
 
+    /// Rows the editor actually has: what it asked for, leaving the log a row.
+    fn usableInputRows(self: *const Screen) usize {
+        return @max(@as(usize, 1), @min(self.input_rows, self.rows -| 1));
+    }
+
+    /// Rows the thinking panel actually has. Never more than the window can
+    /// spare: the status line and one row of conversation stay outside it.
+    fn thinkingRows(self: *const Screen) usize {
+        if (self.thinking_rows == 0) return 0;
+        const spare = self.rows -| (self.usableInputRows() + 2);
+        return @min(@min(self.thinking_rows, thinking_panel_rows), spare);
+    }
+
+    /// The row the progress line and notices are drawn on, directly under the
+    /// log and directly over the thinking panel.
+    fn statusRow(self: *const Screen) usize {
+        return self.logBottom() + 1;
+    }
+
+    /// The first row of the thinking panel, or 0 when there is none.
+    fn thinkingTop(self: *const Screen) usize {
+        return self.statusRow() + 1;
+    }
+
     fn inputTop(self: *const Screen) usize {
-        return self.rows -| @min(self.input_rows, self.rows -| 1) + 1;
+        return self.rows -| @min(self.usableInputRows(), self.rows -| 1) + 1;
     }
 
     fn saveCursor(self: *Screen) void {
@@ -593,6 +833,7 @@ pub const Screen = struct {
         handler_fd = self.out.handle;
         handler_rows = self.rows;
         handler_input_rows = self.input_rows;
+        handler_thinking_rows = self.thinkingRows();
     }
 };
 
@@ -609,6 +850,62 @@ fn statusWidth(bytes: []const u8) usize {
         i += cp.len;
     }
     return width;
+}
+
+/// Drop the front of the reasoning once it outgrows what the panel can show,
+/// cutting on a line break so the oldest row on screen is not half a line.
+fn trimThinking(text: *std.ArrayList(u8)) void {
+    if (text.items.len <= thinking_capacity_bytes) return;
+    var dropped = text.items.len - thinking_capacity_bytes;
+    if (std.mem.indexOfScalarPos(u8, text.items, dropped, '\n')) |newline| dropped = newline + 1;
+    const rest = text.items.len - dropped;
+    std.mem.copyForwards(u8, text.items[0..rest], text.items[dropped..]);
+    text.shrinkRetainingCapacity(rest);
+}
+
+/// Break the reasoning into rows `width` columns wide, at a space where the row
+/// has one: the text arrives as a stream of tokens with almost no newlines, and
+/// a word cut in half reads as a broken terminal rather than as thought.
+///
+/// A word longer than the window is still broken, because the alternative is a
+/// row that cannot be drawn at all.
+fn wrapThinking(allocator: std.mem.Allocator, text: []const u8, width: usize) !std.ArrayList([]const u8) {
+    var lines: std.ArrayList([]const u8) = .empty;
+    errdefer lines.deinit(allocator);
+    var start: usize = 0;
+    while (start < text.len) {
+        // Blank lines and the run of spaces after a break carry nothing.
+        while (start < text.len and (text[start] == '\n' or text[start] == '\r' or text[start] == ' ')) start += 1;
+        if (start >= text.len) break;
+        var i = start;
+        var used: usize = 0;
+        var last_space: ?usize = null;
+        while (i < text.len and text[i] != '\n') {
+            const cp = term.decodeAt(text, i);
+            const w = term.codepointWidth(cp);
+            if (used + w > width and i > start) break;
+            if (text[i] == ' ') last_space = i;
+            used += w;
+            i += cp.len;
+        }
+        // A row that ended at the window breaks at its last space; one that
+        // ended at a newline takes everything up to it.
+        const end = if (i >= text.len or text[i] == '\n')
+            i
+        else if (last_space) |space|
+            if (space > start) space else i
+        else
+            i;
+        // One codepoint wider than the window still has to fit on a row of its
+        // own, or the loop would never move past it.
+        const stop = if (end == start) start + term.decodeAt(text, start).len else end;
+        try lines.append(allocator, text[start..stop]);
+        var next = stop;
+        if (next < text.len and text[next] == '\n') next += 1;
+        while (next < text.len and text[next] == ' ') next += 1;
+        start = next;
+    }
+    return lines;
 }
 
 /// A viewport can start inside a styled span (including a soft-wrapped line).
@@ -715,6 +1012,7 @@ pub const LogWriter = struct {
 var handler_fd: i32 = -1;
 var handler_rows: usize = 24;
 var handler_input_rows: usize = 1;
+var handler_thinking_rows: usize = 0;
 var handler_installed: bool = false;
 /// The terminal attributes in force before the editor ever put it in raw
 /// mode. An exit signal can arrive while the editor has it raw, and the shell
@@ -807,8 +1105,10 @@ fn onTstp(_: std.posix.SIG) callconv(.c) void {
         std.posix.tcsetattr(handler_fd, .NOW, attributes) catch {};
     }
     var buf: [48]u8 = undefined;
-    if (handler_input_rows > 0 and handler_rows > handler_input_rows) {
-        const bottom = handler_rows - handler_input_rows;
+    // The log ends above the status line and the thinking panel, both of which
+    // the replay redraws once the session is running again.
+    if (handler_input_rows > 0 and handler_rows > handler_input_rows + handler_thinking_rows) {
+        const bottom = handler_rows - handler_input_rows - handler_thinking_rows;
         const sequence = std.fmt.bufPrint(&buf, ansi.SCROLL_REGION, .{bottom}) catch "";
         writeRaw(sequence);
     }
@@ -1367,4 +1667,198 @@ test "a transcript past its bound drops the oldest whole lines and moves its off
     s.trimTranscript();
     try std.testing.expectEqual(kept, s.transcript.items.len);
     try std.testing.expect(!s.dirty);
+}
+
+test "the thinking panel keeps only the rows the window can spare" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, false);
+    defer s.deinit();
+    s.rows = 24;
+    s.input_rows = 1;
+    try expectEqual(@as(usize, 0), s.thinkingRows());
+    try expectEqual(@as(usize, 22), s.logBottom());
+    try expectEqual(@as(usize, 23), s.statusRow());
+    try expectEqual(@as(usize, 24), s.inputTop());
+
+    s.thinking_rows = thinking_panel_rows;
+    try expectEqual(@as(usize, 5), s.thinkingRows());
+    try expectEqual(@as(usize, 17), s.logBottom());
+    try expectEqual(@as(usize, 18), s.statusRow());
+    try expectEqual(@as(usize, 19), s.thinkingTop());
+    try expectEqual(@as(usize, 24), s.inputTop());
+
+    // A short window gives the panel what is left over, down to nothing: the
+    // status line and one row of conversation always stay.
+    s.rows = 8;
+    try expectEqual(@as(usize, 5), s.thinkingRows());
+    try expectEqual(@as(usize, 1), s.logBottom());
+    s.rows = 5;
+    try expectEqual(@as(usize, 2), s.thinkingRows());
+    try expectEqual(@as(usize, 1), s.logBottom());
+    s.rows = 3;
+    try expectEqual(@as(usize, 0), s.thinkingRows());
+    try expectEqual(@as(usize, 1), s.logBottom());
+    s.rows = 24;
+
+    // A taller editor pushes the panel up with it rather than under the prompt.
+    s.input_rows = 6;
+    try expectEqual(@as(usize, 5), s.thinkingRows());
+    try expectEqual(@as(usize, 19), s.inputTop());
+    try expectEqual(@as(usize, 12), s.logBottom());
+}
+
+test "reasoning is drawn in the panel and never in the conversation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    s.out = file;
+    s.buffered = true;
+    defer {
+        s.active = false;
+        s.deinit();
+    }
+    try s.writeLog("conversation\n");
+    try s.reserveInput(1, false);
+
+    s.publishThinking("first ");
+    s.publishThinking("thought");
+    try std.testing.expect(try s.drain());
+    try s.reserveInput(1, false);
+    const drawn = try readOutput(tmp.dir, a);
+    defer a.free(drawn);
+    // The newest row of the panel is its bottom one, directly above the prompt.
+    var expected: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&expected, "{s}{d};1H{s}{s}{s}  first thought{s}", .{
+        "\x1b[", s.thinkingTop() + s.thinkingRows() - 1, "\x1b[2K", ansi.DIM, "", RESET,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, drawn, line) != null);
+    // Nothing of it joins the transcript, so a redraw cannot bring it back.
+    try std.testing.expect(std.mem.indexOf(u8, s.transcript.items, "first thought") == null);
+
+    // The whole reasoning is not kept once the panel closes: only the line the
+    // turn writes for it joins the conversation.
+    s.hideThinking();
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqual(@as(usize, 0), s.thinkingRows());
+    try std.testing.expectEqual(@as(usize, 22), s.logBottom());
+    try s.writeLog("folded\n");
+    try s.reserveInput(1, false);
+    const after = try readOutput(tmp.dir, a);
+    defer a.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after[drawn.len..], "first thought") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after[drawn.len..], "folded") != null);
+}
+
+test "the panel scrolls to the newest reasoning and skips blank rows" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    s.out = file;
+    s.buffered = true;
+    defer {
+        s.active = false;
+        s.deinit();
+    }
+
+    const thinking = [_][]const u8{ "one\n", "\n", "two\n", "\n", "three\n", "\n", "four\n", "five\n", "six\n", "seven\n" };
+    for (thinking) |delta| s.publishThinking(delta);
+    try std.testing.expect(try s.drain());
+    try s.reserveInput(1, false);
+    const drawn = try readOutput(tmp.dir, a);
+    defer a.free(drawn);
+    // Five rows: the newest five pieces of thought, with the blanks dropped.
+    try std.testing.expect(std.mem.indexOf(u8, drawn, "three") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawn, "seven") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drawn, "two") == null);
+    try std.testing.expect(std.mem.indexOf(u8, drawn, "one") == null);
+
+    // Only a tail of the reasoning is kept, so a long thought cannot grow the
+    // process: what the panel can scroll to is bounded.
+    var filler: [thinking_capacity_bytes * 2]u8 = undefined;
+    for (&filler, 0..) |*byte, index| byte.* = if (index % 32 == 31) '\n' else 'x';
+    s.publishThinking(&filler);
+    try std.testing.expect(try s.drain());
+    try std.testing.expect(s.thinking.items.len <= thinking_capacity_bytes);
+}
+
+test "a screen with no terminal takes no reasoning at all" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, false);
+    defer s.deinit();
+    s.publishThinking("ignored");
+    try std.testing.expectEqual(@as(usize, 0), s.pending_thinking.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.thinking_rows);
+}
+
+test "reasoning wraps at a space, breaks a long word, and drops blank lines" {
+    const a = std.testing.allocator;
+    var lines = try wrapThinking(a, "the host knows where the prize is", 16);
+    defer lines.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("the host knows", lines.items[0]);
+    try std.testing.expectEqualStrings("where the prize", lines.items[1]);
+    try std.testing.expectEqualStrings("is", lines.items[2]);
+
+    // A word wider than the window is still broken, or its row could not be
+    // drawn at all; a newline ends a line wherever it falls.
+    var wide = try wrapThinking(a, "abcdefghijkl\n\nsecond thought", 8);
+    defer wide.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), wide.items.len);
+    try std.testing.expectEqualStrings("abcdefgh", wide.items[0]);
+    try std.testing.expectEqualStrings("ijkl", wide.items[1]);
+    try std.testing.expectEqualStrings("second", wide.items[2]);
+    try std.testing.expectEqualStrings("thought", wide.items[3]);
+}
+
+test "a scheduled close waits out its delay and leaves the line it was given" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "out", .{});
+    defer file.close(std.testing.io);
+    var s = Screen.init(a, std.testing.io, true);
+    s.out = file;
+    s.buffered = true;
+    defer {
+        s.active = false;
+        s.deinit();
+    }
+
+    s.publishThinking("the reasoning that led here");
+    try std.testing.expect(try s.drain());
+    try s.reserveInput(1, false);
+    try std.testing.expectEqual(@as(usize, 5), s.thinkingRows());
+
+    // The answer has begun, and the panel is to stay for a while longer.
+    const summary = "\x1b[2m  ✻ Thought for 1.2s\n\x1b[0m";
+    s.scheduleThinkingCloseAfter(summary, 60_000);
+    _ = try s.drain();
+    try std.testing.expectEqual(@as(usize, 5), s.thinkingRows());
+    try std.testing.expect(std.mem.indexOf(u8, s.transcript.items, "Thought for") == null);
+
+    // A close that was asked for and then overtaken is performed at once, and
+    // its line lands ahead of what the caller writes after it.
+    try s.writeLog("  an error line\n");
+    s.hideThinking();
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqual(@as(usize, 0), s.thinkingRows());
+    const folded = s.transcript.items;
+    const line_at = std.mem.indexOf(u8, folded, "Thought for 1.2s").?;
+    const error_at = std.mem.indexOf(u8, folded, "an error line").?;
+    try std.testing.expect(line_at < error_at);
+
+    // A delay that has elapsed closes the panel from the drain, writing the
+    // line the screen was given in its place.
+    s.publishThinking("a second thought");
+    try std.testing.expect(try s.drain());
+    s.scheduleThinkingCloseAfter("\x1b[2m  ✻ Thought for 2.0s\n\x1b[0m", 0);
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqual(@as(usize, 0), s.thinkingRows());
+    try std.testing.expect(std.mem.indexOf(u8, s.transcript.items, "Thought for 2.0s") != null);
 }

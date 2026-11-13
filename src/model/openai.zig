@@ -246,6 +246,13 @@ pub const Transport = struct {
 pub const StreamSink = struct {
     context: *anyopaque,
     onText: *const fn (context: *anyopaque, delta: []const u8) void,
+    /// The chain of thought, as the server narrates it. Optional: a sink that
+    /// shows only the answer leaves it null, and the deltas are dropped.
+    ///
+    /// This is not the answer, so it does not count as text that has been
+    /// shown: a request may still be sent again after reasoning arrived, and
+    /// whatever showed it is expected to replace what it had.
+    onReasoning: ?*const fn (context: *anyopaque, delta: []const u8) void = null,
 };
 
 /// Attempts a request is given: the first try and two retries.
@@ -263,13 +270,21 @@ const Delivery = struct {
     shown: bool = false,
 
     fn sink(self: *Delivery) StreamSink {
-        return .{ .context = self, .onText = onText };
+        return .{ .context = self, .onText = onText, .onReasoning = onReasoning };
     }
 
     fn onText(context: *anyopaque, delta: []const u8) void {
         const self: *Delivery = @ptrCast(@alignCast(context));
         self.shown = true;
         self.target.onText(self.target.context, delta);
+    }
+
+    /// Reasoning is passed on but does not count as shown: it is narration, and
+    /// a request that failed after some of it has no answer to duplicate yet.
+    fn onReasoning(context: *anyopaque, delta: []const u8) void {
+        const self: *Delivery = @ptrCast(@alignCast(context));
+        const target = self.target.onReasoning orelse return;
+        target(self.target.context, delta);
     }
 };
 
@@ -317,6 +332,12 @@ pub const Client = struct {
     /// Standard Responses reasoning effort, sent as the outer-level
     /// `reasoning.effort` for every provider, not only for Codex.
     reasoning_effort: ?[]const u8 = null,
+    /// Whether the `reasoning` object asks for a narrated summary as well
+    /// (`reasoning.summary: "auto"`). The OpenAI API and the Codex backend are
+    /// the two that need the request to say so before they stream anything a
+    /// reader can follow; DeepSeek narrates its own reasoning text unasked, and
+    /// a generic compatible endpoint is not sent a member it may not define.
+    reasoning_summary: bool = false,
     /// The Codex backend's fast mode. Only that backend understands its values,
     /// so every other provider omits the field.
     service_tier: ?[]const u8 = null,
@@ -371,6 +392,10 @@ pub const Client = struct {
             .api_key = config.api_key,
             .codex_auth_path = config.codex_auth_path,
             .reasoning_effort = config.reasoning_effort,
+            .reasoning_summary = switch (config.provider orelse .openai) {
+                .openai, .codex => true,
+                else => false,
+            },
             .service_tier = config.service_tier,
             .thinking = config.thinking,
             .prompt_cache_retention = config.prompt_cache_retention,
@@ -542,6 +567,11 @@ pub const Client = struct {
         if (nonEmpty(self.reasoning_effort)) |effort| {
             var reasoning: std.json.ObjectMap = .{};
             try reasoning.put(arena, "effort", .{ .string = effort });
+            // Told to summarize, the backend narrates what it is thinking as
+            // reasoning-summary deltas, which is what the live panel shows. It
+            // is only asked for alongside an effort, so a model that does not
+            // reason is never sent a member it would reject.
+            if (self.reasoning_summary) try reasoning.put(arena, "summary", .{ .string = "auto" });
             try parsed.value.object.put(arena, "reasoning", .{ .object = reasoning });
         }
         if (self.thinking.wireValue()) |value| {
@@ -853,6 +883,18 @@ pub const Client = struct {
                 const delta = root.object.get("delta") orelse return;
                 if (delta != .string) return;
                 sink.onText(sink.context, delta.string);
+                return;
+            }
+            // The chain of thought, in either of the shapes the Responses
+            // protocol narrates it in: the model's own text, or the summary a
+            // reasoning request asks for instead. Both read as thinking, so a
+            // sink that shows one shows the other the same way.
+            if (kind == .string and (std.mem.eql(u8, kind.string, "response.reasoning_text.delta") or
+                std.mem.eql(u8, kind.string, "response.reasoning_summary_text.delta")))
+            {
+                const delta = root.object.get("delta") orelse return;
+                if (delta != .string) return;
+                if (sink.onReasoning) |onReasoning| onReasoning(sink.context, delta.string);
                 return;
             }
         }
@@ -1536,6 +1578,92 @@ test "Responses refuses nonterminal, malformed and ambiguous outputs" {
     const refusal = try parseResponse(a, "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"Cannot do that\"}]}]}");
     defer refusal.deinit(a);
     try std.testing.expectEqualStrings("Cannot do that", refusal.content.?);
+}
+
+test "sse reasoning deltas reach the sink without counting as answer text" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const config = try Config.load(allocator, std.testing.io, &env);
+    defer config.deinit();
+    var client = Client.init(allocator, std.testing.io, config);
+    defer client.deinit();
+
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        text: std.ArrayList(u8) = .empty,
+        reasoning: std.ArrayList(u8) = .empty,
+        fn onText(context: *anyopaque, delta: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.text.appendSlice(self.allocator, delta) catch {};
+        }
+        fn onReasoning(context: *anyopaque, delta: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.reasoning.appendSlice(self.allocator, delta) catch {};
+        }
+    };
+    var capture = Capture{ .allocator = allocator };
+    defer capture.text.deinit(allocator);
+    defer capture.reasoning.deinit(allocator);
+    const sink = StreamSink{ .context = &capture, .onText = Capture.onText, .onReasoning = Capture.onReasoning };
+
+    var completed: ?[]u8 = null;
+    defer if (completed) |c| allocator.free(c);
+
+    // Both shapes the protocol narrates thinking in: the model's own text and
+    // the summary a reasoning request asks for.
+    try client.dispatchSse("{\"type\":\"response.reasoning_text.delta\",\"delta\":\"weigh \",\"item_id\":\"rs_1\",\"output_index\":0}", sink, &completed);
+    try client.dispatchSse("{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"the options\",\"item_id\":\"rs_1\",\"output_index\":0}", sink, &completed);
+    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}", sink, &completed);
+
+    try std.testing.expectEqualStrings("weigh the options", capture.reasoning.items);
+    try std.testing.expectEqualStrings("answer", capture.text.items);
+
+    // A sink that shows only the answer simply gets none of it.
+    const Anonymous = struct {
+        fn onText(_: *anyopaque, _: []const u8) void {}
+    };
+    var nothing: u8 = 0;
+    const plain = StreamSink{ .context = &nothing, .onText = Anonymous.onText };
+    try client.dispatchSse("{\"type\":\"response.reasoning_text.delta\",\"delta\":\"ignored\"}", plain, &completed);
+    try std.testing.expectEqualStrings("weigh the options", capture.reasoning.items);
+}
+
+test "a reasoning summary is requested only where the backend needs asking" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { effort: ?[]const u8, summary: bool, expected: bool }{
+        .{ .effort = "high", .summary = true, .expected = true },
+        // Without an effort no reasoning object is sent at all, so a model that
+        // does not reason is never handed a member it would reject.
+        .{ .effort = null, .summary = true, .expected = false },
+        // A backend that narrates its own reasoning is not asked for a summary.
+        .{ .effort = "high", .summary = false, .expected = false },
+    };
+    for (cases) |case| {
+        var client: Client = .{
+            .allocator = a,
+            .io = std.testing.io,
+            .http_client = .{ .allocator = a, .io = std.testing.io },
+            .api_key = "unused",
+            .base_url = "https://example.invalid",
+            .model = "test",
+            .max_tokens = 512,
+            .http_error = null,
+            .reasoning_effort = case.effort,
+            .reasoning_summary = case.summary,
+        };
+        defer client.deinit();
+        const request = try client.buildWireRequest(&.{}, &.{});
+        defer a.free(request);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
+        defer parsed.deinit();
+        const reasoning = parsed.value.object.get("reasoning");
+        if (case.expected) {
+            try std.testing.expectEqualStrings("auto", reasoning.?.object.get("summary").?.string);
+        } else if (reasoning) |object| {
+            try std.testing.expect(object.object.get("summary") == null);
+        }
+    }
 }
 
 test "sse deltas stream to the sink and the final event is captured" {

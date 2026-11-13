@@ -197,6 +197,42 @@ With no terminal to type at (piped input, or an unsupported terminal) the
 recommended option is taken and the agent says so. Interactive menus also work in
 single-query mode and render on stderr.
 
+## Thinking
+
+While the model reasons, what it is thinking scrolls in a panel of its own: five
+rows between the status line and the prompt, dim, taking the newest text and
+letting the oldest rows go as it arrives. The panel is a window, not a record —
+nothing of it joins the conversation. It stays for about three seconds of the
+answer, so the rows that led there can still be read, and then closes, leaving
+one line behind:
+
+```
+  ⠋ thinking… 4s · in 8120 · out 0
+  I need both files named, so the listing comes first, then the answer.
+  Both of them end in .zig, and the question says list, not read.
+
+  Assistant
+  Both files are there: alpha.zig and beta.zig.
+  ✻ Thought for 4.2s
+```
+
+A turn that ends inside those three seconds closes the panel when it does, so
+the line lands at the end of the answer rather than later, and a tool call or an
+error closes it at once, because neither belongs under reasoning that has
+already finished. Stopping the work with Esc closes it too.
+
+The reasoning is shown when the backend streams it. DeepSeek narrates its own
+chains of thought, and the OpenAI API and Codex backend are asked for a
+reasoning summary (`reasoning.summary: "auto"`) whenever a reasoning effort is
+configured. Nothing is asked for when no effort is set, so a model that does not
+reason is never sent a member it would reject, and a provider that narrates
+nothing simply opens no panel.
+
+The panel needs the full-screen layout, so a single query, a pipe or a
+`TERM=dumb` run shows no reasoning: there is nowhere to scroll it, and the
+output belongs to whatever is reading it. A sub-agent's thinking is its own
+business and is never shown.
+
 ## Live progress
 
 Waiting for the model, and running a tool, each get one animated line

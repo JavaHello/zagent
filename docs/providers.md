@@ -107,7 +107,11 @@ Responses input messages and call/output pairs. Legacy free-form
 `reasoning_content` strings are not sent as a Responses reasoning item.
 
 `AI_REASONING_EFFORT` and `AI_PROMPT_CACHE_RETENTION` are standard Responses
-fields, so any provider gets them as outer-level members when they are set;
+fields, so any provider gets them as outer-level members when they are set. On
+the OpenAI and Codex backends an effort also asks for `reasoning.summary:
+"auto"`, which is what makes them narrate their reasoning to the terminal's
+[thinking panel](ui.md#thinking); DeepSeek streams its own reasoning text
+unasked, and a generic compatible endpoint is not sent the member at all;
 `AI_SERVICE_TIER` is Codex's fast mode and is sent only there. See
 [Environment variables](configuration.md#environment-variables).
 

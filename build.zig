@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
         "tests/menu_integration.py",
         "tests/popup_integration.py",
         "tests/runtime_integration.py",
+        "tests/thinking_integration.py",
         "tests/question_integration.py",
         "tests/steering_integration.py",
         "tests/clipboard_integration.py",
