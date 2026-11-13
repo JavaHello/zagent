@@ -267,7 +267,7 @@ test "session roundtrip retains tool calls, reasoning and the plan" {
     var messages = [_]Message{
         .{ .role = "assistant", .content = null, .reasoning_content = "plan", .tool_calls = &calls, .tool_call_id = null, .response_items = "[{\"type\":\"reasoning\",\"id\":\"rs1\",\"summary\":[],\"encrypted_content\":\"opaque-token\"},{\"type\":\"function_call\",\"call_id\":\"1\",\"name\":\"shell\",\"arguments\":\"{}\"}]" },
         .{ .role = "tool", .content = "done", .reasoning_content = null, .tool_calls = null, .tool_call_id = "1", .tool_status = .{ .is_error = true, .exit_code = 7, .timed_out = true } },
-        .{ .role = "tool", .content = "(no output)", .reasoning_content = null, .tool_calls = null, .tool_call_id = "2", .tool_status = .{ .is_error = true, .termination = "SIGTERM" } },
+        .{ .role = "tool", .content = @import("../tools/mod.zig").no_output, .reasoning_content = null, .tool_calls = null, .tool_call_id = "2", .tool_status = .{ .is_error = true, .termination = "SIGTERM" } },
     };
     try save(io, allocator, path, &messages, &plan);
     var loaded = try load(io, allocator, path);

@@ -292,7 +292,7 @@ pub fn runSearchTimed(
     if (aw.written().len == 0) {
         // A search that matched nothing is the one thing this tool answers with
         // no output at all. Any other silent exit is a failure, and says that.
-        try aw.writer.writeAll(if (is_error) "(no output)" else "(no matches)");
+        try aw.writer.writeAll(if (is_error) result_mod.no_output else "(no matches)");
     }
 
     return searchPage(allocator, aw.written(), !exit_one_is_no_match, .{

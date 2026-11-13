@@ -14,6 +14,15 @@ const std = @import("std");
 pub const ccr_id_len: usize = 12;
 pub const CcrId = [ccr_id_len]u8;
 
+/// What a tool that was asked and had nothing to say hands back.
+///
+/// A result's content is the tool's own text and nothing else, so a silent
+/// answer would arrive as an empty message: the model could not tell a command
+/// that printed nothing from a call whose content went missing. Spelled once,
+/// here, so every tool with nothing to show says it the same way and a reader
+/// of the history recognises the tool's own words.
+pub const no_output = "(no output)";
+
 /// How a call ended, in the fields a reader needs to tell two of them apart.
 /// The content of a result is the tool's own text and nothing else, so the
 /// ending travels here: beside the text for the model, in a header above it,
@@ -120,7 +129,7 @@ test "a killed program says so in the status, not in its output" {
     // The content is the program's own text — what it printed, or that it
     // printed nothing — and the signal that ended it travels beside it, where
     // every reader of the status can find it.
-    const result = ownedResult(try a.dupe(u8, "(no output)"), .{
+    const result = ownedResult(try a.dupe(u8, no_output), .{
         .is_error = true,
         .termination = "SIGTERM",
     });

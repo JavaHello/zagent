@@ -3025,7 +3025,7 @@ test "a result's status is a line of its own, with the result under it" {
     // is the only place the ending is written, so it has to be able to say
     // everything the shell would have.
     aw.clearRetainingCapacity();
-    try writeResultPreview(&aw.writer, "(no output)", .{
+    try writeResultPreview(&aw.writer, tools.no_output, .{
         .is_error = true,
         .termination = "SIGTERM",
     });
