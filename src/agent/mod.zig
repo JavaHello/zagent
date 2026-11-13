@@ -502,7 +502,7 @@ pub const Agent = struct {
                 }
             } else if (std.mem.eql(u8, message.role, "tool")) {
                 if (message.content) |content| {
-                    try self.previewToolResult(content, message.tool_status orelse .{ .is_error = false });
+                    try self.previewToolResult(content, message.tool_status orelse .{ .is_error = false }, false);
                 }
             }
         }
@@ -1030,18 +1030,6 @@ pub const Agent = struct {
                 .is_error = true,
             };
         }
-        self.tool_ui.spinner.stop();
-        defer self.resumeCallProgress();
-        var report: std.Io.Writer.Allocating = .init(self.allocator);
-        defer report.deinit();
-        try report.writer.writeAll("\x1b[35m  ⇢ ");
-        try writeRunTag(&report.writer, run);
-        try report.writer.writeAll(" · ");
-        try sanitize.writeSanitized(&report.writer, heading);
-        try report.writer.writeAll(RESET ++ "\n");
-        try sanitize.writeSanitized(&report.writer, answer);
-        try report.writer.writeByte('\n');
-        try self.emit(std.Io.File.stderr(), "{s}", .{report.written()});
         return .{
             .output = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ heading, answer }),
             .is_error = false,
@@ -1770,7 +1758,8 @@ pub const Agent = struct {
         // only previews the result the tool returned, guarded as it prints.
         const result = try tools.execute(ctx, call.name, call.arguments);
         errdefer result.deinit(self.allocator);
-        try self.previewToolResult(result.output, result.status());
+        const presentation = @import("../tools/dispatch.zig").presentation(call.name);
+        try self.previewToolResult(result.output, result.status(), if (presentation) |spec| spec.delegated else false);
         return result;
     }
 
@@ -1806,17 +1795,19 @@ pub const Agent = struct {
     /// any of their text is read. The text under it is the tool's own, whole
     /// and unchanged: a tool reports how it ended beside its text, not inside
     /// it, so there is nothing here to leave out.
-    fn previewToolResult(self: *Agent, content: []const u8, status: tools.ToolStatus) !void {
+    fn previewToolResult(self: *Agent, content: []const u8, status: tools.ToolStatus, delegated: bool) !void {
         if (self.capture != null) {
             const parent = self.parent orelse return;
             parent.tool_ui.spinner.stop();
             defer parent.resumeCallProgress();
-            return parent.previewToolResult(content, status);
+            return parent.previewToolResult(content, status, delegated);
         }
         // An error is shown whole, because its message is the point of it — but
         // a result cut at the size limit is large even as an error, so even
         // that one keeps to a readable share of the terminal.
-        const preview_len = if (status.is_error)
+        const preview_len = if (delegated)
+            content.len
+        else if (status.is_error)
             @min(content.len, error_preview_max)
         else
             @min(content.len, 200);
@@ -1826,7 +1817,15 @@ pub const Agent = struct {
         if (content.len > preview_len) try body.writer.writeAll("...");
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        try writeResultPreview(&aw.writer, body.written(), status);
+        if (delegated and self.render_markdown) {
+            try writeResultPreview(&aw.writer, "", status);
+            try render.render(&aw.writer, body.written(), .{
+                .width = term.usableWidth(term.columns(std.Io.File.stderr())),
+                .indent = layout.after_glyph.len,
+            });
+        } else {
+            try writeResultPreview(&aw.writer, body.written(), status);
+        }
         try self.emit(std.Io.File.stderr(), "{s}", .{aw.written()});
     }
 
