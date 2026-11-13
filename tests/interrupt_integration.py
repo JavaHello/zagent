@@ -144,26 +144,21 @@ try:
             assert not Path(directory, 'survived').exists(), 'tool descendant survived ESC'
             send(b'choose now\r')
             until(b'Enter confirm')
-            # A question is a detour in the run: Esc backs out of it, the agent
-            # decides for itself and the task carries on instead of dying.
-            send(b'\x1b')
-
-            # The dismissal comes back as a tool output, and a replayed screen
-            # can repeat old lines but cannot fake a request: wait for the one
-            # that carries it. That the run is still alive is the point — an
-            # interruption would leave the question unanswered in the record.
-            def dismissed():
-                bodies = [r for r in requests if r.get('tools')]
-                if not bodies:
-                    return False
-                return any(m.get('call_id') == 'choice' and 'dismissed' in m['output']
-                           for m in bodies[-1]['input'] if m.get('type') == 'function_call_output')
-            wait_for(dismissed)
+            # A question is no exception to Esc: it cancels the questions and
+            # stops the run with them, so nothing is answered and no request
+            # carries the question as a decision.
+            stop()
+            assert not any('Cancel this choice' in json.dumps(body) and
+                           'dismissed' in json.dumps(body) for body in requests), requests
+            # The cancelled question still gets its interrupted result, so the
+            # record replays: recovery sends the next turn and checks that every
+            # recorded call has an output.
+            recover()
             send(b'/quit\r\r')
             until(b'Goodbye!')
             assert process.wait(timeout=5) == 0
             assert termios.tcgetattr(slave) == original
-            print('PASS: ESC cancels API and process group, only dismisses a question; replay and recovery work')
+            print('PASS: ESC cancels API and process group, stops the run at a question too; replay and recovery work')
         finally:
             release.set()
             if process.poll() is None:

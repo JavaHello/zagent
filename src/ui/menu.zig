@@ -86,16 +86,31 @@ pub const Slot = struct {
     }
 };
 
+/// The rows of the tab that ends the form: send the answers as they stand, or
+/// add words of the user's own for the model. Neither is marked recommended, so
+/// the markers the option rows carry stay off the confirmation.
+const confirm_options = [_]Option{
+    .{ .label = "Submit", .description = "Send the answers as they stand", .recommended = false },
+    .{ .label = "Supplement", .description = "Type your own words to add", .recommended = false },
+};
+
 /// Keyboard state is independent of reads: a partial escape sequence never
 /// requires a blocking second read, and both CSI and application arrows work.
 /// Each question in `slots` keeps its own selection, so moving between them
 /// loses nothing.
 const Form = struct {
     slots: []Slot,
-    /// The question the keyboard belongs to.
+    /// The tab the keyboard belongs to: a question, or `slots.len` for the tab
+    /// that submits the answers.
     focus: usize = 0,
     /// A closed form has no free-text row: the trust prompt only offers labels.
     allow_custom: bool = true,
+    /// Whether the tab strip ends on the confirmation. The trust prompt is a
+    /// one-key decision, so it submits on Enter instead.
+    confirm_tab: bool = false,
+    /// The confirmation's own selection, kept off the questions so Tab-ing back
+    /// and forth loses nothing.
+    submit: Slot = .{ .text = "Confirm", .options = &confirm_options },
     escape: enum { none, start, sequence } = .none,
 
     const Action = union(enum) {
@@ -103,18 +118,23 @@ const Form = struct {
         /// Type the answer to question `custom` by hand; the form is drawn
         /// again once that line has been read.
         custom: usize,
-        /// Every question is answered.
+        /// Type the words that go with the answers, chosen on the last tab.
+        supplement,
+        /// Every question is answered and the answers were submitted.
         finish,
+        /// Esc: the user backed out, and the run stops with the questions.
         cancel,
+        /// Ctrl+D or end of input: the form is dismissed, the run carries on.
+        dismiss,
         ignore,
     };
 
     fn key(self: *Form, byte: u8) Action {
         // Ctrl+C is not a way out of a question: it is pressed by habit, so it
         // is ignored here and the question stays open. Ctrl+D keeps its
-        // end-of-input meaning, and the read loop turns a lone Esc into a
-        // cancellation.
-        if (byte == 4) return .cancel;
+        // end-of-input meaning, and the read loop turns a lone Esc into the
+        // cancellation that stops the run.
+        if (byte == 4) return .dismiss;
         if (byte == '\r' or byte == '\n') return self.confirm();
         if (byte == 0x1b) {
             self.escape = .start;
@@ -147,7 +167,7 @@ const Form = struct {
             '1'...'9' => {
                 const index: usize = byte - '1';
                 if (index >= self.rows()) return .ignore;
-                self.slots[self.focus].selected = index;
+                self.focused().selected = index;
             },
             else => return .ignore,
         }
@@ -155,40 +175,83 @@ const Form = struct {
     }
 
     fn rows(self: *Form) usize {
-        return self.slots[self.focus].rowCount(self.allow_custom);
+        return self.focused().rowCount(self.freeText());
     }
 
     fn move(self: *Form, delta: isize) Action {
-        const slot = &self.slots[self.focus];
-        const count: isize = @intCast(slot.rowCount(self.allow_custom));
+        const slot = self.focused();
+        const count: isize = @intCast(slot.rowCount(self.freeText()));
         slot.selected = @intCast(@mod(@as(isize, @intCast(slot.selected)) + delta, count));
         return .redraw;
     }
 
     fn jump(self: *Form, index: usize) Action {
-        self.slots[self.focus].selected = index;
+        self.focused().selected = index;
         return .redraw;
     }
 
-    /// Move the keyboard to another question, wrapping around.
+    /// Move the keyboard to another tab, wrapping around: the questions in
+    /// order, then the confirmation when the form has one.
     fn step(self: *Form, delta: isize) Action {
-        const count: isize = @intCast(self.slots.len);
+        const count: isize = @intCast(self.tabs());
         self.focus = @intCast(@mod(@as(isize, @intCast(self.focus)) + delta, count));
         return .redraw;
     }
 
     /// Enter: take the focused row as this question's answer and move on to the
-    /// next question still without one. The last answer finishes the form.
+    /// next question still without one. The last answer hands the keyboard to
+    /// the confirmation, where Enter submits the answers.
     fn confirm(self: *Form) Action {
-        const slot = &self.slots[self.focus];
-        if (self.allow_custom and slot.selected >= slot.options.len) return .{ .custom = self.focus };
+        if (self.onConfirm()) {
+            // Submit sends the answers as they stand; Supplement asks for a
+            // line of the user's own words to send with them.
+            return if (self.submit.selected > 0) .supplement else .finish;
+        }
+        const slot = self.focused();
+        if (self.freeText() and slot.selected >= slot.options.len) return .{ .custom = self.focus };
         slot.custom = null;
         slot.answered = true;
         if (self.nextUnanswered()) |index| {
             self.focus = index;
             return .redraw;
         }
+        if (self.confirm_tab) {
+            self.focus = self.slots.len;
+            return .redraw;
+        }
         return .finish;
+    }
+
+    /// How many tabs the strip has: one per question, plus the confirmation.
+    fn tabs(self: *const Form) usize {
+        return self.slots.len + @intFromBool(self.confirm_tab);
+    }
+
+    fn onConfirm(self: *const Form) bool {
+        return self.confirm_tab and self.focus >= self.slots.len;
+    }
+
+    /// The tab the keyboard belongs to, question or confirmation.
+    fn focused(self: *Form) *Slot {
+        return if (self.onConfirm()) &self.submit else &self.slots[self.focus];
+    }
+
+    /// The same tab, for drawing it.
+    fn focusedSlot(self: *const Form) *const Slot {
+        return if (self.onConfirm()) &self.submit else &self.slots[self.focus];
+    }
+
+    /// The free-text row closes each question's options; the confirmation has
+    /// only its own two rows.
+    fn freeText(self: *const Form) bool {
+        return self.allow_custom and !self.onConfirm();
+    }
+
+    fn allAnswered(self: *const Form) bool {
+        for (self.slots) |slot| {
+            if (!slot.answered) return false;
+        }
+        return true;
     }
 
     /// The next question without an answer, searching from the focused one, or
@@ -213,8 +276,9 @@ fn writeRow(w: *std.Io.Writer, allocator: std.mem.Allocator, raw: []const u8, co
         if (byte.* == '\n' or byte.* == '\r' or byte.* == '\t') byte.* = ' ';
     }
     const bytes = clean.written();
-    const limit = @max(columns -| 1, 1);
-    const end = term.takeFit(bytes, limit);
+    const limit = columns -| 1;
+    const candidate = term.takeFit(bytes, limit);
+    const end = if (term.width(bytes[0..candidate]) <= limit) candidate else 0;
     try w.writeAll(bytes[0..end]);
     try w.writeAll(RESET ++ sgr.ERASE_LINE_END ++ "\r\n");
 }
@@ -254,11 +318,17 @@ pub const Reply = union(enum) {
 /// The answers to a form, one per question, in the order they were asked.
 pub const Replies = struct {
     items: []Reply,
+    /// Words the user typed on the confirmation's Supplement row, to send with
+    /// the answers. Owned here.
+    note: ?[]u8 = null,
+    /// Esc backed out of the questions: the caller stops the run with them.
+    canceled: bool = false,
 
     pub fn deinit(self: Replies, allocator: std.mem.Allocator) void {
         for (self.items) |reply| {
             if (reply == .custom) allocator.free(reply.custom);
         }
+        if (self.note) |note| allocator.free(note);
         allocator.free(self.items);
     }
 };
@@ -315,24 +385,29 @@ pub const Outcome = union(enum) {
     /// The user chose to type the answer to question `custom`: read the line,
     /// store it on that slot, and call `form` again.
     custom: usize,
-    /// Ctrl+D or Esc: the whole form is dismissed.
+    /// The confirmation's Supplement row: read a line of the user's own words
+    /// to send with the answers.
+    supplement,
+    /// Esc: the user backed out of the questions, and the run stops with them.
     cancel,
+    /// Ctrl+D or end of input: the form is dismissed and the run carries on.
+    dismiss,
 };
 
 /// The most option rows one question shows at a time; more scroll inside it.
 const visible_window: usize = 5;
 
-/// How many rows a form draws: the blank line it starts with, a header per
-/// question, the option rows of the widest question, and the hint line.
-/// Reserving for the widest question keeps the reservation valid while the
-/// keyboard moves between them.
-pub fn formRows(slots: []const Slot, allow_custom: bool) usize {
+/// Tabs (when needed), focused tab, largest row window, and help. A stable
+/// reservation avoids shifting the log when focus changes.
+pub fn formRows(slots: []const Slot, allow_custom: bool, confirm_tab: bool) usize {
     var options: usize = 1;
     for (slots) |slot| {
         const rows = @min(slot.rowCount(allow_custom), visible_window);
         if (rows > options) options = rows;
     }
-    return slots.len + options + 2;
+    // The confirmation offers Submit and Supplement, whatever the questions do.
+    if (confirm_tab) options = @max(options, confirm_options.len);
+    return @as(usize, @intFromBool(slots.len > 1 or confirm_tab)) + options + 2;
 }
 
 /// Put one or more questions to the user and let the form own the keyboard
@@ -345,19 +420,45 @@ pub fn formRows(slots: []const Slot, allow_custom: bool) usize {
 /// choosing it returns `custom` and the caller reads the line, which is how Esc
 /// in that line gets back to the form.
 ///
-/// `focus` is the question the keyboard starts on, which is the one the user was
-/// on when the form was last left. Null starts on the first question still
-/// without an answer.
-pub fn form(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom: bool, focus: ?usize) !Outcome {
+/// `confirm_tab` closes the strip with a tab that submits the answers or takes
+/// words of the user's own to send with them; the trust prompt leaves it off,
+/// because it is one keypress rather than a form.
+///
+/// `focus` is the tab the keyboard starts on: a question index, or `slots.len`
+/// for the confirmation. Null starts on the first question still without an
+/// answer.
+pub fn form(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom: bool, confirm_tab: bool, focus: ?usize) !Outcome {
+    return runForm(allocator, io, slots, allow_custom, confirm_tab, focus, null);
+}
+
+pub const Viewport = struct { top: usize, height: usize, columns: usize };
+pub const Dock = struct {
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, usize) anyerror!Viewport,
+};
+
+pub fn formDocked(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom: bool, confirm_tab: bool, focus: ?usize, dock: Dock) !Outcome {
+    return runForm(allocator, io, slots, allow_custom, confirm_tab, focus, dock);
+}
+
+fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom: bool, confirm_tab: bool, focus: ?usize, dock: ?Dock) !Outcome {
     if (slots.len == 0) return .cancel;
-    var state = Form{ .slots = slots, .allow_custom = allow_custom };
+    var state = Form{ .slots = slots, .allow_custom = allow_custom, .confirm_tab = confirm_tab };
     if (focus) |index| {
-        state.focus = @min(index, slots.len - 1);
-    } else {
+        // `slots.len` is the confirmation, which only a form with one has.
+        state.focus = @min(index, state.tabs() - 1);
+    } else if (state.nextUnanswered()) |index| {
         // Start on the first question still without an answer, so a form
         // entered again after an answer was typed carries on where the user
         // left off.
-        state.focus = state.nextUnanswered() orelse return .answered;
+        state.focus = index;
+    } else if (confirm_tab) {
+        // Every question has an answer: they are submitted from the
+        // confirmation, which is drawn once more for the user to add words to
+        // them or to send them as they stand.
+        state.focus = slots.len;
+    } else {
+        return .answered;
     }
 
     const out = std.Io.File.stderr();
@@ -368,32 +469,41 @@ pub fn form(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custo
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    try aw.writer.writeAll("\r\n");
-
     var drawn: usize = 0;
     while (true) {
         aw.clearRetainingCapacity();
-        if (drawn > 0) try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn});
-        const rows = try drawForm(allocator, &aw.writer, &state, term.columns(out));
-        // A shorter form leaves the tail of the taller one it replaces behind.
-        if (drawn > rows) {
-            for (0..drawn - rows) |_| try aw.writer.writeAll(sgr.ERASE_LINE_END ++ "\r\n");
-            try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn - rows});
+        if (dock) |target| {
+            const view = try target.prepare(target.context, formRows(slots, allow_custom, confirm_tab));
+            try aw.writer.writeAll(sgr.SYNC_BEGIN ++ sgr.HIDE_CURSOR);
+            try drawDocked(allocator, &aw.writer, &state, view);
+            try aw.writer.writeAll(sgr.RESTORE_CURSOR ++ sgr.SYNC_END);
+        } else {
+            if (drawn > 0) try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn});
+            const rows = try drawForm(allocator, &aw.writer, &state, term.columns(out), formRows(slots, allow_custom, confirm_tab));
+            // Clear the tail of a taller standalone form.
+            if (drawn > rows) {
+                for (0..drawn - rows) |_| try aw.writer.writeAll(sgr.ERASE_LINE_END ++ "\r\n");
+                try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn - rows});
+            }
+            drawn = rows;
         }
         try out.writeStreamingAll(io, aw.written());
-        drawn = rows;
 
         while (true) {
-            const byte = try raw.readByte() orelse return .cancel;
+            // Poll only in screen mode so resize and queued panel updates are
+            // serviced even when the user has not pressed another key.
+            if (dock != null and !try raw.waitReadable(io, 100)) break;
+            const byte = try raw.readByte() orelse return .dismiss;
             // Esc opens a sequence only when more bytes follow; on its own it
-            // dismisses the form, like the other ways out of a menu. Esc stops
-            // the task at the prompt instead: a question is a detour in the
-            // run, and backing out of it should not throw the run away.
+            // cancels the questions, and the run stops with them, as Esc at the
+            // prompt stops a task.
             if (byte == 0x1b and !try raw.waitReadable(io, escape_timeout_ms)) return .cancel;
             switch (state.key(byte)) {
                 .finish => return .answered,
                 .custom => |index| return .{ .custom = index },
+                .supplement => return .supplement,
                 .cancel => return .cancel,
+                .dismiss => return .dismiss,
                 .redraw => break,
                 .ignore => {},
             }
@@ -406,11 +516,12 @@ pub fn form(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custo
 /// answered the same way in either.
 pub const Reader = struct {
     context: *anyopaque,
-    /// Put `slots` to the user with the keyboard on `focus` first — null when
-    /// the form should start on the first unanswered question — and take the
-    /// keys until one question is acted on.
+    /// Put `slots` to the user with the keyboard on `focus` first — a question
+    /// index, `slots.len` for the confirmation, or null when the form should
+    /// start on the first unanswered question — and take the keys until one
+    /// question is acted on.
     present: *const fn (*anyopaque, []Slot, ?usize) anyerror!Outcome,
-    /// Read the line of a free-text row.
+    /// Read the line of a free-text row, or the words added to the answers.
     read: *const fn (*anyopaque) anyerror!Line,
 };
 
@@ -421,18 +532,38 @@ pub fn resolve(allocator: std.mem.Allocator, slots: []Slot, reader: Reader) !Rep
     // The typed answers live here, not on the stack of one iteration: the form
     // keeps showing them, and they must stay valid until the replies are made.
     var typed: std.ArrayList([]u8) = .empty;
+    // The words typed on the confirmation's Supplement row, which go with the
+    // answers rather than answering a question of their own.
+    var note: ?[]u8 = null;
     defer {
         for (typed.items) |text| allocator.free(text);
         typed.deinit(allocator);
+        if (note) |text| allocator.free(text);
     }
 
-    // Which question the keyboard goes back to when the form is drawn again.
-    // Null lets the form carry on at the first question still without an answer.
+    // Which tab the keyboard goes back to when the form is drawn again, or null
+    // to carry on at the first question still without an answer.
     var focus: ?usize = null;
 
     loop: while (true) {
         switch (try reader.present(reader.context, slots, focus)) {
-            .answered => return repliesFrom(allocator, slots),
+            // Submit, from the last tab: the answers as they stand.
+            .answered => return submitted(allocator, slots, &note),
+            // Supplement, from the same tab: the words typed there go with the
+            // answers rather than answering a question of their own.
+            .supplement => switch (try reader.read(reader.context)) {
+                .answer => |text| {
+                    if (note) |old| allocator.free(old);
+                    note = text;
+                    return submitted(allocator, slots, &note);
+                },
+                // Esc in that line goes back to the confirmation, where the
+                // answers can still be submitted as they stand.
+                .back => focus = slots.len,
+                // A line with nothing on it adds nothing: submit what was
+                // answered.
+                .none => return submitted(allocator, slots, &note),
+            },
             .custom => |index| switch (try reader.read(reader.context)) {
                 .answer => |text| {
                     typed.append(allocator, text) catch |err| {
@@ -466,37 +597,121 @@ pub fn resolve(allocator: std.mem.Allocator, slots: []Slot, reader: Reader) !Rep
                     return repliesFrom(allocator, slots);
                 },
             },
-            .cancel => return repliesFrom(allocator, slots),
+            // Esc at the questions: the answers given so far go with them, and
+            // the caller stops the run.
+            .cancel => {
+                var replies = try repliesFrom(allocator, slots);
+                replies.canceled = true;
+                return replies;
+            },
+            // Ctrl+D or end of input: the form is dismissed, the run carries on.
+            .dismiss => return repliesFrom(allocator, slots),
         }
     }
 }
 
-/// Draw every question, with the option rows of the one that has the keyboard,
-/// and return how many rows were drawn.
-fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, columns: usize) !usize {
-    var rows: usize = 0;
-    for (state.slots, 0..) |slot, i| {
-        var header: std.Io.Writer.Allocating = .init(allocator);
-        defer header.deinit();
-        try header.writer.writeAll("  ");
-        if (state.slots.len > 1) try header.writer.print("{d}/{d} ", .{ i + 1, state.slots.len });
-        try header.writer.writeAll(slot.text);
-        // An answered question shows its answer, which is what makes a wrong one
-        // visible before the form is submitted.
-        if (slot.answered) {
-            if (slot.custom) |text|
-                try header.writer.print("  → {s}", .{text})
-            else if (slot.options.len > 0)
-                try header.writer.print("  → {s}", .{slot.options[@min(slot.selected, slot.options.len - 1)].label});
+/// The replies of a submitted form, taking over the supplement the user typed
+/// so it is freed with them.
+fn submitted(allocator: std.mem.Allocator, slots: []const Slot, note: *?[]u8) !Replies {
+    var replies = try repliesFrom(allocator, slots);
+    replies.note = note.*;
+    note.* = null;
+    return replies;
+}
+
+/// Theme-palette tabs: cyan underline is focus, green check is answered,
+/// dim dot is pending. The confirmation closes the strip, so the form always
+/// shows how the answers are sent. Windowed around focus on narrow terminals.
+fn drawTabs(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, columns: usize) !void {
+    _ = allocator;
+    const limit = columns -| 1;
+    const count = state.tabs();
+    var first = state.focus;
+    var used: usize = 2;
+    while (first > 0) {
+        var buf: [64]u8 = undefined;
+        const label = try tabLabel(&buf, state, first - 1);
+        if (used + term.width(label) + 7 > limit) break;
+        used += term.width(label) + 1;
+        first -= 1;
+    }
+    used = 0;
+    for (first..count) |i| {
+        var buf: [64]u8 = undefined;
+        const label = try tabLabel(&buf, state, i);
+        if (used + term.width(label) > limit) break;
+        try w.writeAll(tabStyle(state, i));
+        try w.writeAll(label);
+        try w.writeAll(RESET);
+        used += term.width(label);
+        if (used < limit) {
+            try w.writeByte(' ');
+            used += 1;
         }
-        if (i == state.focus) try w.writeAll(sgr.BOLD_CYAN);
+    }
+    try w.writeAll(RESET ++ sgr.ERASE_LINE_END ++ "\r\n");
+}
+
+/// One tab's text: the mark of its state and its number for a question, the
+/// word itself for the confirmation, which checks off once every question has
+/// an answer.
+fn tabLabel(buf: []u8, state: *const Form, index: usize) ![]const u8 {
+    if (state.confirm_tab and index >= state.slots.len) {
+        return std.fmt.bufPrint(buf, " {s} Confirm ", .{if (state.allAnswered()) "✓" else "·"});
+    }
+    const slot = state.slots[index];
+    return std.fmt.bufPrint(buf, " {s} {d} ", .{ if (slot.answered) "✓" else "·", index + 1 });
+}
+
+fn tabStyle(state: *const Form, index: usize) []const u8 {
+    if (index == state.focus) return sgr.BOLD_CYAN ++ sgr.UNDERLINE;
+    const answered = if (state.confirm_tab and index >= state.slots.len) state.allAnswered() else state.slots[index].answered;
+    return if (answered) sgr.GREEN else DIM;
+}
+
+/// Convert logical rows to absolute screen coordinates. In particular, never
+/// emit the last row's newline into the status bar or the log scroll region.
+fn drawDocked(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, view: Viewport) !void {
+    var content: std.Io.Writer.Allocating = .init(allocator);
+    defer content.deinit();
+    _ = try drawForm(allocator, &content.writer, state, view.columns, view.height);
+    var lines = std.mem.splitSequence(u8, content.written(), "\r\n");
+    for (0..view.height) |row| {
+        try w.print(sgr.ROW_START ++ sgr.CLEAR_LINE, .{view.top + row});
+        if (lines.next()) |line| try w.writeAll(line);
+    }
+}
+
+/// Draw the question tabs and the focused tab with its rows, returning the
+/// number of terminal rows used.
+fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, columns: usize, height: usize) !usize {
+    if (height == 0) return 0;
+    const show_tabs = state.tabs() > 1 and height >= 4;
+    var rows: usize = 0;
+    if (show_tabs) {
+        try drawTabs(allocator, w, state, columns);
+        rows += 1;
+    }
+    const slot = state.focusedSlot().*;
+    var header: std.Io.Writer.Allocating = .init(allocator);
+    defer header.deinit();
+    try header.writer.writeAll("  ");
+    if (state.slots.len > 1 and !state.onConfirm()) try header.writer.print("{d}/{d} ", .{ state.focus + 1, state.slots.len });
+    try header.writer.writeAll(slot.text);
+    if (slot.answered) {
+        if (slot.custom) |text|
+            try header.writer.print("  → {s}", .{text})
+        else if (slot.options.len > 0)
+            try header.writer.print("  → {s}", .{slot.options[@min(slot.selected, slot.options.len - 1)].label});
+    }
+    if (height >= 2) {
+        try w.writeAll(BOLD);
         try writeRow(w, allocator, header.written(), columns);
         rows += 1;
     }
-
-    const slot = state.slots[state.focus];
-    const count = slot.rowCount(state.allow_custom);
-    const visible = @min(count, visible_window);
+    const show_help = height >= 3;
+    const count = slot.rowCount(state.freeText());
+    const visible = @min(@min(count, visible_window), height - rows - @intFromBool(show_help));
     const first = @min(slot.selected -| (visible / 2), count - visible);
     for (first..first + visible) |i| {
         var row: std.Io.Writer.Allocating = .init(allocator);
@@ -506,18 +721,23 @@ fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form,
             const option = slot.options[i];
             try row.writer.writeAll(option.label);
             if (recommendedIndex(slot.options) == i) try row.writer.writeAll(" (recommended)");
-            if (option.description.len > 0) try row.writer.print("  {s}", .{option.description});
+            if (option.description.len > 0) try row.writer.print("  " ++ DIM ++ "{s}" ++ RESET, .{option.description});
         } else try row.writer.writeAll("Other / 自定义回答");
         if (i == slot.selected) try w.writeAll(sgr.BOLD_CYAN);
         try writeRow(w, allocator, row.written(), columns);
         rows += 1;
     }
 
+    if (!show_help) return rows;
     var hint: std.Io.Writer.Allocating = .init(allocator);
     defer hint.deinit();
     try hint.writer.writeAll("  ");
-    if (state.slots.len > 1) try hint.writer.writeAll("Tab/Shift+Tab question · ");
-    try hint.writer.writeAll("↑/↓ select · Enter confirm · Esc cancel");
+    if (show_tabs) try hint.writer.writeAll("Tab/Shift+Tab · ");
+    try hint.writer.writeAll(if (state.onConfirm())
+        "↑/↓ select · Enter submit · Esc cancel"
+    else
+        "↑/↓ select · Enter confirm · Esc cancel");
+    try w.writeAll(DIM);
     try writeRow(w, allocator, hint.written(), columns);
     return rows + 1;
 }
@@ -527,15 +747,15 @@ fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form,
 /// them has to be read back with the line editor.
 pub fn selectOnly(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !Choice {
     var slots = [_]Slot{Slot.init(question, options)};
-    return switch (try form(allocator, io, &slots, false, null)) {
+    return switch (try form(allocator, io, &slots, false, false, null)) {
         .answered => switch (slots[0].answer()) {
             .option => |index| .{ .option = index },
             .custom => .cancel,
             .skip => .cancel,
         },
-        // Without a free-text row there is nothing to type.
-        .custom => .cancel,
-        .cancel => .cancel,
+        // Without a free-text row and without a confirmation, there is nothing
+        // to type here.
+        .custom, .supplement, .cancel, .dismiss => .cancel,
     };
 }
 
@@ -659,7 +879,7 @@ test "the form navigates options, arrows and both tabs" {
 
     // A habitual Ctrl+C leaves the form alone; Ctrl+D dismisses it.
     try expectAction(.ignore, state.key(3));
-    try expectAction(.cancel, state.key(4));
+    try expectAction(.dismiss, state.key(4));
 }
 
 test "an answered question can be changed before the form is submitted" {
@@ -684,6 +904,48 @@ test "an answered question can be changed before the form is submitted" {
     // The last answer finishes the form.
     try expectAction(.finish, state.key('\r'));
     try std.testing.expect(slots[1].answered);
+}
+
+test "the last answer hands the keyboard to the confirmation" {
+    var slots = [_]Slot{ Slot.init("First?", &two_options_a), Slot.init("Second?", &two_options_b) };
+    var state = Form{ .slots = &slots, .confirm_tab = true };
+
+    // Enter answers the questions, and the last answer stops on the
+    // confirmation instead of sending them off.
+    _ = state.key('\r');
+    try expectAction(.redraw, state.key('\r'));
+    try std.testing.expect(slots[1].answered);
+    try std.testing.expectEqual(slots.len, state.focus);
+    try std.testing.expect(state.onConfirm());
+
+    // It starts on Submit, which Enter takes; Tab and Shift+Tab still walk back
+    // to the questions, whose answers are unchanged.
+    try std.testing.expectEqual(@as(usize, 0), state.submit.selected);
+    for ("\x1b[Z") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+    try expectAction(.redraw, state.key('\t'));
+    try std.testing.expectEqual(slots.len, state.focus);
+    try expectAction(.finish, state.key('\r'));
+}
+
+test "the confirmation offers the words to add instead of submitting" {
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    var state = Form{ .slots = &slots, .confirm_tab = true };
+    _ = state.key('\r');
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+
+    // Down and the number both land on Supplement, which asks for a line
+    // rather than sending the answers.
+    for ("\x1b[B") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 1), state.submit.selected);
+    try expectAction(.supplement, state.key('\r'));
+    _ = state.key('1');
+    try std.testing.expectEqual(@as(usize, 0), state.submit.selected);
+    // The confirmation has two rows even when the questions have a free-text
+    // row: down from Submit reaches Supplement and no further.
+    try expectAction(.redraw, state.key('j'));
+    _ = state.key('j');
+    try std.testing.expectEqual(@as(usize, 0), state.submit.selected);
 }
 
 test "the free-text row asks the caller for a line instead of answering" {
@@ -715,7 +977,7 @@ test "a typed answer is the slot's answer until an option replaces it" {
     try std.testing.expectEqual(Answer{ .option = 0 }, slots[0].answer());
 }
 
-test "the form draws every question and the options of the focused one" {
+test "the form draws horizontal tabs and only the focused question" {
     const allocator = std.testing.allocator;
     var slots = [_]Slot{
         Slot.init("First question?", &two_options_a),
@@ -724,24 +986,140 @@ test "the form draws every question and the options of the focused one" {
     var state = Form{ .slots = &slots };
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    // Two headers, the two option rows and the free-text row of the focused
-    // question, and the hint.
-    try std.testing.expectEqual(@as(usize, 6), try drawForm(allocator, &aw.writer, &state, 80));
+    // The tabs, focused header, two options, free-text row, and hint.
+    try std.testing.expectEqual(@as(usize, 6), try drawForm(allocator, &aw.writer, &state, 80, 20));
 
     const text = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "1/2 First question?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "2/2 Second question?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 1 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Second question?") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "1) Alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Other / 自定义回答") != null);
     // Only the focused question shows its rows.
     try std.testing.expect(std.mem.indexOf(u8, text, "1) Gamma") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Tab/Shift+Tab question") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Tab/Shift+Tab · ↑/↓ select") != null);
 
     // An answered question shows what it was answered with.
     slots[0].answered = true;
     aw.clearRetainingCapacity();
-    _ = try drawForm(allocator, &aw.writer, &state, 80);
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "First question?  → Beta") != null);
+}
+
+test "the strip ends on the confirmation, which submits or takes the words" {
+    const allocator = std.testing.allocator;
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    var state = Form{ .slots = &slots, .confirm_tab = true, .focus = slots.len };
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    // Focused, it is cyan and underlined like a question, and it draws its own
+    // two rows: nothing is submitted until Enter is pressed here.
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    const text = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · Confirm ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  Confirm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "> 1) Submit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2) Supplement") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Type your own words to add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Enter submit") != null);
+    // The free-text row belongs to the questions, not to the confirmation.
+    try std.testing.expect(std.mem.indexOf(u8, text, "Other / 自定义回答") == null);
+
+    // Pending while a question is open, ready once every one has an answer.
+    state.focus = 0;
+    aw.clearRetainingCapacity();
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), DIM ++ " · Confirm ") != null);
+    slots[0].answered = true;
+    aw.clearRetainingCapacity();
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), sgr.GREEN ++ " ✓ Confirm ") != null);
+}
+
+test "question tabs follow keyboard focus and keep it visible on narrow terminals" {
+    const allocator = std.testing.allocator;
+    var slots = [_]Slot{
+        Slot.init("First?", &two_options_a),
+        Slot.init("Second?", &two_options_a),
+        Slot.init("Third?", &two_options_a),
+        Slot.init("Fourth?", &two_options_a),
+    };
+    var state = Form{ .slots = &slots, .focus = 2 };
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try drawTabs(allocator, &aw.writer, &state, 80);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 3 ") != null);
+    aw.clearRetainingCapacity();
+    try drawTabs(allocator, &aw.writer, &state, 18);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 3 ") != null);
+    _ = state.key('\t');
+    aw.clearRetainingCapacity();
+    try drawTabs(allocator, &aw.writer, &state, 18);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 4 ") != null);
+}
+
+test "question dock stays inside its rows without newlines into status" {
+    const a = std.testing.allocator;
+    var slots = [_]Slot{
+        Slot.init("First\nquestion\r\x1b[2J?", &two_options_a),
+        Slot.init("第二个问题?", &two_options_b),
+    };
+    var state = Form{ .slots = &slots, .confirm_tab = true, .focus = 1 };
+    slots[1].selected = slots[1].rowCount(true) - 1;
+    var dock: std.Io.Writer.Allocating = .init(a);
+    defer dock.deinit();
+    var logical: std.Io.Writer.Allocating = .init(a);
+    defer logical.deinit();
+    var expected: std.Io.Writer.Allocating = .init(a);
+    defer expected.deinit();
+    // Every tab is drawn in the same rows: the questions, including the one
+    // whose free-text row is selected, and the confirmation.
+    for (0..state.tabs()) |tab| {
+        state.focus = tab;
+        for (0..9) |height| {
+            for (0..21) |columns| {
+                dock.clearRetainingCapacity();
+                logical.clearRetainingCapacity();
+                expected.clearRetainingCapacity();
+                const view = Viewport{ .top = 2, .height = height, .columns = columns };
+                try drawDocked(a, &dock.writer, &state, view);
+                try std.testing.expect(std.mem.indexOfAny(u8, dock.written(), "\r\n") == null);
+                const rows = try drawForm(a, &logical.writer, &state, columns, height);
+                try std.testing.expect(rows <= height);
+                var lines = std.mem.splitSequence(u8, logical.written(), "\r\n");
+                for (0..height) |row| {
+                    try expected.writer.print(sgr.ROW_START ++ sgr.CLEAR_LINE, .{view.top + row});
+                    if (lines.next()) |line| {
+                        // Leave the rightmost cell unused, even at widths 0 and 1.
+                        try std.testing.expect(term.width(line) <= columns -| 1);
+                        try expected.writer.writeAll(line);
+                    }
+                }
+                try std.testing.expectEqualStrings(expected.written(), dock.written());
+            }
+        }
+    }
+}
+
+test "short question forms keep the selected option and omit tabs before options" {
+    const a = std.testing.allocator;
+    var slots = [_]Slot{
+        Slot.init("First?", &two_options_a),
+        Slot.init("Second?", &two_options_b),
+    };
+    slots[1].selected = 1;
+    var state = Form{ .slots = &slots, .focus = 1, .allow_custom = false };
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    for (1..4) |height| {
+        aw.clearRetainingCapacity();
+        try std.testing.expectEqual(height, try drawForm(a, &aw.writer, &state, 80, height));
+        try std.testing.expect(std.mem.indexOf(u8, aw.written(), "> 2)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, aw.written(), sgr.UNDERLINE) == null);
+        try std.testing.expectEqual(height >= 2, std.mem.indexOf(u8, aw.written(), "Second?") != null);
+        try std.testing.expectEqual(height >= 3, std.mem.indexOf(u8, aw.written(), "Esc cancel") != null);
+    }
 }
 
 test "menu rows fit CJK text and flatten model control characters" {
@@ -814,19 +1192,28 @@ test "the description names the recommendation" {
 const FakeReader = struct {
     /// One entry per free-text read: the line to type, or null for Esc.
     lines: []const ?[]const u8 = &.{},
+    /// What the first presentation comes to, for the confirmation's own line
+    /// and for backing out of the form. The rest answer the questions.
+    first: ?Outcome = null,
     allocator: std.mem.Allocator = std.testing.allocator,
     reads: usize = 0,
     calls: usize = 0,
-    /// The question the form was last asked to start on.
+    /// The tab the form was last asked to start on.
     focus: ?usize = null,
 
     fn present(context: *anyopaque, slots: []Slot, focus: ?usize) anyerror!Outcome {
         const self: *FakeReader = @ptrCast(@alignCast(context));
         self.calls += 1;
         self.focus = focus;
-        // The form is asked to start on a question: answer that one, the way
-        // Enter on it would.
+        if (self.first) |outcome| {
+            self.first = null;
+            return outcome;
+        }
+        // A form told to go back to its confirmation submits the answers.
         if (focus) |index| {
+            if (index >= slots.len) return .answered;
+            // The form is asked to start on a question: answer that one, the
+            // way Enter on it would.
             const slot = &slots[index];
             slot.answered = true;
             return .answered;
@@ -902,6 +1289,91 @@ test "a typed answer is the reply, and Esc in that line goes back to the options
     });
 }
 
+test "the confirmation submits with the words the user added" {
+    const allocator = std.testing.allocator;
+
+    // Supplement: the line read at the confirmation travels with the answers
+    // instead of answering a question of its own.
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    slots[0].answered = true;
+    var reader = FakeReader{ .first = .supplement, .lines = &.{"and mind the tests"} };
+    const replies = try resolve(allocator, &slots, .{
+        .context = &reader,
+        .present = FakeReader.present,
+        .read = FakeReader.read,
+    });
+    defer replies.deinit(allocator);
+    try std.testing.expectEqualStrings("and mind the tests", replies.note.?);
+    try std.testing.expect(!replies.canceled);
+    try std.testing.expectEqual(@as(usize, 1), replies.items.len);
+    try std.testing.expect(switch (replies.items[0]) {
+        .option => true,
+        else => false,
+    });
+
+    // Submit, with nothing typed: the answers stand on their own.
+    var plain_slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    var plain_reader = FakeReader{};
+    const plain = try resolve(allocator, &plain_slots, .{
+        .context = &plain_reader,
+        .present = FakeReader.present,
+        .read = FakeReader.read,
+    });
+    defer plain.deinit(allocator);
+    try std.testing.expect(plain.note == null);
+
+    // Esc in the supplement line goes back to the confirmation, which then
+    // submits the answers as they stand.
+    var back_slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    back_slots[0].answered = true;
+    var back_reader = FakeReader{ .first = .supplement };
+    const back = try resolve(allocator, &back_slots, .{
+        .context = &back_reader,
+        .present = FakeReader.present,
+        .read = FakeReader.read,
+    });
+    defer back.deinit(allocator);
+    try std.testing.expectEqual(@as(?usize, back_slots.len), back_reader.focus);
+    try std.testing.expect(back.note == null);
+    try std.testing.expect(switch (back.items[0]) {
+        .option => true,
+        else => false,
+    });
+}
+
+test "Esc cancels the questions and asks the caller to stop the run" {
+    const allocator = std.testing.allocator;
+
+    // The answer given before Esc is kept in the replies, so the record shows
+    // what was cancelled, but the caller is told to stop.
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    slots[0].answered = true;
+    var reader = FakeReader{ .first = .cancel };
+    const replies = try resolve(allocator, &slots, .{
+        .context = &reader,
+        .present = FakeReader.present,
+        .read = FakeReader.read,
+    });
+    defer replies.deinit(allocator);
+    try std.testing.expect(replies.canceled);
+    try std.testing.expectEqual(@as(usize, 1), switch (replies.items[0]) {
+        .option => |index| index,
+        else => unreachable,
+    });
+
+    // Ctrl+D only dismisses the form: the run carries on.
+    var dismissed_slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    var dismissed_reader = FakeReader{ .first = .dismiss };
+    const dismissed = try resolve(allocator, &dismissed_slots, .{
+        .context = &dismissed_reader,
+        .present = FakeReader.present,
+        .read = FakeReader.read,
+    });
+    defer dismissed.deinit(allocator);
+    try std.testing.expect(!dismissed.canceled);
+    try std.testing.expect(dismissed.items[0] == .dismissed);
+}
+
 test "replies keep the answers given before the form was left" {
     const allocator = std.testing.allocator;
     // The first question was answered, the second was not: leaving the form
@@ -923,14 +1395,21 @@ test "replies keep the answers given before the form was left" {
 
 test "the form asks for the rows it draws, however many options there are" {
     var one = [_]Slot{Slot.init("Which?", &two_options_a)};
-    // The blank line, the question, its two options and the free-text row, and
-    // the hint.
-    try std.testing.expectEqual(@as(usize, 6), formRows(&one, true));
-    try std.testing.expectEqual(@as(usize, 5), formRows(&one, false));
+    // Question, options (including free text when allowed), and help.
+    try std.testing.expectEqual(@as(usize, 5), formRows(&one, true, false));
+    try std.testing.expectEqual(@as(usize, 4), formRows(&one, false, false));
 
-    // Every question gets a header of its own.
+    // More than one question adds one tab strip, not one row per question.
     var two = [_]Slot{ Slot.init("First?", &two_options_a), Slot.init("Second?", &two_options_b) };
-    try std.testing.expectEqual(@as(usize, 7), formRows(&two, true));
+    try std.testing.expectEqual(@as(usize, 6), formRows(&two, true, false));
+
+    // The confirmation is a tab of its own, with two rows of its own: the
+    // reservation covers the taller of the tabs, not their sum.
+    try std.testing.expectEqual(@as(usize, 6), formRows(&one, true, true));
+    try std.testing.expectEqual(@as(usize, 6), formRows(&two, true, true));
+    // Two options and no free-text row is all a question has, so the
+    // confirmation still asks for the same rows.
+    try std.testing.expectEqual(@as(usize, 5), formRows(&one, false, true));
 
     // The visible window stops at five option rows; more options scroll inside
     // it, so a long list does not push the conversation off the screen.
@@ -946,5 +1425,5 @@ test "the form asks for the rows it draws, however many options there are" {
         .{ .label = "9", .description = "", .recommended = false },
     };
     var wide = [_]Slot{Slot.init("Which one?", &many)};
-    try std.testing.expectEqual(@as(usize, 8), formRows(&wide, true));
+    try std.testing.expectEqual(@as(usize, 7), formRows(&wide, true, false));
 }

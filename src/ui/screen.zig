@@ -74,6 +74,8 @@ pub const Screen = struct {
     /// Rows kept clear at the bottom for the editor and its popup. Never zero
     /// while active: the prompt is always at the bottom.
     input_rows: usize = 1,
+    /// Question dock above the status bar, separate from the editor below it.
+    question_rows: usize = 0,
     /// The log has to be drawn again before the next write.
     dirty: bool = true,
     /// Transcript bytes already painted; queued output can extend the log
@@ -408,6 +410,19 @@ pub const Screen = struct {
         self.dirty = true;
     }
 
+    /// A submitted input resumes following output, even when viewing history.
+    /// Reset before draining so pending output cannot re-anchor the viewport.
+    pub fn followLatest(self: *Screen) void {
+        if (self.scroll_rows != 0 or self.anchor != null or self.selection_start != self.selection_end or self.dragging)
+            self.dirty = true;
+        self.scroll_rows = 0;
+        self.anchor = null;
+        self.anchor_end = 0;
+        self.selection_start = 0;
+        self.selection_end = 0;
+        self.dragging = false;
+    }
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, active: bool) Screen {
         return .{
             .allocator = allocator,
@@ -471,7 +486,7 @@ pub const Screen = struct {
         _ = try self.drain();
         const resized = self.refreshSize();
         if (repaint) self.dirty = true;
-        const clamped = @max(@as(usize, 1), @min(wanted, self.rows -| 1));
+        const clamped = @max(@as(usize, 1), @min(wanted, self.rows -| 2));
         if (resized or clamped != self.input_rows or self.dirty or repaintPending()) {
             self.input_rows = clamped;
             try self.replay();
@@ -491,6 +506,34 @@ pub const Screen = struct {
     pub fn prepareInput(self: *Screen) !void {
         try self.reserveInput(1, false);
         if (self.active) self.saveCursor();
+    }
+
+    /// Reserve a question dock independently of the editor. Repeated calls
+    /// also refresh the geometry and drain queued status/thinking updates.
+    pub fn reserveQuestion(self: *Screen, wanted: usize) !void {
+        if (self.question_rows != wanted) {
+            self.question_rows = wanted;
+            self.dirty = true;
+        }
+        try self.reserveInput(1, false);
+    }
+
+    pub fn questionTop(self: *const Screen) usize {
+        return self.logBottom() + 1;
+    }
+
+    pub fn questionRows(self: *const Screen) usize {
+        // Keep a log row, status, editor, and the thinking panel if present.
+        const thinking = @min(self.thinking_rows, thinking_panel_rows);
+        return @min(self.question_rows, self.rows -| (self.usableInputRows() + 2 + thinking));
+    }
+
+    /// Do not erase-to-end: status and thinking live below the question dock.
+    pub fn endQuestion(self: *Screen) !void {
+        if (!self.active) return;
+        self.question_rows = 0;
+        self.dirty = true;
+        try self.replay();
     }
 
     /// Clear the editor's rows and put the cursor back where the log ended, so
@@ -625,8 +668,10 @@ pub const Screen = struct {
         const rows = self.thinkingRows();
         if (rows == 0) return;
         try w.writeAll(RESET);
-        const width = term.usableWidth(self.cols) -| thinking_indent.len;
-        var lines = try wrapThinking(self.allocator, self.thinking.items, @max(width, 8));
+        const available = self.cols -| 1;
+        const indent = thinking_indent[0..@min(thinking_indent.len, available)];
+        const width = available - indent.len;
+        var lines = try wrapThinking(self.allocator, self.thinking.items, @max(width, 1));
         defer lines.deinit(self.allocator);
 
         // The window shows the newest rows; the rest scroll off the top. Blank
@@ -641,8 +686,12 @@ pub const Screen = struct {
         }
         for (lines.items[first..]) |line| {
             try w.print(ansi.ROW_START ++ ansi.CLEAR_LINE, .{top + row});
-            try w.writeAll(ansi.DIM ++ thinking_indent);
-            try w.writeAll(line);
+            try w.writeAll(ansi.DIM);
+            try w.writeAll(indent);
+            // The wrapper must make progress even for a wide codepoint in a
+            // one-cell viewport; painting it must not wrap into the editor.
+            const end = term.takeFit(line, width);
+            if (term.width(line[0..end]) <= width) try w.writeAll(line[0..end]);
             try w.writeAll(RESET);
             row += 1;
         }
@@ -800,27 +849,28 @@ pub const Screen = struct {
     }
 
     fn logBottom(self: *const Screen) usize {
-        const reserved = self.usableInputRows() + self.thinkingRows() + 1;
+        const reserved = self.usableInputRows() + self.thinkingRows() + self.questionRows() + 1;
         return self.rows -| @min(reserved, self.rows -| 1);
     }
 
-    /// Rows the editor actually has: what it asked for, leaving the log a row.
+    /// Leave a row each for the log and status whenever the window permits.
     fn usableInputRows(self: *const Screen) usize {
-        return @max(@as(usize, 1), @min(self.input_rows, self.rows -| 1));
+        return @max(@as(usize, 1), @min(self.input_rows, self.rows -| 2));
     }
 
     /// Rows the thinking panel actually has. Never more than the window can
     /// spare: the status line and one row of conversation stay outside it.
     fn thinkingRows(self: *const Screen) usize {
         if (self.thinking_rows == 0) return 0;
-        const spare = self.rows -| (self.usableInputRows() + 2);
+        const spare = self.rows -| (self.usableInputRows() + self.questionRows() + 2);
         return @min(@min(self.thinking_rows, thinking_panel_rows), spare);
     }
 
-    /// The row the progress line and notices are drawn on, directly under the
-    /// log and directly over the thinking panel.
+    /// Progress and notices sit below the log/question dock and above thinking.
     fn statusRow(self: *const Screen) usize {
-        return self.logBottom() + 1;
+        // In a one- or two-row terminal some regions must overlap, but no
+        // cursor address may fall outside the physical window.
+        return @min(self.logBottom() + self.questionRows() + 1, @max(self.rows, 1));
     }
 
     /// The first row of the thinking panel, or 0 when there is none.
@@ -829,7 +879,7 @@ pub const Screen = struct {
     }
 
     fn inputTop(self: *const Screen) usize {
-        return self.rows -| @min(self.usableInputRows(), self.rows -| 1) + 1;
+        return self.rows -| self.usableInputRows() + 1;
     }
 
     fn saveCursor(self: *Screen) void {
@@ -1456,6 +1506,44 @@ test "buffered output is drained by the UI and keeps a scrolled viewport anchore
     try std.testing.expect(!try s.drain());
 }
 
+test "submitted input follows latest buffered output and clears history selection" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, true);
+    defer s.transcript.deinit(a);
+    defer s.queued.deinit(a);
+    s.rows = 5;
+    s.cols = 20;
+    s.buffered = true;
+    try s.writeLog("one\ntwo\nthree\nfour\nfive\nsix");
+    try s.scroll(true, false);
+    try std.testing.expect(s.scroll_rows > 0);
+    s.anchor = 0;
+    s.anchor_end = 3;
+    s.selection_start = 0;
+    s.selection_end = 3;
+    s.dragging = true;
+    s.dirty = false;
+    try s.writeLog("\nseven\neight");
+
+    s.followLatest();
+    try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
+    try std.testing.expect(s.anchor == null);
+    try std.testing.expectEqual(@as(usize, 0), s.anchor_end);
+    try std.testing.expectEqual(@as(usize, 0), s.selection_start);
+    try std.testing.expectEqual(@as(usize, 0), s.selection_end);
+    try std.testing.expect(!s.dragging);
+    try std.testing.expect(s.dirty);
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
+    try s.writeLog("\nnine");
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqual(@as(usize, 0), s.scroll_rows);
+
+    // Following output does not prevent browsing history again.
+    try s.scroll(true, false);
+    try std.testing.expect(s.scroll_rows > 0);
+}
+
 test "the log region keeps at least one row above the input" {
     var s: Screen = .{ .allocator = std.testing.allocator, .io = std.testing.io, .out = undefined, .active = false };
     s.rows = 24;
@@ -1674,6 +1762,79 @@ test "a transcript past its bound drops the oldest whole lines and moves its off
     s.trimTranscript();
     try std.testing.expectEqual(kept, s.transcript.items.len);
     try std.testing.expect(!s.dirty);
+}
+
+test "question geometry keeps log status thinking and editor disjoint" {
+    var s = Screen.init(std.testing.allocator, std.testing.io, false);
+    defer s.deinit();
+    for (3..25) |rows| {
+        s.rows = rows;
+        for (1..30) |input| {
+            s.input_rows = input;
+            for ([_]usize{ 0, 1, 8 }) |questions| {
+                s.question_rows = questions;
+                for (0..2) |thinking| {
+                    s.thinking_rows = thinking;
+                    try expect(s.logBottom() >= 1);
+                    try expectEqual(s.logBottom() + 1, s.questionTop());
+                    try expectEqual(s.questionTop() + s.questionRows(), s.statusRow());
+                    try expectEqual(s.statusRow() + 1, s.thinkingTop());
+                    try expectEqual(s.thinkingTop() + s.thinkingRows(), s.inputTop());
+                    try expectEqual(rows + 1, s.inputTop() + s.usableInputRows());
+                    try expect(s.questionRows() <= questions);
+                    try expect(s.thinkingRows() <= thinking);
+                }
+            }
+        }
+    }
+    // Less than three rows cannot fit all mandatory regions. Suppress the
+    // optional panels and at least keep emitted status/editor addresses valid.
+    for (1..3) |rows| {
+        s.rows = rows;
+        s.question_rows = 8;
+        s.thinking_rows = 1;
+        try expectEqual(@as(usize, 0), s.questionRows());
+        try expectEqual(@as(usize, 0), s.thinkingRows());
+        try expect(s.statusRow() >= 1 and s.statusRow() <= rows);
+        try expect(s.inputTop() >= 1 and s.inputTop() <= rows);
+    }
+}
+
+test "question dock gives thinking its row and returns space when panels close" {
+    var s = Screen.init(std.testing.allocator, std.testing.io, false);
+    defer s.deinit();
+    s.rows = 8;
+    s.question_rows = 8;
+    try expectEqual(@as(usize, 5), s.questionRows());
+    s.thinking_rows = 1;
+    try expectEqual(@as(usize, 4), s.questionRows());
+    try expectEqual(@as(usize, 6), s.statusRow());
+    try expectEqual(@as(usize, 7), s.thinkingTop());
+    try expectEqual(@as(usize, 8), s.inputTop());
+    s.question_rows = 0;
+    try expectEqual(@as(usize, 5), s.logBottom());
+    s.thinking_rows = 0;
+    try expectEqual(@as(usize, 6), s.logBottom());
+}
+
+test "thinking paint does not wrap into editor on narrow question viewports" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, false);
+    defer s.deinit();
+    s.rows = 8;
+    s.question_rows = 3;
+    s.thinking_rows = 1;
+    try s.thinking.appendSlice(a, "longword中文");
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    for (1..25) |columns| {
+        s.cols = columns;
+        aw.clearRetainingCapacity();
+        try s.writeThinking(&aw.writer);
+        try expect(std.mem.indexOfAny(u8, aw.written(), "\r\n") == null);
+        // Cursor addressing and styling have zero width; only painted cells count.
+        try expect(term.width(aw.written()) <= columns -| 1);
+    }
 }
 
 test "the thinking panel keeps only the rows the window can spare" {

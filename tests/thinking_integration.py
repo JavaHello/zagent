@@ -147,8 +147,8 @@ try:
 
             # A response that narrates nothing opens no panel and leaves no
             # summary line behind.
+            until('✓ Turn finished'.encode())
             mark = len(transcript)
-            time.sleep(0.3)
             os.write(master, b'and again\r')
             deadline = time.monotonic() + 15
             while second_answer.encode() not in ansi.sub(b'', bytes(transcript[mark:])):

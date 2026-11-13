@@ -1486,17 +1486,25 @@ pub const Agent = struct {
             return menu.repliesFrom(self.allocator, slots);
         }
 
-        return menu.resolve(self.allocator, slots, .{
+        const replies = try menu.resolve(self.allocator, slots, .{
             .context = self,
             .present = presentOnTerminal,
             .read = readOnTerminal,
         });
+        if (replies.canceled) {
+            // Esc at the questions is a stop here too: nothing is answered, and
+            // the run ends the way it does when the screen owns the form. The
+            // replies still go back, so the tool has a result to record.
+            self.interrupted.store(true, .release);
+            try self.emit(std.Io.File.stderr(), YELLOW ++ "  Task interrupted (Esc). The questions were cancelled and no answer was sent.\n" ++ RESET, .{});
+        }
+        return replies;
     }
 
     /// Draw a form on the terminal, which owns the keyboard in this mode.
     fn presentOnTerminal(context: *anyopaque, slots: []menu.Slot, focus: ?usize) anyerror!menu.Outcome {
         const self: *Agent = @ptrCast(@alignCast(context));
-        return menu.form(self.allocator, self.io, slots, true, focus);
+        return menu.form(self.allocator, self.io, slots, true, true, focus);
     }
 
     /// Read the free text a free-text row asks for, on that same terminal.

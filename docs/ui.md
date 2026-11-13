@@ -144,54 +144,61 @@ session state wait for the task to end.
 
 Press **Esc** to interrupt the current task, terminate its running tools, and
 discard input typed while it ran, keeping your own draft. If a completion popup
-is open, Esc only closes the popup, and if a question is open, Esc only steps
-back through it — out of the free-text row to its options, and out of the menu
-to a dismissal — and the task carries on. Completed actions are not undone.
+is open, Esc only closes the popup. A question is no exception to the stop: Esc
+at the questions cancels them and ends the run with them, and the answers given
+are not sent — inside a free-text row Esc only steps back to that question's
+options. Completed actions are not undone.
 
 ## Choices
 
 When a request is ambiguous — several reasonable approaches, unclear scope, a
-decision only you can make — the agent calls `ask_user` and you get a menu:
+decision only you can make — the agent calls `ask_user` and you get a form:
 
 ```
+ · 1   · Confirm
   Which approach should I use?
     > 1) Rewrite in place (recommended)  Keeps the history intact.
       2) New file  Leaves the original alone.
       3) Other / 自定义回答
-  ↑/↓ select · Enter confirm · Esc cancel
+  Tab/Shift+Tab · ↑/↓ select · Enter confirm · Esc cancel
 ```
 
 Use ↑/↓ (or j/k) to move within a question, then Enter to confirm. The
 recommended option is selected initially, or the first option if none is
-recommended. Number keys 1–9 also move the selection. Choose Other to type your
+recommended. Number keys 1–9 select an option directly. Choose Other to type your
 own answer; Esc there goes back to the option list, so a mistyped start costs
-nothing. Ctrl+D or Esc at the list dismisses the question and the agent carries
-on from there on its own; Ctrl+C is deliberately not a way out, because it is
-pressed by habit. Esc stops the task at the prompt, not at a question: backing
-out of a question should not throw the run away. In the fullscreen session the
-menu takes the rows the prompt had, so nothing typed at a menu reaches the input
-box or steers the task: the keyboard belongs to the question until it is
-answered.
+nothing.
 
-Several questions asked in one `ask_user` call are drawn as one form, and Tab
-and Shift+Tab move between them:
+The strip above the question names its tabs: a number per question and a final
+**Confirm**. The tab with the keyboard is cyan and underlined, `✓` marks an
+answered question, and the confirmation stays a `·` until every one of them has
+an answer. The last answer moves the keyboard there instead of sending it off:
 
 ```
-  1/3 Which approach should I use?  → Rewrite in place
-  2/3 Which tests should I run?  → Full suite
-  3/3 Anything else I should know?
-    > 1) No
-      2) Yes (recommended)
-      3) Other / 自定义回答
-  Tab/Shift+Tab question · ↑/↓ select · Enter confirm · Esc cancel
+  ✓ 1   ✓ Confirm
+  Confirm
+    > 1) Submit  Send the answers as they stand
+      2) Supplement  Type your own words to add
+  Tab/Shift+Tab · ↑/↓ select · Enter submit · Esc cancel
 ```
 
-Enter answers the question that has the keyboard and moves on to the next one
-still without an answer; the last answer submits the form. Answered questions
-show what they were answered with, and Tab or Shift+Tab reaches them again, so a
-wrong answer can be changed until the form is submitted. Only the question with
-the keyboard shows its option rows, which keeps a long form on screen. Leaving
-the form keeps the answers already given and dismisses the rest.
+**Submit** sends the answers as they are; **Supplement** asks for a line of your
+own words, which is sent with them, so a decision can carry the detail the
+options left out. Esc in that line goes back to the confirmation.
+
+Tab and Shift+Tab move between the tabs and wrap around, so an earlier answer can
+be revised: answered questions show what they were answered with, and only the
+one with the keyboard shows its option rows, which keeps a long form on screen.
+The form's own words — `Confirm`, `Submit`, `Supplement` — are English; the
+questions and their options are whatever the model wrote.
+
+Esc at the tabs cancels the questions and stops the task with them, as it does at
+the prompt: nothing is answered, and the agent is not told to decide on its own.
+Ctrl+D instead dismisses the form, and the agent carries on from there on its
+own. Ctrl+C is deliberately not a way out, because it is pressed by habit. In the
+fullscreen session the form takes the rows the prompt had, so nothing typed at a
+form reaches the input box or steers the task: the keyboard belongs to the
+questions until they are answered.
 
 With no terminal to type at (piped input, or an unsupported terminal) the
 recommended option is taken and the agent says so. Interactive menus also work in

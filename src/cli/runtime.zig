@@ -72,6 +72,13 @@ pub const Runtime = struct {
 
     pub fn interrupt(self: *Runtime) !void {
         if (!self.busy()) return;
+        try self.stopRun(sgr.YELLOW ++ layout.indent ++ "Task interrupted (Esc). Input typed while it ran was discarded." ++ sgr.RESET ++ "\n");
+    }
+
+    /// End the run now: the worker is cancelled, nothing queued or typed during
+    /// it survives, and the screen says why. Both the prompt's Esc and the Esc
+    /// that cancels a question come through here.
+    fn stopRun(self: *Runtime, message: []const u8) !void {
         self.agent.interrupted.store(true, .release);
         if (self.future) |*f| f.cancel(self.agent.io);
         self.future = null;
@@ -84,7 +91,7 @@ pub const Runtime = struct {
         self.agent.clearSteering();
         try self.agent.finishInterruption();
         _ = try self.screen.drain();
-        try self.screen.writeLog(sgr.YELLOW ++ layout.indent ++ "Task interrupted (Esc). Input typed while it ran was discarded." ++ sgr.RESET ++ "\n");
+        try self.screen.writeLog(message);
         _ = try self.screen.drain();
     }
 
@@ -206,7 +213,8 @@ pub const Runtime = struct {
 
     /// One form, from its questions to either an answer for every one of them
     /// or a dismissal. Esc in the free-text row steps back to the form, so it
-    /// is drawn again until it is settled instead of being thrown away.
+    /// is drawn again until it is settled; Esc at the questions cancels them
+    /// and stops the run, as Esc at the prompt stops a task.
     fn serveForm(self: *Runtime, slots: []menu.Slot) !void {
         const replies = menu.resolve(self.agent.allocator, slots, .{
             .context = self,
@@ -219,33 +227,38 @@ pub const Runtime = struct {
             self.settle(menu.dismissedReplies(self.agent.allocator, slots.len) catch return err) catch {};
             return err;
         };
+        if (replies.canceled) {
+            // Nothing is answered by a cancelled question, so the worker waits
+            // for no reply at all: the run ends here.
+            replies.deinit(self.agent.allocator);
+            try self.stopRun(sgr.YELLOW ++ layout.indent ++ "Task interrupted (Esc). The questions were cancelled and no answer was sent." ++ sgr.RESET ++ "\n");
+            return;
+        }
         try self.settle(replies);
     }
 
-    /// Draw the form in the rows the prompt had, so the conversation above it
-    /// stays where it is instead of scrolling under the menu.
+    /// The screen owns geometry; the menu owns keyboard state and paints only
+    /// the dock above the status bar, never relative to the log's cursor.
     fn presentOnScreen(context: *anyopaque, slots: []menu.Slot, focus: ?usize) anyerror!menu.Outcome {
         const self: *Runtime = @ptrCast(@alignCast(context));
-        try self.reserveRows(menu.formRows(slots, true));
-        const outcome = menu.form(self.agent.allocator, self.agent.io, slots, true, focus) catch |err| {
-            self.screen.endInput() catch {};
-            return err;
-        };
-        try self.screen.endInput();
-        return outcome;
+        if (!self.screen.isActive()) return menu.form(self.agent.allocator, self.agent.io, slots, true, true, focus);
+        defer self.screen.endQuestion() catch {};
+        return menu.formDocked(self.agent.allocator, self.agent.io, slots, true, true, focus, .{
+            .context = self,
+            .prepare = prepareQuestion,
+        });
+    }
+
+    fn prepareQuestion(context: *anyopaque, wanted: usize) anyerror!menu.Viewport {
+        const self: *Runtime = @ptrCast(@alignCast(context));
+        try self.screen.reserveQuestion(wanted);
+        return .{ .top = self.screen.questionTop(), .height = self.screen.questionRows(), .columns = self.screen.cols };
     }
 
     /// Read the free text a free-text row asks for, with the same editor.
     fn readOnScreen(context: *anyopaque) anyerror!menu.Line {
         const self: *Runtime = @ptrCast(@alignCast(context));
         return self.agent.readChoiceLine();
-    }
-
-    /// Reserve bottom rows for the form the way the editor does for its own.
-    fn reserveRows(self: *Runtime, rows: usize) !void {
-        self.screen.editor_frame = true;
-        defer self.screen.editor_frame = false;
-        try self.screen.reserveInput(rows, true);
     }
 
     /// Publish the answers to the worker waiting in `presentForm`.

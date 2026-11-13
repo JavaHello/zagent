@@ -125,9 +125,11 @@ try:
             send(b'\x1b[5~\x1b[6~/model\r\r', b'Model: runtime-mock')
             release.set()
             # The question is put to the user in the rows the prompt had: the
-            # menu owns the keyboard and the input box is not usable.
+            # menu owns the keyboard and the input box is not usable. The answer
+            # lands on the confirmation, which the next Enter submits.
             until(b'Enter confirm')
-            send(b'\x15' + b'1\r', b'Background answer complete')
+            send(b'\x15' + b'1\r', b'1) Submit')
+            send(b'\r', b'Background answer complete')
             until('✓ Turn finished'.encode())
             assert b'\x1b[1m\x1b[32m' + '  ✓ Turn finished'.encode() + b'\x1b[0m' in transcript, transcript
             deadline = time.monotonic() + 8
@@ -141,7 +143,7 @@ try:
             send(b'/quit\r\r', b'Goodbye!')
             assert process.wait(timeout=5) == 0
             assert termios.tcgetattr(slave) == original
-            print('PASS: background requests, live commands, steering input, page keys, foreground choice and clean shutdown')
+            print('PASS: background requests, live commands, steering input, page keys, foreground choice and its confirmation, and clean shutdown')
         finally:
             release.set()
             if process.poll() is None:

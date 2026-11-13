@@ -371,7 +371,11 @@ pub fn main(init: std.process.Init) !void {
         // Single-query mode: join remaining args as the query
         const query = try std.mem.join(allocator, " ", args.items[query_start..]);
         defer allocator.free(query);
-        try agent.processQuery(query);
+        // Esc at a question ends the run as a cancellation, and the notice for
+        // it was written where the run stopped: that is not a failed query.
+        agent.processQuery(query) catch |err| {
+            if (err != error.Canceled or !agent.interrupted.load(.acquire)) return err;
+        };
     } else {
         // Interactive REPL mode
         try runRepl(allocator, io, env, &agent, config, &ln, history_path, &registry, report.written(), &trace);
@@ -489,6 +493,8 @@ fn runRepl(
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
 
         if (line.len == 0) continue;
+
+        screen.followLatest();
 
         // The editor's rows are cleared once the line is read; the question
         // still belongs in the record, with the prompt it was typed after. An
@@ -614,7 +620,14 @@ fn runRepl(
         } else if (screen.isActive()) {
             try runtime.submit(line);
         } else {
+            // A stop ends one run, not the session: the next line starts with
+            // a clean flag, the way the screen runtime's tick does.
+            agent.interrupted.store(false, .release);
             agent.processQuery(line) catch |err| {
+                if (err == error.Canceled and agent.interrupted.load(.acquire)) {
+                    try writeOut(&screen, stdout, io, "\n");
+                    continue;
+                }
                 const errmsg = try std.fmt.allocPrint(allocator, RED ++ "Error: {s}" ++ RESET ++ "\n", .{@errorName(err)});
                 defer allocator.free(errmsg);
                 try writeBlock(allocator, &screen, stderr, io, errmsg);

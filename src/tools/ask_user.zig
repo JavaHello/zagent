@@ -5,6 +5,10 @@ const Agent = @import("../agent/mod.zig").Agent;
 const dismissed_question_message = @import("../agent/prompt.zig").dismissed_question_message;
 const tool = @import("tool.zig");
 
+/// The line that carries the words typed on the confirmation's Supplement row,
+/// which add to the answers rather than answering a question.
+const note_line = "The user added: ";
+
 pub const spec: tool.Tool = .{
     .name = "ask_user",
     .description = "Ask the user to choose between concrete options when the request is ambiguous or a decision only they can make blocks progress. Pass every question you need answered in one call: they are put to the user as one form, so a question whose answer depends on another belongs in a later call, once the answers are in.",
@@ -193,9 +197,10 @@ fn buildOption(allocator: std.mem.Allocator, value: std.json.Value) !?menu.Optio
 
 /// What the model reads back. One question answers as it always has; several
 /// are one line each, naming the question the answer belongs to, because the
-/// model has to know which decision each answer settles.
+/// model has to know which decision each answer settles. Words the user added
+/// at the confirmation follow, on a line of their own.
 fn answersResult(self: *Agent, questions: []const Question, replies: menu.Replies) !tool.ToolResult {
-    if (questions.len == 1) return questionResult(self, replies.items[0], questions[0].options.items);
+    if (questions.len == 1) return questionResult(self, replies.items[0], questions[0].options.items, replies.note);
 
     var aw: std.Io.Writer.Allocating = .init(self.allocator);
     defer aw.deinit();
@@ -206,14 +211,22 @@ fn answersResult(self: *Agent, questions: []const Question, replies: menu.Replie
         if (answer == null) dismissed = true;
         try aw.writer.print("{s} → {s}\n", .{ question.text, answer orelse dismissed_question_message });
     }
+    if (replies.note) |note| try aw.writer.print("{s}{s}\n", .{ note_line, note });
     // A dismissed question leaves the model a decision to make, which is what
     // an error result tells it: the same as a lone dismissed question.
     return .{ .output = try aw.toOwnedSlice(), .is_error = dismissed };
 }
 
-fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option) !tool.ToolResult {
-    if (try menu.describeReply(self.allocator, reply, options)) |line| return .{ .output = line, .is_error = false };
-    return .{ .output = try self.allocator.dupe(u8, dismissed_question_message), .is_error = true };
+fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option, note: ?[]const u8) !tool.ToolResult {
+    const line = try menu.describeReply(self.allocator, reply, options);
+    // The answer is the described reply, or the sentence a dismissal reads as.
+    const answer = line orelse try self.allocator.dupe(u8, dismissed_question_message);
+    defer self.allocator.free(answer);
+    const output = if (note) |text|
+        try std.fmt.allocPrint(self.allocator, "{s}\n{s}{s}", .{ answer, note_line, text })
+    else
+        try self.allocator.dupe(u8, answer);
+    return .{ .output = output, .is_error = line == null };
 }
 
 test "the call line names the questions it asks" {
@@ -323,7 +336,7 @@ test "several questions answer as one line each, and a dismissal is an error" {
     const answered = try allocator.alloc(menu.Reply, questions.items.len);
     answered[0] = .{ .option = 0 };
     answered[1] = .{ .custom = try allocator.dupe(u8, "my own words") };
-    const all = menu.Replies{ .items = answered };
+    var all = menu.Replies{ .items = answered };
     defer all.deinit(allocator);
     const full = try answersResult(&agent, questions.items, all);
     defer full.deinit(allocator);
@@ -334,4 +347,19 @@ test "several questions answer as one line each, and a dismissal is an error" {
     const single = try answersResult(&agent, questions.items[0..1], all);
     defer single.deinit(allocator);
     try std.testing.expectEqualStrings("User selected: Alpha", single.output);
+
+    // Words the user added at the confirmation follow the answers, so the model
+    // reads them as part of the same decision.
+    all.note = try allocator.dupe(u8, "and keep the change small");
+    const noted = try answersResult(&agent, questions.items, all);
+    defer noted.deinit(allocator);
+    try std.testing.expect(std.mem.endsWith(u8, noted.output, "The user added: and keep the change small\n"));
+    try std.testing.expect(std.mem.indexOf(u8, noted.output, "Second? → The user did not pick one of the options and answered: my own words") != null);
+
+    const noted_single = try answersResult(&agent, questions.items[0..1], all);
+    defer noted_single.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "User selected: Alpha\nThe user added: and keep the change small",
+        noted_single.output,
+    );
 }
