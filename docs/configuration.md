@@ -61,9 +61,13 @@ produced.
 
 ## Retries
 
-Transient network errors and HTTP 408/429/500/502/503/504 responses are retried
-up to three attempts. Output still cut off after bounded continuations returns
-an error instead of reporting completion.
+Transient network errors (`HttpConnectionClosing`, a reset connection, a broken
+pipe, a timeout, an unreachable network) and HTTP 408/429/500/502/503/504
+responses are retried, up to three attempts with a one and then two second
+pause, each attempt on a fresh connection. A retry is only sent while no answer
+text has been shown; a stream that fails after the reply started ends the turn
+with its error. Output still cut off after bounded continuations returns an
+error instead of reporting completion.
 
 ## Session and workspace state
 

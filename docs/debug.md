@@ -58,7 +58,7 @@ milliseconds `at`, the agent it belongs to `agent`, and the request of the turn
 | `tool_call` | The tool name, its `call_id` and its arguments |
 | `tool_result` | The result text, `is_error`, `exit_code`, `timed_out`, the signal that ended the program when one did (`termination`), the `ccr` entry a preview stands for, and how long it took |
 | `failure` | A request that produced no usable reply, with what the server sent |
-| `note` | Something the loop did that a request does not explain: a continuation after the output limit, guidance typed mid-task, a stop |
+| `note` | Something the loop did that a request does not explain: a continuation after the output limit, guidance typed mid-task, a stop, a request sent again after a transient failure |
 | `turn` | How the turn ended: tool calls made, elapsed time, and whether the model finished |
 
 A [sub-agent's](subagents.md) requests, tool calls and results are written into

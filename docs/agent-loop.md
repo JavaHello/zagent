@@ -33,10 +33,15 @@ Transport errors and truncation still return errors.
 
 ## Retries and truncation
 
-Transient network errors and HTTP 408/429/500/502/503/504 responses are retried
-up to three attempts. Output that hits the token budget is continued, and
-eventually reported as `ResponseTruncated`; the budget and its growth are
-described in
+Transient network errors (`HttpConnectionClosing`, a reset connection, a broken
+pipe, a timeout, an unreachable network) and HTTP 408/429/500/502/503/504
+responses are retried, up to three attempts with a one and then two second
+pause, each attempt on a fresh connection. A retry is only sent while no answer
+text has been shown: once the reply is streaming onto the screen, a failure ends
+the turn with its error rather than printing the answer twice.
+
+Output that hits the token budget is continued, and eventually reported as
+`ResponseTruncated`; the budget and its growth are described in
 [Configuration](configuration.md#output-budget-and-truncation).
 
 ## Watching a sub-agent

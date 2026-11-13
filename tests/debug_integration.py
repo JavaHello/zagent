@@ -21,7 +21,7 @@ if '--debug' not in subprocess.run([str(BINARY), '--help'], capture_output=True,
     raise SystemExit(0)
 
 requests = []
-fail_next = False
+failures_left = 0
 
 
 def payload(status='completed', output=None, error=None):
@@ -34,12 +34,12 @@ class API(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        global fail_next
+        global failures_left
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         requests.append(body)
         assert self.path == '/v1/responses'
-        if fail_next:
-            fail_next = False
+        if failures_left:
+            failures_left -= 1
             data = json.dumps({'error': {'message': 'the model refused the request'}}).encode()
             self.send_response(500)
             self.send_header('Content-Type', 'application/json')
@@ -141,8 +141,10 @@ try:
         assert rebuilt.stdout.strip() == str(report_path), rebuilt.stdout
         assert report_path.read_text().startswith('<!doctype html>')
 
-        # A failed request is a step too, with what the server said.
-        fail_next = True
+        # A failed request is a step too, with what the server said. The
+        # refusal outlasts every attempt the request is given, so the turn ends
+        # with it instead of the retry recovering.
+        failures_left = 3
         failed = subprocess.run([str(BINARY), '--debug', 'Ask the impossible'],
                                 cwd=workspace, env=env, capture_output=True, text=True, timeout=60)
         assert failed.returncode != 0, failed

@@ -247,6 +247,66 @@ pub const StreamSink = struct {
     onText: *const fn (context: *anyopaque, delta: []const u8) void,
 };
 
+/// Attempts a request is given: the first try and two retries.
+const max_attempts: usize = 3;
+
+/// How long the first retry waits for the network to settle; every later one
+/// waits twice as long again.
+const retry_delay_ms: i64 = 1000;
+
+/// Forwards deltas to the caller's sink and remembers whether any of them got
+/// through. The answer is painted as it arrives, so a retry is only safe while
+/// this says nothing has been shown yet.
+const Delivery = struct {
+    target: StreamSink,
+    shown: bool = false,
+
+    fn sink(self: *Delivery) StreamSink {
+        return .{ .context = self, .onText = onText };
+    }
+
+    fn onText(context: *anyopaque, delta: []const u8) void {
+        const self: *Delivery = @ptrCast(@alignCast(context));
+        self.shown = true;
+        self.target.onText(self.target.context, delta);
+    }
+};
+
+/// Whether the attempt that just failed may be repeated: the failure has to be
+/// one the network or the server can recover from on their own, no answer text
+/// may have reached the screen, and an attempt has to be left.
+fn shouldRetry(attempt: usize, shown: bool, transient: bool) bool {
+    return transient and !shown and attempt + 1 < max_attempts;
+}
+
+/// Connection failures that say the transport failed, not the request: a pooled
+/// connection the server had already closed, a reset, a timeout, a network that
+/// went away. A URL that does not parse or a certificate that does not verify
+/// would fail the same way however often it is sent, and is not here.
+fn isTransientNetworkError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing, // the keep-alive connection was closed under us
+        error.HttpRequestTruncated,
+        error.HttpChunkTruncated,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.NetworkSubsystemFailed,
+        => true,
+        else => false,
+    };
+}
+
+/// Statuses that say the server was busy or briefly broken rather than that the
+/// request was wrong: sending the same request again can work.
+fn isTransientStatus(status: std.http.Status) bool {
+    return switch (@backingInt(status)) {
+        408, 429, 500, 502, 503, 504 => true,
+        else => false,
+    };
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -266,6 +326,9 @@ pub const Client = struct {
     /// a message written from in here would be glued onto a frame and then
     /// erased by the next one. Whoever stops the animation reports it instead.
     http_error: ?[]u8,
+    /// Whether the last response's status was one a retry may fix. Written by
+    /// the exchange and read by the retry loop around it; nothing else uses it.
+    retryable_status: bool = false,
     search: search_tools.SearchBackends = .{},
     /// Borrowed definitions; callers may replace this slice between requests.
     /// The slice and its strings must remain valid for each request's duration.
@@ -424,6 +487,23 @@ pub const Client = struct {
         self.http_client.deinit();
     }
 
+    /// Forget the failure recorded for the last request, without reporting it.
+    /// Used when that request is sent again: what it said no longer describes
+    /// the outcome the caller will see.
+    fn discardHttpError(self: *Client) void {
+        if (self.http_error) |message| self.allocator.free(message);
+        self.http_error = null;
+    }
+
+    /// Drop every pooled connection, so the next attempt opens a new one. A
+    /// request can fail because the keep-alive connection it reused had already
+    /// been closed by the server, and sending it again on that same connection
+    /// would fail the same way.
+    fn resetHttpClient(self: *Client) void {
+        self.http_client.deinit();
+        self.http_client = .{ .allocator = self.allocator, .io = self.io };
+    }
+
     /// Take the failure recorded for the last request, if there was one, and
     /// with it the ownership of the message.
     pub fn takeHttpError(self: *Client) ?[]u8 {
@@ -550,15 +630,53 @@ pub const Client = struct {
     /// is a `data:` line carrying one JSON object. Text deltas are forwarded
     /// to `sink` as they arrive, and the final event carries the complete
     /// response object, which is parsed exactly like a non-streaming reply.
+    ///
+    /// The request is retried while the failure is one the network or the
+    /// server can be expected to recover from: a connection the server had
+    /// already closed, a reset, a timeout, or a status that says the server was
+    /// busy (408, 429, 5xx).
+    ///
+    /// A retry is only sent while none of the answer has reached the caller.
+    /// Deltas are painted as they arrive, so text shown once must never arrive
+    /// a second time: a stream that fails after the reply started ends the turn
+    /// instead of being sent again.
     fn exchangeStreaming(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            var delivery: Delivery = .{ .target = sink };
+            const recorded = if (raw) |buffer| buffer.items.len else 0;
+            if (self.exchangeOnce(response_url, auth_header, req_json, delivery.sink(), raw)) |response| {
+                return response;
+            } else |err| {
+                if (!shouldRetry(attempt, delivery.shown, self.retryable_status or isTransientNetworkError(err))) return err;
+                // The bytes and the message of this attempt belong to a request
+                // that is being sent again: the trace keeps what counts, and
+                // only the final failure is worth reporting.
+                if (raw) |buffer| buffer.shrinkRetainingCapacity(recorded);
+                self.discardHttpError();
+                if (comptime trace_mod.enabled) {
+                    if (self.trace) |trace| trace.note(self.trace_ctx, "warn", "the request failed before any answer text arrived; it was sent again on a new connection");
+                }
+                // The failure may have been the pooled connection the request
+                // reused, so the retry has to reach the server on a fresh one.
+                self.resetHttpClient();
+                try self.io.sleep(.fromMilliseconds(retry_delay_ms * (@as(i64, 1) << @intCast(attempt))), .awake);
+                continue;
+            }
+        }
+    }
+
+    /// One attempt at the exchange: the request, its response, and the stream
+    /// that carries the answer to the sink.
+    fn exchangeOnce(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
         _ = self.requests.fetchAdd(1, .monotonic);
+        self.retryable_status = false;
         if (self.transport) |transport| {
             // Tests drive the buffered path; streaming is a network detail.
             const body = try transport.send(transport.context, self.allocator, req_json);
             defer self.allocator.free(body);
             if (raw) |buffer| buffer.appendSlice(self.allocator, body) catch {};
-            if (self.http_error) |message| self.allocator.free(message);
-            self.http_error = null;
+            self.discardHttpError();
             self.recordResponseUsage(body);
             return parseResponse(self.allocator, body);
         }
@@ -616,12 +734,12 @@ pub const Client = struct {
             _ = reader.streamRemaining(&aw.writer) catch {};
             if (raw) |buffer| buffer.appendSlice(self.allocator, aw.written()) catch {};
             self.recordResponseUsage(aw.written());
+            self.retryable_status = isTransientStatus(response.head.status);
             self.recordHttpError(response.head.status, aw.written());
             return error.ApiError;
         }
 
-        if (self.http_error) |message| self.allocator.free(message);
-        self.http_error = null;
+        self.discardHttpError();
 
         if (json_response) {
             var buffered: std.Io.Writer.Allocating = .init(self.allocator);
@@ -1214,6 +1332,33 @@ test "extract string arg" {
     const result = try extractStringArg(allocator, "{\"command\":\"ls -la\"}", "command");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("ls -la", result);
+}
+
+test "a failed request is sent again only when that can work" {
+    // A connection the server closed under a pooled request, and the statuses
+    // that say the server was busy, are worth another attempt.
+    try std.testing.expect(isTransientNetworkError(error.HttpConnectionClosing));
+    try std.testing.expect(isTransientNetworkError(error.ConnectionResetByPeer));
+    try std.testing.expect(isTransientNetworkError(error.BrokenPipe));
+    try std.testing.expect(isTransientNetworkError(error.ConnectionTimedOut));
+    try std.testing.expect(isTransientStatus(.too_many_requests));
+    try std.testing.expect(isTransientStatus(.service_unavailable));
+    try std.testing.expect(isTransientStatus(.gateway_timeout));
+    // A request the server refused, and a status that says it was wrong, are
+    // not: they fail the same way however often they are sent.
+    try std.testing.expect(!isTransientNetworkError(error.ApiError));
+    try std.testing.expect(!isTransientNetworkError(error.ConnectionRefused));
+    try std.testing.expect(!isTransientStatus(.bad_request));
+    try std.testing.expect(!isTransientStatus(.unauthorized));
+
+    try std.testing.expect(shouldRetry(0, false, true));
+    try std.testing.expect(shouldRetry(1, false, true));
+    // The third attempt is the last one.
+    try std.testing.expect(!shouldRetry(2, false, true));
+    // Text that already reached the screen must never arrive twice.
+    try std.testing.expect(!shouldRetry(0, true, true));
+    // A failure a retry cannot fix is reported as it is.
+    try std.testing.expect(!shouldRetry(0, false, false));
 }
 
 test "an http failure is kept until the caller asks for it" {
