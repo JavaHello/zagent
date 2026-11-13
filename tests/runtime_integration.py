@@ -40,8 +40,9 @@ class API(http.server.BaseHTTPRequestHandler):
             started.set()
             assert release.wait(10), 'foreground never released the request'
             output = [{'type': 'function_call', 'call_id': 'choice', 'name': 'ask_user',
-                       'arguments': json.dumps({'question': 'Runtime choice?', 'options': [
-                           {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]})}]
+                       'arguments': json.dumps({'questions': [
+                           {'question': 'Runtime choice?', 'options': [
+                               {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]}]})}]
         else:
             answers.append(results[-1]['output'])
             output = [{'type': 'message', 'role': 'assistant', 'content': [

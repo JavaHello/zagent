@@ -1,125 +1,66 @@
 const std = @import("std");
 const menu = @import("../ui/menu.zig");
+const text = @import("../util/text.zig");
 const Agent = @import("../agent/mod.zig").Agent;
 const dismissed_question_message = @import("../agent/prompt.zig").dismissed_question_message;
 const tool = @import("tool.zig");
 
 pub const spec: tool.Tool = .{
     .name = "ask_user",
-    .description = "Ask the user to choose between concrete options when the request is ambiguous or a decision only they can make blocks progress. Several such calls sent together are put to the user as one form.",
+    .description = "Ask the user to choose between concrete options when the request is ambiguous or a decision only they can make blocks progress. Pass every question you need answered in one call: they are put to the user as one form, so a question whose answer depends on another belongs in a later call, once the answers are in.",
     .parameters_json =
-    \\{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}
+    \\{"type":"object","properties":{"questions":{"type":"array","minItems":1,"description":"The questions to put to the user, in the order they should be answered","items":{"type":"object","properties":{"question":{"type":"string","description":"The decision that is needed, in one sentence"},"options":{"type":"array","description":"Two to four concrete choices","items":{"type":"object","properties":{"label":{"type":"string","description":"Short name of the choice"},"description":{"type":"string","description":"One sentence on what this choice means"},"recommended":{"type":"boolean","description":"True for the option you would pick"}},"required":["label"]}}},"required":["question","options"]}}},"required":["questions"]}
     ,
+    .summary = writeSummary,
     .run = run,
 };
 
+/// The call is named by the questions it asks: the form draws them in full a
+/// moment later, so the line only has to say what is being asked.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments_json: []const u8) !bool {
+    const questions = parseQuestions(ctx.allocator, arguments_json) catch return false;
+    defer questions.deinit(ctx.allocator);
+    if (questions.items.len == 1) {
+        try text.writeOnOneLine(w, questions.items[0].text);
+        return true;
+    }
+    try w.print("{d} questions: ", .{questions.items.len});
+    for (questions.items, 0..) |question, index| {
+        if (index > 0) try w.writeAll(" · ");
+        try text.writeOnOneLine(w, question.text);
+    }
+    return true;
+}
+
 fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
     const agent = ctx.agent orelse return ctx.refuse("Error: this tool requires an agent context.");
-    return execute(agent, args, ctx.answers, ctx.index);
+    return execute(agent, args);
 }
 
-/// Answers aligned with the tool calls in one model message.
-pub const QuestionAnswers = struct {
-    items: []Slot,
-
-    pub const Content = struct { text: []const u8, is_error: bool };
-    pub const Slot = union(enum) {
-        /// Not a question of this form: dispatch the call as usual.
-        none,
-        /// Owned here until dispatch takes it.
-        content: Content,
-    };
-
-    pub fn deinit(self: QuestionAnswers, allocator: std.mem.Allocator) void {
-        for (self.items) |item| {
-            switch (item) {
-                .content => |content| allocator.free(content.text),
-                .none => {},
-            }
-        }
-        allocator.free(self.items);
-    }
-
-    /// Transfer a prepared result to dispatch, which then owns its text.
-    pub fn take(self: *QuestionAnswers, index: usize) ?Content {
-        if (index >= self.items.len) return null;
-        switch (self.items[index]) {
-            .none => return null,
-            .content => |content| {
-                self.items[index] = .none;
-                return content;
-            },
-        }
-    }
-};
-
-/// Put all valid questions in one form, allowing revisions before submission.
-/// Invalid calls are left for execute to report when dispatched.
-pub fn askQuestions(self: *Agent, calls: []const @import("../model/openai.zig").ToolCallData) !?QuestionAnswers {
-    // A sub-agent must not draw on a terminal it does not own.
-    if (self.role == .subagent) return null;
-    var questions_in_message: usize = 0;
-    for (calls) |call| {
-        if (std.mem.eql(u8, call.name, "ask_user")) questions_in_message += 1;
-    }
-    if (questions_in_message == 0) return null;
-
-    const items = try self.allocator.alloc(QuestionAnswers.Slot, calls.len);
-    @memset(items, .none);
-    var answers = QuestionAnswers{ .items = items };
-    errdefer answers.deinit(self.allocator);
-
-    var questions: std.ArrayList(Question) = .empty;
-    defer {
-        for (questions.items) |question| question.deinit(self.allocator);
-        questions.deinit(self.allocator);
-    }
-    var slots: std.ArrayList(menu.Slot) = .empty;
-    defer slots.deinit(self.allocator);
-    var indexes: std.ArrayList(usize) = .empty;
-    defer indexes.deinit(self.allocator);
-
-    for (calls, 0..) |call, i| {
-        if (!std.mem.eql(u8, call.name, "ask_user")) continue;
-        const question = parseAskUser(self.allocator, call.arguments) catch continue;
-        // The array does not own it until the append succeeds.
-        questions.append(self.allocator, question) catch |err| {
-            question.deinit(self.allocator);
-            return err;
-        };
-        try slots.append(self.allocator, menu.Slot.init(question.text, question.options.items));
-        try indexes.append(self.allocator, i);
-    }
-    if (slots.items.len == 0) return answers;
-
-    const replies = try self.askForm(slots.items);
-    defer replies.deinit(self.allocator);
-    for (replies.items, slots.items, indexes.items) |reply, slot, index| {
-        const result = try questionResult(self, reply, slot.options);
-        answers.items[index] = .{ .content = .{ .text = result.content, .is_error = result.is_error } };
-    }
-    return answers;
-}
-
-pub fn execute(self: *Agent, arguments: []const u8, answers: ?*QuestionAnswers, index: usize) !tool.ToolResult {
+/// Put every question of the call in one form, so the answers can be revised
+/// before the form is submitted, and report what each question was answered
+/// with. One call carries all of them, which is why dispatch needs nothing
+/// special for this tool: it is answered like any other.
+fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     if (self.role == .subagent) return .{
         .content = try self.allocator.dupe(u8, "No user is available to a sub-agent. Decide from what the task gives you, or report what blocks it."),
         .is_error = true,
     };
-    if (answers) |prepared| {
-        if (prepared.take(index)) |content| return .{ .content = content.text, .is_error = content.is_error };
-    }
-    const question = parseAskUser(self.allocator, arguments) catch {
+    const questions = parseQuestions(self.allocator, arguments) catch {
         return .{
-            .content = try self.allocator.dupe(u8, "Error: ask_user needs a 'question' and a non-empty 'options' array"),
+            .content = try self.allocator.dupe(u8, "Error: ask_user needs a non-empty 'questions' array, each entry with a 'question' and a non-empty 'options' array"),
             .is_error = true,
         };
     };
-    defer question.deinit(self.allocator);
-    var slots = [_]menu.Slot{menu.Slot.init(question.text, question.options.items)};
-    const replies = try self.askForm(&slots);
+    defer questions.deinit(self.allocator);
+
+    const slots = try self.allocator.alloc(menu.Slot, questions.items.len);
+    defer self.allocator.free(slots);
+    for (questions.items, slots) |question, *slot| slot.* = menu.Slot.init(question.text, question.options.items);
+
+    const replies = try self.askForm(slots);
     defer replies.deinit(self.allocator);
-    return questionResult(self, replies.items[0], question.options.items);
+    return answersResult(self, questions.items, replies);
 }
 
 /// Parsed tool arguments own their text; menu owns only presentation types.
@@ -134,35 +75,74 @@ pub const Question = struct {
     }
 };
 
+/// The questions of one call, in the order the user answers them.
+pub const Questions = struct {
+    items: []Question,
+
+    pub fn deinit(self: Questions, allocator: std.mem.Allocator) void {
+        for (self.items) |question| question.deinit(allocator);
+        allocator.free(self.items);
+    }
+};
+
 /// Normalize malformed model arguments to InvalidQuestion, preserving OOM.
-pub fn parseAskUser(allocator: std.mem.Allocator, arguments_json: []const u8) !Question {
-    return parseAskUserInner(allocator, arguments_json) catch |err| switch (err) {
+fn parseQuestions(allocator: std.mem.Allocator, arguments_json: []const u8) !Questions {
+    return parseQuestionsInner(allocator, arguments_json) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidQuestion,
     };
 }
 
-fn parseAskUserInner(allocator: std.mem.Allocator, arguments_json: []const u8) !Question {
+fn parseQuestionsInner(allocator: std.mem.Allocator, arguments_json: []const u8) !Questions {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidQuestion;
-    const question_val = parsed.value.object.get("question") orelse return error.InvalidQuestion;
-    if (question_val != .string) return error.InvalidQuestion;
-    const options_val = parsed.value.object.get("options") orelse return error.InvalidQuestion;
+    const value = parsed.value.object.get("questions") orelse return error.InvalidQuestion;
+    if (value != .array) return error.InvalidQuestion;
 
-    const options = try parseOptions(allocator, options_val);
+    var items: std.ArrayList(Question) = .empty;
+    errdefer {
+        for (items.items) |question| question.deinit(allocator);
+        items.deinit(allocator);
+    }
+
+    // One unusable question does not cost the user the others: the form is
+    // drawn from what can be asked, and a call with nothing usable is refused
+    // below with the sentence the model needs.
+    for (value.array.items) |entry| {
+        const question = (try buildQuestion(allocator, entry)) orelse continue;
+        errdefer question.deinit(allocator);
+        try items.append(allocator, question);
+    }
+
+    if (items.items.len == 0) return error.InvalidQuestion;
+    return .{ .items = try items.toOwnedSlice(allocator) };
+}
+
+fn buildQuestion(allocator: std.mem.Allocator, value: std.json.Value) !?Question {
+    if (value != .object) return null;
+    const asked = value.object.get("question") orelse return null;
+    if (asked != .string) return null;
+    const trimmed = std.mem.trim(u8, asked.string, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const options_value = value.object.get("options") orelse return null;
+
+    const options = parseOptions(allocator, options_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     errdefer options.deinit(allocator);
 
     return .{
-        .text = try allocator.dupe(u8, question_val.string),
+        .text = try allocator.dupe(u8, trimmed),
         .options = options,
     };
 }
 
 /// Models also send bare strings; skip malformed entries rather than failing
 /// an otherwise usable question.
-pub fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !menu.Options {
+fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !menu.Options {
     if (value != .array) return error.InvalidOptions;
 
     var items: std.ArrayList(menu.Option) = .empty;
@@ -187,7 +167,7 @@ fn buildOption(allocator: std.mem.Allocator, value: std.json.Value) !?menu.Optio
     var recommended = false;
 
     switch (value) {
-        .string => |text| label = text,
+        .string => |text_value| label = text_value,
         .object => |obj| {
             const label_val = obj.get("label") orelse return null;
             if (label_val != .string) return null;
@@ -211,61 +191,147 @@ fn buildOption(allocator: std.mem.Allocator, value: std.json.Value) !?menu.Optio
     };
 }
 
-test "parse ask_user arguments" {
-    const allocator = std.testing.allocator;
-    const question = try parseAskUser(allocator,
-        \\{"question":"How should I test this?","options":[{"label":"Add tests","description":"Covers the new branch.","recommended":true},{"label":"Skip tests"}]}
-    );
-    defer question.deinit(allocator);
+/// What the model reads back. One question answers as it always has; several
+/// are one line each, naming the question the answer belongs to, because the
+/// model has to know which decision each answer settles.
+fn answersResult(self: *Agent, questions: []const Question, replies: menu.Replies) !tool.ToolResult {
+    if (questions.len == 1) return questionResult(self, replies.items[0], questions[0].options.items);
 
-    try std.testing.expectEqualStrings("How should I test this?", question.text);
-    try std.testing.expectEqual(@as(usize, 2), question.options.items.len);
-    try std.testing.expectEqualStrings("Add tests", question.options.items[0].label);
-    try std.testing.expectEqualStrings("Covers the new branch.", question.options.items[0].description);
-    try std.testing.expect(question.options.items[0].recommended);
-    try std.testing.expectEqualStrings("", question.options.items[1].description);
-    try std.testing.expect(!question.options.items[1].recommended);
+    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+    defer aw.deinit();
+    var dismissed = false;
+    for (questions, replies.items) |question, reply| {
+        const answer = try menu.describeReply(self.allocator, reply, question.options.items);
+        defer if (answer) |line| self.allocator.free(line);
+        if (answer == null) dismissed = true;
+        try aw.writer.print("{s} → {s}\n", .{ question.text, answer orelse dismissed_question_message });
+    }
+    // A dismissed question leaves the model a decision to make, which is what
+    // an error result tells it: the same as a lone dismissed question.
+    return .{ .content = try aw.toOwnedSlice(), .is_error = dismissed };
+}
+
+fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option) !tool.ToolResult {
+    if (try menu.describeReply(self.allocator, reply, options)) |line| return .{ .content = line, .is_error = false };
+    return .{ .content = try self.allocator.dupe(u8, dismissed_question_message), .is_error = true };
+}
+
+test "the call line names the questions it asks" {
+    const allocator = std.testing.allocator;
+    const ctx: tool.Context = .{ .io = std.testing.io, .allocator = allocator };
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    try std.testing.expect(try writeSummary(ctx, &aw.writer, "{\"questions\":[{\"question\":\"Which?\",\"options\":[\"a\"]}]}"));
+    try std.testing.expectEqualStrings("Which?", aw.written());
+
+    // Several questions are counted and named, so the line says what the form
+    // that is about to be drawn is going to ask.
+    aw.clearRetainingCapacity();
+    try std.testing.expect(try writeSummary(ctx, &aw.writer,
+        \\{"questions":[{"question":"First?","options":["a"]},{"question":"Second?","options":["b"]}]}
+    ));
+    try std.testing.expectEqualStrings("2 questions: First? · Second?", aw.written());
+
+    // A call the parser refuses leaves the raw arguments on the line: the tool
+    // answers it with the sentence saying what to fix.
+    aw.clearRetainingCapacity();
+    try std.testing.expect(!try writeSummary(ctx, &aw.writer, "{}"));
+}
+
+test "parse the questions of one call" {
+    const allocator = std.testing.allocator;
+    const questions = try parseQuestions(allocator,
+        \\{"questions":[{"question":"How should I test this?","options":[{"label":"Add tests","description":"Covers the new branch.","recommended":true},{"label":"Skip tests"}]},{"question":"Which branch?","options":["main"]}]}
+    );
+    defer questions.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), questions.items.len);
+    const first = questions.items[0];
+    try std.testing.expectEqualStrings("How should I test this?", first.text);
+    try std.testing.expectEqual(@as(usize, 2), first.options.items.len);
+    try std.testing.expectEqualStrings("Add tests", first.options.items[0].label);
+    try std.testing.expectEqualStrings("Covers the new branch.", first.options.items[0].description);
+    try std.testing.expect(first.options.items[0].recommended);
+    try std.testing.expectEqualStrings("", first.options.items[1].description);
+    try std.testing.expect(!first.options.items[1].recommended);
+    try std.testing.expectEqualStrings("Which branch?", questions.items[1].text);
+    try std.testing.expectEqualStrings("main", questions.items[1].options.items[0].label);
 }
 
 test "parse options accepts bare strings and skips malformed entries" {
     const allocator = std.testing.allocator;
-    const options = try parseAskUser(allocator,
-        \\{"question":"Which?","options":["alpha",{"label":"beta"},42]}
+    const questions = try parseQuestions(allocator,
+        \\{"questions":[{"question":"Which?","options":["alpha",{"label":"beta"},42]}]}
     );
-    defer options.deinit(allocator);
+    defer questions.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), options.options.items.len);
-    try std.testing.expectEqualStrings("alpha", options.options.items[0].label);
-    try std.testing.expectEqualStrings("beta", options.options.items[1].label);
+    try std.testing.expectEqual(@as(usize, 2), questions.items[0].options.items.len);
+    try std.testing.expectEqualStrings("alpha", questions.items[0].options.items[0].label);
+    try std.testing.expectEqualStrings("beta", questions.items[0].options.items[1].label);
 }
 
-test "prepared question answers transfer each result only once" {
+test "a question without usable options is skipped, and none leaves the call refused" {
     const allocator = std.testing.allocator;
-    const items = try allocator.alloc(QuestionAnswers.Slot, 3);
-    items[0] = .none;
-    items[1] = .{ .content = .{ .text = try allocator.dupe(u8, "chosen"), .is_error = false } };
-    items[2] = .{ .content = .{ .text = try allocator.dupe(u8, "dismissed"), .is_error = true } };
-    var answers = QuestionAnswers{ .items = items };
-    defer answers.deinit(allocator);
+    const questions = try parseQuestions(allocator,
+        \\{"questions":[{"question":"no options"},{"question":"  ","options":["a"]},{"options":["a"]},{"question":"Which?","options":[]},{"question":"  Kept  ","options":["only"]}]}
+    );
+    defer questions.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), questions.items.len);
+    try std.testing.expectEqualStrings("Kept", questions.items[0].text);
 
-    try std.testing.expect(answers.take(0) == null);
-    try std.testing.expect(answers.take(3) == null);
-    const content = answers.take(1).?;
-    defer allocator.free(content.text);
-    try std.testing.expectEqualStrings("chosen", content.text);
-    try std.testing.expect(!content.is_error);
-    try std.testing.expect(answers.take(1) == null);
-    // deinit still owns and releases the result which was not taken.
+    for ([_][]const u8{
+        "{}",
+        "{\"question\":\"Which?\",\"options\":[\"a\"]}",
+        "{\"questions\":[]}",
+        "{\"questions\":\"Which?\"}",
+        "{\"questions\":[{\"question\":\"Which?\"}]}",
+        "not json",
+    }) |arguments| {
+        try std.testing.expectError(error.InvalidQuestion, parseQuestions(allocator, arguments));
+    }
 }
 
-test "ask_user arguments without options are rejected" {
+test "several questions answer as one line each, and a dismissal is an error" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.InvalidQuestion, parseAskUser(allocator, "{\"question\":\"Which?\"}"));
-    try std.testing.expectError(error.InvalidQuestion, parseAskUser(allocator, "{\"question\":\"Which?\",\"options\":[]}"));
-    try std.testing.expectError(error.InvalidQuestion, parseAskUser(allocator, "not json"));
-}
+    // Only the allocator is read: the answers are built without a terminal.
+    var agent: Agent = undefined;
+    agent.allocator = allocator;
 
-pub fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option) !tool.ToolResult {
-    if (try menu.describeReply(self.allocator, reply, options)) |line| return .{ .content = line, .is_error = false };
-    return .{ .content = try self.allocator.dupe(u8, dismissed_question_message), .is_error = true };
+    const questions = try parseQuestions(allocator,
+        \\{"questions":[{"question":"First?","options":[{"label":"Alpha"},{"label":"Beta","recommended":true}]},{"question":"Second?","options":["Gamma"]}]}
+    );
+    defer questions.deinit(allocator);
+
+    const items = try allocator.alloc(menu.Reply, questions.items.len);
+    items[0] = .{ .option = 1 };
+    items[1] = .dismissed;
+    const replies = menu.Replies{ .items = items };
+    defer replies.deinit(allocator);
+
+    const result = try answersResult(&agent, questions.items, replies);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(
+        "First? → User selected the recommended option: Beta\n" ++
+            "Second? → " ++ dismissed_question_message ++ "\n",
+        result.content,
+    );
+
+    // Answers to every question are not an error, and a lone question keeps the
+    // result it has always had.
+    const answered = try allocator.alloc(menu.Reply, questions.items.len);
+    answered[0] = .{ .option = 0 };
+    answered[1] = .{ .custom = try allocator.dupe(u8, "my own words") };
+    const all = menu.Replies{ .items = answered };
+    defer all.deinit(allocator);
+    const full = try answersResult(&agent, questions.items, all);
+    defer full.deinit(allocator);
+    try std.testing.expect(!full.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "First? → User selected: Alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "answered: my own words") != null);
+
+    const single = try answersResult(&agent, questions.items[0..1], all);
+    defer single.deinit(allocator);
+    try std.testing.expectEqualStrings("User selected: Alpha", single.content);
 }

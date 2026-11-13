@@ -23,9 +23,6 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     /// Session state for tools such as subagent; host-only calls may omit it.
     agent: ?*@import("../agent/mod.zig").Agent = null,
-    /// Answers collected together for the questions in this model message.
-    answers: ?*@import("ask_user.zig").QuestionAnswers = null,
-    index: usize = 0,
     /// The environment a program the tool runs is handed; null inherits this
     /// process's.
     env: ?*const std.process.Environ.Map = null,
@@ -94,8 +91,6 @@ pub const Tool = struct {
     /// What the terminal shows while the tool runs. Null for a tool that must
     /// not have that line — it writes on the terminal itself.
     label: ?[]const u8 = null,
-    /// Writes its own terminal announcement, before the usual call preview.
-    quiet: bool = false,
     /// Tool-owned argument preview; false leaves the raw arguments visible.
     summary: ?*const fn (Context, *std.Io.Writer, []const u8) anyerror!bool = null,
     /// A block preview may contain trusted rendering, such as a sanitised diff.
@@ -132,7 +127,6 @@ test "local hooks forward context and arguments, short circuit, recover and cons
         fn state(ctx: Context, name: []const u8, args: []const u8) !*@This() {
             try std.testing.expectEqualStrings("hook_test", name);
             try std.testing.expectEqualStrings("opaque arguments", args);
-            try std.testing.expectEqual(@as(usize, 17), ctx.index);
             try std.testing.expectEqualStrings("cache-sentinel", ctx.cache_dir.?);
             return @ptrCast(@alignCast(ctx.hook_data.?));
         }
@@ -177,7 +171,7 @@ test "local hooks forward context and arguments, short circuit, recover and cons
     }) |case| {
         var state: Harness = .{ .mode = case.mode };
         defer state.events.deinit(std.testing.allocator);
-        const ctx: Context = .{ .io = std.testing.io, .allocator = std.testing.allocator, .index = 17, .cache_dir = "cache-sentinel", .hook_data = &state };
+        const ctx: Context = .{ .io = std.testing.io, .allocator = std.testing.allocator, .cache_dir = "cache-sentinel", .hook_data = &state };
         const outcome = spec.execute(ctx, "opaque arguments");
         if (case.err) |err| {
             try std.testing.expectError(err, outcome);

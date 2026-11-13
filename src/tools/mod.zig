@@ -44,7 +44,6 @@ pub const Hooks = tool_mod.Hooks;
 
 /// Send one call to the built-in tool that answers it.
 pub const execute = dispatch.execute;
-pub const isQuiet = dispatch.isQuiet;
 
 // The shape of a tool result and the one size limit it is held to.
 pub const ToolStatus = result_mod.ToolStatus;

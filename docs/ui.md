@@ -151,8 +151,8 @@ menu takes the rows the prompt had, so nothing typed at a menu reaches the input
 box or steers the task: the keyboard belongs to the question until it is
 answered.
 
-Several questions asked in one message are drawn as one form, and Tab and
-Shift+Tab move between them:
+Several questions asked in one `ask_user` call are drawn as one form, and Tab
+and Shift+Tab move between them:
 
 ```
   1/3 Which approach should I use?  → Rewrite in place

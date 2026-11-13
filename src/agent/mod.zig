@@ -135,6 +135,10 @@ pub const Agent = struct {
     current_task: []const u8 = "",
     query_started: ?std.Io.Timestamp = null,
     progress_prompt: ?[]const u8 = null,
+    /// The terminal's part in the tool call being answered. It is filled in by
+    /// the dispatch hooks below, which is where the host UI's work for a call
+    /// happens, and read back by whoever previews the result.
+    tool_ui: ToolUi,
     /// Lines the user typed while this task was running. They are not a new
     /// task: the worker drains them at its next request boundary and sends
     /// them to the model inside the work in progress. The terminal thread
@@ -274,6 +278,7 @@ pub const Agent = struct {
             .search = search,
             .tool_env = env,
             .host = host,
+            .tool_ui = .{ .spinner = spinner.Spinner.disabled(io), .label = .init(allocator) },
             .session_path = null,
             .workspace = workspace,
             .scratch = scratch,
@@ -306,6 +311,8 @@ pub const Agent = struct {
         // life of the process: the model that was going to resume it is gone.
         // Whatever is still open is closed here, before anything it borrows.
         self.closeRuns();
+        self.tool_ui.spinner.stop();
+        self.tool_ui.label.deinit();
         self.runs.deinit(self.allocator);
         if (self.current_task.len > 0) self.allocator.free(self.current_task);
         if (self.trace_agent_owned) |label| self.allocator.free(label);
@@ -468,7 +475,7 @@ pub const Agent = struct {
                     }
                 }
                 if (message.tool_calls) |calls| {
-                    for (calls) |call| try self.announceToolCall(call);
+                    for (calls) |call| try self.announceToolCall(call.name, call.arguments);
                 }
             } else if (std.mem.eql(u8, message.role, "tool")) {
                 if (message.content) |content| {
@@ -1232,19 +1239,16 @@ pub const Agent = struct {
                     });
                 }
 
-                // Every question in this message is put to the user at once, so
-                // the answers can be revised before the form is submitted.
-                var asked: ?QuestionAnswers = try self.askQuestions(tool_calls);
-                defer if (asked) |prepared| prepared.deinit(self.allocator);
-
+                // Every question a call asks is put to the user by the tool
+                // itself, in one form, so the loop just runs the calls.
                 if (self.child_record != null) try self.checkpoint();
-                for (tool_calls, 0..) |call, index| {
+                for (tool_calls) |call| {
                     try self.checkInterrupted();
                     // The call is recorded before it runs, so a call that
                     // never returns is still in the record with its arguments.
                     if (self.trace) |trace| trace.toolCall(self.traceCtx(), call.name, call.id, call.arguments);
                     const tool_started = std.Io.Timestamp.now(self.io, .awake);
-                    const result = self.executeTool(call, index, if (asked) |*prepared| prepared else null) catch |err| blk: {
+                    const result = self.executeTool(call) catch |err| blk: {
                         if (self.interrupted.load(.acquire)) return error.Canceled;
                         const error_content = try std.fmt.allocPrint(
                             self.allocator,
@@ -1424,12 +1428,6 @@ pub const Agent = struct {
         return self.readChoiceLine();
     }
 
-    /// Turn one answer into the tool result the model reads. A dismissed
-    /// question is an error result: the model is told to decide by itself.
-    fn questionResult(self: *Agent, reply: menu.Reply, options: []const menu.Option) !tools.ToolResult {
-        return @import("../tools/ask_user.zig").questionResult(self, reply, options);
-    }
-
     /// Read the free text the "type your own answer" row asks for. Owned by the
     /// caller, trimmed, and never empty: an empty line is no answer at all.
     pub fn readChoiceLine(self: *Agent) !menu.Line {
@@ -1488,12 +1486,6 @@ pub const Agent = struct {
         const answer = std.mem.trim(u8, line, " \t\r\n");
         if (answer.len == 0) return .none;
         return .{ .answer = try self.allocator.dupe(u8, answer) };
-    }
-
-    pub const QuestionAnswers = @import("../tools/ask_user.zig").QuestionAnswers;
-
-    fn askQuestions(self: *Agent, calls: []const ToolCallData) !?QuestionAnswers {
-        return @import("../tools/ask_user.zig").askQuestions(self, calls);
     }
 
     /// Give the history a message whose fields are already owned. The history
@@ -1585,7 +1577,7 @@ pub const Agent = struct {
     /// exception: its argument is the diff itself, and a JSON-escaped diff tells
     /// nobody anything — so it is drawn instead, line by line, in the colours
     /// the change would be read in.
-    fn announceToolCall(self: *Agent, call: ToolCallData) !void {
+    fn announceToolCall(self: *Agent, name: []const u8, arguments: []const u8) !void {
         // A sub-agent's calls are steps inside one tool result: the caller
         // already has a line for the call, and these would only crowd it.
         if (self.capture != null) return;
@@ -1597,38 +1589,81 @@ pub const Agent = struct {
         if (self.screen) |screen| {
             if (screen.isActive()) {
                 var log_writer = screen.logWriter(&buf);
-                try self.writeToolCall(&log_writer.writer, call);
+                try self.writeToolCall(&log_writer.writer, name, arguments);
                 return log_writer.writer.flush();
             }
         }
 
         var file_writer = std.Io.File.stderr().writerStreaming(self.io, &buf);
-        try self.writeToolCall(&file_writer.interface, call);
+        try self.writeToolCall(&file_writer.interface, name, arguments);
         try file_writer.interface.flush();
     }
 
-    fn writeToolCall(self: *Agent, w: *std.Io.Writer, call: ToolCallData) !void {
-        const spec = @import("../tools/dispatch.zig").presentation(call.name);
+    fn writeToolCall(self: *Agent, w: *std.Io.Writer, name: []const u8, arguments: []const u8) !void {
+        const spec = @import("../tools/dispatch.zig").presentation(name);
         var preview: std.Io.Writer.Allocating = .init(self.allocator);
         defer preview.deinit();
         const ctx: tools.Context = .{ .io = self.io, .allocator = self.allocator, .agent = self };
-        const summarized = if (spec) |s| if (s.summary) |write| try write(ctx, &preview.writer, call.arguments) else false else false;
+        const summarized = if (spec) |s| if (s.summary) |write| try write(ctx, &preview.writer, arguments) else false else false;
         const block = summarized and spec.?.summary_block;
         try w.writeAll(if (spec != null and spec.?.delegated) CYAN ++ "  ⇢ " else YELLOW ++ "  ⚙ ");
-        try text.writeSanitized(w, call.name);
+        try text.writeSanitized(w, name);
         if (block) {
             try w.writeAll("\n" ++ RESET);
             try w.writeAll(preview.written());
         } else {
             try w.writeAll(RESET ++ " ");
-            try text.writeSanitized(w, if (summarized) preview.written() else call.arguments);
+            try text.writeSanitized(w, if (summarized) preview.written() else arguments);
             try w.writeByte('\n');
         }
     }
 
-    /// Run one tool call. `index` and `answers` locate the result of a question
-    /// the form of this message has already put to the user, if there was one.
-    fn executeTool(self: *Agent, call: ToolCallData, index: usize, answers: ?*QuestionAnswers) !tools.ToolResult {
+    /// The terminal's part in one tool call, where the call starts: the call is
+    /// named in the title, announced on the terminal, and the line the
+    /// animation draws while it runs belongs to this call alone. Dispatch runs
+    /// this before the tool sees its arguments, so a call that a tool refuses
+    /// is still shown to the user.
+    fn beforeToolCall(ctx: tools.Context, name: []const u8, arguments: []const u8) !?tools.ToolResult {
+        const self = ctx.agent orelse return null;
+        self.terminal_title.update(name, self.current_task);
+        try self.announceToolCall(name, arguments);
+        // Started last: nothing after it may fail, because the after hook is
+        // what gives the line back and an error here would skip that hook.
+        try self.startCallProgress(name, arguments);
+        return null;
+    }
+
+    /// Give the line the call owned back, then let the cache that may stand in
+    /// for the result have it. This runs before the result is previewed, so the
+    /// preview lands on a cleared line whatever the call did.
+    fn afterToolCall(ctx: tools.Context, name: []const u8, arguments: []const u8, outcome: anyerror!tools.ToolResult) !tools.ToolResult {
+        if (ctx.agent) |self| self.tool_ui.spinner.stop();
+        return @import("../tools/ccr.zig").afterExecute(ctx, name, arguments, outcome);
+    }
+
+    /// Start the animation for the call in progress, if the tool has a label
+    /// and this run has a terminal to animate on. A tool can run for minutes,
+    /// so the wait gets the same line the model calls do.
+    fn startCallProgress(self: *Agent, name: []const u8, arguments: []const u8) !void {
+        const label = try self.callProgressLabel(name, arguments, &self.tool_ui.label);
+        var options = self.progressOptions();
+        // A sub-agent works out of sight, so its line is coloured like its
+        // call: the user can tell a second agent at work from the main model
+        // thinking, without reading the words.
+        if (@import("../tools/dispatch.zig").presentation(name)) |spec| {
+            if (spec.delegated) options.style = CYAN;
+        }
+        self.tool_ui.spinner = if (label) |caption|
+            spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options)
+        else
+            spinner.Spinner.disabled(self.io);
+    }
+
+    /// Run one tool call. Everything the user sees of the call — its line in
+    /// the title, its announcement, the animation while it runs, and the
+    /// preview of what it returned — happens here and in the hooks this
+    /// dispatch is given; the tools themselves know nothing of the terminal.
+    fn executeTool(self: *Agent, call: ToolCallData) !tools.ToolResult {
         const cache_dir = try tools.ccrDirPath(self.allocator, self.scratch.path);
         defer self.allocator.free(cache_dir);
         const ctx: tools.Context = .{
@@ -1636,47 +1671,12 @@ pub const Agent = struct {
             .allocator = self.allocator,
             .env = self.tool_env,
             .cache_dir = cache_dir,
-            .hooks = .{ .after = @import("../tools/ccr.zig").afterExecute },
+            .hooks = .{ .before = beforeToolCall, .after = afterToolCall },
             .agent = self,
-            .answers = answers,
-            .index = index,
         };
-        // A tool that answers quietly writes the terminal's line for what it
-        // does itself, so it is answered before the call is announced rather
-        // than under an announcement of itself.
-        if (tools.isQuiet(call.name)) return tools.execute(ctx, call.name, call.arguments);
-        self.terminal_title.update(call.name, self.current_task);
-        try self.announceToolCall(call);
-
-        const result: tools.ToolResult = blk: {
-            // A tool can run for minutes, so the wait gets the same animation
-            // the model calls do. The `defer` covers the dispatch and nothing
-            // else: below this block the result is previewed, and that has to
-            // land on a line the animation has already given back.
-            // A tool from an MCP server has a label too, built when the tool
-            // was listed: it names the server the call is going to, and it is
-            // this process's own string rather than one a server wrote.
-            var label_aw: std.Io.Writer.Allocating = .init(self.allocator);
-            defer label_aw.deinit();
-            const label = try self.callProgressLabel(call, &label_aw);
-            var options = self.progressOptions();
-            // A sub-agent works out of sight, so its line is coloured like
-            // its call: the user can tell a second agent at work from the
-            // main model thinking, without reading the words.
-            if (@import("../tools/dispatch.zig").presentation(call.name)) |spec| {
-                if (spec.delegated) options.style = CYAN;
-            }
-            var spin = if (label) |caption|
-                spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options)
-            else
-                spinner.Spinner.disabled(self.io);
-            defer spin.stop();
-
-            break :blk try tools.execute(ctx, call.name, call.arguments);
-        };
-
-        // Dispatch applies the shared size limit after execution hooks, including
-        // quiet calls and MCP results. The UI only previews the finalized result.
+        // Dispatch applies the shared size limit after execution hooks. The UI
+        // only previews the finalized result.
+        const result = try tools.execute(ctx, call.name, call.arguments);
         errdefer result.deinit(self.allocator);
         try self.previewToolResult(result.content, result.is_error);
         return result;
@@ -1690,18 +1690,18 @@ pub const Agent = struct {
     ///
     /// `buf` is where a built label lives. It must outlive the animation, so
     /// the caller owns it and frees it after the spinner has stopped.
-    fn callProgressLabel(self: *Agent, call: ToolCallData, buf: *std.Io.Writer.Allocating) !?[]const u8 {
-        if (@import("../tools/dispatch.zig").presentation(call.name)) |spec| {
+    fn callProgressLabel(self: *Agent, name: []const u8, arguments: []const u8, buf: *std.Io.Writer.Allocating) !?[]const u8 {
+        if (@import("../tools/dispatch.zig").presentation(name)) |spec| {
             if (spec.progress) |write| {
                 var raw: std.Io.Writer.Allocating = .init(self.allocator);
                 defer raw.deinit();
-                const label = try write(.{ .io = self.io, .allocator = self.allocator, .agent = self }, &raw, call.arguments) orelse return null;
+                const label = try write(.{ .io = self.io, .allocator = self.allocator, .agent = self }, &raw, arguments) orelse return null;
                 buf.clearRetainingCapacity();
                 try text.writeSanitized(&buf.writer, label);
                 return buf.written();
             }
         }
-        return tools.progressLabel(call.name) orelse self.mcp_registry.progressLabel(call.name);
+        return tools.progressLabel(name) orelse self.mcp_registry.progressLabel(name);
     }
 
     /// Use the same result preview for live execution and restored messages.
@@ -1785,6 +1785,21 @@ pub const Agent = struct {
         if (self.capture != null) return;
         try self.writeLogOrStdout("\n");
     }
+};
+
+/// The host UI's state for the tool call being answered.
+///
+/// The animation is started in the context's before hook and stopped in its
+/// after hook, so it has to outlive both; the label the animation reads from
+/// is built for the call and has to outlive the animation. Both live here, on
+/// the agent whose terminal it is.
+const ToolUi = struct {
+    /// The line the running call owns. Disabled when nothing was started: a
+    /// tool with no progress label, or a run with no terminal to animate on.
+    spinner: spinner.Spinner,
+    /// Where the label the animation borrows is built, reused from call to
+    /// call so a long run does not allocate one per call.
+    label: std.Io.Writer.Allocating,
 };
 
 /// One sub-agent this agent started: the child, the handshake they share, and
@@ -2526,49 +2541,35 @@ test "the sub-agent's progress line names its task and keeps to one line" {
 
     // The task is model output: its newlines are flattened and its escape
     // sequences dropped, because the line is read on a terminal.
-    const call: ToolCallData = .{
-        .id = "sub",
-        .name = "subagent",
-        .arguments = "{\"task\":\"count \\u001b[31mthe tests\\u001b[0m\\nquietly\"}",
-    };
     try std.testing.expectEqualStrings(
         "subagent · count the tests…",
-        (try harness.agent.callProgressLabel(call, &label)).?,
+        (try harness.agent.callProgressLabel("subagent", "{\"task\":\"count \\u001b[31mthe tests\\u001b[0m\\nquietly\"}", &label)).?,
     );
     try std.testing.expect(std.mem.indexOfScalar(u8, label.written(), 0x1b) == null);
 
     // A call whose title names the run shows the title, not the task behind
     // it: the title is the summary the caller chose for this line.
-    const titled: ToolCallData = .{
-        .id = "sub",
-        .name = "subagent",
-        .arguments = "{\"task\":\"count every test in the source tree\\\\nand report\",\"title\":\"count the tests\"}",
-    };
-    try std.testing.expectEqualStrings("subagent · count the tests", (try harness.agent.callProgressLabel(titled, &label)).?);
+    const titled = "{\"task\":\"count every test in the source tree\\\\nand report\",\"title\":\"count the tests\"}";
+    try std.testing.expectEqualStrings("subagent · count the tests", (try harness.agent.callProgressLabel("subagent", titled, &label)).?);
     var line: std.Io.Writer.Allocating = .init(allocator);
     defer line.deinit();
-    try harness.agent.writeToolCall(&line.writer, titled);
+    try harness.agent.writeToolCall(&line.writer, "subagent", titled);
     try std.testing.expect(std.mem.indexOf(u8, line.written(), "⇢ subagent") != null);
     try std.testing.expect(std.mem.indexOf(u8, line.written(), "count the tests") != null);
     try std.testing.expect(std.mem.indexOf(u8, line.written(), "every test") == null);
 
     // A call with no task yet still says who is at work, and a tool that is
     // not a sub-agent keeps its own label.
-    const nameless: ToolCallData = .{ .id = "sub", .name = "subagent", .arguments = "{}" };
-    try std.testing.expectEqualStrings("subagent…", (try harness.agent.callProgressLabel(nameless, &label)).?);
-    const bash: ToolCallData = .{ .id = "b", .name = "bash", .arguments = "{}" };
-    try std.testing.expectEqualStrings("bash…", (try harness.agent.callProgressLabel(bash, &label)).?);
+    try std.testing.expectEqualStrings("subagent…", (try harness.agent.callProgressLabel("subagent", "{}", &label)).?);
+    try std.testing.expectEqualStrings("bash…", (try harness.agent.callProgressLabel("bash", "{}", &label)).?);
     // A tool whose wait asks the user a question gets no line at all.
-    const ask: ToolCallData = .{ .id = "a", .name = "ask_user", .arguments = "{}" };
-    try std.testing.expectEqual(@as(?[]const u8, null), try harness.agent.callProgressLabel(ask, &label));
+    try std.testing.expectEqual(@as(?[]const u8, null), try harness.agent.callProgressLabel("ask_user", "{}", &label));
 
     // A stop names the run it stops, which still knows its title.
     const run = try harness.agent.startRun("anything", "", "split the files", 3_600);
-    const halting: ToolCallData = .{ .id = "h", .name = "subagent_stop", .arguments = "{\"id\":\"s1\"}" };
-    try std.testing.expectEqualStrings("subagent · split the files · stopping…", (try harness.agent.callProgressLabel(halting, &label)).?);
+    try std.testing.expectEqualStrings("subagent · split the files · stopping…", (try harness.agent.callProgressLabel("subagent_stop", "{\"id\":\"s1\"}", &label)).?);
     // ...and a resume names it the same way, from the id alone.
-    const resuming: ToolCallData = .{ .id = "r", .name = "subagent", .arguments = "{\"id\":\"s1\"}" };
-    try std.testing.expectEqualStrings("subagent · split the files", (try harness.agent.callProgressLabel(resuming, &label)).?);
+    try std.testing.expectEqualStrings("subagent · split the files", (try harness.agent.callProgressLabel("subagent", "{\"id\":\"s1\"}", &label)).?);
     // The run was started only to be named, so it is stopped here: nothing
     // waits on it, and the harness closes whatever is left at deinit.
     harness.agent.abortRun(run);

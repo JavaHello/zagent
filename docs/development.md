@@ -176,11 +176,18 @@ It takes ownership of result content and must return it, or free it when
 replacing the result or returning an error. Hooks are synchronous and dispatch
 does not retain caller state.
 
-Agent installs `ccr.afterExecute` as its context after hook. This caches
-oversized materialized output (including MCP output) before dispatch clips the
-result, and returns a preview with a `ccr_retrieve` id. No cache directory or a
-cache-write failure leaves the original result for normal clipping. Bash keeps
-its streaming CCR cache so it need not materialize arbitrarily large output.
+Agent does its terminal work for a call in these hooks rather than around the
+dispatch. The context before hook names the call in the terminal title, writes
+its announcement line and starts the animation that owns the line while it
+runs; the context after hook gives that line back and then calls
+`ccr.afterExecute`, which caches oversized materialized output (including MCP
+output) before dispatch clips the result and returns a preview with a
+`ccr_retrieve` id. No cache directory or a cache-write failure leaves the
+original result for normal clipping. Bash keeps its streaming CCR cache so it
+need not materialize arbitrarily large output. Because the animation is started
+in one hook and stopped in the other, both live on the agent whose terminal it
+is, and a call is shown the same way whatever tool answers it — there is no
+class of quiet calls the UI skips.
 
 ## Documentation
 

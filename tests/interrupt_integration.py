@@ -48,8 +48,9 @@ class API(http.server.BaseHTTPRequestHandler):
                 # dismissal would test a looping question, not what Esc does.
                 asked = True
                 output = [{'type': 'function_call', 'call_id': 'choice', 'name': 'ask_user',
-                           'arguments': json.dumps({'question': 'Cancel this choice?', 'options': [
-                               {'label': 'Alpha'}, {'label': 'Beta'}]})}]
+                           'arguments': json.dumps({'questions': [
+                               {'question': 'Cancel this choice?', 'options': [
+                                   {'label': 'Alpha'}, {'label': 'Beta'}]}]})}]
         if output is None:
             output = [{'type': 'message', 'role': 'assistant', 'content': [
                 {'type': 'output_text', 'text': text}]}]

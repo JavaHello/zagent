@@ -36,9 +36,6 @@ pub const Options = struct {
     }
 };
 
-/// Compatibility alias; the tool owns its JSON protocol, not the UI.
-pub const Question = @import("../tools/ask_user.zig").Question;
-
 /// What the user did at a menu.
 pub const Answer = union(enum) {
     /// Index into the offered options.
@@ -48,10 +45,6 @@ pub const Answer = union(enum) {
     /// Nothing to go on: Enter with no recommendation to fall back on.
     skip,
 };
-
-/// Compatibility forwards for callers of the former menu parser API.
-pub const parseAskUser = @import("../tools/ask_user.zig").parseAskUser;
-pub const parseOptions = @import("../tools/ask_user.zig").parseOptions;
 
 pub fn recommendedIndex(options: []const Option) ?usize {
     for (options, 0..) |option, i| {

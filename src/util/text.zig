@@ -96,6 +96,28 @@ pub fn writeSanitized(w: *std.Io.Writer, raw: []const u8) !void {
     }
 }
 
+/// `writeSanitized` for text that must not break the caller's line: a line
+/// ending or a tab becomes a space, so what is written stays on one line
+/// however much of it there is.
+///
+/// A call's arguments and a title are the model's own text; a line drawn from
+/// one of them and cut in two by a newline inside it would be read as two
+/// unrelated lines, one of which says nothing.
+pub fn writeOnOneLine(w: *std.Io.Writer, raw: []const u8) !void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const byte = raw[i];
+        if (byte != '\n' and byte != '\r' and byte != '\t') continue;
+        try writeSanitized(w, raw[start..i]);
+        try w.writeByte(' ');
+        // A CRLF is one line ending, not two.
+        if (byte == '\r' and i + 1 < raw.len and raw[i + 1] == '\n') i += 1;
+        start = i + 1;
+    }
+    try writeSanitized(w, raw[start..]);
+}
+
 /// `writeSanitized` for text that arrives in pieces.
 ///
 /// A whole text is sanitised in one pass: an escape sequence or a character cut
@@ -305,6 +327,13 @@ test "writeSanitized drops an escape that would restyle the caller's output" {
     // written its own colour must not have it cancelled from inside the text.
     try writeSanitized(&aw.writer, "before\x1b[0mafter");
     try expectEqualStrings("beforeafter", aw.written());
+}
+
+test "writeOnOneLine flattens line endings and tabs into one line" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeOnOneLine(&aw.writer, "one\ntwo\r\nthree\tfour \x1b[31mred\x1b[0m");
+    try expectEqualStrings("one two three four red", aw.written());
 }
 
 const expect = std.testing.expect;

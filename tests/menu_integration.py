@@ -39,8 +39,9 @@ class API(http.server.BaseHTTPRequestHandler):
                        'arguments': json.dumps({'title': task_title,
                                                 'description': task_description})},
                       {'type': 'function_call', 'call_id': 'choice', 'name': 'ask_user',
-                       'arguments': json.dumps({'question': '选择方案？', 'options': [
-                           {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]})}]
+                       'arguments': json.dumps({'questions': [
+                           {'question': '选择方案？', 'options': [
+                               {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]}]})}]
         else:
             answers.append(results[-1]['output'])
             output = [{'type': 'message', 'role': 'assistant',

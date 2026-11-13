@@ -18,7 +18,7 @@ answer with the result — until the task is done, see
 | `rg` / `grep` | Search file contents | [Searching](searching.md) |
 | `fd` / `find` | Find files by name | [Searching](searching.md) |
 | `http` | Fetch a URL or call an API | [HTTP requests](http.md) |
-| `ask_user` | Put a question to you as a menu | [Interface](ui.md#choices) |
+| `ask_user` | Put one or more questions to you as a menu | [Interface](ui.md#choices) |
 | `plan` | Keep the checklist of the work in progress | [Plan](plan.md) |
 | `memory_save`, `memory_search` | Save and recall durable notes | [Memory](memory.md) |
 | `announce_task` | Name the task on the terminal | [Interface](ui.md#task-announcement) |

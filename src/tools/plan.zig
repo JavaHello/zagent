@@ -1,5 +1,6 @@
 const std = @import("std");
 const plan_mod = @import("../state/plan.zig");
+const text = @import("../util/text.zig");
 const Agent = @import("../agent/mod.zig").Agent;
 const tool = @import("tool.zig");
 
@@ -43,7 +44,7 @@ pub fn writeCallSummary(w: *std.Io.Writer, allocator: std.mem.Allocator, argumen
                 break;
             }
             try w.writeAll(if (i == 0) ": " else ", ");
-            try writeOnOneLine(w, step.title);
+            try text.writeOnOneLine(w, step.title);
         }
         return true;
     }
@@ -51,27 +52,16 @@ pub fn writeCallSummary(w: *std.Io.Writer, allocator: std.mem.Allocator, argumen
         try w.print("step {d}", .{index});
         if (args.status) |status| {
             try w.writeAll(" → ");
-            try writeOnOneLine(w, status);
+            try text.writeOnOneLine(w, status);
         }
         if (args.note) |note| {
             try w.writeAll(" · ");
-            try writeOnOneLine(w, note);
+            try text.writeOnOneLine(w, note);
         }
         return true;
     }
     try w.writeAll("read");
     return true;
-}
-
-fn writeOnOneLine(w: *std.Io.Writer, raw: []const u8) !void {
-    var start: usize = 0;
-    for (raw, 0..) |byte, i| {
-        if (byte != '\n' and byte != '\r' and byte != '\t') continue;
-        try @import("../util/text.zig").writeSanitized(w, raw[start..i]);
-        try w.writeByte(' ');
-        start = i + 1;
-    }
-    try @import("../util/text.zig").writeSanitized(w, raw[start..]);
 }
 
 pub fn describeChange(plan: *const plan_mod.Plan, allocator: std.mem.Allocator, index: ?usize, previous_status: ?plan_mod.Status, note_changed: bool) ![]u8 {

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """A question owns the prompt rows: the form answers it, the input box does not.
 
-Two ask_user calls arrive in one message, so this also covers the batch: they are
-drawn as one form, each with its own rows, and Tab and Shift+Tab walk between
-them — an answer given to a question further up can be changed before the form is
-submitted. The last row of each question is free text, and nothing typed at the
-form reaches the running task as guidance. Esc in the free-text row steps back to
-the options instead of interrupting the run, Ctrl+C is not a way out of a
-question at all, and a dismissed question lets the task carry on.
+One ask_user call carries two questions, and they are drawn as one form, each
+with its own rows, so Tab and Shift+Tab walk between them — an answer given to a
+question further up can be changed before the form is submitted. The last row of
+each question is free text, and nothing typed at the form reaches the running
+task as guidance. Esc in the free-text row steps back to the options instead of
+interrupting the run, Ctrl+C is not a way out of a question at all, and a
+dismissed question lets the task carry on.
 """
 import fcntl
 import http.server
@@ -45,17 +45,19 @@ class API(http.server.BaseHTTPRequestHandler):
                        'content': [{'type': 'output_text', 'text': '{}'}]}]
         elif turn == 1:
             output = [
-                {'type': 'function_call', 'call_id': 'first', 'name': 'ask_user',
-                 'arguments': json.dumps({'question': 'First question?', 'options': [
-                     {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]})},
-                {'type': 'function_call', 'call_id': 'second', 'name': 'ask_user',
-                 'arguments': json.dumps({'question': 'Second question?', 'options': [
-                     {'label': 'Gamma'}, {'label': 'Delta', 'recommended': True}]})},
+                {'type': 'function_call', 'call_id': 'both', 'name': 'ask_user',
+                 'arguments': json.dumps({'questions': [
+                     {'question': 'First question?', 'options': [
+                         {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]},
+                     {'question': 'Second question?', 'options': [
+                         {'label': 'Gamma'}, {'label': 'Delta', 'recommended': True}]},
+                 ]})},
             ]
         elif turn == 3:
             output = [{'type': 'function_call', 'call_id': 'only', 'name': 'ask_user',
-                       'arguments': json.dumps({'question': 'Cancel this one?', 'options': [
-                           {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]})}]
+                       'arguments': json.dumps({'questions': [
+                           {'question': 'Cancel this one?', 'options': [
+                               {'label': 'Alpha'}, {'label': 'Beta', 'recommended': True}]}]})}]
         else:
             for result in results:
                 # Every earlier result is replayed on each request; only the
@@ -108,7 +110,7 @@ try:
         try:
             until(lambda: clean().count(b'\xe2\x9d\xaf ') > 0, b'the prompt')
 
-            # Turn one: two questions in one message, drawn as one form. The
+            # Turn one: two questions in one call, drawn as one form. The
             # first question has the keyboard: stray typing belongs to it, and
             # Enter answers it with the recommendation.
             os.write(master, b'ask me twice\r')
@@ -156,12 +158,14 @@ try:
                 os.write(master, b'\x1b[1;1R')
             os.write(master, b'my own words\r')
             until(lambda: b'Turn complete' in clean(), b'the answer')
-            until(lambda: len(answers) == 2, b'both tool results')
+            until(lambda: len(answers) == 1, b'the tool result')
 
-            assert answers[0][0] == 'first', answers
-            assert 'User selected: Alpha' in answers[0][1], answers
-            assert answers[1][0] == 'second', answers
-            assert 'answered: my own words' in answers[1][1], answers
+            # One call carries both answers: each line names the question it
+            # settles, so the model knows which decision is which.
+            assert answers[0][0] == 'both', answers
+            assert 'First question? \u2192 User selected: Alpha' in answers[0][1], answers
+            assert 'Second question? \u2192 ' in answers[0][1], answers
+            assert 'answered: my own words' in answers[0][1], answers
             # Nothing typed at a menu is guidance for the running task.
             assert b'Input sent to the running task' not in clean(), transcript
             # Both tool results reached the model in the same request.
@@ -175,11 +179,11 @@ try:
             settle()
             os.write(master, b'\x03')
             settle(0.3)
-            assert len(answers) == 2, 'Ctrl+C must not answer or dismiss a question'
+            assert len(answers) == 1, 'Ctrl+C must not answer or dismiss a question'
             assert process.poll() is None, transcript
             os.write(master, b'\x1b')
-            until(lambda: len(answers) == 3, b'the dismissed result')
-            assert 'dismissed without an answer' in answers[2][1], answers
+            until(lambda: len(answers) == 2, b'the dismissed result')
+            assert 'dismissed without an answer' in answers[1][1], answers
 
             os.write(master, b'/quit\r\r')
             until(lambda: b'Goodbye!' in transcript, b'the exit')

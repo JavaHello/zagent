@@ -65,7 +65,7 @@ fn executeWithSpecs(comptime specs: []const tool.Tool, ctx: tool.Context, name: 
     else
         try ctx.hooks.afterExecute(ctx, name, arguments, executeRaw(specs, ctx, name, arguments));
     // Applied after middleware, so CCR hooks can preserve output without clipping.
-    // This also covers quiet calls and callers outside the agent UI.
+    // This also covers callers outside the agent UI.
     return @import("result.zig").clipOversized(ctx.allocator, result);
 }
 
@@ -87,13 +87,6 @@ pub fn presentation(name: []const u8) ?tool.Tool {
         if (std.mem.eql(u8, name, spec.name)) return spec;
     }
     return null;
-}
-
-pub fn isQuiet(name: []const u8) bool {
-    inline for (all) |spec| {
-        if (std.mem.eql(u8, name, spec.name)) return spec.quiet;
-    }
-    return false;
 }
 
 /// The spec of one built-in tool, by name, at comptime. The definition the
@@ -118,7 +111,6 @@ test "global and local hooks nest, short circuit and propagate errors without cl
         fn state(ctx: tool.Context, name: []const u8, args: []const u8) !*@This() {
             try std.testing.expectEqualStrings("test", name);
             try std.testing.expectEqualStrings("raw arguments", args);
-            try std.testing.expectEqual(@as(usize, 29), ctx.index);
             return @ptrCast(@alignCast(ctx.hook_data.?));
         }
         fn value(ctx: tool.Context) !ToolResult {
@@ -192,7 +184,7 @@ test "global and local hooks nest, short circuit and propagate errors without cl
     }) |case| {
         var state: H = .{ .mode = case.mode };
         defer state.events.deinit(std.testing.allocator);
-        const ctx: tool.Context = .{ .io = std.testing.io, .allocator = std.testing.allocator, .index = 29, .hook_data = &state, .hooks = .{ .before = H.outerBefore, .after = H.outerAfter } };
+        const ctx: tool.Context = .{ .io = std.testing.io, .allocator = std.testing.allocator, .hook_data = &state, .hooks = .{ .before = H.outerBefore, .after = H.outerAfter } };
         const outcome = executeWithSpecs(&specs, ctx, "test", "raw arguments");
         if (case.err) |err| {
             try std.testing.expectError(err, outcome);
@@ -262,6 +254,10 @@ test "presentation callbacks belong to tool specs and preserve fallback" {
     try std.testing.expect(presentation("subagent").?.delegated);
     try std.testing.expect(presentation("subagent_stop").?.progress != null);
     try std.testing.expect(presentation("bash").?.summary == null);
+    // Every call is shown on the terminal, so the two session tools whose
+    // arguments are prose name themselves instead of leaving JSON behind.
+    try std.testing.expect(presentation("announce_task").?.summary != null);
+    try std.testing.expect(presentation("ask_user").?.summary != null);
     try std.testing.expect(presentation("unknown") == null);
 }
 
@@ -277,9 +273,6 @@ test "session and MCP tools require an agent context" {
         try std.testing.expect(result.is_error);
         try std.testing.expectEqualStrings("Error: this tool requires an agent context.", result.content);
     }
-    try std.testing.expect(isQuiet("announce_task"));
-    try std.testing.expect(!isQuiet("subagent"));
-    try std.testing.expect(!isQuiet("unknown"));
 }
 
 test "read dispatch forwards the page the caller asked for" {
