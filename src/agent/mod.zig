@@ -554,26 +554,6 @@ pub const Agent = struct {
         try self.emit(std.Io.File.stderr(), DIM ++ "  ✓ forgot memory {d}\n" ++ RESET, .{number});
     }
 
-    /// Compatibility entry point; tool behavior lives with its schema.
-    pub fn memorySearchTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        return @import("../tools/memory_search.zig").execute(self, arguments);
-    }
-
-    /// The memory_save tool: save one durable note and tell the model whether it
-    /// was new.
-    pub fn memorySaveTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        return @import("../tools/memory_save.zig").execute(self, arguments);
-    }
-
-    /// The plan tool: read the checklist, replace it, or move one step. The
-    /// plan is held in memory and saved with the session. The change reaches
-    /// the snapshot with the checkpoint that closes this tool batch, never
-    /// from here: a snapshot taken mid-batch would hold a call without its
-    /// result, and the next resume would refuse it.
-    pub fn planTool(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        return @import("../tools/plan.zig").execute(self, arguments);
-    }
-
     /// `/plan`: show the checklist, or `/plan clear` to drop it.
     pub fn planCommand(self: *Agent, argument: []const u8) !void {
         const arg = std.mem.trim(u8, argument, " \t");
@@ -1510,13 +1490,6 @@ pub const Agent = struct {
         return .{ .answer = try self.allocator.dupe(u8, answer) };
     }
 
-    /// The ask_user tool: put the model's question to the user and hand the
-    /// answer back as the tool result. `answers` holds what the form drawn for
-    /// this message already produced, when it covered this call.
-    pub fn askUser(self: *Agent, arguments: []const u8, answers: ?*QuestionAnswers, index: usize) !tools.ToolResult {
-        return @import("../tools/ask_user.zig").execute(self, arguments, answers, index);
-    }
-
     pub const QuestionAnswers = @import("../tools/ask_user.zig").QuestionAnswers;
 
     fn askQuestions(self: *Agent, calls: []const ToolCallData) !?QuestionAnswers {
@@ -1655,12 +1628,6 @@ pub const Agent = struct {
 
     // Retained for existing tests of task metadata and title ownership.
     fn announceTask(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        return @import("../tools/announce_task.zig").execute(self, arguments);
-    }
-
-    /// `announce_task` writes the terminal's task line, so it belongs to the
-    /// agent that owns the terminal: a sub-agent reports instead.
-    pub fn announceTaskTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
         return @import("../tools/announce_task.zig").execute(self, arguments);
     }
 

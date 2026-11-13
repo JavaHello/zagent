@@ -737,11 +737,6 @@ pub const Client = struct {
         completed.* = encoded;
     }
 
-    fn resetHttpClient(self: *Client) void {
-        self.http_client.deinit();
-        self.http_client = .{ .allocator = self.allocator, .io = self.io };
-    }
-
     /// Keep what the server said, for the caller to report once no animation is
     /// using the terminal's line. The message is the server's own text when
     /// there is one, since "HTTP error: 429" alone is less useful than
