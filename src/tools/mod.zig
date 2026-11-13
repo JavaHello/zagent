@@ -51,7 +51,6 @@ pub const ToolResult = result_mod.ToolResult;
 pub const max_output_bytes = ccr.max_output_bytes;
 pub const page_room_bytes = ccr.page_room_bytes;
 pub const formatToolOutput = result_mod.formatToolOutput;
-pub const finalizeResult = result_mod.finalizeResult;
 
 // What the terminal shows while a tool runs.
 pub const progressLabel = progress.progressLabel;

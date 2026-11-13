@@ -6,7 +6,6 @@ const args_mod = @import("args.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
-const finalizeResult = result_mod.finalizeResult;
 const fixturePath = util.fixturePath;
 
 /// The apply_patch tool: change files by applying a unified diff to them.
@@ -50,11 +49,13 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
         // as it is: it names the file, the line and the text it wanted, which
         // is what the next patch has to be built from.
         .failed => |message| {
-            const content = try std.fmt.allocPrint(allocator, "Error: {s}", .{message});
-            defer allocator.free(content);
-            // Sanitised like any other result: the message quotes lines of the
-            // patch, which the model wrote.
-            return finalizeResult(allocator, content, .{ .is_error = true });
+            // The message quotes lines of the patch, which the model wrote:
+            // it is handed back as it is, so the two can be compared byte for
+            // byte.
+            return .{
+                .content = try std.fmt.allocPrint(allocator, "Error: {s}", .{message}),
+                .is_error = true,
+            };
         },
         .applied => |stats| {
             var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -80,7 +81,7 @@ pub fn applyPatch(io: std.Io, allocator: std.mem.Allocator, patch_text: []const 
                 }
                 try aw.writer.writeByte(')');
             }
-            return finalizeResult(allocator, aw.written(), .{ .is_error = false });
+            return .{ .content = try aw.toOwnedSlice(), .is_error = false };
         },
     }
 }

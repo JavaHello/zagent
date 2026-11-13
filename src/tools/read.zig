@@ -6,7 +6,6 @@ const tool = @import("tool.zig");
 
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
-const finalizeToolContent = result_mod.finalizeToolContent;
 const optionalUnsigned = args_mod.optionalUnsigned;
 
 /// One page of a file: where it starts, and how many lines it may hold.
@@ -261,16 +260,18 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
         if ((reader.peekByte() catch null) != null) resumes_at = line;
     }
 
-    const normalized = try finalizeToolContent(allocator, body.items);
-    const body_text = std.mem.trimEnd(u8, normalized, "\n");
+    // The page is handed over as the file holds it. Reading is how the model
+    // gets the exact text of what it means to quote, copy or patch, so nothing
+    // is rewritten on the way out: a sanitiser here would drop escape
+    // sequences and escape bytes that are not UTF-8, handing the model text
+    // that is not in the file. The screen is guarded where it is written.
     if (resumes_at) |next| {
-        defer allocator.free(normalized);
         return .{
-            .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ body_text, next }),
+            .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ std.mem.trimEnd(u8, body.items, "\n"), next }),
             .is_error = false,
         };
     }
-    return .{ .content = normalized, .is_error = false };
+    return .{ .content = try allocator.dupe(u8, body.items), .is_error = false };
 }
 
 test "read takes a 1-based offset and a line limit" {
@@ -323,10 +324,11 @@ test "read streams a page from deep in a large file" {
     defer tail.deinit(a);
     try std.testing.expectEqualStrings("4:last\n", tail.content);
 
-    // A page past the last line has nothing to show, and says so.
+    // A page past the last line has no lines to show: the page is empty, and
+    // says nothing a file does not.
     const beyond = try readFilePage(io, a, path, .{ .offset = 5 });
     defer beyond.deinit(a);
-    try std.testing.expectEqualStrings("(no output)", beyond.content);
+    try std.testing.expectEqualStrings("", beyond.content);
 
     // Even a first line larger than the presentation budget is returned whole.
     const full = try readFile(io, a, path);
@@ -378,6 +380,24 @@ test "read preserves a line longer than a page without splitting a character" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
     try std.testing.expectEqual(buffer.items.len + 3, result.content.len);
     try std.testing.expectEqualStrings(buffer.items, result.content[2 .. result.content.len - 1]);
+}
+
+test "read hands back the file's bytes as they are" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A cursor-move sequence and a byte that is not UTF-8 are the file's own
+    // contents: a model reading it to copy it exactly must get them back
+    // unchanged, not dropped or escaped.
+    const raw = "\x1b[2Jred\xff\nsecond\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "raw.txt", .data = raw });
+    const path = try tmp.dir.realPathFileAlloc(io, "raw.txt", a);
+    defer a.free(path);
+
+    const result = try readFilePage(io, a, path, .{});
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("1:\x1b[2Jred\xff\n2:second\n", result.content);
 }
 
 test "read missing file" {

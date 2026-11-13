@@ -1720,7 +1720,7 @@ pub const Agent = struct {
             .agent = self,
         };
         // Dispatch applies the shared size limit after execution hooks. The UI
-        // only previews the finalized result.
+        // only previews the result the tool returned, guarded as it prints.
         const result = try tools.execute(ctx, call.name, call.arguments);
         errdefer result.deinit(self.allocator);
         try self.previewToolResult(result.content, result.is_error);

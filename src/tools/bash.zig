@@ -8,7 +8,7 @@ const normalize = @import("../util/terminal/normalize.zig");
 const host_exec = @import("../host/exec.zig");
 
 const ToolResult = result_mod.ToolResult;
-const finalizeNormalizedResultOwned = result_mod.finalizeNormalizedResultOwned;
+const ownedResult = result_mod.ownedResult;
 
 /// How many lines of a long output the preview keeps. Enough for the end of a
 /// build to be read at a glance, few enough that the result stays a summary:
@@ -330,7 +330,7 @@ pub fn executeShellTimed(
         } else {
             try aw.writer.writeAll(collector.head.items);
         }
-        return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
+        return ownedResult(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
         });
@@ -353,7 +353,7 @@ pub fn executeShellTimed(
             "[This command printed more than {d} MiB; the rest is not cached and was not kept.]",
             .{cache_max_bytes / (1024 * 1024)},
         );
-        var result = finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
+        var result = ownedResult(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
         });
@@ -370,7 +370,7 @@ pub fn executeShellTimed(
             "[Output cut here: {d} lines, {d} bytes of output, and this run could not cache the rest ({s}). Redirect long output to a file and read it in pages.]",
             .{ countedLines(collector.bytes, collector.newlines, collector.last_byte), collector.bytes, @errorName(err) },
         );
-        return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
+        return ownedResult(try aw.toOwnedSlice(), .{
             .is_error = failed,
             .exit_code = exit_code,
         });
@@ -382,7 +382,7 @@ pub fn executeShellTimed(
         "[Output cut: {d} lines, {d} bytes, only the last lines shown. Redirect long output to a file and read it in pages.]",
         .{ countedLines(collector.bytes, collector.newlines, collector.last_byte), collector.bytes },
     );
-    return finalizeNormalizedResultOwned(try aw.toOwnedSlice(), .{
+    return ownedResult(try aw.toOwnedSlice(), .{
         .is_error = true,
         .exit_code = exit_code,
     });

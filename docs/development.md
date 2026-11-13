@@ -78,7 +78,7 @@ src/
     find.zig     — find
     http.zig     — http
     search.zig   — What the four search tools share: backends, arguments, paging
-    result.zig   — ToolResult and its status, sanitising and finalising
+    result.zig   — The shape of a result: its text, status and header
     ccr.zig      — The output cache: its sizes, a preview and its id, and ccr_retrieve
     dispatch.zig — Sending one call to the tool that answers it, statically, in this process
     args.zig     — Reading a call's JSON arguments

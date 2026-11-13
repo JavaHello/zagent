@@ -21,7 +21,6 @@ const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
-const finalizeToolContent = result_mod.finalizeToolContent;
 const optionalUnsigned = args_mod.optionalUnsigned;
 const truncateUtf8 = util.truncateUtf8;
 
@@ -490,10 +489,7 @@ fn queryPage(
         try aw.writer.print("[End of ccr {s}: {d} matching line(s) for \"{s}\".]", .{ id, matches, query });
     }
 
-    return .{
-        .content = try finalizeToolContent(allocator, aw.written()),
-        .is_error = false,
-    };
+    return .{ .content = try aw.toOwnedSlice(), .is_error = false };
 }
 
 test "afterExecute caches a result past 8 KiB and keeps a 4 KiB beginning" {

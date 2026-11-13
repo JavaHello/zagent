@@ -5,7 +5,6 @@ const tool = @import("tool.zig");
 
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
-const finalizeResult = result_mod.finalizeResult;
 const optionalString = args_mod.optionalString;
 
 /// The http tool: one request, its answer, or the file its body was saved to.
@@ -363,7 +362,7 @@ fn perform(allocator: std.mem.Allocator, deadline: *Deadline, request: HttpReque
         defer aw.deinit();
         try aw.writer.print("Saved {d} bytes to '{s}'\n", .{ written, path });
         try aw.writer.writeAll(head_aw.written());
-        return finalizeResult(allocator, aw.written(), .{ .is_error = false });
+        return .{ .content = try aw.toOwnedSlice(), .is_error = false };
     }
 
     const body_text = if (has_body)
@@ -382,7 +381,7 @@ fn perform(allocator: std.mem.Allocator, deadline: *Deadline, request: HttpReque
         try aw.writer.writeAll("(empty body)");
     }
 
-    return finalizeResult(allocator, aw.written(), .{ .is_error = http_error });
+    return .{ .content = try aw.toOwnedSlice(), .is_error = http_error };
 }
 
 /// Write the status line and every response header. Takes the head's parts

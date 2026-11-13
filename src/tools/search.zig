@@ -7,8 +7,7 @@ const host_exec = @import("../host/exec.zig");
 const ToolResult = result_mod.ToolResult;
 const ToolStatus = result_mod.ToolStatus;
 const toolError = result_mod.toolError;
-const normalizeToolText = result_mod.normalizeToolText;
-const finalizeResult = result_mod.finalizeResult;
+const ownedResult = result_mod.ownedResult;
 const lessString = util.lessString;
 const fixturePath = util.fixturePath;
 const optionalUnsigned = args_mod.optionalUnsigned;
@@ -281,17 +280,14 @@ pub fn runSearchTimed(
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    if (captured.stdout.items.len > 0) {
-        const normalized = try normalizeToolText(allocator, captured.stdout.items);
-        defer allocator.free(normalized);
-        try aw.writer.writeAll(normalized);
-    }
+    // What the search program printed is handed on as it printed it: a match
+    // is quoted, copied or patched from, so a rewritten line would not be the
+    // line it matched.
+    if (captured.stdout.items.len > 0) try aw.writer.writeAll(captured.stdout.items);
     if (captured.stderr.items.len > 0) {
         if (aw.written().len > 0) try aw.writer.writeAll("\n");
         try aw.writer.writeAll("stderr: ");
-        const normalized = try normalizeToolText(allocator, captured.stderr.items);
-        defer allocator.free(normalized);
-        try aw.writer.writeAll(normalized);
+        try aw.writer.writeAll(captured.stderr.items);
     }
     if (aw.written().len == 0) {
         // A search that matched nothing is the one thing this tool answers with
@@ -307,7 +303,7 @@ pub fn runSearchTimed(
 
 pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, status: ToolStatus) !ToolResult {
     if (std.mem.eql(u8, output, "(no matches)"))
-        return finalizeResult(allocator, output, status);
+        return ownedResult(try allocator.dupe(u8, output), status);
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(allocator);
     var it = std.mem.tokenizeScalar(u8, output, '\n');
@@ -319,7 +315,7 @@ pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, 
     while (index < lines.items.len) : (index += 1) {
         try aw.writer.print("{s}\n", .{lines.items[index]});
     }
-    return finalizeResult(allocator, aw.written(), status);
+    return ownedResult(try aw.toOwnedSlice(), status);
 }
 
 pub fn runContentSearch(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, args: GrepArgs) !ToolResult {

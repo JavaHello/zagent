@@ -96,8 +96,8 @@ and what each brought.
   (elicitation, sampling, a root list); zagent reports that as a failed call
   saying so. The tool list is also a snapshot from startup: a server that
   changes its tools later is not re-read.
-- **Results.** Up to 32 KB of text comes back to the model, sanitised the way
-  any tool result is. Images and audio are named rather than carried — `[image:
+- **Results.** Up to 32 KB of text comes back to the model as the server wrote
+  it. Images and audio are named rather than carried — `[image:
   image/png, 48213 bytes]` — because the bytes would cost more of the context
   than they could ever repay, and a result the server marks as an error stays an
   error, so the model can correct itself.

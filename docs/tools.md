@@ -94,6 +94,9 @@ larger than a megabyte can be read without loading it whole. A single line
 longer than the output limit (minified JSON, say) comes back as its beginning,
 cut on a UTF-8 boundary, with the suggestion to read the rest with `bash`.
 
+The numbered lines are the file's own bytes, handed over unchanged — see
+[Result text](#result-text).
+
 A page already in the conversation is not repeated: a read whose path, page and
 output are identical to an earlier one is answered with a one-line marker naming
 that earlier result and the SHA-256 of the contents. The marker is never counted
@@ -163,6 +166,14 @@ prompt.
 
 ## Result text
 
-Every result is sanitised before it reaches the model or the screen: escape
-sequences are dropped and the text stays valid UTF-8. A result the tool marks as
-a failure stays an error, so the model can correct itself.
+A result is the tool's own text, handed to the model as the tool produced it: a
+file's bytes, a search match, a server's reply, a patch summary. Nothing is
+sanitised, escaped or rewritten on the way out, so what the model quotes is what
+it read — escape sequences and bytes that are not UTF-8 included. The terminal
+is guarded where the preview is written instead, so a result cannot move the
+cursor or clear the screen it is shown on.
+
+`bash` is the exception: its body is a program's own, so escape sequences are
+dropped and a line a carriage return redraws is flattened to what a terminal
+would have ended up showing. A result the tool marks as a failure stays an
+error, so the model can correct itself.

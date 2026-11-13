@@ -1,5 +1,13 @@
+//! The shape of a tool result: the text a tool hands the agent, how the call
+//! ended, and the header the text is read under.
+//!
+//! Nothing is cleaned, clipped or cached here. A tool's text is the tool's own
+//! answer — a file's bytes, a program's output, a server's reply — and a model
+//! that quotes, copies or patches from it needs it as it was written. Where a
+//! terminal must not see what the text holds, the guard is at the point the
+//! terminal is written to.
+
 const std = @import("std");
-const sanitize = @import("../util/terminal/sanitize.zig");
 
 /// The name `ccr` gives a cached entry: twelve hex characters, drawn at random
 /// so two entries of one run cannot collide.
@@ -42,76 +50,47 @@ pub const ToolResult = struct {
     }
 };
 
-pub fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    return normalizeToolText(allocator, raw);
-}
-
-pub fn finalizeResult(allocator: std.mem.Allocator, raw: []const u8, status: ToolStatus) !ToolResult {
-    return finalizeNormalizedResultOwned(try normalizeToolText(allocator, raw), status);
-}
-
-/// Consumes sanitized, owned text without discarding any content.
-pub fn finalizeNormalizedResultOwned(normalized: []u8, status: ToolStatus) ToolResult {
+/// A result from text the caller already owns and hands over: the text becomes
+/// the content unchanged, so only the status is added.
+pub fn ownedResult(content: []u8, status: ToolStatus) ToolResult {
     return .{
-        .content = normalized,
+        .content = content,
         .is_error = status.is_error,
         .exit_code = status.exit_code,
         .timed_out = status.timed_out,
     };
 }
 
-/// Strip terminal control sequences and escape invalid text without clipping.
-pub fn normalizeToolText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    try sanitize.writeSanitized(&aw.writer, raw);
-    if (aw.written().len == 0) try aw.writer.writeAll("(no output)");
-    return aw.toOwnedSlice();
-}
-
 pub fn toolError(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !ToolResult {
     return .{ .content = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
 }
 
-test "finalization preserves complete oversized results and status" {
+test "a result hands on the text it was given, whole and unchanged" {
     const a = std.testing.allocator;
-    // Larger than anything a reader or a cache would hand over in one piece:
-    // finalizing text cleans it and never clips it.
-    const oversized = 16 * 1024;
-    const raw = try a.alloc(u8, oversized);
-    defer a.free(raw);
-    @memset(raw, 'x');
-    const result = try finalizeResult(a, raw, .{ .is_error = false, .exit_code = 7, .timed_out = true });
+    // Larger than anything a terminal preview would show, and carrying bytes a
+    // terminal acts on: neither is a reason to change what the model receives.
+    const text = try a.alloc(u8, 16 * 1024);
+    @memset(text, 'x');
+    text[0] = 0x1b;
+    text[1] = 0xff;
+    // The result takes ownership of the text and frees it as its own.
+    const result = ownedResult(text, .{ .is_error = false, .exit_code = 7, .timed_out = true });
     defer result.deinit(a);
-    try std.testing.expectEqualStrings(raw, result.content);
-    try std.testing.expect(!result.is_error and result.ccr_id == null and result.timed_out);
-    try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
-    const content = try finalizeToolContent(a, raw);
-    defer a.free(content);
-    try std.testing.expectEqualStrings(raw, content);
-}
-
-test "owned finalization transfers the full allocation and preserves status" {
-    const a = std.testing.allocator;
-    const normalized = try a.alloc(u8, 16 * 1024 + 1);
-    @memset(normalized, 'x');
-    const result = finalizeNormalizedResultOwned(normalized, .{ .is_error = false, .timed_out = true });
-    defer result.deinit(a);
-    try std.testing.expectEqual(normalized.ptr, result.content.ptr);
-    try std.testing.expectEqual(normalized.len, result.content.len);
+    try std.testing.expectEqual(text.ptr, result.content.ptr);
+    try std.testing.expectEqual(text.len, result.content.len);
     try std.testing.expect(!result.is_error and result.timed_out and result.ccr_id == null);
+    try std.testing.expectEqual(@as(?u8, 7), result.exit_code);
 }
 
-test "normalization sanitizes without changing printed markers into status" {
+test "the status header names every field and keeps markers out of it" {
     const a = std.testing.allocator;
-    const normalized = try normalizeToolText(a, "\x1b[32mgreen\x1b[0m\xff");
-    defer a.free(normalized);
-    try std.testing.expectEqualStrings("green\\xFF", normalized);
-    const printed = try finalizeResult(a, "... (truncated)", .{ .is_error = false });
+    const printed = try toolError(a, "Error: {s}", .{"nope"});
     defer printed.deinit(a);
-    try std.testing.expect(printed.ccr_id == null);
+    try std.testing.expect(printed.is_error and printed.ccr_id == null);
+    try std.testing.expectEqualStrings("Error: nope", printed.content);
     const encoded = try formatToolOutput(a, .{ .is_error = true, .exit_code = 7, .timed_out = true }, "body");
     defer a.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"exit_code\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"timed_out\":true") != null);
+    try std.testing.expect(std.mem.endsWith(u8, encoded, "\nbody"));
 }

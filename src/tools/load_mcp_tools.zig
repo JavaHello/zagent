@@ -44,8 +44,5 @@ pub fn execute(self: *Registry, allocator: std.mem.Allocator, arguments_json: []
 }
 
 fn errorResult(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !tool.ToolResult {
-    const raw = try std.fmt.allocPrint(allocator, fmt, args);
-    defer allocator.free(raw);
-    const tools = @import("mod.zig");
-    return tools.finalizeResult(allocator, raw, .{ .is_error = true });
+    return .{ .content = try std.fmt.allocPrint(allocator, fmt, args), .is_error = true };
 }
