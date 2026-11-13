@@ -3,6 +3,7 @@ const search_tools = @import("../tools/mod.zig");
 const codex_auth = @import("codex_auth.zig");
 const trace_mod = @import("../debug/trace.zig");
 const Config = @import("config.zig").Config;
+const ThinkingMode = @import("config.zig").ThinkingMode;
 pub const tool_schema = @import("../tools/schema.zig");
 pub const ToolDefinition = tool_schema.ToolDefinition;
 
@@ -313,9 +314,16 @@ pub const Client = struct {
     http_client: std.http.Client,
     api_key: []const u8,
     codex_auth_path: ?[]const u8 = null,
-    codex_options: CodexOptions = .{},
-    /// Borrowed from Config, with the same lifetime as model and codex_options.
-    prompt_cache_key: ?[]const u8 = null,
+    /// Standard Responses reasoning effort, sent as the outer-level
+    /// `reasoning.effort` for every provider, not only for Codex.
+    reasoning_effort: ?[]const u8 = null,
+    /// The Codex backend's fast mode. Only that backend understands its values,
+    /// so every other provider omits the field.
+    service_tier: ?[]const u8 = null,
+    /// Whether the request asks the backend to think, sent as the outer-level
+    /// `thinking` member. The presets decide the default; see `ThinkingMode`.
+    thinking: ThinkingMode = .omit,
+    /// Borrowed from Config, with the same lifetime as model and the fields above.
     prompt_cache_retention: ?[]const u8 = null,
     credentials: ?codex_auth.Credentials = null,
     base_url: []const u8,
@@ -362,8 +370,9 @@ pub const Client = struct {
             .http_client = .{ .allocator = allocator, .io = io },
             .api_key = config.api_key,
             .codex_auth_path = config.codex_auth_path,
-            .codex_options = .{ .reasoning_effort = config.reasoning_effort, .service_tier = config.service_tier },
-            .prompt_cache_key = config.prompt_cache_key,
+            .reasoning_effort = config.reasoning_effort,
+            .service_tier = config.service_tier,
+            .thinking = config.thinking,
             .prompt_cache_retention = config.prompt_cache_retention,
             .base_url = config.base_url,
             .model = config.model,
@@ -512,28 +521,35 @@ pub const Client = struct {
         return message;
     }
 
-    /// Estimate the wire request independently of accounting, including tool
-    /// schemas and the Codex adapter, without sending or authenticating.
-    pub fn estimateRequestTokens(self: *Client, messages: []const Message, extra_tools: []const []const u8) !u64 {
-        const request = try self.buildWireRequest(messages, extra_tools);
-        defer self.allocator.free(request);
-        return estimateTokens(request);
-    }
-
-    /// Shared projection for estimation and sending. With no cache options the
-    /// original serialization is returned unchanged (including for Codex).
+    /// Shared projection for sending. With none of the optional outer-level
+    /// fields set the original serialization is returned unchanged (including
+    /// for Codex).
     fn buildWireRequest(self: *Client, messages: []const Message, extra_tools: []const []const u8) ![]u8 {
         const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools }, true, self.search);
-        const request = if (self.codex_auth_path != null) adapted: {
+        const codex = self.codex_auth_path != null;
+        const request = if (codex) adapted: {
             defer self.allocator.free(ordinary);
-            break :adapted try codexRequest(self.allocator, ordinary, self.codex_options);
+            break :adapted try codexRequest(self.allocator, ordinary);
         } else ordinary;
-        if (self.prompt_cache_key == null and self.prompt_cache_retention == null) return request;
+        const service_tier = if (codex) self.service_tier else null;
+        if (self.reasoning_effort == null and self.thinking == .omit and service_tier == null and self.prompt_cache_retention == null) return request;
         defer self.allocator.free(request);
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, request, .{});
         defer parsed.deinit();
         const arena = parsed.arena.allocator();
-        if (self.prompt_cache_key) |key| try parsed.value.object.put(arena, "prompt_cache_key", .{ .string = key });
+        // `reasoning.effort` is a Responses field of its own, so it is not tied
+        // to the Codex adapter above; only `service_tier` is Codex's fast mode.
+        if (nonEmpty(self.reasoning_effort)) |effort| {
+            var reasoning: std.json.ObjectMap = .{};
+            try reasoning.put(arena, "effort", .{ .string = effort });
+            try parsed.value.object.put(arena, "reasoning", .{ .object = reasoning });
+        }
+        if (self.thinking.wireValue()) |value| {
+            var thinking: std.json.ObjectMap = .{};
+            try thinking.put(arena, "type", .{ .string = value });
+            try parsed.value.object.put(arena, "thinking", .{ .object = thinking });
+        }
+        if (nonEmpty(service_tier)) |tier| try parsed.value.object.put(arena, "service_tier", .{ .string = tier });
         if (self.prompt_cache_retention) |retention| try parsed.value.object.put(arena, "prompt_cache_retention", .{ .string = retention });
         return std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{});
     }
@@ -1277,30 +1293,21 @@ test "cache usage distinguishes absent from explicit zero" {
     try std.testing.expect(parseUsage(zero.value).?.cache_usage_reported);
 }
 
-test "cache options are borrowed and projected identically for ordinary and Codex requests" {
+test "cache retention is borrowed and projected identically for ordinary and Codex requests" {
     const a = std.testing.allocator;
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
     var config = try Config.load(a, std.testing.io, &env);
     defer config.deinit();
-    // Restore borrowed test values before Config frees its owned strings.
-    const original_key = config.prompt_cache_key;
+    // Restore the borrowed test values before Config frees its owned strings.
     const original_retention = config.prompt_cache_retention;
-    defer {
-        config.prompt_cache_key = original_key;
-        config.prompt_cache_retention = original_retention;
-    }
-    const keys = [_]?[]const u8{ null, "", null, "key\"\\value", "both" };
-    const retentions = [_]?[]const u8{ null, null, "in_memory", "in_memory", "24h" };
+    defer config.prompt_cache_retention = original_retention;
+    const retentions = [_]?[]const u8{ null, "", "in_memory", "24h" };
     for ([_]bool{ false, true }) |codex| {
-        for (keys, retentions) |key, retention| {
-            config.prompt_cache_key = key;
+        for (retentions) |retention| {
             config.prompt_cache_retention = retention;
             var client = Client.init(a, std.testing.io, config);
             defer client.deinit();
-            if (key) |value| {
-                try std.testing.expect(client.prompt_cache_key.?.ptr == value.ptr);
-            } else try std.testing.expect(client.prompt_cache_key == null);
             if (retention) |value| {
                 try std.testing.expect(client.prompt_cache_retention.?.ptr == value.ptr);
             } else try std.testing.expect(client.prompt_cache_retention == null);
@@ -1309,17 +1316,13 @@ test "cache options are borrowed and projected identically for ordinary and Code
             defer a.free(request);
             var parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
             defer parsed.deinit();
-            if (key) |value| {
-                try std.testing.expectEqualStrings(value, parsed.value.object.get("prompt_cache_key").?.string);
-            } else try std.testing.expect(!parsed.value.object.contains("prompt_cache_key"));
             if (retention) |value| {
                 try std.testing.expectEqualStrings(value, parsed.value.object.get("prompt_cache_retention").?.string);
             } else try std.testing.expect(!parsed.value.object.contains("prompt_cache_retention"));
-            try std.testing.expectEqual(estimateTokens(request), try client.estimateRequestTokens(&.{}, &.{}));
-            if (key == null and retention == null) {
+            if (retention == null) {
                 const ordinary = try buildRequestWithToolSelection(a, client.model, &.{}, client.max_tokens, .{}, true, client.search);
                 defer a.free(ordinary);
-                const baseline = if (codex) try codexRequest(a, ordinary, client.codex_options) else try a.dupe(u8, ordinary);
+                const baseline = if (codex) try codexRequest(a, ordinary) else try a.dupe(u8, ordinary);
                 defer a.free(baseline);
                 try std.testing.expectEqualStrings(baseline, request);
             }
@@ -1389,29 +1392,6 @@ test "an http failure is kept until the caller asks for it" {
     const message = client.takeHttpError() orelse return error.TestUnexpectedResult;
     defer allocator.free(message);
     try std.testing.expectEqualStrings("API error (HTTP 429): rate limit reached", message);
-}
-
-test "preflight estimate uses full wire request including schemas and Codex projection" {
-    const a = std.testing.allocator;
-    var client: Client = .{ .allocator = a, .io = std.testing.io, .http_client = .{ .allocator = a, .io = std.testing.io }, .api_key = "unused", .base_url = "https://example.invalid", .model = "test", .max_tokens = 512, .http_error = null };
-    defer client.deinit();
-    const messages = [_]Message{.{ .role = "user", .content = "中文\n\"quoted\"", .reasoning_content = null, .tool_calls = null, .tool_call_id = null }};
-    const extra = [_][]const u8{"{\"type\":\"function\",\"name\":\"mcp__test\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}"};
-    const ordinary = try buildRequestWithToolSelection(a, client.model, &messages, client.max_tokens, .{ .extra = &extra }, true, client.search);
-    defer a.free(ordinary);
-    try std.testing.expectEqual(estimateTokens(ordinary), try client.estimateRequestTokens(&messages, &extra));
-    try std.testing.expect(try client.estimateRequestTokens(&messages, &extra) > try client.estimateRequestTokens(&messages, &.{}));
-    client.codex_auth_path = "unused";
-    const adapted = try codexRequest(a, ordinary, client.codex_options);
-    defer a.free(adapted);
-    try std.testing.expectEqual(estimateTokens(adapted), try client.estimateRequestTokens(&messages, &extra));
-    client.builtin_tools = &.{ tool_schema.read, tool_schema.ls };
-    const subset = try buildRequestWithToolSelection(a, client.model, &messages, client.max_tokens, .{ .builtin = client.builtin_tools, .extra = &extra }, true, client.search);
-    defer a.free(subset);
-    const adapted_subset = try codexRequest(a, subset, client.codex_options);
-    defer a.free(adapted_subset);
-    try std.testing.expectEqual(estimateTokens(adapted_subset), try client.estimateRequestTokens(&messages, &extra));
-    try std.testing.expect(estimateTokens(adapted_subset) < estimateTokens(adapted));
 }
 
 test "Responses request uses typed items and flat non-strict function schemas" {
@@ -1603,52 +1583,117 @@ test "token estimates count cjk and ascii sensibly" {
     try std.testing.expectEqual(@as(u64, 2), estimateTokens("你好"));
 }
 
-test "Codex request includes only configured options" {
+test "reasoning effort is an outer field for every provider and service tier stays Codex-only" {
     const a = std.testing.allocator;
-    const ordinary = try buildRequestWithToolSelection(a, "test", &.{}, 100, null, false, .{});
-    defer a.free(ordinary);
-    const cases = [_]CodexOptions{
-        .{},
-        .{ .reasoning_effort = "", .service_tier = "" },
-        .{ .reasoning_effort = "high" },
-        .{ .service_tier = "fast" },
-        .{ .reasoning_effort = "high", .service_tier = "fast" },
-    };
-    for (cases) |options| {
-        const body = try codexRequest(a, ordinary, options);
-        defer a.free(body);
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
-        defer parsed.deinit();
-        const reasoning = parsed.value.object.get("reasoning");
-        const tier = parsed.value.object.get("service_tier");
-        if (options.reasoning_effort != null and options.reasoning_effort.?.len > 0) {
-            try std.testing.expectEqualStrings(options.reasoning_effort.?, reasoning.?.object.get("effort").?.string);
-        } else try std.testing.expect(reasoning == null);
-        if (options.service_tier != null and options.service_tier.?.len > 0) {
-            try std.testing.expectEqualStrings(options.service_tier.?, tier.?.string);
-        } else try std.testing.expect(tier == null);
+    const efforts = [_]?[]const u8{ null, "", "high" };
+    const tiers = [_]?[]const u8{ null, "", "fast" };
+    for ([_]bool{ false, true }) |codex| {
+        for (efforts) |effort| {
+            for (tiers) |tier| {
+                var client: Client = .{
+                    .allocator = a,
+                    .io = std.testing.io,
+                    .http_client = .{ .allocator = a, .io = std.testing.io },
+                    .api_key = "unused",
+                    .base_url = "https://example.invalid",
+                    .model = "test",
+                    .max_tokens = 512,
+                    .http_error = null,
+                    .codex_auth_path = if (codex) "unused" else null,
+                    .reasoning_effort = effort,
+                    .service_tier = tier,
+                };
+                defer client.deinit();
+                const request = try client.buildWireRequest(&.{}, &.{});
+                defer a.free(request);
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
+                defer parsed.deinit();
+                const reasoning = parsed.value.object.get("reasoning");
+                // A blank setting omits the field rather than sending "".
+                if (nonEmpty(effort)) |value| {
+                    try std.testing.expectEqualStrings(value, reasoning.?.object.get("effort").?.string);
+                } else try std.testing.expect(reasoning == null);
+                const sent_tier = parsed.value.object.get("service_tier");
+                if (codex) {
+                    if (nonEmpty(tier)) |value| {
+                        try std.testing.expectEqualStrings(value, sent_tier.?.string);
+                    } else try std.testing.expect(sent_tier == null);
+                } else try std.testing.expect(sent_tier == null);
+            }
+        }
     }
 }
 
-const CodexOptions = struct {
-    reasoning_effort: ?[]const u8 = null,
-    service_tier: ?[]const u8 = null,
-};
-
-fn codexRequest(a: std.mem.Allocator, ordinary: []const u8, options: CodexOptions) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, ordinary, .{});
-    defer parsed.deinit();
-    const arena = parsed.arena.allocator();
-    if (options.reasoning_effort) |effort| {
-        if (effort.len > 0) {
-            var reasoning: std.json.ObjectMap = .{};
-            try reasoning.put(arena, "effort", .{ .string = effort });
-            try parsed.value.object.put(arena, "reasoning", .{ .object = reasoning });
+test "thinking is a member of its own, sent only when the request asks for it" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { mode: ThinkingMode, value: ?[]const u8 }{
+        .{ .mode = .omit, .value = null },
+        .{ .mode = .enabled, .value = "enabled" },
+        .{ .mode = .disabled, .value = "disabled" },
+    };
+    for ([_]bool{ false, true }) |codex| {
+        for (cases) |case| {
+            var client: Client = .{
+                .allocator = a,
+                .io = std.testing.io,
+                .http_client = .{ .allocator = a, .io = std.testing.io },
+                .api_key = "unused",
+                .base_url = "https://example.invalid",
+                .model = "test",
+                .max_tokens = 512,
+                .http_error = null,
+                .codex_auth_path = if (codex) "unused" else null,
+                .thinking = case.mode,
+            };
+            defer client.deinit();
+            const request = try client.buildWireRequest(&.{}, &.{});
+            defer a.free(request);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, request, .{});
+            defer parsed.deinit();
+            const thinking = parsed.value.object.get("thinking");
+            if (case.value) |value| {
+                try std.testing.expectEqualStrings(value, thinking.?.object.get("type").?.string);
+                // The member is the outer object DeepSeek documents, nothing else.
+                try std.testing.expectEqual(@as(usize, 1), thinking.?.object.count());
+            } else try std.testing.expect(thinking == null);
         }
     }
-    if (options.service_tier) |tier| {
-        if (tier.len > 0) try parsed.value.object.put(arena, "service_tier", .{ .string = tier });
+}
+
+test "the Codex projection keeps its structural changes" {
+    const a = std.testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "system", .content = "be brief", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "user", .content = "hi", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const ordinary = try buildRequestWithToolSelection(a, "test", &messages, 100, null, true, .{});
+    defer a.free(ordinary);
+    const adapted = try codexRequest(a, ordinary);
+    defer a.free(adapted);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, adapted, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("be brief\n", parsed.value.object.get("instructions").?.string);
+    try std.testing.expect(!parsed.value.object.contains("max_output_tokens"));
+    try std.testing.expect(!parsed.value.object.contains("reasoning"));
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("input").?.array.items.len);
+}
+
+/// The value when it is set and not blank: an empty setting means "leave the
+/// field out" rather than sending an empty string the backend has to reject.
+fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    if (value) |text| {
+        if (text.len > 0) return text;
     }
+    return null;
+}
+
+/// The structural half of the Codex projection: streaming instructions move to
+/// `instructions` and the unsupported `max_output_tokens` is dropped. Optional
+/// outer-level fields are added afterwards, in `buildWireRequest`, because they
+/// are not specific to this backend.
+fn codexRequest(a: std.mem.Allocator, ordinary: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, ordinary, .{});
+    defer parsed.deinit();
     _ = parsed.value.object.swapRemove("max_output_tokens");
     const input = parsed.value.object.getPtr("input") orelse return error.InvalidRequest;
     var instructions: std.Io.Writer.Allocating = .init(a);

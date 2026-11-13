@@ -106,6 +106,19 @@ durable sessions preserve them across restarts, see
 Responses input messages and call/output pairs. Legacy free-form
 `reasoning_content` strings are not sent as a Responses reasoning item.
 
+`AI_REASONING_EFFORT` and `AI_PROMPT_CACHE_RETENTION` are standard Responses
+fields, so any provider gets them as outer-level members when they are set;
+`AI_SERVICE_TIER` is Codex's fast mode and is sent only there. See
+[Environment variables](configuration.md#environment-variables).
+
+`thinking` is DeepSeek's own switch, and the spelling the compatible endpoints
+use for the same idea, so those two presets ask for it by default
+(`"thinking":{"type":"enabled"}`) and `AI_THINKING=disabled` asks for the
+non-thinking mode explicitly — DeepSeek keeps thinking on when the field is
+missing. The OpenAI API and the Codex backend do not define the member, so they
+send nothing unless `AI_THINKING` is set for them by name. Use
+`AI_THINKING=omit` to drop it again for a compatible endpoint that rejects it.
+
 There is no automatic fallback to Chat Completions. Protocol mapping follows the
 [official Responses migration guide](https://developers.openai.com/api/docs/guides/migrate-to-responses).
 

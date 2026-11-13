@@ -32,8 +32,9 @@ and `mcp.example.json` shows every member an MCP entry takes.
 | `AI_URL`            | `https://api.openai.com/v1`         | API base URL, without `/responses`              |
 | `AI_MODEL`          | `gpt-4o-mini`                       | Model name, sent unchanged                      |
 | `AI_MAX_TOKENS`     | `8192`                              | Initial output token budget per response        |
-| `AI_REASONING_EFFORT` | *(unset)*                         | Codex only: sent as `reasoning.effort`          |
+| `AI_REASONING_EFFORT` | *(unset)*                         | Sent as a top-level `reasoning.effort` by every provider |
 | `AI_SERVICE_TIER`   | *(unset)*                           | Codex only: sent as `service_tier`              |
+| `AI_THINKING`       | `enabled` for `deepseek` and `openai-compatible`, otherwise omitted | `thinking` switch: `enabled`, `disabled`, or `omit` |
 | `AI_MEMORY_FILE`    | Global workspace state: `memory.md` | Override where the notes are stored             |
 | `AI_DEBUG`          | *(unset)*                           | Any value but `0`/`false`/`off`/`no` records a debug trace; see [Debug tracing](debug.md) |
 

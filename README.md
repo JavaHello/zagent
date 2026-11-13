@@ -104,14 +104,13 @@ An explicit `AI_URL`, `AI_MODEL` or key always wins over the preset, and
 autodetection and the Responses API mapping:
 [Providers](docs/providers.md).
 
-## Optional prompt cache controls
+## Optional prompt cache retention
 
-`AI_PROMPT_CACHE_KEY` and `AI_PROMPT_CACHE_RETENTION` can be set in the environment
-or config file (environment wins). Both default to unset: no explicit cache fields
-are sent. Retention accepts only `in_memory` or `24h`; other values fail configuration
-loading with `InvalidPromptCacheRetention`. Confirm support before enabling these
-on a compatible endpoint. Use a stable, non-secret key, not a secret or a new random
-value each turn. Automatic server-side caching may work without either field.
+`AI_PROMPT_CACHE_RETENTION` can be set in the environment or config file
+(environment wins). It defaults to unset: no explicit cache field is sent. It
+accepts only `in_memory` or `24h`; other values fail configuration loading with
+`InvalidPromptCacheRetention`. Confirm support before enabling it on a compatible
+endpoint. Automatic server-side caching may work without it.
 See [the example config](zagent.example.conf).
 
 Read/search pages hold about 7.5 KiB, and any tool result larger than 8 KiB —

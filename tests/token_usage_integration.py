@@ -58,8 +58,7 @@ try:
             (True, 'missing', 'cached 0, unknown; cache reports 0/2'),
             (True, 'zero', 'cached 0, reported; cache reports 2/2'),
         )
-        for cache_options in ({}, {'AI_PROMPT_CACHE_KEY': 'integration-project',
-                                   'AI_PROMPT_CACHE_RETENTION': '24h'}):
+        for cache_options in ({}, {'AI_PROMPT_CACHE_RETENTION': '24h'}):
             for report_usage, cache_mode, cached_summary in scenarios:
                 calls = 0
                 requests.clear()
@@ -70,13 +69,11 @@ try:
                 assert calls == 2, calls
                 assert len(requests) == 2, requests
                 for request in requests:
-                    for setting, field in (
-                            ('AI_PROMPT_CACHE_KEY', 'prompt_cache_key'),
-                            ('AI_PROMPT_CACHE_RETENTION', 'prompt_cache_retention')):
-                        if setting in cache_options:
-                            assert request.get(field) == cache_options[setting], request
-                        else:
-                            assert field not in request, request
+                    if 'AI_PROMPT_CACHE_RETENTION' in cache_options:
+                        assert (request.get('prompt_cache_retention') ==
+                                cache_options['AI_PROMPT_CACHE_RETENTION']), request
+                    else:
+                        assert 'prompt_cache_retention' not in request, request
                 expected = (f'in 300 ({cached_summary}) · out 60 (reasoning 36) · '
                             'total 360 tokens · usage 2/2 calls'
                             if report_usage else

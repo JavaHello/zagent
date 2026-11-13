@@ -53,17 +53,20 @@ credentials are untouched.
 
 ## Optional request fields
 
-Codex only, set in the config file or the environment (environment wins):
+Set in the config file or the environment (environment wins):
 
 ```ini
 AI_REASONING_EFFORT=high
 AI_SERVICE_TIER=fast
 ```
 
-They are passed through as `"reasoning":{"effort":"high"}` and
-`"service_tier":"fast"`. When unset or empty the field is omitted, and other
-providers never send either. Whether a value is accepted is up to the model and
-the backend.
+`AI_REASONING_EFFORT` is a standard Responses field, so every provider sends it
+as the outer-level `"reasoning":{"effort":"high"}`. `AI_SERVICE_TIER` selects
+this backend's fast mode and is the Codex-only one, sent as
+`"service_tier":"fast"`. `AI_THINKING` is DeepSeek's member: this backend does
+not define it and sends nothing unless the setting names it. When unset or empty
+the field is omitted. Whether a value is accepted is up to the model and the
+backend.
 
 References: [official authentication](https://developers.openai.com/codex/auth),
 [official gateway routing](https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway?gateway-auth=api-key).

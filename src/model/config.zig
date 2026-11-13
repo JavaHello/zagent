@@ -3,6 +3,26 @@ const provider = @import("provider.zig");
 
 const Provider = provider.Provider;
 
+/// Whether a request carries DeepSeek's `thinking` field, and with what value.
+///
+/// DeepSeek enables thinking by default, so asking for the non-thinking mode
+/// has to be explicit rather than done by leaving the field out. `omit` exists
+/// for a backend that does not define the field at all and would reject it.
+pub const ThinkingMode = enum {
+    omit,
+    enabled,
+    disabled,
+
+    /// The member's `type` value, or null when the field is not sent.
+    pub fn wireValue(self: ThinkingMode) ?[]const u8 {
+        return switch (self) {
+            .omit => null,
+            .enabled => "enabled",
+            .disabled => "disabled",
+        };
+    }
+};
+
 /// The most output tokens a request may ask DeepSeek for: its chat models cap
 /// `max_output_tokens` at 8192. The default budget stays inside it, and the
 /// truncation retry in `openai.zig` grows no further.
@@ -19,7 +39,7 @@ const ConfigFile = struct {
     model: ?[]u8 = null,
     reasoning_effort: ?[]u8 = null,
     service_tier: ?[]u8 = null,
-    prompt_cache_key: ?[]u8 = null,
+    thinking: ?[]u8 = null,
     prompt_cache_retention: ?[]u8 = null,
     max_tokens: ?u32 = null,
     debug: ?bool = null,
@@ -31,7 +51,7 @@ const ConfigFile = struct {
         if (self.model) |value| allocator.free(value);
         if (self.reasoning_effort) |value| allocator.free(value);
         if (self.service_tier) |value| allocator.free(value);
-        if (self.prompt_cache_key) |value| allocator.free(value);
+        if (self.thinking) |value| allocator.free(value);
         if (self.prompt_cache_retention) |value| allocator.free(value);
         self.* = .{};
     }
@@ -155,8 +175,8 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         try setString(allocator, &config.reasoning_effort, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_SERVICE_TIER")) {
         try setString(allocator, &config.service_tier, value);
-    } else if (std.ascii.eqlIgnoreCase(key, "AI_PROMPT_CACHE_KEY")) {
-        try setString(allocator, &config.prompt_cache_key, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_THINKING")) {
+        try setString(allocator, &config.thinking, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_PROMPT_CACHE_RETENTION")) {
         try setString(allocator, &config.prompt_cache_retention, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
@@ -280,6 +300,30 @@ fn resolveOptionalSetting(
     return null;
 }
 
+/// `AI_THINKING` chooses the value; left blank it follows the preset, because a
+/// backend that does not define the member would reject a request carrying it.
+/// An explicit value is honoured for any provider: the user is describing the
+/// endpoint they actually talk to, which a preset only narrows down.
+fn resolveThinking(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    file_value: *?[]u8,
+    selected: ?Provider,
+) !ThinkingMode {
+    const asked = try resolveOptionalSetting(allocator, env, "AI_THINKING", file_value);
+    defer if (asked) |value| allocator.free(value);
+    if (asked) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "enabled") or std.ascii.eqlIgnoreCase(value, "on") or std.mem.eql(u8, value, "1")) return .enabled;
+        if (std.ascii.eqlIgnoreCase(value, "disabled") or std.ascii.eqlIgnoreCase(value, "off") or std.mem.eql(u8, value, "0")) return .disabled;
+        if (std.ascii.eqlIgnoreCase(value, "omit") or std.ascii.eqlIgnoreCase(value, "none")) return .omit;
+        return error.InvalidThinking;
+    }
+    return switch (selected orelse return .omit) {
+        .deepseek, .openai_compatible => .enabled,
+        else => .omit,
+    };
+}
+
 fn resolveU32(
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
@@ -351,8 +395,7 @@ fn resolve(
     errdefer if (reasoning_effort) |value| allocator.free(value);
     const service_tier = try resolveOptionalSetting(allocator, env, "AI_SERVICE_TIER", &file_config.service_tier);
     errdefer if (service_tier) |value| allocator.free(value);
-    const prompt_cache_key = try resolveOptionalSetting(allocator, env, "AI_PROMPT_CACHE_KEY", &file_config.prompt_cache_key);
-    errdefer if (prompt_cache_key) |value| allocator.free(value);
+    const thinking = try resolveThinking(allocator, env, &file_config.thinking, selected_provider);
     const prompt_cache_retention = try resolveOptionalSetting(allocator, env, "AI_PROMPT_CACHE_RETENTION", &file_config.prompt_cache_retention);
     errdefer if (prompt_cache_retention) |value| allocator.free(value);
     if (prompt_cache_retention) |value| {
@@ -396,7 +439,7 @@ fn resolve(
         .model = model,
         .reasoning_effort = reasoning_effort,
         .service_tier = service_tier,
-        .prompt_cache_key = prompt_cache_key,
+        .thinking = thinking,
         .prompt_cache_retention = prompt_cache_retention,
         .max_tokens = max_tokens,
         .provider = selected_provider,
@@ -411,7 +454,10 @@ pub const Config = struct {
     model: []const u8,
     reasoning_effort: ?[]const u8 = null,
     service_tier: ?[]const u8 = null,
-    prompt_cache_key: ?[]const u8 = null,
+    /// Sent as an outer-level `thinking` member. DeepSeek and the generic
+    /// compatible preset ask for it by default; the OpenAI and Codex backends
+    /// do not define the field and leave it out.
+    thinking: ThinkingMode = .omit,
     /// Only "in_memory" and "24h" are accepted; null leaves server defaults.
     prompt_cache_retention: ?[]const u8 = null,
     max_tokens: u32,
@@ -439,7 +485,6 @@ pub const Config = struct {
         if (self.codex_auth_path) |path| self.allocator.free(path);
         if (self.reasoning_effort) |value| self.allocator.free(value);
         if (self.service_tier) |value| self.allocator.free(value);
-        if (self.prompt_cache_key) |value| self.allocator.free(value);
         if (self.prompt_cache_retention) |value| self.allocator.free(value);
         self.allocator.free(self.api_key);
         self.allocator.free(self.base_url);
@@ -514,20 +559,97 @@ test "Codex options resolve from environment and file, or remain absent" {
     try std.testing.expect(empty.service_tier == null);
 }
 
+test "thinking follows the preset unless it is asked for" {
+    const a = std.testing.allocator;
+    // A preset that documents the member asks for thinking by default; the
+    // OpenAI API and the Codex backend do not define it at all.
+    const presets = [_]struct { provider: []const u8, expected: ThinkingMode }{
+        .{ .provider = "openai", .expected = .omit },
+        .{ .provider = "codex", .expected = .omit },
+        .{ .provider = "deepseek", .expected = .enabled },
+        .{ .provider = "openai-compatible", .expected = .enabled },
+    };
+    for (presets) |preset| {
+        var env = try testEnv(a, &.{
+            .{ "AI_PROVIDER", preset.provider },
+            .{ "AI_URL", "https://example.test/v1" },
+            .{ "AI_MODEL", "test-model" },
+        });
+        defer env.deinit();
+        var file = ConfigFile{};
+        defer file.deinit(a);
+        const config = try resolve(a, &file, &env);
+        defer config.deinit();
+        try std.testing.expectEqual(preset.expected, config.thinking);
+    }
+
+    // Nothing selected at all is the historical OpenAI default, which sends no
+    // member it does not define.
+    var bare_env = try testEnv(a, &.{});
+    defer bare_env.deinit();
+    var bare_file = ConfigFile{};
+    defer bare_file.deinit(a);
+    const bare = try resolve(a, &bare_file, &bare_env);
+    defer bare.deinit();
+    try std.testing.expectEqual(ThinkingMode.omit, bare.thinking);
+}
+
+test "an explicit thinking value wins over the preset and is validated" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { asked: []const u8, expected: ThinkingMode }{
+        .{ .asked = "enabled", .expected = .enabled },
+        .{ .asked = "on", .expected = .enabled },
+        .{ .asked = "disabled", .expected = .disabled },
+        .{ .asked = "off", .expected = .disabled },
+        .{ .asked = "omit", .expected = .omit },
+    };
+    for (cases) |case| {
+        // An explicit value is honoured even where the preset would say no: the
+        // setting describes the endpoint the user actually reaches.
+        var env = try testEnv(a, &.{
+            .{ "AI_PROVIDER", "openai" },
+            .{ "AI_THINKING", case.asked },
+        });
+        defer env.deinit();
+        var file = ConfigFile{};
+        defer file.deinit(a);
+        const config = try resolve(a, &file, &env);
+        defer config.deinit();
+        try std.testing.expectEqual(case.expected, config.thinking);
+        // The environment also overrides the config file.
+        var overridden_env = try testEnv(a, &.{.{ "AI_PROVIDER", "deepseek" }});
+        defer overridden_env.deinit();
+        var overridden_file = try testFile(a, &.{.{ "AI_THINKING", case.asked }});
+        defer overridden_file.deinit(a);
+        const overridden = try resolve(a, &overridden_file, &overridden_env);
+        defer overridden.deinit();
+        try std.testing.expectEqual(case.expected, overridden.thinking);
+    }
+
+    // A blank setting is no setting: the preset decides.
+    var blank_env = try testEnv(a, &.{ .{ "AI_PROVIDER", "deepseek" }, .{ "AI_THINKING", "" } });
+    defer blank_env.deinit();
+    var blank_file = ConfigFile{};
+    defer blank_file.deinit(a);
+    const blank = try resolve(a, &blank_file, &blank_env);
+    defer blank.deinit();
+    try std.testing.expectEqual(ThinkingMode.enabled, blank.thinking);
+
+    // An unknown spelling is a startup error rather than a silent default.
+    var invalid_env = try testEnv(a, &.{.{ "AI_THINKING", "maybe" }});
+    defer invalid_env.deinit();
+    var invalid_file = ConfigFile{};
+    defer invalid_file.deinit(a);
+    try std.testing.expectError(error.InvalidThinking, resolve(a, &invalid_file, &invalid_env));
+}
+
 fn checkCacheAllocationFailures(allocator: std.mem.Allocator) !void {
-    var env = try testEnv(allocator, &.{
-        .{ "AI_PROMPT_CACHE_KEY", "environment-project" },
-        .{ "AI_PROMPT_CACHE_RETENTION", "24h" },
-    });
+    var env = try testEnv(allocator, &.{.{ "AI_PROMPT_CACHE_RETENTION", "24h" }});
     defer env.deinit();
-    var file = try testFile(allocator, &.{
-        .{ "AI_PROMPT_CACHE_KEY", "file-project" },
-        .{ "AI_PROMPT_CACHE_RETENTION", "in_memory" },
-    });
+    var file = try testFile(allocator, &.{.{ "AI_PROMPT_CACHE_RETENTION", "in_memory" }});
     defer file.deinit(allocator);
     const config = try resolve(allocator, &file, &env);
     defer config.deinit();
-    try std.testing.expectEqualStrings("environment-project", config.prompt_cache_key.?);
     try std.testing.expectEqualStrings("24h", config.prompt_cache_retention.?);
 }
 
@@ -540,14 +662,10 @@ test "prompt cache file values, blanks and invalid retention" {
     var env = try testEnv(a, &.{});
     defer env.deinit();
     for ([_][]const u8{ "in_memory", "24h", "" }) |retention| {
-        var file = try testFile(a, &.{
-            .{ "AI_PROMPT_CACHE_KEY", "project" },
-            .{ "AI_PROMPT_CACHE_RETENTION", retention },
-        });
+        var file = try testFile(a, &.{.{ "AI_PROMPT_CACHE_RETENTION", retention }});
         defer file.deinit(a);
         const config = try resolve(a, &file, &env);
         defer config.deinit();
-        try std.testing.expectEqualStrings("project", config.prompt_cache_key.?);
         if (retention.len == 0) {
             try std.testing.expect(config.prompt_cache_retention == null);
         } else try std.testing.expectEqualStrings(retention, config.prompt_cache_retention.?);
@@ -562,16 +680,12 @@ test "prompt cache file values, blanks and invalid retention" {
         defer empty_file.deinit(a);
         try std.testing.expectError(error.InvalidPromptCacheRetention, resolve(a, &empty_file, &invalid_env));
     }
-    var blank_env = try testEnv(a, &.{
-        .{ "AI_PROMPT_CACHE_KEY", "" },
-        .{ "AI_PROMPT_CACHE_RETENTION", "" },
-    });
+    var blank_env = try testEnv(a, &.{.{ "AI_PROMPT_CACHE_RETENTION", "" }});
     defer blank_env.deinit();
-    var blank_file = try testFile(a, &.{.{ "AI_PROMPT_CACHE_KEY", "" }});
+    var blank_file = ConfigFile{};
     defer blank_file.deinit(a);
     const blank = try resolve(a, &blank_file, &blank_env);
     defer blank.deinit();
-    try std.testing.expect(blank.prompt_cache_key == null);
     try std.testing.expect(blank.prompt_cache_retention == null);
 }
 
@@ -587,7 +701,6 @@ test "config defaults" {
     defer config.deinit();
 
     try std.testing.expectEqual(@as(?Provider, null), config.provider);
-    try std.testing.expect(config.prompt_cache_key == null);
     try std.testing.expect(config.prompt_cache_retention == null);
     try std.testing.expectEqualStrings("https://api.openai.com/v1", config.base_url);
     try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
@@ -595,7 +708,7 @@ test "config defaults" {
     try std.testing.expectEqual(@as(u32, 8192), config.max_tokens);
 }
 
-test "removed presentation, compaction and memory settings are ignored" {
+test "removed presentation, compaction, memory and prompt-cache-key settings are ignored" {
     const allocator = std.testing.allocator;
     const pairs = &[_][2][]const u8{
         .{ "AI_MARKDOWN", "false" },
@@ -603,6 +716,7 @@ test "removed presentation, compaction and memory settings are ignored" {
         .{ "AI_MEMORY", "false" },
         .{ "AI_MEMORY_AUTO", "false" },
         .{ "AI_MAX_ITERATIONS", "5" },
+        .{ "AI_PROMPT_CACHE_KEY", "project" },
     };
     var env = try testEnv(allocator, pairs);
     defer env.deinit();
@@ -616,6 +730,7 @@ test "removed presentation, compaction and memory settings are ignored" {
     try std.testing.expect(!@hasField(Config, "memory"));
     try std.testing.expect(!@hasField(Config, "memory_auto"));
     try std.testing.expect(!@hasField(Config, "max_iterations"));
+    try std.testing.expect(!@hasField(Config, "prompt_cache_key"));
 }
 
 test "debug tracing is a switch the file and the environment can both set" {

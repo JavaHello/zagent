@@ -245,6 +245,13 @@ pub fn main(init: std.process.Init) !void {
             std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
             std.process.exit(1);
         },
+        error.InvalidThinking => {
+            std.Io.File.stderr().writeStreamingAll(io, RED ++ "Error: unknown AI_THINKING value." ++ RESET ++
+                "\n  Accepted: enabled, disabled, or omit (on/off also work)." ++
+                "\n  DeepSeek and openai-compatible ask for thinking by default; the OpenAI" ++
+                "\n  and Codex backends send nothing unless AI_THINKING says otherwise.\n") catch {};
+            std.process.exit(1);
+        },
         else => return err,
     };
     defer config.deinit();
