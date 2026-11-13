@@ -94,6 +94,7 @@ src/
   ui/            — Terminal presentation
     screen.zig   — Screen buffer, scrolling, selection and copying
     render.zig   — Markdown rendering
+    layout.zig   — The conversation's left margin, one constant and its writers
     menu.zig     — Option parsing, choice menus, and reading the user's answer
     spinner.zig  — The animation shown while a request or tool runs
     banner.zig   — The startup wordmark: letterforms, palette, plain-text fallback

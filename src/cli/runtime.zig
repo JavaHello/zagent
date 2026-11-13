@@ -1,6 +1,7 @@
 //! The terminal has one owner. Workers only enqueue output and request answers.
 const std = @import("std");
 const sgr = @import("../ui/style.zig");
+const layout = @import("../ui/layout.zig");
 const Agent = @import("../agent/mod.zig").Agent;
 const Screen = @import("../ui/screen.zig").Screen;
 const menu = @import("../ui/menu.zig");
@@ -83,7 +84,7 @@ pub const Runtime = struct {
         self.agent.clearSteering();
         try self.agent.finishInterruption();
         _ = try self.screen.drain();
-        try self.screen.writeLog(sgr.YELLOW ++ "Task interrupted (Esc). Input typed while it ran was discarded." ++ sgr.RESET ++ "\n");
+        try self.screen.writeLog(sgr.YELLOW ++ layout.indent ++ "Task interrupted (Esc). Input typed while it ran was discarded." ++ sgr.RESET ++ "\n");
         _ = try self.screen.drain();
     }
 
@@ -95,7 +96,7 @@ pub const Runtime = struct {
         // reach this function from it.
         if (self.busy()) {
             try self.agent.steer(line);
-            try self.screen.writeLog(sgr.DIM ++ "Input sent to the running task." ++ sgr.RESET ++ "\n");
+            try self.screen.writeLog(sgr.DIM ++ layout.indent ++ "Input sent to the running task." ++ sgr.RESET ++ "\n");
             _ = try self.tick();
             return;
         }
@@ -132,7 +133,7 @@ pub const Runtime = struct {
         defer self.agent.allocator.free(line);
         self.agent.processQuery(line) catch |err| {
             if (self.agent.interrupted.load(.acquire)) return;
-            const message = std.fmt.allocPrint(self.agent.allocator, sgr.RED ++ "Error: {s}" ++ sgr.RESET ++ "\n", .{@errorName(err)}) catch return;
+            const message = std.fmt.allocPrint(self.agent.allocator, sgr.RED ++ layout.indent ++ "Error: {s}" ++ sgr.RESET ++ "\n", .{@errorName(err)}) catch return;
             defer self.agent.allocator.free(message);
             self.screen.writeLog(message) catch {};
         };

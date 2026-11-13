@@ -25,14 +25,30 @@ the shell's own scrollback comes back untouched when zagent exits.
 ❯ list all .zig files in the current directory
   ⚙ bash {"command":"find . -name '*.zig' -type f"}
   ✓ ./src/agent/mod.zig
-./src/model/config.zig
-...
+    ./src/model/config.zig
+    ./src/tools/bash.zig
+    ...
 
-Assistant
-Here are all the .zig files in the current directory: ...
+  Assistant
+  Here are all the .zig files in the current directory:
 
+  • src/agent/mod.zig — the loop, and the hooks a tool call runs through
+  • src/model/config.zig — provider and model settings
+
+  Worked for 3.4s · in 8120 (cached 0) · out 421 · total 8541 tokens · usage 2/2 calls
   ✓ Turn finished
 ```
+
+Everything the conversation shows starts two columns in. The call's `⚙` sits at
+that margin, the result under it follows the `✓` and its continuation lines line
+up under the result's own text, and the answer's header and body take the same
+margin — so a paragraph, a list, a fence and a table all hang off the same left
+edge. The prompt's `❯` is the one thing at column zero: it is the left anchor
+the rest is read against. A command's listing (`/help`, `/memory`, `/plan`,
+`/mcp`) is written at the margin too.
+
+The margin is applied as the text is produced, not as it is drawn, so it is a
+terminal's layout only: what a pipe or a file receives is untouched.
 
 `Ctrl+Z` suspends the session the way it suspends any other foreground program:
 the terminal is handed back to the shell first, and `fg` resumes zagent, redraws
@@ -47,7 +63,8 @@ context. That conversation is still on disk — `zagent --resume <old-id>`, name
 in the line under the header, brings it back.
 
 When stdout is not a terminal (a pipe or a file), the layout stays inline and
-the answer is written straight to stdout, so `zagent "q" > notes.md` is clean.
+the answer is written straight to stdout, so `zagent "q" > notes.md` is clean:
+raw markdown, no margin, nothing for another program to trip over.
 
 ## REPL commands
 

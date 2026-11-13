@@ -13,8 +13,11 @@
 //! two- and four-space indentation from a model therefore renders unevenly, but
 //! never incorrectly.
 //!
-//! Only lines that carry a prefix are reflowed. A plain paragraph is emitted
-//! whole and left to the terminal's own soft-wrap.
+//! Only lines that carry a prefix are reflowed. At column zero a plain
+//! paragraph is emitted whole and left to the terminal's own soft-wrap; under a
+//! margin (`Options.indent`) every line carries a prefix, so prose is wrapped
+//! here — a terminal continues a soft-wrapped line at column zero, which would
+//! leave the tail of a paragraph hanging outside the margin.
 
 const std = @import("std");
 const sgr = @import("style.zig");
@@ -94,6 +97,14 @@ pub const Options = struct {
     /// Wrap long code lines. Turning this off keeps a long path or URL on one
     /// line for copy-paste, at the cost of the bar vanishing past the margin.
     wrap_code: bool = true,
+    /// Columns of left margin before every line, on top of whatever prefix a
+    /// block carries itself. The conversation renders at its margin; a caller
+    /// laying a document out from column zero leaves this at zero.
+    ///
+    /// A margin is why a wrapped paragraph is reflowed here rather than left to
+    /// the terminal: a terminal's soft-wrap continues at column zero, which
+    /// would break the margin on every long line.
+    indent: usize = 0,
 };
 
 /// What is written before the content of a line, and before each continuation
@@ -774,6 +785,15 @@ pub const Renderer = struct {
         };
     }
 
+    /// A block's own prefix, moved out to the document's margin. Every prefix
+    /// the renderer writes goes through here, which is what keeps a list, a
+    /// fence and a table at the same left edge.
+    fn margin(self: *const Renderer, p: Prefix) Prefix {
+        var shifted = p;
+        shifted.indent += self.options.indent;
+        return shifted;
+    }
+
     /// Feed a whole document. A streaming caller would call `feedLine` itself
     /// with complete lines; the renderer keeps no state that requires more.
     pub fn feed(self: *Renderer, doc: []const u8) !void {
@@ -932,7 +952,7 @@ pub const Renderer = struct {
         }
         if (cols == 0) return self.tableProse(table);
 
-        const indent = Prefix{ .quote_depth = table.quote_depth, .indent = table_indent };
+        const indent = self.margin(.{ .quote_depth = table.quote_depth, .indent = table_indent });
         fitColumns(widths[0..cols], self.wrap.width -| indent.width(self.theme));
 
         try self.tableRowLine(table.rows[0], cols, widths[0..cols], aligns[0..cols], table.quote_depth, self.theme.table_header);
@@ -965,7 +985,7 @@ pub const Renderer = struct {
             lines = @max(lines, renderedLines(rendered));
         }
 
-        const indent = Prefix{ .quote_depth = quote_depth, .indent = table_indent };
+        const indent = self.margin(.{ .quote_depth = quote_depth, .indent = table_indent });
         for (0..lines) |line_index| {
             // A row whose later cells are empty on this line stops there: the
             // padding that would align them is whitespace at the end of a line.
@@ -997,7 +1017,7 @@ pub const Renderer = struct {
     }
 
     fn tableRule(self: *Renderer, cols: usize, widths: []const usize, quote_depth: u8) !void {
-        const indent = Prefix{ .quote_depth = quote_depth, .indent = table_indent };
+        const indent = self.margin(.{ .quote_depth = quote_depth, .indent = table_indent });
         try self.wrap.beginRaw(indent);
         for (0..cols) |c| {
             try self.wrap.setStyle(self.theme.rule);
@@ -1010,14 +1030,14 @@ pub const Renderer = struct {
     }
 
     fn paragraph(self: *Renderer, content: []const u8, quote_depth: u8) !void {
-        const prefix = Prefix{ .quote_depth = quote_depth };
+        const prefix = self.margin(.{ .quote_depth = quote_depth });
         self.wrap.setup(prefix, prefix);
         try self.inlineRun(content);
         return self.wrap.finish();
     }
 
     fn headingLine(self: *Renderer, level: u8, content: []const u8, quote_depth: u8) !void {
-        const prefix = Prefix{ .quote_depth = quote_depth };
+        const prefix = self.margin(.{ .quote_depth = quote_depth });
         self.wrap.setup(prefix, prefix);
         var scanner = Inline{
             .wrap = &self.wrap,
@@ -1029,7 +1049,7 @@ pub const Renderer = struct {
     }
 
     fn rule(self: *Renderer, quote_depth: u8) !void {
-        const prefix = Prefix{ .quote_depth = quote_depth };
+        const prefix = self.margin(.{ .quote_depth = quote_depth });
         self.wrap.setup(prefix, prefix);
         const glyph_width = term.width(self.theme.rule_glyph);
         const room = self.wrap.width -| prefix.width(self.theme);
@@ -1041,18 +1061,18 @@ pub const Renderer = struct {
         const base = item.level * 2;
         const marker = if (item.number.len > 0) item.number else self.theme.bullet_glyph;
 
-        const first = Prefix{
+        const first = self.margin(.{
             .quote_depth = quote_depth,
             .indent = base,
             .marker = marker,
             .marker_style = self.theme.marker,
-        };
+        });
         // The continuation prefix is exactly as wide as the first one, so the
         // wrapped text lines up under the item's text and never at column zero.
-        const cont = Prefix{
+        const cont = self.margin(.{
             .quote_depth = quote_depth,
             .indent = base + term.width(marker) + 1,
-        };
+        });
 
         self.wrap.setup(first, cont);
         try self.inlineRun(item.content);
@@ -1061,21 +1081,21 @@ pub const Renderer = struct {
 
     fn codeLabel(self: *Renderer, fence: Fence) !void {
         if (fence.lang.len == 0) return;
-        const prefix = Prefix{
+        const prefix = self.margin(.{
             .quote_depth = fence.quote_depth,
             .indent = code_indent,
-        };
+        });
         self.wrap.setup(prefix, prefix);
         try self.wrap.flow(self.theme.code_lang, fence.lang);
         return self.wrap.finish();
     }
 
     fn codeLine(self: *Renderer, line: []const u8, fence: Fence) !void {
-        const prefix = Prefix{
+        const prefix = self.margin(.{
             .quote_depth = fence.quote_depth,
             .code_bar = true,
             .indent = code_indent,
-        };
+        });
         self.wrap.setup(prefix, prefix);
         self.wrap.allow_wrap = self.options.wrap_code and prefix.width(self.theme) > 0;
         // Start the line before flow sees whitespace: prose drops leading
@@ -1461,6 +1481,29 @@ test "a paragraph is not reflowed" {
     // No prefix means no wrapping: the terminal's own soft-wrap handles it.
     try expectPlain("a b c d e f\n", "a b c d e f", 4);
     try expectPlain("a b c d e f\n", "a b c d e f", 80);
+}
+
+test "a document margin moves every line out, prefix and all" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try render(&aw.writer, "# Quiz\n\n- one two three\n\n```zig\ncode();\n```", .{
+        .width = 14,
+        .styled = false,
+        .indent = 2,
+    });
+    try testing.expectEqualStrings(
+        "  Quiz\n\n  \xe2\x80\xa2 one two\n    three\n\n    zig\n    \xe2\x96\x8f code();\n",
+        aw.written(),
+    );
+}
+
+test "under a margin a paragraph is reflowed rather than run past it" {
+    // The margin is the only prefix a paragraph has, and a prefix is what turns
+    // wrapping on: a terminal would continue the line at column zero.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try render(&aw.writer, "aaaa bbbb cccc", .{ .width = 8, .styled = false, .indent = 2 });
+    try testing.expectEqualStrings("  aaaa\n  bbbb\n  cccc\n", aw.written());
 }
 
 test "trailing spaces are never emitted" {

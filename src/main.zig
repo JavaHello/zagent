@@ -10,6 +10,7 @@ const banner = @import("ui/banner.zig");
 const term = @import("ui/term.zig");
 const sanitize = @import("util/terminal/sanitize.zig");
 const Screen = @import("ui/screen.zig").Screen;
+const layout = @import("ui/layout.zig");
 const Linenoise = @import("editor/linenoise.zig").Linenoise;
 
 const sgr = @import("ui/style.zig");
@@ -511,19 +512,19 @@ fn runRepl(
             !std.mem.eql(u8, line, "/debug") and
             !std.mem.eql(u8, line, "/quit") and !std.mem.eql(u8, line, "/exit"))
         {
-            try screen.writeLog("This command changes session state; retry after the current task finishes.\n");
+            try writeBlock(allocator, &screen, stdout, io, "This command changes session state; retry after the current task finishes.\n");
             continue;
         }
 
         if (std.mem.eql(u8, line, "/quit") or std.mem.eql(u8, line, "/exit")) {
-            try writeOut(&screen, stdout, io, DIM ++ "Goodbye!\n" ++ RESET);
+            try writeBlock(allocator, &screen, stdout, io, DIM ++ "Goodbye!\n" ++ RESET);
             break;
         } else if (std.mem.eql(u8, line, "/help")) {
-            try writeOut(&screen, stdout, io, HELP);
+            try writeBlock(allocator, &screen, stdout, io, HELP);
         } else if (std.mem.eql(u8, line, "/session")) {
             const message = try std.fmt.allocPrint(allocator, "Session: {s}\nResume: zagent --resume {s}\n", .{ agent.session_id.?, agent.session_id.? });
             defer allocator.free(message);
-            try writeOut(&screen, stdout, io, message);
+            try writeBlock(allocator, &screen, stdout, io, message);
         } else if (std.mem.eql(u8, line, "/new")) {
             // The id of the session being left outlives it: the line that
             // announces the new session names the old one, so the conversation
@@ -533,7 +534,7 @@ fn runRepl(
             agent.startSession(null) catch |err| {
                 const message = try std.fmt.allocPrint(allocator, "Cannot create session: {s}\n", .{@errorName(err)});
                 defer allocator.free(message);
-                try writeOut(&screen, stderr, io, message);
+                try writeBlock(allocator, &screen, stderr, io, message);
                 continue;
             };
             // The scratch directory belongs to the conversation being left
@@ -542,7 +543,7 @@ fn runRepl(
             agent.scratch.reset() catch |err| {
                 const message = try std.fmt.allocPrint(allocator, "Cannot clear scratch directory: {s}\n", .{@errorName(err)});
                 defer allocator.free(message);
-                try writeOut(&screen, stderr, io, message);
+                try writeBlock(allocator, &screen, stderr, io, message);
             };
             // Nothing of the old session may stay visible: an answer above the
             // prompt would be read as this session's own context. The screen is
@@ -562,7 +563,7 @@ fn runRepl(
             continue;
         } else if (std.mem.eql(u8, line, "/clear")) {
             agent.clearHistory();
-            try writeOut(&screen, stdout, io, DIM ++ "Conversation history cleared.\n" ++ RESET);
+            try writeBlock(allocator, &screen, stdout, io, DIM ++ "Conversation history cleared.\n" ++ RESET);
         } else if (std.mem.eql(u8, line, "/plan") or std.mem.startsWith(u8, line, "/plan ")) {
             const argument = std.mem.trim(u8, line["/plan".len..], " \t");
             agent.planCommand(argument) catch |err| try reportCommandError(allocator, &screen, io, "plan", err);
@@ -578,11 +579,11 @@ fn runRepl(
             const counts = agent.client.tokenCounts();
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\nWorkspace: {s}\nScratch: {s}\nLast turn tokens (server usage only): input {d} (cached {d}), output {d} (reasoning {d}), total {d}\nUsage reported: {d}/{d} calls; missing usage is unknown, not estimated.\nCached/reasoning tokens are included in input/output, not added again.\n", .{ config.model, agent.workspace, agent.scratch.path, counts.input, counts.cached, counts.output, counts.reasoning, counts.total, counts.usage_reports, counts.requests });
             defer allocator.free(msg);
-            try writeOut(&screen, stdout, io, msg);
+            try writeBlock(allocator, &screen, stdout, io, msg);
             if (config.provider == .codex) {
                 const settings = try @import("model/status.zig").formatCodexSettings(allocator, config.service_tier, config.reasoning_effort);
                 defer allocator.free(settings);
-                try writeOut(&screen, stdout, io, settings);
+                try writeBlock(allocator, &screen, stdout, io, settings);
             }
             var status_client = @import("model/openai.zig").Client.init(allocator, io, config);
             defer status_client.deinit();
@@ -591,16 +592,16 @@ fn runRepl(
                 continue;
             };
             defer allocator.free(quota);
-            try writeOut(&screen, stdout, io, quota);
+            try writeBlock(allocator, &screen, stdout, io, quota);
         } else if (std.mem.eql(u8, line, "/model")) {
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\n", .{config.model});
             defer allocator.free(msg);
-            try writeOut(&screen, stdout, io, msg);
+            try writeBlock(allocator, &screen, stdout, io, msg);
         } else if (std.mem.eql(u8, line, "/mcp")) {
             var aw: std.Io.Writer.Allocating = .init(allocator);
             defer aw.deinit();
             try registry.writeStatus(&aw.writer);
-            try writeOut(&screen, stdout, io, aw.written());
+            try writeBlock(allocator, &screen, stdout, io, aw.written());
         } else if (std.mem.eql(u8, line, "/debug")) {
             try debugCommand(allocator, io, &screen, stdout, stderr, env, agent, trace);
         } else if (screen.isActive()) {
@@ -609,7 +610,7 @@ fn runRepl(
             agent.processQuery(line) catch |err| {
                 const errmsg = try std.fmt.allocPrint(allocator, RED ++ "Error: {s}" ++ RESET ++ "\n", .{@errorName(err)});
                 defer allocator.free(errmsg);
-                try writeOut(&screen, stderr, io, errmsg);
+                try writeBlock(allocator, &screen, stderr, io, errmsg);
             };
         }
 
@@ -624,6 +625,33 @@ fn writeOut(screen: *Screen, file: std.Io.File, io: std.Io, bytes: []const u8) !
     try file.writeStreamingAll(io, bytes);
 }
 
+/// Send a finished block — help, a listing, a notice — to the conversation at
+/// its left margin, so a command's output starts where the answer and the tool
+/// calls above it start. Anything else is handed over as it is: a pipe or a
+/// file is read by another program, which cannot see a margin and did not ask
+/// for one.
+fn writeBlock(
+    allocator: std.mem.Allocator,
+    screen: *Screen,
+    file: std.Io.File,
+    io: std.Io,
+    bytes: []const u8,
+) !void {
+    if (!onTerminal(screen, io)) return writeOut(screen, file, io, bytes);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try layout.write(&aw.writer, bytes);
+    return writeOut(screen, file, io, aw.written());
+}
+
+/// Whether what is written is read by a person on a terminal rather than by
+/// another program. It is the one condition under which the conversation takes
+/// a left margin.
+fn onTerminal(screen: *Screen, io: std.Io) bool {
+    if (screen.isActive()) return true;
+    return std.Io.File.stdout().isTty(io) catch false;
+}
+
 /// Report a slash-command failure without taking the REPL down with it.
 fn reportCommandError(
     allocator: std.mem.Allocator,
@@ -634,7 +662,7 @@ fn reportCommandError(
 ) !void {
     const message = try std.fmt.allocPrint(allocator, RED ++ "Error: {s}: {s}" ++ RESET ++ "\n", .{ command, @errorName(err) });
     defer allocator.free(message);
-    try writeOut(screen, std.Io.File.stderr(), io, message);
+    try writeBlock(allocator, screen, std.Io.File.stderr(), io, message);
 }
 
 /// The opening report: wordmark, model, session, hints.
@@ -704,7 +732,7 @@ fn writeHeader(
             .{ key_var, key_var },
         );
         defer allocator.free(msg);
-        try writeOut(screen, std.Io.File.stderr(), io, msg);
+        try writeBlock(allocator, screen, std.Io.File.stderr(), io, msg);
     }
 }
 
@@ -773,20 +801,20 @@ fn debugCommand(
     trace: *?*debug.Recorder,
 ) !void {
     if (comptime !debug.enabled) {
-        try writeOut(screen, stderr, io, NO_TRACING);
+        try writeBlock(allocator, screen, stderr, io, NO_TRACING);
     } else {
         if (trace.*) |opened| {
             const message = try std.fmt.allocPrint(allocator, "Debug: report {s}\nDebug: trace  {s}\n", .{ opened.report_path, opened.jsonl_path });
             defer allocator.free(message);
-            try writeOut(screen, stdout, io, message);
+            try writeBlock(allocator, screen, stdout, io, message);
         } else if (openTrace(allocator, io, env, agent.session_id)) |opened| {
             trace.* = opened;
             agent.attachTrace(opened);
             const message = try std.fmt.allocPrint(allocator, DIM ++ "Debug: recording from here; report {s}\n" ++ RESET, .{opened.report_path});
             defer allocator.free(message);
-            try writeOut(screen, stdout, io, message);
+            try writeBlock(allocator, screen, stdout, io, message);
         } else {
-            try writeOut(screen, stderr, io, "Debug: this run cannot be recorded.\n");
+            try writeBlock(allocator, screen, stderr, io, "Debug: this run cannot be recorded.\n");
         }
     }
 }
@@ -878,6 +906,7 @@ test {
     _ = @import("util/terminal/sanitize.zig");
     _ = @import("util/terminal/normalize.zig");
     _ = @import("ui/render.zig");
+    _ = @import("ui/layout.zig");
     _ = @import("ui/spinner.zig");
     _ = @import("mcp/mod.zig");
     _ = @import("mcp/transport.zig");

@@ -10,6 +10,7 @@ const mcp = @import("../mcp/mod.zig");
 const scratch_mod = @import("../state/scratch.zig");
 const sysinfo = @import("../host/sysinfo.zig");
 const render = @import("../ui/render.zig");
+const layout = @import("../ui/layout.zig");
 const term = @import("../ui/term.zig");
 const spinner = @import("../ui/spinner.zig");
 const Screen = @import("../ui/screen.zig").Screen;
@@ -494,7 +495,7 @@ pub const Agent = struct {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         try self.memory.writeList(&aw.writer);
-        try self.writeLogOrStdout(aw.written());
+        try self.writeBlock(aw.written());
     }
 
     /// `/remember <text>`: save a note by hand, as the model's memory_save tool
@@ -566,7 +567,7 @@ pub const Agent = struct {
             var aw: std.Io.Writer.Allocating = .init(self.allocator);
             defer aw.deinit();
             try self.plan.writeChecklist(&aw.writer);
-            return self.writeLogOrStdout(aw.written());
+            return self.writeBlock(aw.written());
         }
         if (!std.ascii.eqlIgnoreCase(arg, "clear")) {
             try self.emit(std.Io.File.stderr(), DIM ++ "  usage: /plan [clear]\n" ++ RESET, .{});
@@ -1750,6 +1751,11 @@ pub const Agent = struct {
     }
 
     /// Use the same result preview for live execution and restored messages.
+    ///
+    /// The result follows the marker on the call's own line, and every line
+    /// after the first is moved under that text: a preview that began at the
+    /// margin and continued at column zero would read as a different block from
+    /// the one it belongs to.
     fn previewToolResult(self: *Agent, content: []const u8, is_error: bool) !void {
         if (self.capture != null) return;
         // An error is shown whole, because its message is the point of it — but
@@ -1759,11 +1765,18 @@ pub const Agent = struct {
             @min(content.len, error_preview_max)
         else
             @min(content.len, 200);
+        var body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer body.deinit();
+        try sanitize.writeSanitized(&body.writer, content[0..preview_len]);
+        if (content.len > preview_len) try body.writer.writeAll("...");
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        try aw.writer.writeAll(if (is_error) RED ++ "  ✗ " else DIM ++ "  ✓ ");
-        try sanitize.writeSanitized(&aw.writer, content[0..preview_len]);
-        if (content.len > preview_len) try aw.writer.writeAll("...");
+        try layout.writeBlock(
+            &aw.writer,
+            body.written(),
+            if (is_error) RED ++ layout.indent ++ "✗ " else DIM ++ layout.indent ++ "✓ ",
+            layout.after_glyph,
+        );
         try aw.writer.writeAll("\n" ++ RESET);
         try self.emit(std.Io.File.stderr(), "{s}", .{aw.written()});
     }
@@ -1789,6 +1802,7 @@ pub const Agent = struct {
                 var log_writer = screen.logWriter(&buf);
                 try render.render(&log_writer.writer, content, .{
                     .width = term.usableWidth(term.columns(stdout)),
+                    .indent = layout.columns,
                 });
                 return log_writer.writer.flush();
             }
@@ -1798,8 +1812,32 @@ pub const Agent = struct {
 
         try render.render(&file_writer.interface, content, .{
             .width = term.usableWidth(term.columns(stdout)),
+            .indent = layout.columns,
         });
         try file_writer.interface.flush();
+    }
+
+    /// Write a finished block to the conversation at its left margin: a
+    /// command's own listing is shown against the same left edge as the answer
+    /// above the prompt. A pipe or a file is handed the block as it is, because
+    /// what reads it there cannot see a margin and did not ask for one.
+    fn writeBlock(self: *Agent, block: []const u8) !void {
+        if (!self.onTerminal()) return self.writeLogOrStdout(block);
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try layout.write(&aw.writer, block);
+        return self.writeLogOrStdout(aw.written());
+    }
+
+    /// Whether what is written is read by a person on a terminal rather than by
+    /// another program. It is the one condition under which the conversation
+    /// takes a left margin.
+    fn onTerminal(self: *Agent) bool {
+        if (self.capture != null) return false;
+        if (self.screen) |screen| {
+            if (screen.isActive()) return true;
+        }
+        return std.Io.File.stdout().isTty(self.io) catch false;
     }
 
     /// Send finished bytes to the conversation, or to stdout when the
@@ -1815,14 +1853,18 @@ pub const Agent = struct {
         return std.Io.File.stdout().writeStreamingAll(self.io, bytes);
     }
 
+    /// The line the answer opens with, at the same margin as everything else
+    /// the conversation shows: the header is what the text under it lines up
+    /// with, so it carries the margin rather than the renderer alone.
     fn answerHeader(self: *Agent) !void {
         if (self.capture != null) return;
+        const header = "\n" ++ layout.indent ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n";
         if (self.screen) |screen| {
-            if (screen.isActive()) return screen.writeLog("\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+            if (screen.isActive()) return screen.writeLog(header);
         }
         const stdout = std.Io.File.stdout();
         if (stdout.isTty(self.io) catch false) {
-            try stdout.writeStreamingAll(self.io, "\n" ++ BOLD ++ CYAN ++ "Assistant" ++ RESET ++ "\n");
+            try stdout.writeStreamingAll(self.io, header);
         }
     }
 
@@ -1931,12 +1973,18 @@ const AnswerStream = struct {
             if (agent.screen) |screen| {
                 if (screen.isActive()) {
                     self.log_writer = screen.logWriter(&self.buf);
-                    self.renderer = render.Renderer.init(&self.log_writer.?.writer, .{ .width = width });
+                    self.renderer = render.Renderer.init(&self.log_writer.?.writer, .{
+                        .width = width,
+                        .indent = layout.columns,
+                    });
                 }
             }
             if (self.renderer == null) {
                 self.file_writer = std.Io.File.stdout().writerStreaming(agent.io, &self.buf);
-                self.renderer = render.Renderer.init(&self.file_writer.?.interface, .{ .width = width });
+                self.renderer = render.Renderer.init(&self.file_writer.?.interface, .{
+                    .width = width,
+                    .indent = layout.columns,
+                });
             }
         }
         return self;
