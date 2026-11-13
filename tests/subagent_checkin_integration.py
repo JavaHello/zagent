@@ -145,10 +145,24 @@ try:
         assert 'two files split, the other two are untouched' in final, final
         assert 'two of the four tools are split' not in final, final
 
-        # The run is over: the session is the caller's alone, and the child's
-        # scratch directory went with it.
-        sessions = list((state / 'sessions').glob('*.json'))
-        assert len(sessions) == 1, sessions
+        # The run is over: the caller's session holds its own conversation and
+        # the run keeps the one it was stopped in, so a resume can pick it up.
+        # The child's scratch directory went with it.
+        sessions = sorted((state / 'sessions').glob('*.json'))
+        assert len(sessions) == 2, sessions
+        caller_session = next(path for path in sessions if '.json.s' not in path.name)
+        assert json.loads(caller_session.read_text())['child'] is None, 'the caller session is the run\'s'
+        run_session = json.loads((state / 'sessions' / f'{caller_session.name}.s1.json').read_text())
+        assert run_session['child']['id'] == 's1', run_session['child']
+        assert run_session['child']['title'] == 'Split the tree', run_session['child']
+        # The child answered the stop with its final report, so the run
+        # finished rather than being cut off mid-turn.
+        assert run_session['child']['status'] == 'completed', run_session['child']
+        # What the run kept is its own conversation: the check-in it answered
+        # with the report tool, and the final report it was stopped into.
+        assert any(call['name'] == 'report'
+                   for message in run_session['messages'] for call in message.get('tool_calls') or []), run_session['messages']
+        assert 'two files split' in (run_session['messages'][-1].get('content') or ''), run_session['messages']
         assert not Path(scratch_of(child[0])).exists(), 'the child scratch outlived the child'
 
         assert 'Stopped the run.' in result.stdout, result.stdout

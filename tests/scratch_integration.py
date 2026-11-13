@@ -115,7 +115,9 @@ try:
         first = runs[0]
         assert first.startswith(str(scratch_root.resolve()) + '/'), first
         assert not Path(first).exists(), f'{first} outlived the run'
-        sid = re.search(r'New session: ([a-f0-9]{32})', output)[1]
+        # /new draws the opening report again, so the session the process is
+        # in now is the one the last report names.
+        sid = re.findall(r'Session\s+([a-f0-9]{32})', output)[-1]
         saved = json.loads((state / 'sessions' / f'{sid}.json').read_text())
         # The directory belongs to the process, so the session does not carry it.
         assert 'temp_dirs' not in saved, saved

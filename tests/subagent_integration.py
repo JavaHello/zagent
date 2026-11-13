@@ -141,13 +141,24 @@ try:
         assert 'Ran bash' in report[1] and 'child ran a tool' not in report[1], report
         assert 'Checking the workspace' not in report[1], report
 
-        # The parent owns the session: the sub-agent starts none of its own.
-        sessions = list((state / 'sessions').glob('*.json'))
-        assert len(sessions) == 1, sessions
-        saved = json.loads(sessions[0].read_text())
+        # The caller's session stays its own: the run keeps a session of its
+        # own, named after the id the report gave, so it can be resumed once
+        # this process is gone.
+        sessions = sorted((state / 'sessions').glob('*.json'))
+        assert len(sessions) == 2, sessions
+        caller_session = next(path for path in sessions if '.json.s' not in path.name)
+        saved = json.loads(caller_session.read_text())
         assert saved['plan'] == [], saved['plan']
+        assert saved['child'] is None, saved['child']
         assert all(message['role'] != 'assistant' or 'Ran bash' not in (message.get('content') or '')
                    for message in saved['messages']), saved['messages']
+        run_session = json.loads((state / 'sessions' / f'{caller_session.name}.s1.json').read_text())
+        assert run_session['child']['id'] == 's1', run_session['child']
+        assert run_session['child']['title'] == 'Run one command', run_session['child']
+        assert run_session['child']['status'] == 'completed', run_session['child']
+        assert run_session['child']['parent'] == caller_session.stem, run_session['child']
+        assert any('Ran bash' in (message.get('content') or '')
+                   for message in run_session['messages']), run_session['messages']
 
         # The sub-agent's scratch directory is gone with its agent.
         assert not Path(scratch_of(child[0])).exists(), 'the child scratch outlived the child'
