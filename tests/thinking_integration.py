@@ -4,7 +4,7 @@
 The reasoning is streamed as `response.reasoning_text.delta` events. It must be
 drawn in the panel the full-screen layout keeps above the prompt, must outlive
 the start of the answer by a few seconds, and must not join the conversation:
-when the panel closes, only one line about it stays.
+the completed duration stays in the status bar, never in the conversation.
 """
 import fcntl
 import http.server
@@ -114,12 +114,14 @@ try:
             until(answer_chunks[0].encode())
             during = ansi.sub(b'', bytes(transcript))
             assert reasoning[-1].strip().encode() in during, during
-            assert '✻ Thought for'.encode() not in during, 'the panel folded too early'
-
             until('✻ Thought for'.encode())
-            folded_at = time.monotonic()
-            lingered = folded_at - first_answer_at
-            assert 2.5 <= lingered <= 6, f'the panel lingered {lingered:.1f}s after the answer began'
+            reported_at = time.monotonic()
+            assert reported_at - first_answer_at < 2.5, 'duration was not shown when thinking ended'
+            # With the five-row panel open, the status bar is on row 18.
+            raw = bytes(transcript)
+            duration_at = raw.index('✻ Thought for'.encode())
+            positions = re.findall(rb'\x1b\[(\d+)(?:;\d+)?H', raw[:duration_at])
+            assert positions[-1] == b'18', 'duration missing from status bar'
 
             plain = ansi.sub(b'', bytes(transcript))
             folded_index = plain.index('✻ Thought for'.encode())
@@ -127,19 +129,20 @@ try:
             # piece at a time, and all of it before the fold.
             for chunk in reasoning:
                 assert chunk.strip().encode() in plain[:folded_index], plain[:folded_index]
-            # The panel outlived the beginning of the answer rather than folding
-            # the instant it started, and the answer is written under its line.
-            assert plain.index(answer_chunks[0].encode()) < folded_index, plain
-            assert b'Assistant' in plain[:folded_index], plain[:folded_index]
-            # Nothing of the reasoning joins the conversation once it is folded:
-            # it lived in the panel, and the panel's rows are the log's again.
-            for chunk in reasoning:
-                assert chunk.encode() not in plain[folded_index:], plain[folded_index:]
+            assert b'Assistant' in plain, plain
+            # The panel still lingers after the duration appears in the status.
+            time.sleep(3.2)
+            while select.select([master], [], [], 0)[0]:
+                transcript.extend(os.read(master, 65536))
+            mark_closed = len(transcript)
 
             # The rest of the answer keeps arriving after the panel has gone.
             until(b'is in it.')
             plain = ansi.sub(b'', bytes(transcript))
             assert plain.index(b'is in it.') > plain.index('✻ Thought for'.encode()), plain
+            after_close = ansi.sub(b'', bytes(transcript[mark_closed:]))
+            for chunk in reasoning:
+                assert chunk.strip().encode() not in after_close, after_close
 
             # A response that narrates nothing opens no panel and leaves no
             # summary line behind.
@@ -169,7 +172,7 @@ try:
                 process.wait()
             os.close(master)
             os.close(slave)
-        print('PASS: reasoning scrolls in the panel, lingers into the answer, folds to one line')
+        print('PASS: thinking panel lingers; completed duration stays in the status bar')
 finally:
     server.shutdown()
     server.server_close()

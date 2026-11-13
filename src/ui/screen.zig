@@ -108,10 +108,10 @@ pub const Screen = struct {
     /// streaming the answer it began with.
     thinking_close_started: ?std.Io.Timestamp = null,
     thinking_close_delay_ms: i64 = 0,
-    /// The line to leave in the panel's place, built when the close was asked
-    /// for so that the foreground only has to write it.
+    /// Completed thinking duration shown in the status bar, never the log.
     thinking_summary: [128]u8 = undefined,
     thinking_summary_len: usize = 0,
+    thinking_summary_changed: bool = false,
     anchor: ?usize = null,
     anchor_end: usize = 0,
     selection_start: usize = 0,
@@ -231,11 +231,10 @@ pub const Screen = struct {
         defer self.queue_mutex.unlock(self.io);
         // Reasoning that arrives while a close is pending belongs to a new
         // thought and takes the panel over: the delayed close is called off
-        // rather than pulling the rows out from under it. Only a turn that
-        // reasons twice in a row can see this, and the line the first thought
-        // would have left is not worth a panel that cannot be read.
+        // rather than pulling the rows out from under it.
         self.thinking_close_started = null;
         self.thinking_summary_len = 0;
+        self.thinking_summary_changed = true;
         for (delta) |byte| {
             if (byte < 0x20 and byte != '\n') {
                 if (byte == '\t') self.pending_thinking.appendSlice(self.allocator, "    ") catch return;
@@ -249,28 +248,26 @@ pub const Screen = struct {
         self.pending_thinking_rows = thinking_panel_rows;
     }
 
-    /// Close the panel now: the rows go back to the conversation. A close that
-    /// was scheduled earlier happens here rather than later, and leaves its
-    /// line, so the reasoning is never thrown away without a trace.
+    /// Clear the previous turn's duration before a new query starts.
+    pub fn clearThinkingSummary(self: *Screen) void {
+        self.queue_mutex.lockUncancelable(self.io);
+        defer self.queue_mutex.unlock(self.io);
+        self.thinking_summary_len = 0;
+        self.thinking_summary_changed = true;
+    }
+
+    /// Close the panel now, keeping the completed duration in the status bar.
     pub fn hideThinking(self: *Screen) void {
         if (!self.active) return;
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
-        // A close that was already scheduled leaves its line here, ahead of
-        // whatever the caller writes next — the error, the call it made.
-        if (self.thinking_close_started != null) {
-            const summary = self.thinking_summary[0..self.thinking_summary_len];
-            if (summary.len > 0) self.queued.insertSlice(self.allocator, 0, summary) catch {};
-            self.thinking_close_started = null;
-            self.thinking_summary_len = 0;
-            self.thinking_close_delay_ms = 0;
-        }
+        self.thinking_close_started = null;
+        self.thinking_close_delay_ms = 0;
         self.pending_thinking_rows = 0;
         self.pending_thinking.clearRetainingCapacity();
     }
 
-    /// Keep the panel open a while longer and then close it, leaving `summary`
-    /// in the conversation where it was.
+    /// Show the duration in the status bar now, then close the panel later.
     ///
     /// The close is timed by the foreground, which is the only side that is not
     /// busy: the answer is streaming on the thread that asked for this.
@@ -279,22 +276,19 @@ pub const Screen = struct {
     }
 
     fn scheduleThinkingCloseAfter(self: *Screen, summary: []const u8, delay_ms: i64) void {
-        if (!self.active or self.thinking_rows == 0) return;
+        if (!self.active) return;
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
         const len = @min(summary.len, self.thinking_summary.len);
         @memcpy(self.thinking_summary[0..len], summary[0..len]);
         self.thinking_summary_len = len;
+        self.thinking_summary_changed = true;
         self.thinking_close_delay_ms = delay_ms;
         self.thinking_close_started = std.Io.Timestamp.now(self.io, .awake);
     }
 
-    /// Perform a close that was asked for, writing the line it leaves. Called
-    /// and only called with the queue mutex held.
+    /// Perform a close with the queue mutex held; the status survives it.
     fn settleThinkingLocked(self: *Screen) void {
-        const summary = self.thinking_summary[0..self.thinking_summary_len];
-        if (summary.len > 0) self.queued.appendSlice(self.allocator, summary) catch {};
-        self.thinking_summary_len = 0;
         self.thinking_close_started = null;
         self.thinking_close_delay_ms = 0;
         self.pending_thinking_rows = 0;
@@ -334,7 +328,11 @@ pub const Screen = struct {
         self.queue_mutex.lockUncancelable(self.io);
         defer self.queue_mutex.unlock(self.io);
         const old_bottom = self.logBottom();
-        var changed = self.progress_changed;
+        var changed = self.progress_changed or self.thinking_summary_changed;
+        if (self.thinking_summary_changed) {
+            self.status_dirty = true;
+            self.thinking_summary_changed = false;
+        }
         if (self.notice_started) |started| {
             if (started.untilNow(self.io, .awake).toMilliseconds() >= 3000) {
                 self.notice_len = 0;
@@ -593,7 +591,15 @@ pub const Screen = struct {
     /// Keep the current status on the left; notices never overwrite it.
     fn writeStatus(self: *const Screen, w: *std.Io.Writer) !void {
         try w.writeAll(RESET);
-        const progress = self.progress[0..self.progress_len];
+        var status_buf: [512]u8 = undefined;
+        var status = std.Io.Writer.fixed(&status_buf);
+        try status.writeAll(self.progress[0..self.progress_len]);
+        if (self.thinking_summary_len > 0) {
+            try status.writeAll(RESET ++ ansi.DIM);
+            try status.writeAll(if (self.progress_len > 0) " · " else "  ");
+            try status.writeAll(self.thinking_summary[0..self.thinking_summary_len]);
+        }
+        const progress = status.buffered();
         const end = selection.offset(progress, self.cols, false);
         try w.writeAll(progress[0..end]);
         const progress_width = statusWidth(progress[0..end]);
@@ -611,9 +617,8 @@ pub const Screen = struct {
     /// Draw the thinking panel: its rows cleared, the newest reasoning at the
     /// bottom of the window, the way a terminal scrolls.
     ///
-    /// Nothing of the panel goes into the transcript. It is a window onto the
-    /// reasoning while it is being written, and the row the turn keeps of it is
-    /// the one line the caller writes when it closes.
+    /// Nothing of the panel goes into the transcript. The completed duration
+    /// belongs to the status bar instead.
     fn writeThinking(self: *Screen, w: *std.Io.Writer) !void {
         const rows = self.thinkingRows();
         if (rows == 0) return;
@@ -1816,7 +1821,7 @@ test "reasoning wraps at a space, breaks a long word, and drops blank lines" {
     try std.testing.expectEqualStrings("thought", wide.items[3]);
 }
 
-test "a scheduled close waits out its delay and leaves the line it was given" {
+test "completed thinking stays in status through delayed and immediate panel closes" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1836,29 +1841,46 @@ test "a scheduled close waits out its delay and leaves the line it was given" {
     try std.testing.expectEqual(@as(usize, 5), s.thinkingRows());
 
     // The answer has begun, and the panel is to stay for a while longer.
-    const summary = "\x1b[2m  ✻ Thought for 1.2s\n\x1b[0m";
+    const summary = "✻ Thought for 1.2s";
     s.scheduleThinkingCloseAfter(summary, 60_000);
-    _ = try s.drain();
+    try std.testing.expect(try s.drain());
     try std.testing.expectEqual(@as(usize, 5), s.thinkingRows());
+    var buf: [512]u8 = undefined;
+    var status = std.Io.Writer.fixed(&buf);
+    try s.writeStatus(&status);
+    try std.testing.expect(std.mem.indexOf(u8, status.buffered(), summary) != null);
     try std.testing.expect(std.mem.indexOf(u8, s.transcript.items, "Thought for") == null);
 
-    // A close that was asked for and then overtaken is performed at once, and
-    // its line lands ahead of what the caller writes after it.
+    // Immediate closure keeps the duration out of the error's transcript.
     try s.writeLog("  an error line\n");
     s.hideThinking();
     try std.testing.expect(try s.drain());
     try std.testing.expectEqual(@as(usize, 0), s.thinkingRows());
-    const folded = s.transcript.items;
-    const line_at = std.mem.indexOf(u8, folded, "Thought for 1.2s").?;
-    const error_at = std.mem.indexOf(u8, folded, "an error line").?;
-    try std.testing.expect(line_at < error_at);
+    try std.testing.expectEqualStrings("  an error line\n", s.transcript.items);
+    try std.testing.expectEqualStrings(summary, s.thinking_summary[0..s.thinking_summary_len]);
 
-    // A delay that has elapsed closes the panel from the drain, writing the
-    // line the screen was given in its place.
+    // New thinking clears the old duration; a timed close preserves the new one.
     s.publishThinking("a second thought");
     try std.testing.expect(try s.drain());
-    s.scheduleThinkingCloseAfter("\x1b[2m  ✻ Thought for 2.0s\n\x1b[0m", 0);
+    try std.testing.expectEqual(@as(usize, 0), s.thinking_summary_len);
+    s.scheduleThinkingCloseAfter("✻ Thought for 2.0s", 0);
     try std.testing.expect(try s.drain());
     try std.testing.expectEqual(@as(usize, 0), s.thinkingRows());
-    try std.testing.expect(std.mem.indexOf(u8, s.transcript.items, "Thought for 2.0s") != null);
+    try std.testing.expectEqualStrings("✻ Thought for 2.0s", s.thinking_summary[0..s.thinking_summary_len]);
+    try std.testing.expect(std.mem.indexOf(u8, s.transcript.items, "Thought for") == null);
+
+    // A new turn without thinking must not inherit the previous duration.
+    s.clearThinkingSummary();
+    try std.testing.expect(try s.drain());
+    status = std.Io.Writer.fixed(&buf);
+    try s.writeStatus(&status);
+    try std.testing.expect(std.mem.indexOf(u8, status.buffered(), "Thought for") == null);
+
+    // A fast response may finish before the panel has ever been drained.
+    s.publishThinking("fast thought");
+    s.scheduleThinkingCloseAfter(summary, 60_000);
+    s.hideThinking();
+    try std.testing.expect(try s.drain());
+    try std.testing.expectEqual(@as(usize, 0), s.thinkingRows());
+    try std.testing.expectEqualStrings(summary, s.thinking_summary[0..s.thinking_summary_len]);
 }

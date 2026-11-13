@@ -176,8 +176,7 @@ pub const Agent = struct {
     /// `zagent "q" > notes.md` stays clean.
     screen: ?*Screen = null,
     /// What the model is thinking while it thinks it. The reasoning is shown in
-    /// a panel the screen keeps above the prompt, and the turn keeps one line
-    /// of it, written when the panel closes.
+    /// a panel above the prompt; only its duration stays in the status bar.
     thinking: Thinking = .{},
     /// The MCP servers and the tools they brought. Borrowed rather than owned:
     /// whoever started the agent outlives it, and the agent only reads this and
@@ -739,6 +738,7 @@ pub const Agent = struct {
         self.query_started = std.Io.Timestamp.now(self.io, .awake);
         defer self.query_started = null;
         self.client.resetTokenCounters();
+        if (self.screen) |screen| screen.clearThinkingSummary();
         // Raw user input is never a terminal title, and the task last
         // announced stays until the model announces a new one: the title
         // describes the work in progress, not the line that started it.
@@ -1204,8 +1204,7 @@ pub const Agent = struct {
     /// printed and kept in the history.
     fn runToolLoop(self: *Agent) !void {
         // However the turn ends — an answer, a tool call, a failure, Esc — the
-        // panel the reasoning was shown in is closed here, and the one line the
-        // conversation keeps of it is written before anything that follows.
+        // reasoning panel closes here and its duration stays in the status bar.
         defer self.thinking.close(self);
         var made: usize = 0;
         var iteration: usize = 0;
@@ -1951,9 +1950,8 @@ pub const Agent = struct {
 ///
 /// The reasoning is not part of the answer and is never kept: it is shown in a
 /// panel the full-screen layout holds open above the prompt, and when the panel
-/// closes the conversation keeps one line — how long the model thought for.
-/// That is the whole of what a turn records about it, which is why no buffer
-/// here outlives the request it belongs to.
+/// closes only the status bar keeps the duration. No reasoning buffer here
+/// outlives the request it belongs to.
 ///
 /// The panel outlives the start of the answer by a few seconds, so the last
 /// rows of reasoning can be read while the answer is written; the screen times
@@ -2000,37 +1998,35 @@ const Thinking = struct {
     /// on the screen waiting for a delay that no longer means anything.
     fn close(self: *Thinking, agent: *Agent) void {
         const started = self.started orelse {
-            // The panel may be one the screen is holding open to close on its
-            // own; hiding it writes the line that was prepared for it.
+            // The screen may still be holding the panel open after the answer.
             if (agent.screen) |screen| {
                 if (screen.isActive()) screen.hideThinking();
             }
             return;
         };
         self.started = null;
-        closeNow(started, agent) catch {};
+        closeNow(started, agent);
     }
 
-    fn closeNow(started: std.Io.Timestamp, agent: *Agent) !void {
+    fn closeNow(started: std.Io.Timestamp, agent: *Agent) void {
         const screen = agent.screen orelse return;
         if (!screen.isActive()) return;
-        screen.hideThinking();
         var buf: [96]u8 = undefined;
         const line = thoughtLine(started, agent, &buf) orelse return;
-        try screen.writeLog(line);
+        screen.scheduleThinkingClose(line);
+        screen.hideThinking();
     }
 };
 
-/// One line saying how long the model thought, in the shape the conversation
-/// uses for everything else it reports about a turn.
+/// Compact duration for the status bar, without terminal styling or newlines.
 fn thoughtLine(started: std.Io.Timestamp, agent: *Agent, buf: []u8) ?[]const u8 {
     const elapsed_ms = started.untilNow(agent.io, .awake).toMilliseconds();
     if (elapsed_ms >= 10 * std.time.ms_per_s) {
-        return std.fmt.bufPrint(buf, DIM ++ layout.indent ++ "✻ Thought for {d}s\n" ++ RESET, .{
+        return std.fmt.bufPrint(buf, "✻ Thought for {d}s", .{
             @divTrunc(elapsed_ms, std.time.ms_per_s),
         }) catch null;
     }
-    return std.fmt.bufPrint(buf, DIM ++ layout.indent ++ "✻ Thought for {d}.{d}s\n" ++ RESET, .{
+    return std.fmt.bufPrint(buf, "✻ Thought for {d}.{d}s", .{
         @divTrunc(elapsed_ms, std.time.ms_per_s),
         @divTrunc(@mod(elapsed_ms, std.time.ms_per_s), 100),
     }) catch null;
