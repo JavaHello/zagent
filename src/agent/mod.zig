@@ -1626,11 +1626,6 @@ pub const Agent = struct {
         }
     }
 
-    // Retained for existing tests of task metadata and title ownership.
-    fn announceTask(self: *Agent, arguments: []const u8) !tools.ToolResult {
-        return @import("../tools/announce_task.zig").execute(self, arguments);
-    }
-
     /// Run one tool call. `index` and `answers` locate the result of a question
     /// the form of this message has already put to the user, if there was one.
     fn executeTool(self: *Agent, call: ToolCallData, index: usize, answers: ?*QuestionAnswers) !tools.ToolResult {
@@ -2272,7 +2267,7 @@ test "a follow-up that announces no task keeps the one in the title" {
     var silence = try Silence.init(std.testing.io);
     defer silence.deinit(std.testing.io);
 
-    const announced = try harness.agent.announceTask("{\"title\":\"修复终端标题\",\"description\":\"先定位标题逻辑。\"}");
+    const announced = try @import("../tools/announce_task.zig").execute(&harness.agent, "{\"title\":\"修复终端标题\",\"description\":\"先定位标题逻辑。\"}");
     announced.deinit(allocator);
     try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
 
@@ -2285,7 +2280,7 @@ test "a follow-up that announces no task keeps the one in the title" {
     try std.testing.expectEqualStrings("修复终端标题", harness.agent.current_task);
 
     // A new announcement replaces it: the title follows the latest task.
-    const replaced = try harness.agent.announceTask("{\"title\":\"别的任务\",\"description\":\"换一件事。\"}");
+    const replaced = try @import("../tools/announce_task.zig").execute(&harness.agent, "{\"title\":\"别的任务\",\"description\":\"换一件事。\"}");
     replaced.deinit(allocator);
     try std.testing.expectEqualStrings("别的任务", harness.agent.current_task);
 }
@@ -2665,34 +2660,6 @@ test "a line typed while the task runs joins the next request instead of a new t
     try std.testing.expectEqualStrings("assistant", harness.agent.history.items[5].role);
     // Nothing is left waiting in the inbox once the turn settled.
     try std.testing.expectEqual(@as(usize, 0), harness.agent.inbox.items.len);
-}
-
-test "task metadata requires title and description and fewer than 80 Unicode characters" {
-    const allocator = std.testing.allocator;
-    const harness = try TestHarness.init(allocator, std.testing.io);
-    defer harness.deinit(allocator);
-    var silence = try Silence.init(std.testing.io);
-    defer silence.deinit(std.testing.io);
-    for ([_][]const u8{ "{}", "{\"title\":\"t\"}", "{\"title\":\"\",\"description\":\"d\"}", "{\"title\":\"t\",\"description\":\" \"}" }) |args| {
-        if (harness.agent.announceTask(args)) |result| {
-            result.deinit(allocator);
-            return error.ExpectedInvalidMetadata;
-        } else |_| {}
-        try std.testing.expectEqualStrings("", harness.agent.current_task);
-    }
-    var title: std.ArrayList(u8) = .empty;
-    defer title.deinit(allocator);
-    for (0..79) |_| try title.appendSlice(allocator, "题");
-    const valid = try std.json.Stringify.valueAlloc(allocator, .{ .title = title.items, .description = "测试" }, .{});
-    defer allocator.free(valid);
-    const result = try harness.agent.announceTask(valid);
-    defer result.deinit(allocator);
-    try std.testing.expectEqualStrings(title.items, harness.agent.current_task);
-    try title.appendSlice(allocator, "题");
-    const invalid = try std.json.Stringify.valueAlloc(allocator, .{ .title = title.items, .description = "测试" }, .{});
-    defer allocator.free(invalid);
-    try std.testing.expectError(error.InvalidTaskMetadata, harness.agent.announceTask(invalid));
-    try std.testing.expectEqualStrings(title.items[0 .. 79 * "题".len], harness.agent.current_task);
 }
 
 test "every tool a sub-agent is denied exists in the default set" {

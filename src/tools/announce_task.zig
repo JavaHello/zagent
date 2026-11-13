@@ -35,3 +35,43 @@ pub fn execute(self: *Agent, arguments: []const u8) !tool.ToolResult {
     try self.writeAnswer(description);
     return .{ .content = try self.allocator.dupe(u8, "Task announced; the description is shown to the user."), .is_error = false };
 }
+
+test "task metadata requires title and description and fewer than 80 Unicode characters" {
+    const allocator = std.testing.allocator;
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    // Only the announcement's dependencies are initialized: no client, process,
+    // scratch directory, or terminal is needed for this tool-local test.
+    var agent: Agent = undefined;
+    agent.allocator = allocator;
+    agent.role = .main;
+    agent.current_task = "";
+    agent.terminal_title = .{ .io = std.testing.io, .enabled = false };
+    agent.render_markdown = false;
+    agent.capture = &output;
+    defer if (agent.current_task.len > 0) allocator.free(agent.current_task);
+
+    for ([_][]const u8{ "{}", "{\"title\":\"t\"}", "{\"title\":\"\",\"description\":\"d\"}", "{\"title\":\"t\",\"description\":\" \"}" }) |args| {
+        if (execute(&agent, args)) |result| {
+            result.deinit(allocator);
+            return error.ExpectedInvalidMetadata;
+        } else |_| {}
+        try std.testing.expectEqualStrings("", agent.current_task);
+        try std.testing.expectEqualStrings("", output.items);
+    }
+    var title: std.ArrayList(u8) = .empty;
+    defer title.deinit(allocator);
+    for (0..79) |_| try title.appendSlice(allocator, "题");
+    const valid = try std.json.Stringify.valueAlloc(allocator, .{ .title = title.items, .description = "测试" }, .{});
+    defer allocator.free(valid);
+    const result = try execute(&agent, valid);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings(title.items, agent.current_task);
+    try std.testing.expectEqualStrings("测试", output.items);
+    try title.appendSlice(allocator, "题");
+    const invalid = try std.json.Stringify.valueAlloc(allocator, .{ .title = title.items, .description = "测试" }, .{});
+    defer allocator.free(invalid);
+    try std.testing.expectError(error.InvalidTaskMetadata, execute(&agent, invalid));
+    try std.testing.expectEqualStrings(title.items[0 .. 79 * "题".len], agent.current_task);
+    try std.testing.expectEqualStrings("测试", output.items);
+}
