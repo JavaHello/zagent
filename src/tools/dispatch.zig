@@ -60,13 +60,8 @@ pub fn execute(ctx: tool.Context, name: []const u8, arguments: []const u8) !Tool
 }
 
 fn executeWithSpecs(comptime specs: []const tool.Tool, ctx: tool.Context, name: []const u8, arguments: []const u8) !ToolResult {
-    const result = if (try ctx.hooks.beforeExecute(ctx, name, arguments)) |result|
-        result
-    else
-        try ctx.hooks.afterExecute(ctx, name, arguments, executeRaw(specs, ctx, name, arguments));
-    // Applied after middleware, so CCR hooks can preserve output without clipping.
-    // This also covers callers outside the agent UI.
-    return @import("result.zig").clipOversized(ctx.allocator, result);
+    if (try ctx.hooks.beforeExecute(ctx, name, arguments)) |result| return result;
+    return ctx.hooks.afterExecute(ctx, name, arguments, executeRaw(specs, ctx, name, arguments));
 }
 
 fn executeRaw(comptime specs: []const tool.Tool, ctx: tool.Context, name: []const u8, arguments: []const u8) !ToolResult {

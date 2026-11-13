@@ -50,7 +50,6 @@ pub const ToolStatus = result_mod.ToolStatus;
 pub const ToolResult = result_mod.ToolResult;
 pub const max_output_bytes = result_mod.max_output_bytes;
 pub const page_room_bytes = result_mod.page_room_bytes;
-pub const clipOversized = result_mod.clipOversized;
 pub const formatToolOutput = result_mod.formatToolOutput;
 pub const finalizeResultLimited = result_mod.finalizeResultLimited;
 pub const finalizeToolContentLimited = result_mod.finalizeToolContentLimited;

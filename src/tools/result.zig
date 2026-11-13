@@ -38,12 +38,6 @@ pub const max_output_bytes: usize = 40 * 1024;
 pub const default_output_bytes: usize = 12 * 1024;
 pub const page_room_bytes: usize = default_output_bytes - 256;
 
-/// Compatibility entry point: CCR alone controls oversized results.
-/// Ownership of the content is transferred unchanged.
-pub fn clipOversized(_: std.mem.Allocator, result: ToolResult) !ToolResult {
-    return result;
-}
-
 pub fn finalizeToolContent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return normalizeToolText(allocator, raw);
 }
@@ -102,10 +96,6 @@ test "finalization preserves complete oversized results and status for CCR" {
     const content = try finalizeToolContentLimited(a, raw, 1);
     defer a.free(content);
     try std.testing.expectEqualStrings(raw, content);
-    const unchanged = try clipOversized(a, .{ .content = try a.dupe(u8, raw), .is_error = true, .truncated = true });
-    defer unchanged.deinit(a);
-    try std.testing.expectEqualStrings(raw, unchanged.content);
-    try std.testing.expect(unchanged.is_error and unchanged.truncated);
 }
 
 test "owned finalization transfers the full allocation and preserves explicit pagination status" {
