@@ -1030,6 +1030,18 @@ pub const Agent = struct {
                 .is_error = true,
             };
         }
+        self.tool_ui.spinner.stop();
+        defer self.resumeCallProgress();
+        var report: std.Io.Writer.Allocating = .init(self.allocator);
+        defer report.deinit();
+        try report.writer.writeAll("\x1b[35m  ⇢ ");
+        try writeRunTag(&report.writer, run);
+        try report.writer.writeAll(" · ");
+        try sanitize.writeSanitized(&report.writer, heading);
+        try report.writer.writeAll(RESET ++ "\n");
+        try sanitize.writeSanitized(&report.writer, answer);
+        try report.writer.writeByte('\n');
+        try self.emit(std.Io.File.stderr(), "{s}", .{report.written()});
         return .{
             .output = try std.fmt.allocPrint(self.allocator, "{s}\n{s}", .{ heading, answer }),
             .is_error = false,
@@ -1631,9 +1643,18 @@ pub const Agent = struct {
     /// nobody anything — so it is drawn instead, line by line, in the colours
     /// the change would be read in.
     fn announceToolCall(self: *Agent, name: []const u8, arguments: []const u8) !void {
-        // A sub-agent's calls are steps inside one tool result: the caller
-        // already has a line for the call, and these would only crowd it.
-        if (self.capture != null) return;
+        if (self.capture != null) {
+            const parent = self.parent orelse return;
+            parent.tool_ui.spinner.stop();
+            defer parent.resumeCallProgress();
+            var line: std.Io.Writer.Allocating = .init(self.allocator);
+            defer line.deinit();
+            try line.writer.writeAll("\x1b[35m  ⇢ ");
+            try sanitize.writeSanitized(&line.writer, if (self.child_record) |record| record.id else "subagent");
+            try line.writer.writeAll(RESET ++ "\n");
+            try self.writeToolCall(&line.writer, name, arguments);
+            return parent.emit(std.Io.File.stderr(), "{s}", .{line.written()});
+        }
         // Written through a fixed buffer rather than built up in memory first:
         // a patch is read as it is drawn, and a long one never has to be held
         // whole to be shown.
@@ -1659,7 +1680,7 @@ pub const Agent = struct {
         const ctx: tools.Context = .{ .io = self.io, .allocator = self.allocator, .agent = self };
         const summarized = if (spec) |s| if (s.summary) |write| try write(ctx, &preview.writer, arguments) else false else false;
         const block = summarized and spec.?.summary_block;
-        try w.writeAll(if (spec != null and spec.?.delegated) CYAN ++ "  ⇢ " else YELLOW ++ "  ⚙ ");
+        try w.writeAll(if (self.role == .subagent) "\x1b[35m  ⚙ " else if (spec != null and spec.?.delegated) CYAN ++ "  ⇢ " else YELLOW ++ "  ⚙ ");
         try sanitize.writeSanitized(w, name);
         if (block) {
             try w.writeAll("\n" ++ RESET);
@@ -1786,7 +1807,12 @@ pub const Agent = struct {
     /// and unchanged: a tool reports how it ended beside its text, not inside
     /// it, so there is nothing here to leave out.
     fn previewToolResult(self: *Agent, content: []const u8, status: tools.ToolStatus) !void {
-        if (self.capture != null) return;
+        if (self.capture != null) {
+            const parent = self.parent orelse return;
+            parent.tool_ui.spinner.stop();
+            defer parent.resumeCallProgress();
+            return parent.previewToolResult(content, status);
+        }
         // An error is shown whole, because its message is the point of it — but
         // a result cut at the size limit is large even as an error, so even
         // that one keeps to a readable share of the terminal.
@@ -2235,6 +2261,18 @@ fn nextWake(check_at: std.Io.Timestamp, deadline_at: std.Io.Timestamp, cut_at: ?
         if (std.Io.Timestamp.compare(cut, .lt, next)) next = cut;
     }
     return next;
+}
+
+test "subagent tool actions use a distinct color without changing arguments" {
+    const allocator = std.testing.allocator;
+    const harness = try TestHarness.init(allocator, std.testing.io);
+    defer harness.deinit(allocator);
+    harness.agent.role = .subagent;
+    var line: std.Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    try harness.agent.writeToolCall(&line.writer, "read", "{\"path\":\"example.zig\"}");
+    try std.testing.expect(std.mem.startsWith(u8, line.written(), "\x1b[35m  ⚙ read"));
+    try std.testing.expect(std.mem.indexOf(u8, line.written(), "example.zig") != null);
 }
 
 /// A standalone agent with a hermetic environment for tests. The line editor
