@@ -176,7 +176,7 @@ pub const Memory = struct {
 
     /// Local lexical retrieval, ranked by relevance then recency. Never dumps
     /// unrelated notes; callers can retry with different keywords.
-    pub fn search(self: *const Memory, allocator: std.mem.Allocator, query: []const u8, limit: usize, max_bytes: usize) ![]u8 {
+    pub fn search(self: *const Memory, allocator: std.mem.Allocator, query: []const u8, limit: usize, _: usize) ![]u8 {
         if (!self.enabled) return allocator.dupe(u8, "Memory is disabled.");
         var scores: [max_entries]usize = @splat(0);
         var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n,.;:!?，。；：！？/\\\"'()[]{}");
@@ -196,7 +196,6 @@ pub const Memory = struct {
             const index = best orelse break;
             scores[index] = 0;
             const entry = self.entries.items[index];
-            if (aw.written().len + entry.len + 3 > max_bytes) continue;
             try aw.writer.print("- {s}\n", .{entry});
         }
         if (aw.written().len == 0) return allocator.dupe(u8, "No matching memories. Try different or shorter keywords.");
@@ -366,7 +365,7 @@ test "memory search supports unspaced Chinese and bounds results" {
     try std.testing.expectEqualStrings("- 用户偏好中文回答\n", result);
     const bounded = try memory.search(allocator, "中文", 5, 4);
     defer allocator.free(bounded);
-    try std.testing.expect(std.mem.startsWith(u8, bounded, "No matching memories"));
+    try std.testing.expect(std.mem.indexOf(u8, bounded, "中文") != null);
     const absent = try memory.search(allocator, "nonexistent", 5, search_budget);
     defer allocator.free(absent);
     try std.testing.expect(std.mem.startsWith(u8, absent, "No matching memories"));
@@ -376,7 +375,7 @@ test "memory search supports unspaced Chinese and bounds results" {
     try std.testing.expectEqualStrings("Memory is disabled.", disabled);
 }
 
-test "memory lookup never returns a partial note or exceeds its byte budget" {
+test "memory lookup returns complete notes regardless of legacy byte budget" {
     const allocator = std.testing.allocator;
     var memory = try Memory.initWithPath(allocator, std.testing.io, "unused");
     defer memory.deinit();
@@ -387,17 +386,16 @@ test "memory lookup never returns a partial note or exceeds its byte budget" {
         defer allocator.free(note);
         _ = try memory.add(note);
     }
-    // A budget only some of these notes can fill proves both halves: no note
-    // comes back in part, and the total stays inside what the caller allowed.
+    // The legacy byte budget must not hide matches or cut notes.
     const budget = search_budget / 10;
     const result = try memory.search(allocator, "tmux", 10, budget);
     defer allocator.free(result);
-    try std.testing.expect(result.len <= budget);
+    try std.testing.expect(result.len > budget);
     var lines = std.mem.tokenizeScalar(u8, result, '\n');
     var count: usize = 0;
     while (lines.next()) |line| {
         count += 1;
         try std.testing.expect(std.mem.endsWith(u8, line, padding));
     }
-    try std.testing.expectEqual(@as(usize, 8), count);
+    try std.testing.expectEqual(@as(usize, 10), count);
 }

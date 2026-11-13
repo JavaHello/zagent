@@ -5,7 +5,6 @@ const args_mod = @import("args.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
-const page_room_bytes = result_mod.page_room_bytes;
 const lessString = util.lessString;
 
 /// The most entries one call may ask for.
@@ -108,7 +107,6 @@ pub fn listDirPage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, p
     var index: usize = 0;
     while (index < entries.items.len and index < page.limit) : (index += 1) {
         const entry = entries.items[index];
-        if (aw.written().len + entry.len > page_room_bytes) break;
         try aw.writer.writeAll(entry);
     }
     const truncated = has_more or index < entries.items.len;

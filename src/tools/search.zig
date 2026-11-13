@@ -318,22 +318,10 @@ pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var index: usize = 0;
-    var oversized = false;
     while (index < lines.items.len) : (index += 1) {
-        const line = lines.items[index];
-        if (aw.written().len + line.len + 1 > page_room_bytes) {
-            if (aw.written().len == 0) {
-                try aw.writer.writeAll("[One result exceeds the page size; narrow the search with a more specific pattern.]\n");
-                oversized = true;
-                index += 1;
-            }
-            break;
-        }
-        try aw.writer.print("{s}\n", .{line});
+        try aw.writer.print("{s}\n", .{lines.items[index]});
     }
-    const truncated = index < lines.items.len;
-    if (truncated) try aw.writer.writeAll("[More results than shown; narrow the pattern, path or glob to see the rest.]\n");
-    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = status.is_error, .exit_code = status.exit_code, .truncated = truncated or oversized }, max_output_bytes);
+    return finalizeResultLimited(allocator, aw.written(), status, max_output_bytes);
 }
 
 pub fn runContentSearch(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, args: GrepArgs) !ToolResult {
@@ -355,7 +343,7 @@ pub fn runContentSearch(io: std.Io, allocator: std.mem.Allocator, argv: []const 
     return runSearch(io, allocator, argv, true);
 }
 
-test "search pages sort names, preserve status, and mark a page that was cut" {
+test "search results sort names and preserve complete output and status" {
     const a = std.testing.allocator;
     const sorted = try searchPage(a, "z\na\nm\n", true, .{ .is_error = false, .exit_code = 0 });
     defer sorted.deinit(a);
@@ -370,10 +358,10 @@ test "search pages sort names, preserve status, and mark a page that was cut" {
     defer page.deinit(a);
     try std.testing.expect(page.is_error);
     try std.testing.expectEqual(@as(?u8, 2), page.exit_code);
-    try std.testing.expect(page.truncated);
+    try std.testing.expect(!page.truncated);
     // The cut is reported and the call is narrowed; there is no cursor to resume.
     try std.testing.expect(std.mem.indexOf(u8, page.content, "offset=") == null);
-    try std.testing.expect(std.mem.indexOf(u8, page.content, "[More results than shown") != null);
+    try std.testing.expectEqualStrings(data, page.content);
 }
 
 test "a search program is only found where one can be run" {

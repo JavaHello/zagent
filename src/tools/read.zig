@@ -2,7 +2,6 @@ const std = @import("std");
 const args_mod = @import("args.zig");
 const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
-const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
@@ -10,13 +9,12 @@ const finalizeToolContent = result_mod.finalizeToolContent;
 const max_output_bytes = result_mod.max_output_bytes;
 const page_room_bytes = result_mod.page_room_bytes;
 const optionalUnsigned = args_mod.optionalUnsigned;
-const truncateUtf8 = util.truncateUtf8;
 
 /// One page of a file: where it starts, and how many lines it may hold.
 pub const ReadPage = struct {
     /// 1-based number of the first line to read.
     offset: usize = 1,
-    /// Number of lines to read; null reads as many as the output page holds.
+    /// Number of lines to read; null reads all remaining lines.
     limit: ?usize = null,
 };
 
@@ -102,7 +100,7 @@ pub const spec: tool.Tool = .{
     .name = "read",
     .description = "Read a file page, numbered by line. Follow the next offset for more; use limit to request fewer lines.",
     .parameters_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"integer","minimum":1,"description":"1-based number of the first line to read; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to read; defaults to as many as the output page holds"}},"required":["path"]}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"integer","minimum":1,"description":"1-based number of the first line to read; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to read; defaults to all remaining lines; large results are cached by CCR"}},"required":["path"]}
     ,
     .label = "read…",
     .run = run,
@@ -120,8 +118,8 @@ fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
 
 /// Read a page of a file, each line carrying the number it has in the file.
 ///
-/// The page starts at `offset` and holds up to `limit` lines, or as many as fit
-/// the output cap. It always ends on a line boundary, so the offset it reports
+/// The page starts at `offset` and holds up to `limit` lines, or all remaining
+/// lines when no limit is supplied. It always ends on a line boundary, so the offset it reports
 /// as the next one is a line the model has not seen a part of.
 pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, page: ReadPage) !ToolResult {
     if (page.offset == 0 or (page.limit != null and page.limit.? == 0))
@@ -156,30 +154,17 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
     var shown: usize = 0;
     // The line the next page starts at, when this one stopped short.
     var resumes_at: ?usize = null;
-    // The one line that is longer than a page can hold, when that is why.
-    var cut_line: ?usize = null;
     while (page.limit == null or shown < page.limit.?) {
-        const ending = readLine(reader, allocator, &current, page_room_bytes) catch |err|
+        const ending = readLine(reader, allocator, &current, std.math.maxInt(usize)) catch |err|
             return toolError(allocator, "Error reading '{s}': {s}", .{ path, @errorName(err) });
         if (ending == .eof) break;
-        // A page ends on a line boundary, and the line prefix counts against it.
-        if (body.items.len + linePrefixWidth(line) + current.items.len + 1 > page_room_bytes) {
-            if (shown == 0) {
-                // A single line fills the page and more: pass on its beginning
-                // so the model has somewhere to start, and say where it stops.
-                const room = page_room_bytes - linePrefixWidth(line) - 1;
-                try appendNumberedLine(&body, allocator, line, truncateUtf8(current.items, room));
-                cut_line = line;
-            } else resumes_at = line;
-            break;
-        }
         try appendNumberedLine(&body, allocator, line, current.items);
         shown += 1;
         line += 1;
     }
     // A page that stopped because it had shown `limit` lines only continues if
     // another line is there; the file may have ended exactly on the limit.
-    if (resumes_at == null and cut_line == null and page.limit != null and shown == page.limit.?) {
+    if (resumes_at == null and page.limit != null and shown == page.limit.?) {
         if ((reader.peekByte() catch null) != null) resumes_at = line;
     }
 
@@ -189,14 +174,6 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
         defer allocator.free(normalized);
         return .{
             .content = try std.fmt.allocPrint(allocator, "{s}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ body_text, next }),
-            .is_error = false,
-            .truncated = true,
-        };
-    }
-    if (cut_line) |number| {
-        defer allocator.free(normalized);
-        return .{
-            .content = try std.fmt.allocPrint(allocator, "{s}\n[Line {d} alone is longer than a page holds and was cut; read the rest of it with bash.]", .{ body_text, number }),
             .is_error = false,
             .truncated = true,
         };
@@ -260,18 +237,18 @@ test "read streams a page from deep in a large file" {
     defer beyond.deinit(a);
     try std.testing.expectEqualStrings("(no output)", beyond.content);
 
-    // The first line alone is larger than a page, so it is cut and named.
+    // Even a first line larger than the presentation budget is returned whole.
     const full = try readFile(io, a, path);
     defer full.deinit(a);
     try std.testing.expect(!full.is_error);
-    try std.testing.expect(full.truncated);
+    try std.testing.expect(!full.truncated);
     try std.testing.expect(std.mem.startsWith(u8, full.content, "1:xxx"));
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "Line 1 alone is longer") != null);
-    // The page plus its notice stays inside the limit a result is held to.
-    try std.testing.expect(full.content.len <= max_output_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, full.content, "4:last") != null);
+    // CCR, not the file reader, owns the presentation budget.
+    try std.testing.expect(full.content.len > max_output_bytes);
 }
 
-test "read continues at a line boundary the model has not seen" {
+test "read returns every line when no explicit limit is supplied" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -288,23 +265,12 @@ test "read continues at a line boundary the model has not seen" {
 
     const first = try readFilePage(io, a, path, .{});
     defer first.deinit(a);
-    try std.testing.expect(first.truncated);
+    try std.testing.expect(!first.truncated);
     try std.testing.expect(std.mem.startsWith(u8, first.content, "1:line 0\n"));
-    // Every row is a whole line; the next page starts at the first one skipped.
-    const rows = std.mem.count(u8, first.content, "\n");
-    const hint = try std.fmt.allocPrint(a, "offset={d} ", .{rows + 1});
-    defer a.free(hint);
-    try std.testing.expect(std.mem.indexOf(u8, first.content, hint) != null);
-    try std.testing.expect(std.mem.endsWith(u8, first.content, "(1-based line number).]"));
-
-    const next = try readFilePage(io, a, path, .{ .offset = rows + 1, .limit = 1 });
-    defer next.deinit(a);
-    const expected = try std.fmt.allocPrint(a, "{d}:line {d}\n[Output truncated; continue with offset={d} (1-based line number).]", .{ rows + 1, rows, rows + 2 });
-    defer a.free(expected);
-    try std.testing.expectEqualStrings(expected, next.content);
+    try std.testing.expectEqual(index, std.mem.count(u8, first.content, "\n"));
 }
 
-test "read cuts a line longer than a page without splitting a character" {
+test "read preserves a line longer than a page without splitting a character" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -318,16 +284,10 @@ test "read cuts a line longer than a page without splitting a character" {
 
     const result = try readFilePage(io, a, path, .{});
     defer result.deinit(a);
-    try std.testing.expect(result.truncated);
+    try std.testing.expect(!result.truncated);
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "你") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "Line 1 alone is longer") != null);
-    // The line was given all the room its prefix left, cut back to a character.
-    const room = std.mem.indexOf(u8, result.content, "\n").? - "1:".len;
-    // Include the newline in the page budget before rounding to UTF-8.
-    try std.testing.expect(room <= page_room_bytes - "1:".len - 1);
-    try std.testing.expect(room > page_room_bytes - "1:".len - 1 - 3);
-    try std.testing.expectEqual(@as(usize, 0), room % 3);
+    try std.testing.expectEqual(buffer.items.len + 3, result.content.len);
+    try std.testing.expectEqualStrings(buffer.items, result.content[2 .. result.content.len - 1]);
 }
 
 test "read missing file" {

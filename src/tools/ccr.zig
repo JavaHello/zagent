@@ -169,7 +169,7 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, text: []c
 
 /// Optional execution-after hook for any tool (including MCP). Unlike bash's
 /// streaming cache this handles already-materialized results. Install as
-/// Context.hooks.after or Tool.hooks.after; dispatch clips only after it runs.
+/// Context.hooks.after or Tool.hooks.after; producers preserve complete output.
 /// Consumes outcome's content on success and failure.
 pub fn afterExecute(ctx: tool.Context, _: []const u8, _: []const u8, outcome: anyerror!ToolResult) !ToolResult {
     var result = try outcome;

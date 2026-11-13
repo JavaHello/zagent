@@ -383,7 +383,7 @@ fn perform(allocator: std.mem.Allocator, deadline: *Deadline, request: HttpReque
         try aw.writer.writeAll("(empty body)");
     }
 
-    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = http_error, .truncated = body_text.len == max_output_bytes }, max_output_bytes);
+    return finalizeResultLimited(allocator, aw.written(), .{ .is_error = http_error, .truncated = false }, max_output_bytes);
 }
 
 /// Write the status line and every response header. Takes the head's parts
@@ -422,8 +422,7 @@ fn responseHasBody(response: *const std.http.Client.Response) bool {
     return status.class() != .informational;
 }
 
-/// Read the response body into memory, stopping at `max_output_bytes` rather
-/// than failing, so an oversized body still shows its beginning.
+/// Read the complete response body; CCR owns caching and presentation limits.
 fn readResponseBody(allocator: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
     const decompress_buffer = try allocDecompressBuffer(allocator, response.head.content_encoding);
     defer allocator.free(decompress_buffer);
@@ -434,17 +433,13 @@ fn readResponseBody(allocator: std.mem.Allocator, response: *std.http.Client.Res
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    while (aw.written().len < max_output_bytes) {
-        // A short read is not the end of the body: the stream reports zero when
-        // nothing has arrived yet, so only EndOfStream or the cap ends this
-        // loop. Stopping at the cap leaves the rest unread, which deinit closes
-        // the connection over rather than draining.
-        _ = reader.stream(&aw.writer, .limited(max_output_bytes - aw.written().len)) catch |err| switch (err) {
+    while (true) {
+        _ = reader.stream(&aw.writer, .unlimited) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
     }
-    if (aw.written().len < max_output_bytes) try checkResponseBodyComplete(response);
+    try checkResponseBodyComplete(response);
     return aw.toOwnedSlice();
 }
 

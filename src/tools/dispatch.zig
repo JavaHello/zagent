@@ -64,7 +64,7 @@ fn executeWithSpecs(comptime specs: []const tool.Tool, ctx: tool.Context, name: 
         result
     else
         try ctx.hooks.afterExecute(ctx, name, arguments, executeRaw(specs, ctx, name, arguments));
-    // Applied after middleware, so CCR hooks can preserve output before clipping.
+    // Applied after middleware, so CCR hooks can preserve output without clipping.
     // This also covers quiet calls and callers outside the agent UI.
     return @import("result.zig").clipOversized(ctx.allocator, result);
 }
@@ -111,7 +111,7 @@ pub fn specOf(comptime name: []const u8) tool.Tool {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "global and local hooks nest, short circuit and propagate errors before clipping" {
+test "global and local hooks nest, short circuit and propagate errors without clipping" {
     const H = struct {
         events: std.ArrayList(u8) = .empty,
         mode: enum { normal, outer_short, inner_short, outer_before_error, before_error, run_error, after_error, oversized } = .normal,
@@ -172,7 +172,7 @@ test "global and local hooks nest, short circuit and propagate errors before cli
                 defer result.deinit(ctx.allocator);
                 try std.testing.expect(result.content.len > @import("result.zig").max_output_bytes);
                 try std.testing.expect(!result.truncated and !result.is_error);
-                // Remain oversized so the dispatch's final clip is also exercised.
+                // The dispatch must preserve this complete oversized result.
                 return .{ .content = try ctx.allocator.dupe(u8, result.content), .is_error = false };
             }
             return result;
@@ -200,8 +200,8 @@ test "global and local hooks nest, short circuit and propagate errors before cli
             const result = try outcome;
             defer result.deinit(ctx.allocator);
             if (case.mode == .oversized) {
-                try std.testing.expect(result.truncated and result.is_error);
-                try std.testing.expect(result.content.len <= @import("result.zig").max_output_bytes);
+                try std.testing.expect(!result.truncated and !result.is_error);
+                try std.testing.expect(result.content.len > @import("result.zig").max_output_bytes);
             } else try std.testing.expectEqualStrings("result", result.content);
         }
         try std.testing.expectEqualStrings(case.events, state.events.items);
