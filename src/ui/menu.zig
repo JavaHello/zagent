@@ -191,9 +191,12 @@ const Form = struct {
     }
 
     /// Move the keyboard to another tab, wrapping around: the questions in
-    /// order, then the confirmation when the form has one.
+    /// order, then the confirmation once every question has an answer. Until
+    /// then the questions are all there is to walk: a form with a question left
+    /// open has nothing to submit, and its two rows would only dismiss what was
+    /// never asked.
     fn step(self: *Form, delta: isize) Action {
-        const count: isize = @intCast(self.tabs());
+        const count: isize = @intCast(self.reachableTabs());
         self.focus = @intCast(@mod(@as(isize, @intCast(self.focus)) + delta, count));
         return .redraw;
     }
@@ -225,6 +228,15 @@ const Form = struct {
     /// How many tabs the strip has: one per question, plus the confirmation.
     fn tabs(self: *const Form) usize {
         return self.slots.len + @intFromBool(self.confirm_tab);
+    }
+
+    /// How many of them the keyboard can reach. The confirmation is drawn from
+    /// the start so the form says how the answers are sent, but it cannot be
+    /// walked to while a question is still without an answer: Tab then cycles
+    /// the questions, where the free-text row is the way to answer in words of
+    /// the user's own.
+    fn reachableTabs(self: *const Form) usize {
+        return self.slots.len + @intFromBool(self.confirm_tab and self.allAnswered());
     }
 
     fn onConfirm(self: *const Form) bool {
@@ -422,7 +434,9 @@ pub fn formRows(slots: []const Slot, allow_custom: bool, confirm_tab: bool) usiz
 ///
 /// `confirm_tab` closes the strip with a tab that submits the answers or takes
 /// words of the user's own to send with them; the trust prompt leaves it off,
-/// because it is one keypress rather than a form.
+/// because it is one keypress rather than a form. It is drawn from the start
+/// but only reachable once every question has an answer: a form that still has
+/// an open question has nothing to submit.
 ///
 /// `focus` is the tab the keyboard starts on: a question index, or `slots.len`
 /// for the confirmation. Null starts on the first question still without an
@@ -445,8 +459,9 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
     if (slots.len == 0) return .cancel;
     var state = Form{ .slots = slots, .allow_custom = allow_custom, .confirm_tab = confirm_tab };
     if (focus) |index| {
-        // `slots.len` is the confirmation, which only a form with one has.
-        state.focus = @min(index, state.tabs() - 1);
+        // `slots.len` is the confirmation, which a form with one only reaches
+        // once every question has an answer.
+        state.focus = @min(index, state.reachableTabs() - 1);
     } else if (state.nextUnanswered()) |index| {
         // Start on the first question still without an answer, so a form
         // entered again after an answer was typed carries on where the user
@@ -619,15 +634,21 @@ fn submitted(allocator: std.mem.Allocator, slots: []const Slot, note: *?[]u8) !R
     return replies;
 }
 
+/// The strip is indented like the question header and the hint below it: a
+/// strip that starts in the first column reads as a row of the log rather than
+/// as part of the form.
+const tabs_indent = "  ";
+
 /// Theme-palette tabs: cyan underline is focus, green check is answered,
 /// dim dot is pending. The confirmation closes the strip, so the form always
 /// shows how the answers are sent. Windowed around focus on narrow terminals.
 fn drawTabs(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, columns: usize) !void {
     _ = allocator;
     const limit = columns -| 1;
+    const indent: usize = @min(tabs_indent.len, limit);
     const count = state.tabs();
     var first = state.focus;
-    var used: usize = 2;
+    var used: usize = indent;
     while (first > 0) {
         var buf: [64]u8 = undefined;
         const label = try tabLabel(&buf, state, first - 1);
@@ -635,7 +656,8 @@ fn drawTabs(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form,
         used += term.width(label) + 1;
         first -= 1;
     }
-    used = 0;
+    try w.writeAll(tabs_indent[0..indent]);
+    used = indent;
     for (first..count) |i| {
         var buf: [64]u8 = undefined;
         const label = try tabLabel(&buf, state, i);
@@ -928,6 +950,35 @@ test "the last answer hands the keyboard to the confirmation" {
     try expectAction(.finish, state.key('\r'));
 }
 
+test "the confirmation waits until every question has an answer" {
+    var slots = [_]Slot{ Slot.init("First?", &two_options_a), Slot.init("Second?", &two_options_b) };
+    var state = Form{ .slots = &slots, .confirm_tab = true };
+
+    // While a question is still open, Tab and Shift+Tab cycle the questions:
+    // there is nothing to submit, and no answer for words of the user's own to
+    // be added to. Answering in words is a question's free-text row instead.
+    try expectAction(.redraw, state.key('\t'));
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+    try expectAction(.redraw, state.key('\t'));
+    try std.testing.expectEqual(@as(usize, 0), state.focus);
+    for ("\x1b[Z") |byte| _ = state.key(byte);
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+    try std.testing.expect(!state.onConfirm());
+
+    // The last answer hands the keyboard to the confirmation, which Tab then
+    // reaches like any other tab.
+    slots[0].answered = true;
+    try expectAction(.redraw, state.key('\r'));
+    try std.testing.expectEqual(slots.len, state.focus);
+    try std.testing.expect(state.onConfirm());
+    try expectAction(.redraw, state.key('\t'));
+    try std.testing.expectEqual(@as(usize, 0), state.focus);
+    try expectAction(.redraw, state.key('\t'));
+    try std.testing.expectEqual(@as(usize, 1), state.focus);
+    try expectAction(.redraw, state.key('\t'));
+    try std.testing.expectEqual(slots.len, state.focus);
+}
+
 test "the confirmation offers the words to add instead of submitting" {
     var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
     var state = Form{ .slots = &slots, .confirm_tab = true };
@@ -990,6 +1041,9 @@ test "the form draws horizontal tabs and only the focused question" {
     try std.testing.expectEqual(@as(usize, 6), try drawForm(allocator, &aw.writer, &state, 80, 20));
 
     const text = aw.written();
+    // The strip is indented like the header and the hint under it, so it reads
+    // as part of the form rather than as a row of the log.
+    try std.testing.expect(std.mem.startsWith(u8, text, tabs_indent ++ sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 1 "));
     try std.testing.expect(std.mem.indexOf(u8, text, "1/2 First question?") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 1 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Second question?") == null);

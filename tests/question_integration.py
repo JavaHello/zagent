@@ -7,9 +7,11 @@ given to an earlier question can be changed before the form is submitted. The la
 each question is free text, and nothing typed at the form reaches the running
 task as guidance. The strip ends on a Confirm tab, which either submits the
 answers or takes words of the user's own to send with them, and every answer
-lands there instead of being sent off on the last Enter. Esc in the free-text
-row steps back to the options; Esc at the questions cancels them and stops the
-run, and Ctrl+C is not a way out of a question at all.
+lands there instead of being sent off on the last Enter. It is drawn from the
+start but cannot be walked to while a question is still open: Tab then cycles
+the questions, where typing an answer in your own words belongs. Esc in the
+free-text row steps back to the options; Esc at the questions cancels them and
+stops the run, and Ctrl+C is not a way out of a question at all.
 """
 import fcntl
 import http.server
@@ -143,6 +145,19 @@ try:
             until(lambda: drawn('1) Gamma', mark), b'second question')
             until(lambda: focused_tab('2', mark), b'the second tab')
 
+            # The second question is still open, so the confirmation cannot be
+            # walked to: Tab cycles the questions, and nothing that submits or
+            # adds words to answers appears while there is no answer to add to.
+            settle()
+            mark = len(transcript)
+            os.write(master, b'\t')
+            until(lambda: focused_tab('1', mark), b'the first tab again')
+            settle()
+            os.write(master, b'\t')
+            until(lambda: focused_tab('2', mark), b'the second tab again')
+            assert not drawn('1) Submit', mark), since(mark)
+            assert not drawn('2) Supplement', mark), since(mark)
+
             # Shift+Tab walks back to the question already answered: the wrong
             # answer can still be changed, and after an arrow key the answer is
             # the other option. That is the whole point of one form.
@@ -253,10 +268,10 @@ try:
             assert process.wait(timeout=5) == 0
             assert termios.tcgetattr(slave) == original, 'raw terminal was not restored'
             print('PASS: questions share the prompt rows, one form holds them all, Tab and '
-                  'Shift+Tab revise an answer already given, the last row types an answer or '
-                  'steps back to the options, the Confirm tab submits the answers or takes '
-                  'words to add, Ctrl+C is ignored, and Esc cancels the questions and stops '
-                  'the run')
+                  'Shift+Tab revise an answer already given and cycle the questions until '
+                  'every one has an answer, the last row types an answer or steps back to '
+                  'the options, the Confirm tab submits the answers or takes words to add, '
+                  'Ctrl+C is ignored, and Esc cancels the questions and stops the run')
         finally:
             if process.poll() is None:
                 process.kill()

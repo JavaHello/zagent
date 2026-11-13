@@ -155,7 +155,7 @@ When a request is ambiguous — several reasonable approaches, unclear scope, a
 decision only you can make — the agent calls `ask_user` and you get a form:
 
 ```
- · 1   · Confirm
+   · 1   · Confirm
   Which approach should I use?
     > 1) Rewrite in place (recommended)  Keeps the history intact.
       2) New file  Leaves the original alone.
@@ -172,10 +172,13 @@ nothing.
 The strip above the question names its tabs: a number per question and a final
 **Confirm**. The tab with the keyboard is cyan and underlined, `✓` marks an
 answered question, and the confirmation stays a `·` until every one of them has
-an answer. The last answer moves the keyboard there instead of sending it off:
+an answer: it is drawn from the start, but it cannot be walked to while a
+question is still open, because there is nothing to submit yet and the way to
+answer in your own words is that question's Other row. The last answer moves the
+keyboard there instead of sending it off:
 
 ```
-  ✓ 1   ✓ Confirm
+   ✓ 1   ✓ Confirm
   Confirm
     > 1) Submit  Send the answers as they stand
       2) Supplement  Type your own words to add
@@ -189,6 +192,8 @@ options left out. Esc in that line goes back to the confirmation.
 Tab and Shift+Tab move between the tabs and wrap around, so an earlier answer can
 be revised: answered questions show what they were answered with, and only the
 one with the keyboard shows its option rows, which keeps a long form on screen.
+Once every question has an answer the confirmation joins that ring, and Tab from
+it leads back to the first question.
 The form's own words — `Confirm`, `Submit`, `Supplement` — are English; the
 questions and their options are whatever the model wrote.
 
