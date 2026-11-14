@@ -1621,10 +1621,14 @@ pub const Agent = struct {
 
     /// Announce a tool call on the line above whatever it prints.
     ///
-    /// Most tools are one line of name and arguments. `apply_patch` is the
-    /// exception: its argument is the diff itself, and a JSON-escaped diff tells
-    /// nobody anything — so it is drawn instead, line by line, in the colours
-    /// the change would be read in.
+    /// Most tools are one line of name and arguments, and the arguments are
+    /// named rather than serialised: `summary.zig` is what turns a call's JSON
+    /// into the words beside the tool's name, and a tool that has nothing to say
+    /// about an argument keeps that argument out of the line rather than putting
+    /// it there as it arrived. `apply_patch` and `edit` are the block-shaped
+    /// exceptions: their arguments are the diff itself, and a JSON-escaped diff
+    /// tells nobody anything — so it is drawn instead, line by line, in the
+    /// colours the change would be read in.
     fn announceToolCall(self: *Agent, name: []const u8, arguments: []const u8) !void {
         if (self.capture != null) {
             const parent = self.parent orelse return;
@@ -1657,6 +1661,7 @@ pub const Agent = struct {
     }
 
     fn writeToolCall(self: *Agent, w: *std.Io.Writer, name: []const u8, arguments: []const u8) !void {
+        const summary = @import("../tools/summary.zig");
         const spec = @import("../tools/dispatch.zig").presentation(name);
         var preview: std.Io.Writer.Allocating = .init(self.allocator);
         defer preview.deinit();
@@ -1664,15 +1669,46 @@ pub const Agent = struct {
         const summarized = if (spec) |s| if (s.summary) |write| try write(ctx, &preview.writer, arguments) else false else false;
         const block = summarized and spec.?.summary_block;
         try w.writeAll(if (self.role == .subagent) "\x1b[35m  ⚙ " else if (spec != null and spec.?.delegated) CYAN ++ "  ⇢ " else YELLOW ++ "  ⚙ ");
+        try w.writeAll(BOLD);
         try sanitize.writeSanitized(w, name);
+        try w.writeAll(RESET);
         if (block) {
-            try w.writeAll("\n" ++ RESET);
-            try w.writeAll(preview.written());
-        } else {
-            try w.writeAll(RESET ++ " ");
-            try sanitize.writeSanitized(w, if (summarized) preview.written() else arguments);
             try w.writeByte('\n');
+            try w.writeAll(preview.written());
+            return;
         }
+        // A call no spec here describes — an MCP tool's, whose arguments arrive
+        // in a shape this program does not know — is still named rather than
+        // dumped. Only arguments that are not an object at all, or a tool whose
+        // own preview failed, keep the JSON they arrived as.
+        const text = if (summarized) preview.written() else named: {
+            preview.clearRetainingCapacity();
+            const named = try summary.writeObject(&preview.writer, self.allocator, arguments);
+            break :named if (named) preview.written() else arguments;
+        };
+        // The name is what a reader scans a turn for; the arguments are its
+        // detail, so they are drawn dim beside it.
+        try w.writeAll(" " ++ DIM);
+        try summary.writeFitted(w, text, self.callLineRoom(name));
+        try w.writeAll(RESET ++ "\n");
+    }
+
+    /// Columns a call's arguments may take: what the terminal has left on the
+    /// line after the margin, the glyph and the tool's name.
+    ///
+    /// A run whose stderr is not a terminal is writing to a pipe or a file,
+    /// where the line is content rather than layout — the margin is not drawn
+    /// there either — so nothing is cut and the whole summary is kept. On a
+    /// terminal one call is one line: a shell command carrying a loop is worth
+    /// reading, but not at the price of hiding the calls after it behind its
+    /// wrapping.
+    fn callLineRoom(self: *Agent, name: []const u8) usize {
+        const stderr = std.Io.File.stderr();
+        if (!(stderr.isTty(self.io) catch false)) return std.math.maxInt(usize);
+        const width = term.usableWidth(term.columns(stderr));
+        // `  ⚙ ` is the margin and the glyph, two columns each; then the name
+        // and the space that separates it from its arguments.
+        return width -| (layout.columns + 2 + term.width(name) + 1);
     }
 
     /// The terminal's part in one tool call, where the call starts: the call is
@@ -2372,7 +2408,7 @@ test "subagent tool actions use a distinct color without changing arguments" {
     var line: std.Io.Writer.Allocating = .init(allocator);
     defer line.deinit();
     try harness.agent.writeToolCall(&line.writer, "read", "{\"path\":\"example.zig\"}");
-    try std.testing.expect(std.mem.startsWith(u8, line.written(), "\x1b[35m  ⚙ read"));
+    try std.testing.expect(std.mem.startsWith(u8, line.written(), "\x1b[35m  ⚙ " ++ BOLD ++ "read" ++ RESET ++ " " ++ DIM ++ "example.zig"));
     try std.testing.expect(std.mem.indexOf(u8, line.written(), "example.zig") != null);
 }
 
@@ -2923,7 +2959,7 @@ test "the sub-agent's progress line names its task and keeps to one line" {
     var line: std.Io.Writer.Allocating = .init(allocator);
     defer line.deinit();
     try harness.agent.writeToolCall(&line.writer, "subagent", titled);
-    try std.testing.expect(std.mem.indexOf(u8, line.written(), "⇢ subagent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.written(), "⇢ " ++ BOLD ++ "subagent") != null);
     try std.testing.expect(std.mem.indexOf(u8, line.written(), "count the tests") != null);
     try std.testing.expect(std.mem.indexOf(u8, line.written(), "every test") == null);
 

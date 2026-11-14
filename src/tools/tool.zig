@@ -106,7 +106,10 @@ pub const Tool = struct {
     /// What the terminal shows while the tool runs. Null for a tool that must
     /// not have that line — it writes on the terminal itself.
     label: ?[]const u8 = null,
-    /// Tool-owned argument preview; false leaves the raw arguments visible.
+    /// Tool-owned argument preview; `summary.zig` is how a tool writes one.
+    /// Null, or a `false` from the callback, leaves the arguments to the
+    /// generic preview — every field named, or the raw JSON when they are not
+    /// an object at all.
     summary: ?*const fn (Context, *std.Io.Writer, []const u8) anyerror!bool = null,
     /// A block preview may contain trusted rendering, such as a sanitised diff.
     summary_block: bool = false,

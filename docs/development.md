@@ -85,6 +85,7 @@ src/
     ccr.zig      — The output cache: its sizes, the notice a cut result ends with, a preview and its id, and ccr_retrieve
     dispatch.zig — Sending one call to the tool that answers it, statically, in this process
     args.zig     — Reading a call's JSON arguments
+    summary.zig  — Writing those arguments as the line the terminal shows
     progress.zig — The label shown while a tool runs
     util.zig     — Helpers several tools share
     schema.zig   — The JSON schema of every built-in tool, from the tools' specs
@@ -147,7 +148,10 @@ of the tool reads:
   to its `run` when the program is built, with no lookup at run time;
 - `schema.zig` derives the definition the model is offered from the same spec,
   so a tool cannot be advertised without being runnable, or the reverse;
-- `progress.zig` takes the label from the same spec.
+- `progress.zig` takes the label from the same spec;
+- `summary.zig` is what the spec's `summary` callback writes the call's
+  arguments with, so the line the terminal shows names them instead of printing
+  the JSON they arrived as.
 
 The tool's `run(ctx, arguments)` parses and validates its own JSON arguments: a
 call it cannot use comes back as a `ToolResult` with `is_error` set and a

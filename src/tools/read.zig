@@ -1,6 +1,7 @@
 const std = @import("std");
 const openai = @import("../model/openai.zig");
 const args_mod = @import("args.zig");
+const summary = @import("summary.zig");
 const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 
@@ -97,8 +98,16 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"integer","minimum":1,"description":"1-based number of the first line to read; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to read; defaults to all remaining lines; large results are cached by CCR"}},"required":["path"]}
     ,
     .label = "read…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// A page is named by the file and the lines it covers: the offsets are what
+/// tells one read of a file from another in a conversation, and without them
+/// two pages of the same file are the same line.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{ "path", "offset", "limit" });
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     const path = args_mod.requiredString(ctx.allocator, arguments, "path") catch

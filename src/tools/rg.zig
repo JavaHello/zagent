@@ -3,6 +3,7 @@ const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 const args_mod = @import("args.zig");
 const search = @import("search.zig");
+const summary = @import("summary.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -21,8 +22,18 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob to search (e.g. README* or src/*.zig); defaults to the current directory. Path globs expand before searching, unlike the recursive glob filter."},"glob":{"type":"string","description":"Only search files whose names match this glob, e.g. *.zig"},"ignore_case":{"type":"boolean","description":"Match case-insensitively"},"context_lines":{"type":"integer","minimum":0,"description":"Number of surrounding lines before and after each match; defaults to 0"},"max_matches":{"type":"integer","minimum":1,"description":"Stop after this many matching lines per file (not a global limit); defaults to unlimited."},"hidden":{"type":"boolean","description":"Include hidden files (default false)"},"no_ignore":{"type":"boolean","description":"Disable ignore files (default false)"}},"required":["pattern"]}
     ,
     .label = "rg…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The pattern first — it is what the call is about — then what it is searched
+/// in and the flags that narrow it. A flag that is off is the default and stays
+/// out of the line.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{
+        "pattern", "path", "glob", "ignore_case", "context_lines", "max_matches", "hidden", "no_ignore",
+    });
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     if (args_mod.hasField(ctx.allocator, arguments, "offset")) return ctx.refuseOffset("rg");

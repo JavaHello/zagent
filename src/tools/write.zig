@@ -2,6 +2,7 @@ const std = @import("std");
 const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 const args_mod = @import("args.zig");
+const summary = @import("summary.zig");
 
 const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
@@ -14,8 +15,37 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Entire file contents for creation or full replacement"}},"required":["path","content"],"additionalProperties":false}
     ,
     .label = "write…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The path, and how much is being written to it. The content is the file
+/// itself, and printing it here would put a whole file on the call's line where
+/// what the reader needs is to know which call wrote it and how much arrived.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, arguments, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const path = switch (parsed.value.object.get("path") orelse return false) {
+        .string => |text| text,
+        else => return false,
+    };
+    if (path.len == 0) return false;
+    try summary.writeText(w, path);
+    const content = switch (parsed.value.object.get("content") orelse return true) {
+        .string => |text| text,
+        else => return true,
+    };
+    try w.print(" · {d} lines", .{lineCount(content)});
+    return true;
+}
+
+/// The lines `content` holds. A trailing newline ends the last line rather than
+/// starting one, and nothing at all is no lines.
+fn lineCount(content: []const u8) usize {
+    if (content.len == 0) return 0;
+    return std.mem.count(u8, content, "\n") + @intFromBool(content[content.len - 1] != '\n');
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     // A call that carries an edit's fields is an `edit` call that named the

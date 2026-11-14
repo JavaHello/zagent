@@ -2,6 +2,7 @@ const std = @import("std");
 const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 const args_mod = @import("args.zig");
+const summary = @import("summary.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -18,8 +19,16 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"path":{"type":"string","description":"Directory path, defaults to the current directory","default":"."},"limit":{"type":"integer","minimum":1,"maximum":1000,"description":"Most entries to list, default 100"}},"required":[]}
     ,
     .label = "ls…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// Where the listing is of, and how much of it was asked for. A call that names
+/// no path lists the working directory, and says so little that the line is the
+/// tool's name alone.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{ "path", "limit" });
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     if (args_mod.hasField(ctx.allocator, arguments, "offset")) return ctx.refuseOffset("ls");

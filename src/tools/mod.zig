@@ -6,7 +6,8 @@
 //! `bash.zig`, `read.zig`, `write.zig`, `edit.zig`, `apply_patch.zig`, `ls.zig`, `rg.zig`, `grep.zig`,
 //! `fd.zig`, `find.zig`, `web_fetch.zig`, `web_search.zig` — over a small shared floor: `result.zig`
 //! for the shape of a result, `progress.zig` for the progress labels,
-//! `args.zig` for reading a call's JSON arguments, `search.zig` for what the
+//! `args.zig` for reading a call's JSON arguments, `summary.zig` for writing
+//! them as the line that announces the call, `search.zig` for what the
 //! four search tools have in common, `web.zig` for the one HTTP client both web
 //! tools ask through, `html.zig` for reading a page as text, and `util.zig` for
 //! a handful of helpers.

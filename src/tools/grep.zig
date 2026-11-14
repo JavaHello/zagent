@@ -3,6 +3,7 @@ const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 const args_mod = @import("args.zig");
 const search = @import("search.zig");
+const summary = @import("summary.zig");
 const rg_mod = @import("rg.zig");
 const util = @import("util.zig");
 
@@ -26,8 +27,17 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"pattern":{"type":"string","description":"Extended regular expression to search for"},"path":{"type":"string","description":"File, directory, or shell-style path glob (e.g. README*); defaults to ."},"glob":{"type":"string","description":"Only search files whose names match this glob"},"ignore_case":{"type":"boolean"},"context_lines":{"type":"integer","minimum":0},"max_matches":{"type":"integer","minimum":1}},"required":["pattern"]}
     ,
     .label = "grep…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// As for `rg`: the pattern, then what it is searched in and the flags that
+/// narrow it.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{
+        "pattern", "path", "glob", "ignore_case", "context_lines", "max_matches",
+    });
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     if (args_mod.hasField(ctx.allocator, arguments, "offset")) return ctx.refuseOffset("grep");

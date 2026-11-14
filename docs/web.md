@@ -10,12 +10,12 @@ request that needs a method, headers or a body — an API call — is
 
 ```
 ❯ what do the Zig 0.14 release notes say about the build system?
-  ⚙ web_search {"query":"zig 0.14 release notes build system","limit":5}
+  ⚙ web_search zig 0.14 release notes build system · limit 5
   ✓
     1. Zig 0.14.0 Release Notes
        https://ziglang.org/download/0.14.0/release-notes.html
        Declarations, build system, ...
-  ⚙ web_fetch {"url":"https://ziglang.org/download/0.14.0/release-notes.html"}
+  ⚙ web_fetch https://ziglang.org/download/0.14.0/release-notes.html
   ✓
     # Zig 0.14.0 Release Notes
     ...

@@ -139,7 +139,10 @@ try:
         assert 'self-check' in result.stderr, result.stderr
         assert 'two of the four tools are split' in result.stderr, result.stderr
         assert 's1 "Split the tree"' in result.stderr, result.stderr
-        assert '⇢ subagent' in result.stderr and 'Split the tree' in result.stderr, result.stderr
+        # The call's name is styled and its arguments dimmed, so the line is
+        # read with the terminal codes taken out of it.
+        plain = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', result.stderr)
+        assert '⇢ subagent' in plain and 'Split the tree' in plain, result.stderr
 
         # The run keeps its own session, with the self-check it answered in it,
         # and the child's scratch directory went with the child.

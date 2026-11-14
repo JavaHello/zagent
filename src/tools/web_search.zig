@@ -12,6 +12,7 @@ const args_mod = @import("args.zig");
 const html = @import("html.zig");
 const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
+const summary = @import("summary.zig");
 const web = @import("web.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -24,8 +25,15 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"query":{"type":"string","description":"What to search for"},"limit":{"type":"integer","description":"How many results to return, 1-20; defaults to 8","minimum":1,"maximum":20}},"required":["query"]}
     ,
     .label = "web_search…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The query is what the call is about; the limit follows it, because a call
+/// that asked for twenty results is not the same call as the default eight.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{ "query", "limit" });
+}
 
 /// How many results a call gets when it does not say.
 const default_limit: usize = 8;

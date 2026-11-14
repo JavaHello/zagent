@@ -4,6 +4,7 @@ const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 const args_mod = @import("args.zig");
 const search = @import("search.zig");
+const summary = @import("summary.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -21,8 +22,14 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"pattern":{"type":"string","description":"Name glob, e.g. *.zig or *test*"},"path":{"type":"string","description":"Directory to search; defaults to ."}},"required":["pattern"]}
     ,
     .label = "find…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The name glob first, then the directory it is looked for in.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{ "pattern", "path" });
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     if (args_mod.hasField(ctx.allocator, arguments, "offset")) return ctx.refuseOffset("find");

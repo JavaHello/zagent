@@ -253,9 +253,10 @@ test "presentation callbacks belong to tool specs and preserve fallback" {
     try std.testing.expect(block_edit.summary_block);
     try std.testing.expect(!try block_edit.summary.?(ctx, &out.writer, "{}"));
     try std.testing.expect(presentation("subagent").?.delegated);
-    try std.testing.expect(presentation("bash").?.summary == null);
-    // Every call is shown on the terminal, so the two session tools whose
-    // arguments are prose name themselves instead of leaving JSON behind.
+    // Every built-in tool names the arguments of its own call, so a call on the
+    // terminal is never a JSON dump. Only a tool this program does not describe
+    // — an MCP server's — falls back to naming them generically.
+    for (all) |spec| try std.testing.expect(spec.summary != null);
     try std.testing.expect(presentation("announce_task").?.summary != null);
     try std.testing.expect(presentation("ask_user").?.summary != null);
     try std.testing.expect(presentation("unknown") == null);

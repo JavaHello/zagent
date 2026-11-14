@@ -1,5 +1,6 @@
 const std = @import("std");
 const Registry = @import("../mcp/mod.zig").Registry;
+const summary = @import("summary.zig");
 const tool = @import("tool.zig");
 pub const spec: tool.Tool = .{
     .name = "load_mcp_tools",
@@ -7,8 +8,14 @@ pub const spec: tool.Tool = .{
     .parameters_json =
     \\{"type":"object","properties":{"server":{"type":"string","description":"Exact MCP server name from the directory"}},"required":["server"],"additionalProperties":false}
     ,
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The server whose tools are being loaded: the call is about nothing else.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{"server"});
+}
 
 fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
     const agent = ctx.agent orelse return ctx.refuse("Error: this tool requires an agent context.");

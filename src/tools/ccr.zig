@@ -17,6 +17,7 @@ const args_mod = @import("args.zig");
 const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 const read = @import("read.zig");
+const summary = @import("summary.zig");
 const util = @import("util.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -321,8 +322,15 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"id":{"type":"string","description":"The hex id a cached result named"},"offset":{"type":"integer","minimum":1,"description":"1-based first line, or first matching line when query is given; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to return; defaults to as many as the page holds"},"query":{"type":"string","description":"Only the lines containing this text, matched without regard to case"}},"required":["id"],"additionalProperties":false}
     ,
     .label = "ccr_retrieve…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The id names the cached result, so it comes first; the query and the page
+/// follow it when the call asks for less than the whole of it.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{ "id", "query", "offset", "limit" });
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     const dir = ctx.cache_dir orelse return ctx.refuse(

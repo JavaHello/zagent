@@ -23,7 +23,7 @@ the shell's own scrollback comes back untouched when zagent exits.
   Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.
 
 ❯ list all .zig files in the current directory
-  ⚙ bash {"command":"find . -name '*.zig' -type f"}
+  ⚙ bash find . -name '*.zig' -type f
   ✓ exit 0
     ./src/agent/mod.zig
     ./src/model/config.zig
@@ -54,6 +54,22 @@ anchor the rest is read against. A command's listing (`/help`, `/memory`,
 
 The margin is applied as the text is produced, not as it is drawn, so it is a
 terminal's layout only: what a pipe or a file receives is untouched.
+
+A call is one line: the tool's name, then its arguments named rather than
+serialised — `⚙ read src/agent/mod.zig · offset 40 · limit 200`, not the JSON
+they arrived as. The name is drawn bold and the arguments dim, so a turn is
+scanned by what ran rather than by what it was given. The first argument stands
+bare because it is what the call is about; the ones after it carry their names,
+so that two values are never read as one; and an argument the call did not send
+is not shown at all, because a default is not something it asked for. A tool
+whose arguments this program does not know — an MCP server's — names every
+argument it was sent the same way. What a call carries as a block rather than as
+a value — `edit`, `apply_patch` — is drawn under the name instead: the diff it
+makes, in the colours it is read in.
+
+On a terminal the line is cut to the width the tool's name leaves, so one call
+stays one line however long the command it runs; what a pipe or a file receives
+is the whole summary, since there the line is content rather than layout.
 
 `Ctrl+Z` suspends the session the way it suspends any other foreground program:
 the terminal is handed back to the shell first, and `fg` resumes zagent, redraws

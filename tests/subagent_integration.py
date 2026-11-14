@@ -168,7 +168,10 @@ try:
         # line on it is named by the title the caller gave, not by the task.
         assert 'Delegation done.' in result.stdout, result.stdout
         assert 'Ran bash' not in result.stdout, result.stdout
-        assert '⇢ subagent' in result.stderr and 'Run one command' in result.stderr, result.stderr
+        # The call's name is styled and its arguments dimmed, so the line is
+        # read with the terminal codes taken out of it.
+        plain = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', result.stderr)
+        assert '⇢ subagent' in plain and 'Run one command' in plain, result.stderr
         print('PASS: sub-agent runs its own turn, keeps the caller session and reports back')
 finally:
     server.shutdown()

@@ -9,8 +9,19 @@ pub const spec: tool.Tool = .{
     .parameters_json =
     \\{"type":"object","properties":{"summary":{"type":"string","description":"Short progress report: what you have done and changed, what you ran and what it printed, what is verified, and what is left"}},"required":["summary"]}
     ,
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The report's own words are printed on the terminal the moment the call
+/// returns, so the line that announces it says only what the call is for: the
+/// words belong to the report below that line, not to the call above it.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    _ = ctx;
+    _ = arguments;
+    try w.writeAll("progress");
+    return true;
+}
 
 fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
     const agent = ctx.agent orelse return ctx.refuse("Error: this tool requires an agent context.");

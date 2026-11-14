@@ -2,6 +2,7 @@ const std = @import("std");
 const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
 const args_mod = @import("args.zig");
+const summary = @import("summary.zig");
 const sanitize = @import("../util/terminal/sanitize.zig");
 const normalize = @import("../util/terminal/normalize.zig");
 const host_exec = @import("../host/exec.zig");
@@ -176,8 +177,16 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}
     ,
     .label = "bash…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The command is the whole of what the call says, and it is worth reading to
+/// its end: the escaped JSON form of a line carrying quotes and newlines tells
+/// nobody what is about to run.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{ "command", "timeout_seconds" });
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     const command = args_mod.requiredString(ctx.allocator, arguments, "command") catch

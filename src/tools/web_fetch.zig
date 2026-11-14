@@ -12,6 +12,7 @@ const std = @import("std");
 const html = @import("html.zig");
 const result_mod = @import("result.zig");
 const tool = @import("tool.zig");
+const summary = @import("summary.zig");
 const web = @import("web.zig");
 
 const ToolResult = result_mod.ToolResult;
@@ -24,8 +25,15 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"url":{"type":"string","description":"The full URL, including the scheme"}},"required":["url"]}
     ,
     .label = "web_fetch…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// The address is the whole of what the call asks for, and it is read on the
+/// call's line as it would be pasted into a browser.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{"url"});
+}
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     const url = parseArguments(ctx.allocator, arguments) catch |err| return switch (err) {

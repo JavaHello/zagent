@@ -2,6 +2,7 @@ const std = @import("std");
 const memory_mod = @import("../state/memory.zig");
 const openai = @import("../model/openai.zig");
 const Agent = @import("../agent/mod.zig").Agent;
+const summary = @import("summary.zig");
 const tool = @import("tool.zig");
 
 pub const spec: tool.Tool = .{
@@ -11,8 +12,16 @@ pub const spec: tool.Tool = .{
     \\{"type":"object","properties":{"text":{"type":"string","description":"Note to add, new note for replace, or exact existing note for delete"},"action":{"type":"string","enum":["add","replace","delete"],"description":"Default add; replace and delete require an exact existing note"},"old_text":{"type":"string","description":"Exact existing note to replace; required only for replace"}},"required":["text"]}
     ,
     .label = "saving memory…",
+    .summary = writeSummary,
     .run = run,
 };
+
+/// What is being done to memory, and which note: `add` and `delete` are told
+/// apart at the first word, and the note itself follows, cut short — it is
+/// prose, and a memory line is not the place to read it whole.
+fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
+    return summary.writeFields(w, ctx.allocator, arguments, &.{ "action", "text" });
+}
 
 fn run(ctx: tool.Context, args: []const u8) !tool.ToolResult {
     const agent = ctx.agent orelse return ctx.refuse("Error: this tool requires an agent context.");
