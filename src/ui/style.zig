@@ -63,6 +63,14 @@ pub const PASTE_ON = "\x1b[?2004h";
 pub const PASTE_OFF = "\x1b[?2004l";
 pub const PASTE_END = "\x1b[201~";
 
+// The kitty keyboard protocol, flag 1: keys that share a byte are reported with
+// their modifiers, which is how Shift+Enter reaches the editor as its own key
+// rather than as the Enter it was always sent as. Pushed while the line is
+// being edited and popped after, so no other reader has to know about it;
+// terminals without it ignore both.
+pub const KEYS_ON = "\x1b[>1u";
+pub const KEYS_OFF = "\x1b[<u";
+
 pub const SAVE_TITLE = "\x1b[22;2t";
 pub const RESTORE_TITLE = "\x1b[23;2t";
 pub const TITLE_PREFIX = "\x1b]2;";

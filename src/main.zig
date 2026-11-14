@@ -740,7 +740,7 @@ fn writeHeader(
         defer allocator.free(message);
         try writeOut(screen, stdout, io, message);
     }
-    try writeOut(screen, stdout, io, DIM ++ "  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
+    try writeOut(screen, stdout, io, DIM ++ "  Enter to send, Shift+Enter for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.\n\n" ++ RESET);
 
     if (config.api_key.len == 0 and config.provider != .codex) {
         // Name the variable that actually applies, so a provider user is not

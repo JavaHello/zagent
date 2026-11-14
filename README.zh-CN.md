@@ -127,7 +127,7 @@ Debug 请求事件包含输入字节数、工具 schema 字节数及工具集合
 | `/debug` | 记录每一步并写出 HTML 报告 |
 | `/quit` | 退出 |
 
-Enter 提交，Alt+Enter 或 Ctrl+J 换行，`Ctrl+Z` 挂起，`Ctrl+D` 退出，Esc 中断
+Enter 提交，Shift+Enter 换行（终端不上报时用 Ctrl+J），`Ctrl+Z` 挂起，`Ctrl+D` 退出，Esc 中断
 正在运行的任务，`/` 和 `@` 打开补全弹窗。完整键盘说明见
 [界面（英文）](docs/ui.md)。
 

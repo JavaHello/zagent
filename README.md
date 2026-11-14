@@ -143,8 +143,9 @@ summaries distinguish missing cache reports from a reported zero.
 | `/debug`      | Record every step and write an HTML report |
 | `/quit`       | Exit                             |
 
-Enter submits, Alt+Enter or Ctrl+J inserts a newline, `Ctrl+Z` suspends, `Ctrl+D`
-exits, Esc interrupts a running task, and `/` or `@` open the completion popups.
+Enter submits, Shift+Enter inserts a newline (Ctrl+J where the terminal does not
+report it), `Ctrl+Z` suspends, `Ctrl+D` exits, Esc interrupts a running task,
+and `/` or `@` open the completion popups.
 The keyboard in full: [Interface](docs/ui.md).
 
 ## Before you run it

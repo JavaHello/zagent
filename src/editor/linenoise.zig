@@ -111,6 +111,39 @@ fn handOff(state: *LinenoiseState) !bool {
     return true;
 }
 
+/// A cursor key, as the letter a `CSI` sequence reports it with: the arrows,
+/// Home and End, and Shift+Tab walking a popup back.
+fn cursorKey(state: *LinenoiseState, byte: u8) !void {
+    switch (byte) {
+        'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editMoveVertical(false),
+        'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editMoveVertical(true),
+        'Z' => if (state.popup_items.len > 0) try state.movePopup(false),
+        'C' => try state.editMoveRight(),
+        'D' => try state.editMoveLeft(),
+        'H' => try state.editMoveHome(),
+        'F' => try state.editMoveEnd(),
+        else => {},
+    }
+}
+
+/// Esc on its own: step back out of a popup, or stop what is running.
+fn escapePressed(state: *LinenoiseState, ln: *Linenoise) !void {
+    // The free-text row of a question is not a place to interrupt the run: Esc
+    // steps back to the option list, so the read ends and the caller draws the
+    // menu again.
+    if (ln.question_input) {
+        ln.history.pop();
+        return error.Escaped;
+    }
+    // A question can take the keyboard in the moment this Esc is pressed. The
+    // menu comes first, and the run it belongs to must not be killed by the
+    // answer to its own dismissal.
+    if (try handOff(state)) return error.Handoff;
+    try ln.escape(state.popup_items.len > 0);
+    try state.dismissPopup();
+    try state.refreshLine();
+}
+
 fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]const u8 {
     var state = LinenoiseState.init(ln, in, out, prompt);
     defer state.buf.deinit(state.allocator);
@@ -130,6 +163,9 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
     state.ln.history.current = state.ln.history.hist.items.len - 1;
     try state.refreshLine();
 
+    // The one byte a reported key stands for, waiting for the loop to act on it.
+    var pushed: ?u8 = null;
+
     while (true) {
         // A question is put to the user in front of this line: hand the
         // terminal over before waiting for a key, keeping what was typed.
@@ -144,7 +180,9 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                     try state.refreshLine();
                 }
             }
-            if (@import("builtin").os.tag != .windows) {
+            // A key already waiting in `pushed` is read at once: polling for
+            // the next one would hold it back until the user typed again.
+            if (pushed == null and @import("builtin").os.tag != .windows) {
                 var fds = [_]std.posix.pollfd{.{ .fd = in.handle, .events = std.posix.POLL.IN, .revents = 0 }};
                 if (try std.posix.poll(&fds, 100) == 0) continue;
             }
@@ -156,7 +194,11 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
         // question must not swallow that answer to its own dismissal.
         if (try handOff(&state)) return error.Handoff;
         var input_buf: [1]u8 = undefined;
-        if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
+        // A key the terminal reported with its modifiers is taken as the byte
+        // it used to arrive as; it waits here for the turn of the loop that
+        // acts on it, so one switch handles both encodings.
+        if (pushed) |byte| input_buf[0] = byte else if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
+        pushed = null;
         var c = input_buf[0];
 
         // Browse completions before editing
@@ -217,7 +259,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                 }
                 try state.refreshLine();
             },
-            10 => try state.editInsert("\n"), // Ctrl+J
+            10 => try state.editInsert("\n"), // Ctrl+J, and Shift+Enter where it is reported
             key_enter => {
                 state.ln.history.pop();
                 return try ln.allocator.dupe(u8, state.buf.items);
@@ -239,20 +281,7 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             },
             key_esc => {
                 if ((try term.readEscape(ln.io, in, &input_buf)) < 1) {
-                    // The free-text row of a question is not a place to
-                    // interrupt the run: Esc steps back to the option list, so
-                    // the read ends and the caller draws the menu again.
-                    if (ln.question_input) {
-                        ln.history.pop();
-                        return error.Escaped;
-                    }
-                    // A question can take the keyboard in the moment this Esc is
-                    // pressed. The menu comes first, and the run it belongs to
-                    // must not be killed by the answer to its own dismissal.
-                    if (try handOff(&state)) return error.Handoff;
-                    try ln.escape(state.popup_items.len > 0);
-                    try state.dismissPopup();
-                    try state.refreshLine();
+                    try escapePressed(&state, ln);
                     continue;
                 }
                 switch (input_buf[0]) {
@@ -297,12 +326,25 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                                     length += 1;
                                     if (input_buf[0] >= 0x40 and input_buf[0] <= 0x7e) break;
                                 }
-                                const code = sequence[0..length];
+                                // Lock keys are reported like modifiers, which is
+                                // what turns the arrows into `CSI 1;129A` while
+                                // num lock is on: read them as the key they are.
+                                var unlocked: [16]u8 = undefined;
+                                const code = withoutLocks(sequence[0..length], &unlocked) orelse sequence[0..length];
                                 if (std.mem.eql(u8, code, "200~")) {
                                     const pasted = try readPaste(ln, in);
                                     defer ln.allocator.free(pasted);
                                     try state.editInsert(pasted);
-                                } else if (length == 2 and code[1] == '~') {
+                                } else if (code.len > 2 and code[code.len - 1] == 'u') {
+                                    // A key reported with its modifiers, which is
+                                    // how Shift+Enter is told from Enter.
+                                    if (decodeReported(code[0 .. code.len - 1])) |reported| switch (reported) {
+                                        .escape => try escapePressed(&state, ln),
+                                        .byte => |byte| pushed = byte,
+                                        // Shift+Tab, the popup's way back.
+                                        .popup_back => try cursorKey(&state, 'Z'),
+                                    };
+                                } else if (code.len == 2 and code[1] == '~') {
                                     switch (num) {
                                         '1', '7' => try state.editMoveHome(),
                                         '3' => try state.editDelete(),
@@ -315,27 +357,19 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                                         },
                                         else => {},
                                     }
+                                } else if (code.len == 1) {
+                                    // A cursor key whose only modifiers were the
+                                    // lock keys: the bare form the editor reads.
+                                    try cursorKey(&state, code[0]);
                                 }
                             },
-                            'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editMoveVertical(false),
-                            'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editMoveVertical(true),
-                            'Z' => if (state.popup_items.len > 0) try state.movePopup(false),
-                            'C' => try state.editMoveRight(),
-                            'D' => try state.editMoveLeft(),
-                            'H' => try state.editMoveHome(),
-                            'F' => try state.editMoveEnd(),
+                            'A', 'B', 'C', 'D', 'H', 'F', 'Z' => try cursorKey(&state, input_buf[0]),
                             else => {},
                         }
                     },
                     'O', '0' => {
                         if ((try term.read(ln.io, in, &input_buf)) < 1) return null;
-                        switch (input_buf[0]) {
-                            'H' => try state.editMoveHome(),
-                            'F' => try state.editMoveEnd(),
-                            'A' => if (state.popup_items.len > 0) try state.movePopup(false) else try state.editMoveVertical(false),
-                            'B' => if (state.popup_items.len > 0) try state.movePopup(true) else try state.editMoveVertical(true),
-                            else => {},
-                        }
+                        try cursorKey(&state, input_buf[0]);
                     },
                     else => {},
                 }
@@ -352,6 +386,135 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             },
         }
     }
+}
+
+/// A key the terminal reports as `CSI <code>;<modifier> u` once the keyboard
+/// protocol is on.
+const Reported = union(enum) {
+    /// Esc on its own, which a byte of its own would only become after waiting
+    /// out the escape timeout.
+    escape,
+    /// A key the editor knows, as the byte it arrives as without the protocol.
+    byte: u8,
+    /// Shift+Tab, the popup's way back and nothing else's.
+    popup_back,
+};
+
+/// The key `body` names, where the terminal sent `CSI <body> u` — the parameters
+/// between `CSI` and the final `u` — or null for the keys that arrive as text
+/// and for modifiers the editor has no use for. The protocol reports with its
+/// modifiers every key that shares a byte, so the editor reads them back as the
+/// byte it was written for: Ctrl+M is Enter, Ctrl+J breaks the line, Alt+B and
+/// Alt+F walk by words.
+fn decodeReported(body: []const u8) ?Reported {
+    var fields = std.mem.splitScalar(u8, body, ';');
+    const code = std.fmt.parseInt(u21, fields.next() orelse return null, 10) catch return null;
+    const modifier = if (fields.next()) |text| (std.fmt.parseInt(u8, text, 10) catch return null) else 1;
+    // A third field is the event type, which is only reported when it is asked
+    // for: a key being released is not a key being pressed.
+    if (fields.next() != null or modifier == 0) return null;
+    const held: u8 = modifier - 1; // 1 shift, 2 alt, 4 ctrl, 8 super
+    const ctrl = held & 4 != 0 and held & 2 == 0;
+    const alt = held & 2 != 0 and held & 4 == 0;
+    switch (code) {
+        // Ctrl+[ is the Esc key too, and Shift+Esc was always Esc.
+        27 => return if (alt) null else .escape,
+        13 => return .{ .byte = if (held == 0) key_enter else 10 },
+        9 => return if (held & 1 != 0 and !ctrl and !alt) .popup_back else null,
+        else => {},
+    }
+    if (ctrl) {
+        // The letter held, as the control byte it used to be sent as.
+        const letter: u8 = if (code >= 'a' and code <= 'z')
+            @intCast(code)
+        else if (code >= '@' and code <= '_')
+            @intCast(code)
+        else
+            return null;
+        const byte = letter & 0x1f;
+        return if (byte == 0) null else .{ .byte = byte };
+    }
+    if (alt and code >= 'a' and code <= 'z') return .{ .byte = @intCast(code) };
+    return null;
+}
+
+test "a reported key reads back as the key it was before the protocol" {
+    // Shift+Enter breaks the line, and Enter is still Enter.
+    try std.testing.expectEqual(@as(?Reported, .{ .byte = 10 }), decodeReported("13;2"));
+    try std.testing.expectEqual(@as(?Reported, .{ .byte = key_enter }), decodeReported("13"));
+    // Alt+Enter, and Ctrl+J, which the protocol reports instead of the 0x0a.
+    try std.testing.expectEqual(@as(?Reported, .{ .byte = 10 }), decodeReported("13;3"));
+    try std.testing.expectEqual(@as(?Reported, .{ .byte = 10 }), decodeReported("106;5"));
+    // Esc on its own, Ctrl+[ , and Shift+Esc.
+    try std.testing.expectEqual(@as(?Reported, Reported.escape), decodeReported("27"));
+    try std.testing.expectEqual(@as(?Reported, Reported.escape), decodeReported("27;5"));
+    try std.testing.expectEqual(@as(?Reported, Reported.escape), decodeReported("27;2"));
+    // Shift+Tab, and the letters held with a modifier.
+    try std.testing.expectEqual(@as(?Reported, Reported.popup_back), decodeReported("9;2"));
+    try std.testing.expectEqual(@as(?Reported, .{ .byte = key_ctrl_p }), decodeReported("112;5"));
+    try std.testing.expectEqual(@as(?Reported, .{ .byte = 'b' }), decodeReported("98;3"));
+    // A key released, a modifier the editor has nothing for, and a key that
+    // arrives as text anyway.
+    try std.testing.expectEqual(@as(?Reported, null), decodeReported("13;2;3"));
+    try std.testing.expectEqual(@as(?Reported, null), decodeReported("98;9"));
+    try std.testing.expectEqual(@as(?Reported, null), decodeReported("98;2"));
+    try std.testing.expectEqual(@as(?Reported, null), decodeReported("9;6"));
+    try std.testing.expectEqual(@as(?Reported, null), decodeReported("32;5"));
+    try std.testing.expectEqual(@as(?Reported, null), decodeReported(""));
+    try std.testing.expectEqual(@as(?Reported, null), decodeReported("13;x"));
+}
+
+/// The key `sequence` names with the lock keys taken out of its modifiers, or
+/// null when no lock is held and it can be used as it came. Caps lock and num
+/// lock are reported like any other modifier, which is what a num lock turns
+/// the up arrow into: `CSI 1;129A` where `CSI A` is meant, and `CSI 3;65~` for
+/// Delete. The locks are dropped from the modifier field, and the field itself
+/// once nothing is left of it, so what stays is the sequence this editor was
+/// reading before the keyboard protocol was asked for.
+fn withoutLocks(sequence: []const u8, buffer: *[16]u8) ?[]const u8 {
+    if (sequence.len < 3) return null;
+    const final = sequence[sequence.len - 1];
+    var fields = std.mem.splitScalar(u8, sequence[0 .. sequence.len - 1], ';');
+    const first = fields.next() orelse return null;
+    const modifier = fields.next() orelse return null;
+    if (fields.next() != null) return null;
+    const reported = std.fmt.parseInt(u16, modifier, 10) catch return null;
+    // 64 is caps lock and 128 is num lock; without them no lock is held.
+    if (reported == 0) return null;
+    const locks = (reported - 1) & @as(u16, 64 | 128);
+    const held = (reported - 1) & ~@as(u16, 64 | 128);
+    // A modifier the editor has no use for, and no lock to take out of it.
+    if (held != 0 and locks == 0) return null;
+    // A key reported with a code of its own keeps one: only the cursor keys and
+    // their `CSI <code> <letter>` form can lose the whole modifier field.
+    if (final == 'u') return std.fmt.bufPrint(buffer, "{s};{d}u", .{ first, held + 1 }) catch null;
+    if (held != 0) return std.fmt.bufPrint(buffer, "{s};{d}{c}", .{ first, held + 1, final }) catch null;
+    if (final == '~') return std.fmt.bufPrint(buffer, "{s}~", .{first}) catch null;
+    return std.fmt.bufPrint(buffer, "{c}", .{final}) catch null;
+}
+
+test "a lock key does not turn the keys into ones nobody reads" {
+    var buffer: [16]u8 = undefined;
+    // The arrows, Home and End under num lock, and Delete under caps lock.
+    try std.testing.expectEqualStrings("A", withoutLocks("1;129A", &buffer).?);
+    try std.testing.expectEqualStrings("B", withoutLocks("1;129B", &buffer).?);
+    try std.testing.expectEqualStrings("H", withoutLocks("1;193H", &buffer).?);
+    try std.testing.expectEqualStrings("3~", withoutLocks("3;65~", &buffer).?);
+    try std.testing.expectEqualStrings("5~", withoutLocks("5;193~", &buffer).?);
+    // The cursor key a terminal spells out with no modifier at all.
+    try std.testing.expectEqualStrings("A", withoutLocks("1;1A", &buffer).?);
+    try std.testing.expectEqualStrings("3~", withoutLocks("3;1~", &buffer).?);
+    // A real modifier next to the lock is kept where it was, so a key held with
+    // Shift stays the key the editor ignores.
+    try std.testing.expectEqualStrings("1;2A", withoutLocks("1;130A", &buffer).?);
+    // A reported key keeps its modifier field, with only the lock taken out.
+    try std.testing.expectEqualStrings("13;2u", withoutLocks("13;130u", &buffer).?);
+    try std.testing.expectEqualStrings("13;1u", withoutLocks("13;129u", &buffer).?);
+    // Nothing to take out: the sequence is used as it came.
+    try std.testing.expectEqual(@as(?[]const u8, null), withoutLocks("1;2A", &buffer));
+    try std.testing.expectEqual(@as(?[]const u8, null), withoutLocks("13;2u", &buffer));
+    try std.testing.expectEqual(@as(?[]const u8, null), withoutLocks("200~", &buffer));
+    try std.testing.expectEqual(@as(?[]const u8, null), withoutLocks("1;2;3A", &buffer));
 }
 
 /// SGR report after CSI '<'. Only vertical wheel presses scroll the log.
@@ -391,6 +554,11 @@ fn linenoiseRaw(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]con
     defer disableRawMode(in, out, orig);
     try out.writeStreamingAll(ln.io, ansi.PASTE_ON);
     defer out.writeStreamingAll(ln.io, ansi.PASTE_OFF) catch {};
+    // Asked for here rather than for the whole session: the line editor is the
+    // reader that has a use for the modifiers, and a menu handed the keyboard
+    // mid-line reads the keys it was written for.
+    try out.writeStreamingAll(ln.io, ansi.KEYS_ON);
+    defer out.writeStreamingAll(ln.io, ansi.KEYS_OFF) catch {};
 
     return try linenoiseEdit(ln, in, out, prompt);
 }

@@ -757,12 +757,21 @@ pub const LinenoiseState = struct {
         const column = width(bytes[start..self.pos]);
         var target_start: usize = undefined;
         var target_end: usize = undefined;
+        // At the entry's own first or last line the walk carries on into the
+        // history, the way an entry of one line goes to the prompt before it.
+        // Nothing on that side leaves the line where it is.
         if (forward) {
-            const end = std.mem.indexOfScalarPos(u8, bytes, self.pos, '\n') orelse return;
+            const end = std.mem.indexOfScalarPos(u8, bytes, self.pos, '\n') orelse {
+                if (self.ln.history.current + 1 >= self.ln.history.hist.items.len) return;
+                return self.editHistoryNext(.next);
+            };
             target_start = end + 1;
             target_end = std.mem.indexOfScalarPos(u8, bytes, target_start, '\n') orelse bytes.len;
         } else {
-            if (start == 0) return;
+            if (start == 0) {
+                if (self.ln.history.current == 0) return;
+                return self.editHistoryNext(.prev);
+            }
             target_end = start - 1;
             target_start = if (std.mem.lastIndexOfScalar(u8, bytes[0..target_end], '\n')) |index| index + 1 else 0;
         }
@@ -1059,6 +1068,53 @@ test "large multiline input stays inside viewport and supports Unicode editing" 
     try state.editMoveHome();
     try std.testing.expectEqual(0, state.cursor_row);
     try std.testing.expectEqual(0, state.viewport_start);
+}
+
+test "arrows walk out of a multi-line entry into the history around it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try tmp.dir.createFile(std.testing.io, "output", .{});
+    defer out.close(std.testing.io);
+    var ln: Linenoise = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .env = undefined,
+        .history = History.empty(allocator),
+        .multiline_mode = true,
+    };
+    defer ln.deinit();
+    // The line being edited is the placeholder `add` leaves for it, as the
+    // editor does, so the walk starts from the empty entry at the newest end.
+    try ln.history.add("older");
+    try ln.history.add("first line\nsecond line");
+    try ln.history.add("");
+    ln.history.current = ln.history.hist.items.len - 1;
+
+    var state: LinenoiseState = .{
+        .allocator = allocator,
+        .ln = &ln,
+        .stdin = out,
+        .stdout = out,
+        .prompt = "> ",
+        .cols = 40,
+    };
+    defer state.buf.deinit(allocator);
+
+    try state.editMoveVertical(false); // the entry of two lines, from its end
+    try std.testing.expectEqualStrings("first line\nsecond line", state.buf.items);
+    try state.editMoveVertical(false); // up to its own first line
+    try std.testing.expectEqual("first line".len, state.pos);
+    try state.editMoveVertical(false); // and out of it, to the entry before
+    try std.testing.expectEqualStrings("older", state.buf.items);
+    try state.editMoveVertical(false); // nothing older: the line stays
+    try std.testing.expectEqualStrings("older", state.buf.items);
+    try state.editMoveVertical(true); // back down into the two lines
+    try std.testing.expectEqualStrings("first line\nsecond line", state.buf.items);
+    try state.editMoveVertical(true); // and out of it, to the empty line after
+    try std.testing.expectEqualStrings("", state.buf.items);
+    try state.editMoveVertical(true); // nothing newer: the line stays
+    try std.testing.expectEqualStrings("", state.buf.items);
 }
 
 const LayoutRecord = struct {

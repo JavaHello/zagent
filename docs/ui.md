@@ -20,7 +20,7 @@ the shell's own scrollback comes back untouched when zagent exits.
   ✦ an AI agent in your terminal
 
   Model  gpt-4o-mini · openai
-  Enter to send, Alt+Enter or Ctrl+J for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.
+  Enter to send, Shift+Enter for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.
 
 ❯ list all .zig files in the current directory
   ⚙ bash find . -name '*.zig' -type f
@@ -108,17 +108,22 @@ raw markdown, no margin, nothing for another program to trip over.
 | `Ctrl+Z`      | Suspend; resume with `fg`        |
 | `Ctrl+D`      | Exit                             |
 
-The prompt supports multiple lines: Enter submits; Alt+Enter or Ctrl+J inserts
-a newline, and the input area grows upward while the conversation moves up.
+The prompt supports multiple lines: Enter submits; Shift+Enter inserts a
+newline, and the input area grows upward while the conversation moves up.
+Ctrl+J and Alt+Enter do the same, which is what a terminal that cannot report
+Shift+Enter is left with.
 In terminals supporting bracketed paste, pasted newlines stay in the editor
-until you press Enter to send. Multiline entries can be recalled during the
-current session but are omitted from the on-disk input history.
+until you press Enter to send. A multiline entry is stored and recalled like
+any other: the history file keeps it on one line, with the line breaks inside
+it escaped.
 
 ## Prompt history
 
 ↑ and ↓ walk back and forward through the prompts of this session and earlier
-ones. The history is read at startup and rewritten after every accepted prompt,
-from:
+ones. A prompt that spans several lines is walked line by line first: once the
+cursor reaches its own first or last line, the next ↑ or ↓ carries on into the
+prompt before or after it. The history is read at startup and rewritten after
+every accepted prompt, from:
 
 - `$XDG_STATE_HOME/zagent/history` (if `XDG_STATE_HOME` is set)
 - `~/.local/state/zagent/history` (fallback)
