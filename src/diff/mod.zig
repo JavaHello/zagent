@@ -1532,10 +1532,13 @@ fn parseRange(line: []const u8, i: *usize) ?Range {
 // Drawing
 // ---------------------------------------------------------------------------
 
-/// Draw a patch for a terminal: file headers bold, hunk headers cyan, added
-/// lines the terminal's green, and removed lines its red held back to a faint
-/// shade — so what was added is what reads first, and what it replaced is there
-/// to be found rather than to be looked at. Context lines are left plain.
+/// Draw a patch for a terminal: added lines the terminal's green, removed lines
+/// its red held back to a faint shade, hunk headers cyan, and everything that is
+/// not a change — the `---`/`+++` file headers, context lines and the
+/// `\ No newline` marker — one uniform faint grey, the shade the rest of the
+/// transcript draws its detail in. So what was added is what reads first, what
+/// it replaced is there to be found, and the frame around a change stays out of
+/// the way.
 ///
 /// A patch is model output, so every line goes through the same sanitising as
 /// anything else printed: an escape sequence inside a "source line" is text
@@ -1598,7 +1601,7 @@ pub fn renderEdit(w: *std.Io.Writer, path: []const u8, start: ?usize, old_text: 
 
 fn writeHeader(w: *std.Io.Writer, marker: []const u8, path: []const u8) !void {
     try w.writeAll("  ");
-    try w.writeAll(sgr.BOLD);
+    try w.writeAll(sgr.DIM);
     try w.writeAll(marker);
     // The path is model output: it stays on the header's one line, and an
     // escape sequence in it is text rather than a colour of its own.
@@ -1660,7 +1663,9 @@ fn lineCount(text: []const u8) usize {
     return std.mem.count(u8, text, "\n") + @intFromBool(!std.mem.endsWith(u8, text, "\n"));
 }
 
-/// The colour one line of a patch is drawn in, or an empty slice for plain.
+/// The colour one line of a patch is drawn in. Every line has one: the change
+/// takes its green or faint red, and everything else — headers, context, the
+/// metadata around a hunk — the one faint grey the transcript draws detail in.
 ///
 /// Classification is by prefix alone, which the parser cannot afford and this
 /// can: the one line it gets wrong is a removed line whose own text starts with
@@ -1668,18 +1673,24 @@ fn lineCount(text: []const u8) usize {
 /// counts here to tell the difference would mean refusing to draw exactly the
 /// malformed patches a user most needs to see.
 fn lineStyle(line: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, line, "--- ")) return sgr.BOLD;
-    if (std.mem.startsWith(u8, line, "+++ ")) return sgr.BOLD;
+    // The file headers are checked before the marker switch below: `---`/`+++`
+    // are the frame around the change rather than a removal or an addition, so
+    // they take the same faint grey as the context instead of a colour of their
+    // own.
+    if (std.mem.startsWith(u8, line, "--- ")) return sgr.DIM;
+    if (std.mem.startsWith(u8, line, "+++ ")) return sgr.DIM;
     if (std.mem.startsWith(u8, line, "@@")) return sgr.CYAN;
-    if (line.len == 0) return "";
+    if (line.len == 0) return sgr.DIM;
     return switch (line[0]) {
         '+' => sgr.GREEN,
         // Faint as well as red: a line on its way out is context for the one
         // arriving, and full-strength red on every line of a large deletion
         // turns a diff into a wall the eye stops reading.
         '-' => sgr.DIM ++ sgr.RED,
-        '\\' => sgr.DIM,
-        else => if (isDecoration(line)) sgr.DIM else "",
+        // Everything else — context lines, git's own metadata, the `\ No
+        // newline` marker — is the frame around the change, drawn in one grey
+        // so that the change is what the block differs in.
+        else => sgr.DIM,
     };
 }
 
@@ -2784,14 +2795,14 @@ test "the diff is drawn in the terminal's red and green, and faint for what goes
     );
 
     try testing.expectEqualStrings(
-        "  " ++ sgr.BOLD ++ "--- a/note.txt" ++ sgr.RESET ++ "\n" ++
-            "  " ++ sgr.BOLD ++ "+++ b/note.txt" ++ sgr.RESET ++ "\n" ++
+        "  " ++ sgr.DIM ++ "--- a/note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ "+++ b/note.txt" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.CYAN ++ "@@ -1,2 +1,2 @@" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.DIM ++ sgr.RED ++ "-gone" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.GREEN ++ "+added" ++ sgr.RESET ++ "\n" ++
-            // Context is left plain, with no escape of its own: a caller that
-            // has styled the block around it keeps its styling.
-            "   kept\n" ++
+            // Context is drawn in the same faint grey as the headers: it is the
+            // frame the change stands in, not part of the change.
+            "  " ++ sgr.DIM ++ " kept" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.DIM ++ "\\ No newline at end of file" ++ sgr.RESET ++ "\n",
         aw.written(),
     );
@@ -2837,8 +2848,8 @@ test "an edit is drawn as the diff it makes, from the line it starts on" {
     try renderEdit(&aw.writer, "src/note.txt", 3, "gone\nkept\n", "added\n");
 
     try testing.expectEqualStrings(
-        "  " ++ sgr.BOLD ++ "--- src/note.txt" ++ sgr.RESET ++ "\n" ++
-            "  " ++ sgr.BOLD ++ "+++ src/note.txt" ++ sgr.RESET ++ "\n" ++
+        "  " ++ sgr.DIM ++ "--- src/note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ "+++ src/note.txt" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.CYAN ++ "@@ -3,2 +3,1 @@" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.DIM ++ sgr.RED ++ "-gone" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.DIM ++ sgr.RED ++ "-kept" ++ sgr.RESET ++ "\n" ++
@@ -2856,8 +2867,8 @@ test "an edit whose line is unknown is drawn without a hunk header" {
     try renderEdit(&aw.writer, "note.txt", null, "one", "two\nthree");
 
     try testing.expectEqualStrings(
-        "  " ++ sgr.BOLD ++ "--- note.txt" ++ sgr.RESET ++ "\n" ++
-            "  " ++ sgr.BOLD ++ "+++ note.txt" ++ sgr.RESET ++ "\n" ++
+        "  " ++ sgr.DIM ++ "--- note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ "+++ note.txt" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.DIM ++ sgr.RED ++ "-one" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.GREEN ++ "+two" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.GREEN ++ "+three" ++ sgr.RESET ++ "\n",
@@ -2880,8 +2891,8 @@ test "a drawn edit carries nothing a terminal would act on, path included" {
     // The path stays on the header's line, and an escape inside either block is
     // text: it can neither move the cursor nor end the colour early.
     try testing.expectEqualStrings(
-        "  " ++ sgr.BOLD ++ "--- ab c.txt" ++ sgr.RESET ++ "\n" ++
-            "  " ++ sgr.BOLD ++ "+++ ab c.txt" ++ sgr.RESET ++ "\n" ++
+        "  " ++ sgr.DIM ++ "--- ab c.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ "+++ ab c.txt" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.CYAN ++ "@@ -1,1 +1,1 @@" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.DIM ++ sgr.RED ++ "--old red" ++ sgr.RESET ++ "\n" ++
             "  " ++ sgr.GREEN ++ "++new \\xFF" ++ sgr.RESET ++ "\n",

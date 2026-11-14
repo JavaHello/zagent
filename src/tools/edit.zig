@@ -132,7 +132,7 @@ test "an edit call is drawn as the diff it makes, at the line it starts on" {
 
     // The line is the file's own count, not the model's: the arguments name the
     // text, and only the file says where it is.
-    try std.testing.expect(std.mem.startsWith(u8, out.written(), "  " ++ sgr.BOLD ++ "--- "));
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "  " ++ sgr.DIM ++ "--- "));
     try std.testing.expect(std.mem.indexOf(u8, out.written(), path) != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "@@ -2,1 +2,2 @@") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "-two") != null);

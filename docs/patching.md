@@ -24,8 +24,9 @@ terminal's own red and green:
 | `patch`  | yes      | The Git Unified Diff to apply, with its newlines    |
 
 Added lines are green, removed lines are red held back to a faint shade, hunk
-headers are cyan and file headers bold. Context lines are left alone, so what
-changed is what stands out.
+headers are cyan, and everything that is not a change — the `---`/`+++` file
+headers, context lines and `\ No newline` markers — is one uniform faint grey,
+so what changed is what stands out.
 
 ## What a patch may contain
 
