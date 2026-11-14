@@ -34,13 +34,6 @@ pub const Status = enum {
     }
 };
 
-/// One step as the model sends it: the status arrives as text, and is read
-/// with `Status.parse` so the error can name what was wrong.
-pub const ArgumentStep = @import("../tools/plan.zig").ArgumentStep;
-
-/// Compatibility aliases; tool arguments belong to the tool.
-pub const Arguments = @import("../tools/plan.zig").Arguments;
-
 pub const Step = struct {
     title: []u8,
     status: Status = .pending,
@@ -226,12 +219,6 @@ pub const Plan = struct {
     }
 };
 
-/// What a `plan` call is doing, in one line for the terminal: the arguments
-/// are a whole checklist, and the JSON would take ten times the room to say
-/// the same thing. Returns false when they are not a call this program can
-/// read, so the caller can show what actually came in.
-pub const writeCallSummary = @import("../tools/plan.zig").writeCallSummary;
-
 fn freeStep(a: std.mem.Allocator, step: Step) void {
     a.free(step.title);
     if (step.note) |note| a.free(note);
@@ -401,19 +388,20 @@ test "mutation acknowledgements are compact while reads keep the full plan" {
 
 test "a plan call is summarised for the terminal on one line" {
     const a = std.testing.allocator;
+    const plan_tool = @import("../tools/plan.zig");
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
 
     // A title arrives as model text: a newline in it is flattened, not drawn.
-    try std.testing.expect(try writeCallSummary(&aw.writer, a, "{\"steps\":[{\"title\":\"one\\ntwo\"},{\"title\":\"b\"}]}"));
+    try std.testing.expect(try plan_tool.writeCallSummary(&aw.writer, a, "{\"steps\":[{\"title\":\"one\\ntwo\"},{\"title\":\"b\"}]}"));
     try std.testing.expectEqualStrings("2 steps: one two, b", aw.written());
     aw.clearRetainingCapacity();
-    try std.testing.expect(try writeCallSummary(&aw.writer, a, "{\"index\":2,\"status\":\"completed\",\"note\":\"ok\"}"));
+    try std.testing.expect(try plan_tool.writeCallSummary(&aw.writer, a, "{\"index\":2,\"status\":\"completed\",\"note\":\"ok\"}"));
     try std.testing.expectEqualStrings("step 2 → completed · ok", aw.written());
     aw.clearRetainingCapacity();
-    try std.testing.expect(try writeCallSummary(&aw.writer, a, "{}"));
+    try std.testing.expect(try plan_tool.writeCallSummary(&aw.writer, a, "{}"));
     try std.testing.expectEqualStrings("read", aw.written());
     aw.clearRetainingCapacity();
     // Not a plan call this program can read: the caller shows what came in.
-    try std.testing.expect(!try writeCallSummary(&aw.writer, a, "{\"title\":\"x\"}"));
+    try std.testing.expect(!try plan_tool.writeCallSummary(&aw.writer, a, "{\"title\":\"x\"}"));
 }

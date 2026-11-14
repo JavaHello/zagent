@@ -942,13 +942,6 @@ pub const Client = struct {
     }
 };
 
-/// The single source of truth for Responses history replay and size estimates.
-pub fn writeInput(allocator: std.mem.Allocator, w: *std.Io.Writer, messages: []const Message) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    try std.json.Stringify.value(try buildInput(arena.allocator(), messages), .{}, w);
-}
-
 /// Heterogeneous Responses items serialize as their payload, not a union tag.
 const InputItem = union(enum) {
     replay: std.json.Value,

@@ -1,12 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-// Dim, so the hint reads as a suggestion rather than typed text. linenoise's
-// width() skips SGR sequences, so the colours cost no columns.
-const sgr = @import("../ui/style.zig");
-const DIM = sgr.DIM;
-const RESET = sgr.RESET;
-
 /// A build without tracing still lists the command, because the user who types
 /// it deserves to be told why nothing was recorded. What the row says is the
 /// difference: the command itself is one sentence in such a binary.
@@ -44,7 +38,7 @@ pub const all = [_]Command{
 
 /// A line that is still a command being typed: it starts with a slash and has
 /// not reached a space yet. Once a space appears the user is writing a query,
-/// and completing or hinting would only be in the way.
+/// and completing it would only be in the way.
 fn isCommandPrefix(buffer: []const u8) bool {
     if (buffer.len == 0 or buffer[0] != '/') return false;
     return std.mem.indexOfAny(u8, buffer, " \t") == null;
@@ -72,30 +66,6 @@ pub fn complete(allocator: Allocator, buffer: []const u8) Allocator.Error![]cons
     }
 
     return matches.toOwnedSlice(allocator);
-}
-
-/// The dim text drawn after the line: the rest of the command name, like ghost
-/// text, followed by what it does. Only shown while a single command still
-/// matches — with several candidates the list Tab shows is clearer.
-pub fn hint(allocator: Allocator, buffer: []const u8) Allocator.Error!?[]const u8 {
-    if (!isCommandPrefix(buffer)) return null;
-
-    var match: ?Command = null;
-    for (all) |command| {
-        if (std.mem.startsWith(u8, command.name, buffer)) {
-            if (match != null) return null; // Ambiguous: let Tab list them.
-            match = command;
-        }
-    }
-
-    const command = match orelse return null;
-    const remainder = command.name[buffer.len..];
-    if (remainder.len == 0) {
-        const text = try std.fmt.allocPrint(allocator, DIM ++ "  {s}" ++ RESET, .{command.description});
-        return text;
-    }
-    const text = try std.fmt.allocPrint(allocator, DIM ++ "{s}  {s}" ++ RESET, .{ remainder, command.description });
-    return text;
 }
 
 /// Free a completion list handed out by `complete`, matching how linenoise
@@ -133,15 +103,12 @@ test "complete offers every command matching the prefix" {
     try std.testing.expectEqualStrings("/exit", e[0]);
 }
 
-test "status has a unique completion and hint" {
+test "status has a unique completion" {
     const a = std.testing.allocator;
     const matches = try complete(a, "/st");
     defer freeCompletions(a, matches);
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("/status", matches[0]);
-    const suggestion = (try hint(a, "/status")).?;
-    defer a.free(suggestion);
-    try std.testing.expect(std.mem.indexOf(u8, suggestion, "account quota") != null);
 }
 
 test "complete leaves ordinary text and finished commands alone" {
@@ -155,25 +122,4 @@ test "complete leaves ordinary text and finished commands alone" {
     const query = try complete(allocator, "/model please");
     defer freeCompletions(allocator, query);
     try std.testing.expectEqual(@as(usize, 0), query.len);
-}
-
-test "hint completes a unique command and names it" {
-    const allocator = std.testing.allocator;
-
-    const partial = (try hint(allocator, "/cl")).?;
-    defer allocator.free(partial);
-    try std.testing.expectEqualStrings(DIM ++ "ear  Clear conversation history" ++ RESET, partial);
-
-    // A fully typed command hints its description with no ghost text.
-    const exact = (try hint(allocator, "/quit")).?;
-    defer allocator.free(exact);
-    try std.testing.expectEqualStrings(DIM ++ "  Exit zagent" ++ RESET, exact);
-}
-
-test "hint stays quiet for ambiguous or non-command input" {
-    const allocator = std.testing.allocator;
-
-    try std.testing.expectEqual(@as(?[]const u8, null), try hint(allocator, "/"));
-    try std.testing.expectEqual(@as(?[]const u8, null), try hint(allocator, "/zzz"));
-    try std.testing.expectEqual(@as(?[]const u8, null), try hint(allocator, "plain words"));
 }

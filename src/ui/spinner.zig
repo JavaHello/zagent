@@ -93,13 +93,6 @@ pub const Spinner = struct {
         return .{ .io = io, .future = future };
     }
 
-    /// Whether a task was started: false when the caller asked for no
-    /// animation, and false when none could be spared, which is the same thing
-    /// to a caller deciding what else to print.
-    pub fn animating(self: Spinner) bool {
-        return self.future != null;
-    }
-
     /// Erase the line and wait for the animation to be gone. Idempotent, so a
     /// caller that stops early — to print something before it returns — can
     /// keep its `defer` in place. Nothing the caller prints after this lands
@@ -250,7 +243,6 @@ test "a caller that decided against animating writes nothing" {
     defer file.close(io);
 
     var spin = Spinner.start(io, file, "thinking…", .{ .enabled = false });
-    try expect(!spin.animating());
     spin.stop();
 
     const written = try tmp.dir.readFileAlloc(io, "probe", std.testing.allocator, .limited(4096));
@@ -272,7 +264,6 @@ test "the animation draws frames and gives the line back" {
         .first_frame_delay_ms = 0,
         .frame_interval_ms = 1,
     });
-    try expect(spin.animating());
 
     try io.sleep(.fromMilliseconds(60), .awake);
     spin.stop();

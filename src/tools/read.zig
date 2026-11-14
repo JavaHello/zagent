@@ -27,10 +27,6 @@ pub fn parseReadPage(allocator: std.mem.Allocator, arguments: []const u8) !ReadP
     };
 }
 
-pub fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !ToolResult {
-    return readFilePage(io, allocator, path, .{});
-}
-
 /// How one attempt to read a line ended.
 pub const LineEnd = enum {
     /// A whole line is in the buffer, without its terminator.
@@ -331,7 +327,7 @@ test "read streams a page from deep in a large file" {
     try std.testing.expectEqualStrings("", beyond.output);
 
     // Even a first line larger than the presentation budget is returned whole.
-    const full = try readFile(io, a, path);
+    const full = try readFilePage(io, a, path, .{});
     defer full.deinit(a);
     try std.testing.expect(!full.is_error);
     try std.testing.expect(std.mem.startsWith(u8, full.output, "1:xxx"));
@@ -401,7 +397,7 @@ test "read hands back the file's bytes as they are" {
 }
 
 test "read missing file" {
-    const result = try readFile(std.testing.io, std.testing.allocator, "/nonexistent/path/file.txt");
+    const result = try readFilePage(std.testing.io, std.testing.allocator, "/nonexistent/path/file.txt", .{});
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
 }

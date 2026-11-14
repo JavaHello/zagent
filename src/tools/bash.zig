@@ -118,19 +118,6 @@ const Collector = struct {
     }
 };
 
-pub fn executeShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
-    return executeShellTimed(io, allocator, command, null, default_timeout_seconds);
-}
-
-pub fn executeShellWithEnv(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    command: []const u8,
-    env: ?*const std.process.Environ.Map,
-) !ToolResult {
-    return executeShellTimed(io, allocator, command, env, default_timeout_seconds);
-}
-
 /// Run one shell command with a deadline and hand back everything it printed.
 /// What a result too long to show becomes is the cache's business: this tool
 /// knows how to run a command, not where an oversized answer goes.
@@ -213,12 +200,17 @@ fn parseTimeout(allocator: std.mem.Allocator, arguments: []const u8) !u32 {
     return @intCast(value.integer);
 }
 
+/// One command run at the default deadline: what the tests below assert on.
+fn runShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
+    return executeShellTimed(io, allocator, command, null, default_timeout_seconds);
+}
+
 test "a long output is handed over whole, and the tool adds nothing to it" {
     const a = std.testing.allocator;
     for ([_]usize{ 8192, 8193, 1024 * 1024 + 1 }) |size| {
         const command = try std.fmt.allocPrint(a, "printf '%{d}s' ''", .{size});
         defer a.free(command);
-        const result = try executeShell(std.testing.io, a, command);
+        const result = try runShell(std.testing.io, a, command);
         defer result.deinit(a);
         try std.testing.expect(!result.is_error);
         // Trimming belongs to the cache: this tool hands on what the command
@@ -246,7 +238,7 @@ test "shell status survives empty output, stderr and signals" {
         .{ .command = "printf '%50000s' ''; exit 9", .output = null, .exit_code = 9, .termination = null, .is_error = true },
     };
     for (cases) |case| {
-        const result = try executeShell(std.testing.io, std.testing.allocator, case.command);
+        const result = try runShell(std.testing.io, std.testing.allocator, case.command);
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.is_error, result.is_error);
         try std.testing.expectEqual(case.exit_code, result.exit_code);
@@ -258,7 +250,7 @@ test "shell status survives empty output, stderr and signals" {
         try std.testing.expect(std.mem.indexOf(u8, result.output, "Exit code:") == null);
     }
     // The output a command printed is not cut, whatever its size.
-    const long = try executeShell(std.testing.io, std.testing.allocator, "printf '%50000s' ''");
+    const long = try runShell(std.testing.io, std.testing.allocator, "printf '%50000s' ''");
     defer long.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 50000), long.output.len);
     try std.testing.expect(!long.is_error and long.ccr_id == null);
@@ -276,7 +268,7 @@ test "output is collected as the screen showed it, not as it was written" {
         .{ .command = "printf 'a\\n\\n\\n\\nb\\n'", .expected = "a\n\nb\n" },
     };
     for (cases) |case| {
-        const result = try executeShell(std.testing.io, a, case.command);
+        const result = try runShell(std.testing.io, a, case.command);
         defer result.deinit(a);
         try std.testing.expectEqualStrings(case.expected, result.output);
     }
@@ -284,7 +276,7 @@ test "output is collected as the screen showed it, not as it was written" {
 
 test "both streams reach the result in full, stdout before stderr" {
     const a = std.testing.allocator;
-    const result = try executeShell(
+    const result = try runShell(
         std.testing.io,
         a,
         "printf START; for ((i=0;i<6000;i++)); do printf '你好'; done; printf OUT_END; printf ERR_START >&2; for ((i=0;i<6000;i++)); do printf '世界' >&2; done; printf ERR_END >&2; exit 7",

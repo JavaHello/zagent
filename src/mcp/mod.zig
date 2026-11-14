@@ -107,11 +107,6 @@ pub const ServerConfig = struct {
     }
 };
 
-pub fn freeServers(allocator: std.mem.Allocator, servers: []ServerConfig) void {
-    for (servers) |server| server.deinit(allocator);
-    allocator.free(servers);
-}
-
 fn freePairs(allocator: std.mem.Allocator, pairs: []const [2][]const u8) void {
     for (pairs) |pair| {
         allocator.free(pair[0]);
@@ -1102,7 +1097,6 @@ const Server = struct {
 
 pub const Registry = struct {
     const loader_spec = @import("../tools/load_mcp_tools.zig").spec;
-    pub const loader_name = loader_spec.name;
     // These static strings contain no JSON escapes; schema tests validate them.
     const loader_json = "{\"name\":\"" ++ loader_spec.name ++
         "\",\"description\":\"" ++ loader_spec.description ++
@@ -1305,11 +1299,6 @@ pub const Registry = struct {
         const replacement = try views.toOwnedSlice(self.allocator);
         self.allocator.free(self.tool_json);
         self.tool_json = replacement;
-    }
-
-    /// Activate one service, without copying its schemas into conversation history.
-    pub fn loadTools(self: *Registry, allocator: std.mem.Allocator, arguments_json: []const u8) !tools.ToolResult {
-        return @import("../tools/load_mcp_tools.zig").execute(self, allocator, arguments_json);
     }
 
     /// The progress line for a call, or null for anything that is not one of
@@ -1617,6 +1606,13 @@ fn scriptedConnection(allocator: std.mem.Allocator, script: []const transport.An
         .transport = .{ .scripted = transport.Scripted.init(allocator, script) },
         .timeout_ms = 200,
     };
+}
+
+/// A list of configured servers handed to a test: freed the way the loader that
+/// builds one does it.
+fn freeServers(allocator: std.mem.Allocator, servers: []ServerConfig) void {
+    for (servers) |server| server.deinit(allocator);
+    allocator.free(servers);
 }
 
 test "an alias fits what an endpoint accepts" {
@@ -2204,6 +2200,7 @@ test "the registry connects what mcp.json names, end to end" {
     try skipUnlessPosix();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    const load_mcp_tools = @import("../tools/load_mcp_tools.zig");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2256,13 +2253,13 @@ test "the registry connects what mcp.json names, end to end" {
     const premature = try registry.call(allocator, "mcp__demo__echo", "{}");
     defer premature.deinit(allocator);
     try std.testing.expect(premature.is_error);
-    const missing = try registry.loadTools(allocator, "{\"server\":\"missing\"}");
+    const missing = try load_mcp_tools.execute(&registry, allocator, "{\"server\":\"missing\"}");
     defer missing.deinit(allocator);
     try std.testing.expect(missing.is_error);
-    const invalid = try registry.loadTools(allocator, "[]");
+    const invalid = try load_mcp_tools.execute(&registry, allocator, "[]");
     defer invalid.deinit(allocator);
     try std.testing.expect(invalid.is_error);
-    const loaded = try registry.loadTools(allocator, "{\"server\":\"demo\"}");
+    const loaded = try load_mcp_tools.execute(&registry, allocator, "{\"server\":\"demo\"}");
     defer loaded.deinit(allocator);
     try std.testing.expect(!loaded.is_error);
     try std.testing.expect(std.mem.indexOf(u8, loaded.output, "Say it back.") != null);
@@ -2270,7 +2267,7 @@ test "the registry connects what mcp.json names, end to end" {
     try std.testing.expect(!registry.servers[1].loaded);
     try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[1], "\"name\":\"mcp__demo__echo\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, registry.functionJson()[1], "\"required\":[\"text\"]") != null);
-    const again = try registry.loadTools(allocator, "{\"server\":\"demo\"}");
+    const again = try load_mcp_tools.execute(&registry, allocator, "{\"server\":\"demo\"}");
     defer again.deinit(allocator);
     try std.testing.expect(!again.is_error);
     try std.testing.expectEqual(@as(usize, 2), registry.functionJson().len);

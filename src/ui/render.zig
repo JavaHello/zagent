@@ -53,7 +53,6 @@ const max_table_columns: usize = 10;
 const cell_buffer_size: usize = 1024;
 
 // Preserve the renderer API while keeping SGR encoding in one module.
-pub const Color = sgr.Color;
 pub const Style = sgr.Style;
 
 pub const Theme = struct {

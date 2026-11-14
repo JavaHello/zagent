@@ -35,7 +35,6 @@ const RED = sgr.RED;
 // prompt.zig; the loop below uses them by their own names.
 const agent_prompt = @import("prompt.zig");
 const subagent = @import("subagent.zig");
-const SYSTEM_PROMPT = agent_prompt.SYSTEM_PROMPT;
 const max_continuations = agent_prompt.max_continuations;
 const max_empty_continuations = agent_prompt.max_empty_continuations;
 const continue_prompt = agent_prompt.continue_prompt;
@@ -781,31 +780,6 @@ pub const Agent = struct {
         };
     }
 
-    /// The `subagent` tool: hand one self-contained task to an agent of its own
-    /// and read back what it did.
-    ///
-    /// The sub-agent is a second Agent in this process, running in a task of its
-    /// own. It shares the provider, the working directory, the MCP servers and
-    /// the tool environment, but not this conversation, this plan, this session
-    /// or this terminal: its answer is captured, and the caller prints the one
-    /// line for the call. The plan stays the caller's, which is why the report
-    /// is a report and not a claim of completion — the caller verifies the work
-    /// before marking a step done.
-    ///
-    /// Two clocks bound it, and both belong to this call: every
-    /// `self_check_seconds` the child is asked for a progress report, which is
-    /// printed on the terminal and never reaches the model; at
-    /// `deadline_seconds` the child must stop and write its final report, and
-    /// that report is the tool result. Nothing comes back in between, so the
-    /// caller waits once and reads once.
-    ///
-    /// The error set is spelled out rather than inferred: this function starts
-    /// an agent that runs the tool loop that calls this function, and an
-    /// inferred set would have to be known before it can be.
-    pub fn subagentTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
-        return @import("../tools/subagent.zig").execute(self, arguments);
-    }
-
     /// Start one sub-agent and the task that runs it. The run owns the child,
     /// what the two sides share, and the buffer the child answers into; the
     /// caller of `subagent` only ever holds it by its id.
@@ -1121,17 +1095,6 @@ pub const Agent = struct {
     fn abortRun(self: *Agent, run: *Run) void {
         run.child.interrupted.store(true, .release);
         self.closeRun(run);
-    }
-
-    /// The `report` tool: a sub-agent answering a self-check.
-    ///
-    /// The sub-agent's model writes the summary and issues this tool call; the
-    /// parent does not construct either. The runtime only injects the
-    /// self-check request, and the report is handed over for the terminal
-    /// without anything coming back but an acknowledgement — the child keeps
-    /// working, and the caller sees nothing of it until the run ends.
-    pub fn reportTool(self: *Agent, arguments: []const u8) anyerror!tools.ToolResult {
-        return @import("../tools/report.zig").execute(self, arguments);
     }
 
     /// Take what the run's clocks asked for at a request boundary: a
@@ -2885,20 +2848,25 @@ test "the report tool belongs to the child and the clocks are checked" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);
     defer harness.deinit(allocator);
+    const ctx: tools.Context = .{
+        .io = std.testing.io,
+        .allocator = allocator,
+        .agent = &harness.agent,
+    };
 
     // A caller has nobody to report to: the self-check is the child's, and a
     // report from the agent on the terminal would only reach its own history.
-    const reported = try harness.agent.reportTool("{\"summary\":\"halfway\"}");
+    const reported = try tools.execute(ctx, "report", "{\"summary\":\"halfway\"}");
     defer reported.deinit(allocator);
     try std.testing.expect(reported.is_error);
     try std.testing.expect(std.mem.indexOf(u8, reported.output, "belongs to a sub-agent") != null);
 
     // A clock no run could keep is refused before the run starts.
-    const checked = try harness.agent.subagentTool("{\"task\":\"anything\",\"self_check_seconds\":4000}");
+    const checked = try tools.execute(ctx, "subagent", "{\"task\":\"anything\",\"self_check_seconds\":4000}");
     defer checked.deinit(allocator);
     try std.testing.expect(checked.is_error);
     try std.testing.expect(std.mem.indexOf(u8, checked.output, "self_check_seconds") != null);
-    const undated = try harness.agent.subagentTool("{\"task\":\"anything\",\"deadline_seconds\":0}");
+    const undated = try tools.execute(ctx, "subagent", "{\"task\":\"anything\",\"deadline_seconds\":0}");
     defer undated.deinit(allocator);
     try std.testing.expect(undated.is_error);
     try std.testing.expect(std.mem.indexOf(u8, undated.output, "deadline_seconds") != null);
@@ -2979,6 +2947,11 @@ test "a title that cannot be one line is refused before a run starts" {
     const allocator = std.testing.allocator;
     const harness = try TestHarness.init(allocator, std.testing.io);
     defer harness.deinit(allocator);
+    const ctx: tools.Context = .{
+        .io = std.testing.io,
+        .allocator = allocator,
+        .agent = &harness.agent,
+    };
 
     // A title of eighty characters is one too many and a line break inside one
     // would end the line early: both are refused, and neither starts a run.
@@ -2987,12 +2960,12 @@ test "a title that cannot be one line is refused before a run starts" {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.print("{{\"task\":\"anything\",\"title\":\"{s}\"}}", .{too_long});
-    const long = try harness.agent.subagentTool(aw.written());
+    const long = try tools.execute(ctx, "subagent", aw.written());
     defer long.deinit(allocator);
     try std.testing.expect(long.is_error);
     try std.testing.expect(std.mem.indexOf(u8, long.output, "title") != null);
 
-    const broken = try harness.agent.subagentTool("{\"task\":\"anything\",\"title\":\"one\\ntwo\"}");
+    const broken = try tools.execute(ctx, "subagent", "{\"task\":\"anything\",\"title\":\"one\\ntwo\"}");
     defer broken.deinit(allocator);
     try std.testing.expect(broken.is_error);
     try std.testing.expect(std.mem.indexOf(u8, broken.output, "one line") != null);

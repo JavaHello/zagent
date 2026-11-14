@@ -127,38 +127,6 @@ pub fn wcwidth(wc: u21) isize {
     }
 }
 
-/// Given a unicode string, return its printable length on a terminal.
-///
-/// Returns ``-1`` if a non-printable character is encountered.
-pub fn wcswidth(wcs: []const u21) isize {
-    var width: isize = 0;
-
-    for (wcs) |char| {
-        const wcw = wcwidth(char);
-        if (wcw < 0) return -1;
-        width += wcw;
-    }
-
-    return width;
-}
-
-/// Given a byte slice, return its printable length on a terminal. Returns
-/// error.InvalidUtf8 when the byte slice does not contain valid UTF-8.
-///
-/// Returns ``-1`` if a non-printable character is encountered.
-pub fn sliceWidth(s: []const u8) !isize {
-    var width: isize = 0;
-
-    var utf8 = (try std.unicode.Utf8View.init(s)).iterator();
-    while (utf8.nextCodepoint()) |codepoint| {
-        const wcw = wcwidth(codepoint);
-        if (wcw < 0) return -1;
-        width += wcw;
-    }
-
-    return width;
-}
-
 test "terminal widths cover controls combining marks CJK and emoji" {
     const cases = .{
         .{ @as(u21, 0), @as(isize, 0) },
@@ -171,15 +139,6 @@ test "terminal widths cover controls combining marks CJK and emoji" {
         .{ @as(u21, 0x1f600), @as(isize, 2) },
     };
     inline for (cases) |case| try testing.expectEqual(case[1], wcwidth(case[0]));
-}
-
-test "string widths validate UTF8 and stop on controls" {
-    try testing.expectEqual(@as(isize, 0), try sliceWidth(""));
-    try testing.expectEqual(@as(isize, 5), try sliceWidth("Ae\u{301}中!"));
-    try testing.expectEqual(@as(isize, -1), try sliceWidth("hello\n世界"));
-    try testing.expectError(error.InvalidUtf8, sliceWidth("\xff"));
-    try testing.expectEqual(@as(isize, 3), wcswidth(&.{ 'A', '中', 0x301 }));
-    try testing.expectEqual(@as(isize, -1), wcswidth(&.{ 'A', '\t' }));
 }
 
 test "width tables have ordered nonoverlapping valid ranges" {

@@ -76,18 +76,6 @@ pub const Saved = struct {
     bytes: usize,
 };
 
-/// The number of lines in `text`: a trailing terminator ends the last line
-/// rather than starting an empty one. Empty text is no lines at all.
-pub fn countLines(text: []const u8) usize {
-    if (text.len == 0) return 0;
-    var lines: usize = 1;
-    for (text) |byte| {
-        if (byte == '\n') lines += 1;
-    }
-    if (text[text.len - 1] == '\n') lines -= 1;
-    return lines;
-}
-
 /// An entry written in pieces, then named after what it holds.
 ///
 /// The text is not kept in this process to be counted later: the line and byte
@@ -117,10 +105,10 @@ pub const Stream = struct {
         self.last_byte = data[data.len - 1];
     }
 
-    /// Close the entry and answer what it holds. A line count is the one
-    /// `countLines` would give for the same text: a trailing terminator ends
-    /// the last line rather than starting an empty one. The id is the one its
-    /// content gives it, which is the name it is kept under.
+    /// Close the entry and answer what it holds. A line count is the one an
+    /// even read of the text would give: a trailing terminator ends the last
+    /// line rather than starting an empty one. The id is the one its content
+    /// gives it, which is the name it is kept under.
     pub fn finish(self: *Stream, io: std.Io) Saved {
         self.close(io);
         const lines = self.newlines + @intFromBool(self.bytes > 0 and self.last_byte != '\n');
@@ -800,14 +788,6 @@ test "identical output is kept once and named after its content" {
     try std.testing.expect(!std.mem.eql(u8, &first, &other.id));
 }
 
-test "line counting ends with the last line, not after it" {
-    try std.testing.expectEqual(@as(usize, 0), countLines(""));
-    try std.testing.expectEqual(@as(usize, 1), countLines("one"));
-    try std.testing.expectEqual(@as(usize, 1), countLines("one\n"));
-    try std.testing.expectEqual(@as(usize, 2), countLines("one\ntwo\n"));
-    try std.testing.expectEqual(@as(usize, 3), countLines("\n\n\n"));
-}
-
 test "an entry written as the output arrives counts what a whole text would" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -825,7 +805,8 @@ test "an entry written as the output arrives counts what a whole text would" {
     var whole: std.ArrayList(u8) = .empty;
     defer whole.deinit(a);
     for (pieces) |piece| try whole.appendSlice(a, piece);
-    try std.testing.expectEqual(countLines(whole.items), written.lines);
+    // "first\nsecond\nthird\nfourth": three terminators and a last line.
+    try std.testing.expectEqual(@as(usize, 4), written.lines);
     try std.testing.expectEqual(whole.items.len, written.bytes);
 
     const path = try filePath(a, dir, &written.id);

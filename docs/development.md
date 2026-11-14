@@ -127,7 +127,7 @@ src/
     term.zig     — Raw mode, key reads and terminal size
     unicode.zig  — Moving by character and word across UTF-8
   unicode_width/ — Terminal character widths and Unicode tables
-    wcwidth.zig  — wcwidth, wcswidth and sliceWidth
+    wcwidth.zig  — wcwidth, the printable width of one code point
     manual.zig, table_wide.zig, table_zero.zig — The width tables
 build.zig     — Zig build script
 ```

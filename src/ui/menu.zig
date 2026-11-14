@@ -800,26 +800,6 @@ pub fn writeMenu(w: *std.Io.Writer, question: []const u8, options: []const Optio
     }
 }
 
-/// Interpret one line typed at a menu. An empty answer takes the recommended
-/// option; a number or the option's own label picks by position; anything else
-/// is handed back as the user's own words.
-pub fn parseAnswer(raw: []const u8, options: []const Option, recommended: ?usize) Answer {
-    const line = std.mem.trim(u8, raw, " \t\r\n");
-    if (line.len == 0) return if (recommended) |i| .{ .option = i } else .skip;
-
-    // Accept "2", "2)" and "2." — the numbering is what the menu shows.
-    const digits = std.mem.trimEnd(u8, line, ").");
-    if (std.fmt.parseInt(usize, digits, 10)) |number| {
-        if (number >= 1 and number <= options.len) return .{ .option = number - 1 };
-    } else |_| {}
-
-    for (options, 0..) |option, i| {
-        if (std.ascii.eqlIgnoreCase(line, option.label)) return .{ .option = i };
-    }
-
-    return .{ .custom = line };
-}
-
 /// One line describing the outcome, for the model to read. Owned by the caller.
 pub fn describeAnswer(allocator: std.mem.Allocator, answer: Answer, options: []const Option) ![]u8 {
     return switch (answer) {
@@ -1181,27 +1161,6 @@ test "menu rows fit CJK text and flatten model control characters" {
     defer aw.deinit();
     try writeRow(&aw.writer, std.testing.allocator, "你\n好\x1b[2J世界", 7);
     try std.testing.expectEqualStrings("你 好" ++ RESET ++ "\x1b[K\r\n", aw.written());
-}
-
-test "a numbered answer picks that option" {
-    try std.testing.expectEqual(Answer{ .option = 1 }, parseAnswer("2", &test_options, 0));
-    try std.testing.expectEqual(Answer{ .option = 0 }, parseAnswer(" 1) ", &test_options, null));
-    try std.testing.expectEqual(Answer{ .option = 0 }, parseAnswer("1.", &test_options, null));
-}
-
-test "an empty answer takes the recommendation" {
-    try std.testing.expectEqual(Answer{ .option = 0 }, parseAnswer("\n", &test_options, 0));
-    // With nothing marked, Enter leaves the decision to the model.
-    try std.testing.expectEqual(Answer.skip, parseAnswer("", &test_options, null));
-}
-
-test "an answer may repeat an option label" {
-    try std.testing.expectEqual(Answer{ .option = 1 }, parseAnswer("skip TESTS", &test_options, 0));
-}
-
-test "anything else is the user's own words" {
-    try std.testing.expectEqualStrings("do neither", parseAnswer("do neither", &test_options, 0).custom);
-    try std.testing.expectEqualStrings("9", parseAnswer("9", &test_options, 0).custom);
 }
 
 test "the menu marks only the first recommended option" {

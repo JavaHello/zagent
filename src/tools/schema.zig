@@ -97,8 +97,6 @@ pub const subagent = hostDefinition(dispatch.specOf("subagent"));
 
 pub const report = hostDefinition(dispatch.specOf("report"));
 
-pub const load_mcp_tools = hostDefinition(dispatch.specOf("load_mcp_tools"));
-
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
@@ -148,7 +146,7 @@ test "built-in definitions have valid schemas and unique names" {
 test "every host tool the model is offered is one dispatch runs" {
     for (dispatch.all) |spec| {
         // The MCP loader is advertised only when a service has tools.
-        if (std.mem.eql(u8, spec.name, load_mcp_tools.name)) continue;
+        if (std.mem.eql(u8, spec.name, "load_mcp_tools")) continue;
         var listed = false;
         for (builtin) |definition| {
             if (std.mem.eql(u8, definition.name, spec.name)) listed = true;

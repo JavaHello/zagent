@@ -11,12 +11,6 @@ pub fn rootForPath(a: std.mem.Allocator, env: *const std.process.Environ.Map, ca
     return std.fmt.allocPrint(a, "{s}/workspaces/{s}", .{ base, std.fmt.bytesToHex(digest, .lower) });
 }
 
-pub fn root(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]u8 {
-    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
-    defer a.free(canonical);
-    return rootForPath(a, env, canonical);
-}
-
 pub fn filePath(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: []const u8) ![]u8 {
     const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
     defer a.free(canonical);
