@@ -98,11 +98,16 @@ pub const Spinner = struct {
     /// keep its `defer` in place. Nothing the caller prints after this lands
     /// on the animation's line: when this returns, the task has finished and
     /// the line is clear.
+    ///
+    /// The future is taken out of the struct before it is cancelled, not
+    /// after: `std.Io.Future` may not be cancelled twice, so the one that
+    /// takes it is the only one that cancels it. The line lock in `ToolUi` is
+    /// what keeps two threads out of here at once; this is what keeps a stop
+    /// that arrives late from repeating it.
     pub fn stop(self: *Spinner) void {
-        if (self.future) |*future| {
-            _ = future.cancel(self.io);
-            self.future = null;
-        }
+        var future = self.future orelse return;
+        self.future = null;
+        _ = future.cancel(self.io);
     }
 };
 

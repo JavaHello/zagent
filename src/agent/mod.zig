@@ -337,7 +337,7 @@ pub const Agent = struct {
         // the process: the caller that was watching it is gone.
         // Whatever is still open is closed here, before anything it borrows.
         self.closeRuns();
-        self.tool_ui.spinner.stop();
+        self.stopCallProgress();
         self.tool_ui.label.deinit();
         self.runs.deinit(self.allocator);
         if (self.current_task.len > 0) self.allocator.free(self.current_task);
@@ -979,8 +979,8 @@ pub const Agent = struct {
     /// animation the call owns is given the line back for it and taken again
     /// afterwards, because a frame drawn over the report would erase it.
     fn showSelfCheck(self: *Agent, run: *Run, report: []const u8) !void {
-        self.tool_ui.spinner.stop();
-        defer self.resumeCallProgress();
+        self.takeLine();
+        defer self.giveLine();
         const elapsed_s = @divTrunc(run.started.untilNow(self.io, .awake).toMilliseconds(), std.time.ms_per_s);
         var line: std.Io.Writer.Allocating = .init(self.allocator);
         defer line.deinit();
@@ -1632,8 +1632,8 @@ pub const Agent = struct {
     fn announceToolCall(self: *Agent, name: []const u8, arguments: []const u8) !void {
         if (self.capture != null) {
             const parent = self.parent orelse return;
-            parent.tool_ui.spinner.stop();
-            defer parent.resumeCallProgress();
+            parent.takeLine();
+            defer parent.giveLine();
             var line: std.Io.Writer.Allocating = .init(self.allocator);
             defer line.deinit();
             try line.writer.writeAll("\x1b[35m  ⇢ ");
@@ -1730,7 +1730,7 @@ pub const Agent = struct {
     /// for the result have it. This runs before the result is previewed, so the
     /// preview lands on a cleared line whatever the call did.
     fn afterToolCall(ctx: tools.Context, name: []const u8, arguments: []const u8, outcome: anyerror!tools.ToolResult) !tools.ToolResult {
-        if (ctx.agent) |self| self.tool_ui.spinner.stop();
+        if (ctx.agent) |self| self.stopCallProgress();
         // A sub-agent's report is not something to cache: it is the one thing
         // the caller reads back from a run, and swapping it for a preview plus
         // an id would hide exactly the text it has to verify. Everything else
@@ -1745,6 +1745,10 @@ pub const Agent = struct {
     /// and this run has a terminal to animate on. A tool can run for minutes,
     /// so the wait gets the same line the model calls do.
     fn startCallProgress(self: *Agent, name: []const u8, arguments: []const u8) !void {
+        // The label is built here and read again by the child that prints on
+        // this agent's line, so it is built under the lock that guards it.
+        self.tool_ui.lock.lockUncancelable(self.io);
+        defer self.tool_ui.lock.unlock(self.io);
         const label = try self.callProgressLabel(name, arguments, &self.tool_ui.label);
         var options = self.progressOptions();
         // A sub-agent works out of sight, so its line is coloured like its
@@ -1761,13 +1765,40 @@ pub const Agent = struct {
 
     /// Take the call's line again after something else wrote to the terminal.
     /// The label is the one `startCallProgress` built for this call and nothing
-    /// has rebuilt it since, so the caption is still the same caption.
-    fn resumeCallProgress(self: *Agent) void {
+    /// has rebuilt it since, so the caption is still the same caption. The
+    /// caller holds `tool_ui.lock`: this is the second half of `takeLine`.
+    fn resumeCallProgressLocked(self: *Agent) void {
         const caption = self.tool_ui.label.written();
         if (caption.len == 0) return;
         var options = self.progressOptions();
         options.style = CYAN;
         self.tool_ui.spinner = spinner.Spinner.start(self.io, std.Io.File.stderr(), caption, options);
+    }
+
+    /// Take the line away from the animation so another kind of line can be
+    /// printed on it, and keep every other thread out until `giveLine`. Two
+    /// threads ask for it: this agent's turn, printing what a run reported at a
+    /// self-check, and the child that turn is waiting for, printing one of its
+    /// own tool calls. They share one terminal, one spinner and one label, and
+    /// a spinner stopped twice is a future cancelled twice.
+    fn takeLine(self: *Agent) void {
+        self.tool_ui.lock.lockUncancelable(self.io);
+        self.tool_ui.spinner.stop();
+    }
+
+    /// Hand the line back and let the call's animation have it again. Always
+    /// pairs with `takeLine`, on the error path a `defer` covers as well.
+    fn giveLine(self: *Agent) void {
+        self.resumeCallProgressLocked();
+        self.tool_ui.lock.unlock(self.io);
+    }
+
+    /// Stop the animation when nothing is printed after it: the call has
+    /// returned, or this agent is being torn down.
+    fn stopCallProgress(self: *Agent) void {
+        self.tool_ui.lock.lockUncancelable(self.io);
+        defer self.tool_ui.lock.unlock(self.io);
+        self.tool_ui.spinner.stop();
     }
 
     /// The endpoints the web tools ask, as this session's configuration
@@ -1841,8 +1872,8 @@ pub const Agent = struct {
     fn previewToolResult(self: *Agent, content: []const u8, status: tools.ToolResult, delegated: bool) !void {
         if (self.capture != null) {
             const parent = self.parent orelse return;
-            parent.tool_ui.spinner.stop();
-            defer parent.resumeCallProgress();
+            parent.takeLine();
+            defer parent.giveLine();
             return parent.previewToolResult(content, status, delegated);
         }
         // An error is shown whole, because its message is the point of it — but
@@ -2064,6 +2095,16 @@ const ToolUi = struct {
     /// Where the label the animation borrows is built, reused from call to
     /// call so a long run does not allocate one per call.
     label: std.Io.Writer.Allocating,
+    /// The line has one owner at a time, and two threads reach for it: this
+    /// agent's own turn, when it prints the self-check of a run it is waiting
+    /// for, and the child it is running, when it prints a tool call or a
+    /// result of its own on the caller's terminal. Giving the line up means
+    /// stopping the spinner and restarting it afterwards, so the whole
+    /// stop-write-start is one critical section: two stops of one spinner are
+    /// two cancelations of one future, which `std.Io.Future` does not allow,
+    /// and two restarts would leave the first animation running with nothing
+    /// left to stop it.
+    lock: std.Io.Mutex = .init,
 };
 
 /// One sub-agent this agent started: the child, what the two share, and the

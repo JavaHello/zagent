@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         "tests/plan_integration.py",
         "tests/subagent_integration.py",
         "tests/subagent_checkin_integration.py",
+        "tests/spinner_race_integration.py",
         "tests/streaming_integration.py",
         "tests/retry_integration.py",
         "tests/token_usage_integration.py",
