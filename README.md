@@ -49,8 +49,9 @@ between runs.
   result, and renders the run as one self-contained HTML flowchart to read when
   something went wrong. It is a build option, so a release binary carries none of
   it. [Debug tracing](docs/debug.md)
-- **Provider presets** — `openai`, `deepseek`, `openai-compatible` for any
-  vendor speaking the Responses API, and `codex` for a ChatGPT subscription.
+- **Provider presets** — `openai`, `deepseek` and `openai-compatible` for the
+  Responses API, `anthropic` and `anthropic-compatible` for the Anthropic
+  Messages API, and `codex` for a ChatGPT subscription.
   [Providers](docs/providers.md) · [ChatGPT / Codex](docs/codex.md)
 - **Markdown rendering and ANSI colour** — styled in a terminal, raw markdown
   when piped. [Rendering](docs/ui.md#rendering)
@@ -58,7 +59,7 @@ between runs.
 ## Requirements
 
 - Zig 0.17.x
-- An API key and base URL for a Responses-compatible endpoint
+- An API key and base URL for a Responses- or Messages-compatible endpoint
 
 ## Build
 
@@ -78,12 +79,23 @@ zagent --resume <session-id> "Continue the task"
 ```
 
 Exported keys alone are enough: `DEEPSEEK_API_KEY` selects the `deepseek`
-preset, `OPENAI_API_KEY` selects `openai`. For any other vendor:
+preset, `OPENAI_API_KEY` selects `openai`, `ANTHROPIC_API_KEY` selects
+`anthropic`. For any other vendor on the Responses API:
 
 ```bash
 export AI_PROVIDER=openai-compatible
 export AI_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 export AI_MODEL=qwen-plus
+export AI_KEY='your key'
+zagent
+```
+
+A vendor speaking the Anthropic Messages API instead:
+
+```bash
+export AI_PROVIDER=anthropic-compatible
+export AI_URL=https://api.moonshot.cn/anthropic
+export AI_MODEL=kimi-k2-turbo-preview
 export AI_KEY='your key'
 zagent
 ```
@@ -95,16 +107,18 @@ are in [Configuration](docs/configuration.md). Start with a copy of
 
 ## Provider presets
 
-| Provider            | Base URL                    | Default model           | API key variable   |
-|---------------------|-----------------------------|-------------------------|--------------------|
-| `openai`            | `https://api.openai.com/v1` | `gpt-4o-mini`           | `OPENAI_API_KEY`   |
-| `deepseek`          | `https://api.deepseek.com`  | `deepseek-flash`        | `DEEPSEEK_API_KEY` |
-| `openai-compatible` | *(set with `AI_URL`)*       | *(set with `AI_MODEL`)* | `AI_KEY`           |
-| `codex`             | ChatGPT backend             | `gpt-5.4`               | — (`zagent login`) |
+| Provider               | Protocol    | Base URL                    | Default model      | API key variable   |
+|------------------------|-------------|-----------------------------|--------------------|--------------------|
+| `openai`               | `responses` | `https://api.openai.com/v1` | `gpt-4o-mini`      | `OPENAI_API_KEY`   |
+| `deepseek`             | `responses` | `https://api.deepseek.com`  | `deepseek-flash`   | `DEEPSEEK_API_KEY` |
+| `anthropic`            | `messages`  | `https://api.anthropic.com/v1` | `claude-sonnet-4-5` | `ANTHROPIC_API_KEY` |
+| `openai-compatible`    | `responses` | *(set with `AI_URL`)*       | *(set with `AI_MODEL`)* | `AI_KEY`      |
+| `anthropic-compatible` | `messages`  | *(set with `AI_URL`)*       | *(set with `AI_MODEL`)* | `AI_KEY`      |
+| `codex`                | `responses` | ChatGPT backend             | `gpt-5.4`          | — (`zagent login`) |
 
 An explicit `AI_URL`, `AI_MODEL` or key always wins over the preset, and
 `AI_PROVIDER` unset is autodetected from the exported keys. Details, including
-autodetection and the Responses API mapping:
+autodetection and the mapping of both protocols:
 [Providers](docs/providers.md).
 
 ## Optional prompt cache retention
@@ -162,7 +176,7 @@ before pointing it at anything unfamiliar.
 |------|--------|
 | [docs/index.md](docs/index.md) | The full documentation index |
 | [Configuration](docs/configuration.md) | Config file, environment variables, output budget, retries |
-| [Providers](docs/providers.md) | Presets, autodetection, any Responses-compatible endpoint |
+| [Providers](docs/providers.md) | Presets, autodetection, Responses- and Messages-compatible endpoints |
 | [ChatGPT / Codex](docs/codex.md) | Subscription login, models, quotas, credentials |
 | [Interface](docs/ui.md) | Full-screen session, commands, history, popups, menus, rendering |
 | [The agent loop](docs/agent-loop.md) | Tool chaining, completion, how a turn ends |

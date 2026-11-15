@@ -25,16 +25,18 @@ and `mcp.example.json` shows every member an MCP entry takes.
 
 | Variable            | Default                             | Description                                     |
 |---------------------|-------------------------------------|-------------------------------------------------|
-| `AI_PROVIDER`       | *(autodetected)*                    | Built-in preset: `deepseek`, `openai`, `openai-compatible`, `codex`; see [Providers](providers.md) |
+| `AI_PROVIDER`       | *(autodetected)*                    | Built-in preset: `deepseek`, `anthropic`, `openai`, `openai-compatible`, `anthropic-compatible`, `codex`; see [Providers](providers.md) |
 | `AI_KEY`            | *(optional)*                        | API key for the selected endpoint               |
 | `OPENAI_API_KEY`    | *(required for OpenAI)*             | OpenAI (or compatible) API key                  |
 | `DEEPSEEK_API_KEY`  | *(required for DeepSeek)*           | DeepSeek API key                                |
-| `AI_URL`            | `https://api.openai.com/v1`         | API base URL, without `/responses`              |
+| `ANTHROPIC_API_KEY` | *(required for Anthropic)*          | Anthropic API key                               |
+| `AI_URL`            | `https://api.openai.com/v1`         | API base URL, without `/responses` or `/messages` |
 | `AI_MODEL`          | `gpt-4o-mini`                       | Model name, sent unchanged                      |
-| `AI_MAX_TOKENS`     | `8192`                              | Initial output token budget per response        |
-| `AI_REASONING_EFFORT` | *(unset)*                         | Sent as a top-level `reasoning.effort` by every provider; OpenAI and Codex are also asked for a reasoning summary |
+| `AI_MAX_TOKENS`     | `8192`                              | Initial output token budget per response (`max_output_tokens`, or `max_tokens` for the Messages API) |
+| `AI_REASONING_EFFORT` | *(unset)*                         | Responses API only: sent as a top-level `reasoning.effort`; OpenAI and Codex are also asked for a reasoning summary |
 | `AI_SERVICE_TIER`   | *(unset)*                           | Codex only: sent as `service_tier`              |
-| `AI_THINKING`       | `enabled` for `deepseek` and `openai-compatible`, otherwise omitted | `thinking` switch: `enabled`, `disabled`, or `omit` |
+| `AI_PROMPT_CACHE_RETENTION` | *(unset)*                   | Responses API only: sent as `prompt_cache_retention`; `in_memory` or `24h` |
+| `AI_THINKING`       | `enabled` for `deepseek` and `openai-compatible`, otherwise omitted | Thinking switch: `enabled`, `disabled`, or `omit`. On the Messages API, `enabled` reserves `AI_MAX_TOKENS / 2` for a thinking budget |
 | `AI_MEMORY_FILE`    | Global workspace state: `memory.md` | Override where the notes are stored             |
 | `AI_DEBUG`          | *(unset)*                           | Any value but `0`/`false`/`off`/`no` records a debug trace; see [Debug tracing](debug.md) |
 | `WEB_SEARCH_URL`    | *(unset — DuckDuckGo)*              | Endpoint `web_search` puts a query to, with `{query}` and `{limit}` filled in |
@@ -42,7 +44,7 @@ and `mcp.example.json` shows every member an MCP entry takes.
 | `WEB_FETCH_URL`     | *(unset — the page itself)*         | Fetch service `web_fetch` asks for a page, with `{url}` filled in or the address appended |
 | `WEB_FETCH_KEY`     | *(unset)*                           | Sent to that service as `Authorization: Bearer` |
 
-Provider-specific API keys (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`) are read from
+Provider-specific API keys (`OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`) are read from
 the environment; use `AI_KEY` in the config file when you want one key for
 every provider. An explicit value always wins over the provider preset —
 see [Precedence](providers.md#precedence).
@@ -58,7 +60,9 @@ each of them reads.
 
 ## Output budget and truncation
 
-`AI_MAX_TOKENS` is the initial `max_output_tokens` of a Responses request.
+The budget is spelled per protocol: `AI_MAX_TOKENS` is the initial
+`max_output_tokens` of a Responses request and the `max_tokens` of a Messages
+one, which is where `AI_THINKING=enabled` takes its thinking budget from.
 
 When a response hits `max_output_tokens`, the main conversation retries the
 same input with a doubled token budget, up to three retries and a growth cap of

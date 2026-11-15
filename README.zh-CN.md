@@ -39,8 +39,9 @@
   成一张单文件 HTML 流程图，出问题时照着查。它是编译期选项，正式版本里不含这部分
   代码（重新编译时加 `-Dtrace` 可打开）。
   [调试追踪（英文）](docs/debug.md)
-- **服务商预设** — `openai`、`deepseek`、面向任意 Responses 兼容厂商的
-  `openai-compatible`，以及用 ChatGPT 订阅的 `codex`。
+- **服务商预设** — `openai`、`deepseek` 与面向任意 Responses 兼容厂商的
+  `openai-compatible`，面向 Anthropic Messages API 的 `anthropic` 和
+  `anthropic-compatible`，以及用 ChatGPT 订阅的 `codex`。
   [服务商](docs/providers.md) · [ChatGPT / Codex](docs/codex.md)
 - **Markdown 渲染与 ANSI 颜色** — 终端里渲染，管道输出保留原始 Markdown。
   [渲染](docs/ui.md#rendering)
@@ -48,7 +49,7 @@
 ## 环境要求
 
 - Zig 0.17.x
-- 一个兼容 Responses 的端点的 API key 和基础地址
+- 一个兼容 Responses 或 Anthropic Messages 的端点的 API key 和基础地址
 
 ## 构建
 
@@ -68,12 +69,22 @@ zagent --resume <会话id> "继续任务"
 ```
 
 只导出 key 就能用：`DEEPSEEK_API_KEY` 自动选中 `deepseek`，`OPENAI_API_KEY`
-选中 `openai`。其他厂商：
+选中 `openai`，`ANTHROPIC_API_KEY` 选中 `anthropic`。走 Responses 协议的其他厂商：
 
 ```bash
 export AI_PROVIDER=openai-compatible
 export AI_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 export AI_MODEL=qwen-plus
+export AI_KEY='你的 key'
+zagent
+```
+
+走 Anthropic Messages 协议的厂商或网关：
+
+```bash
+export AI_PROVIDER=anthropic-compatible
+export AI_URL=https://api.moonshot.cn/anthropic
+export AI_MODEL=kimi-k2-turbo-preview
 export AI_KEY='你的 key'
 zagent
 ```
@@ -85,15 +96,17 @@ zagent
 
 ## 服务商预设
 
-| 预设 | 基础地址 | 默认模型 | Key 环境变量 |
-|------|----------|----------|--------------|
-| `openai` | `https://api.openai.com/v1` | `gpt-4o-mini` | `OPENAI_API_KEY` |
-| `deepseek` | `https://api.deepseek.com` | `deepseek-flash` | `DEEPSEEK_API_KEY` |
-| `openai-compatible` | 由 `AI_URL` 指定 | 由 `AI_MODEL` 指定 | `AI_KEY` |
-| `codex` | ChatGPT 后端 | `gpt-5.4` | 无需（`zagent login`） |
+| 预设 | 协议 | 基础地址 | 默认模型 | Key 环境变量 |
+|------|------|----------|----------|--------------|
+| `openai` | `responses` | `https://api.openai.com/v1` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| `deepseek` | `responses` | `https://api.deepseek.com` | `deepseek-flash` | `DEEPSEEK_API_KEY` |
+| `anthropic` | `messages` | `https://api.anthropic.com/v1` | `claude-sonnet-4-5` | `ANTHROPIC_API_KEY` |
+| `openai-compatible` | `responses` | 由 `AI_URL` 指定 | 由 `AI_MODEL` 指定 | `AI_KEY` |
+| `anthropic-compatible` | `messages` | 由 `AI_URL` 指定 | 由 `AI_MODEL` 指定 | `AI_KEY` |
+| `codex` | `responses` | ChatGPT 后端 | `gpt-5.4` | 无需（`zagent login`） |
 
 显式设置的 `AI_URL`、`AI_MODEL` 和 key 总是覆盖预设；未设置 `AI_PROVIDER` 时按
-已导出的 key 自动选择。自动选择规则和 Responses 协议的用法见
+已导出的 key 自动选择。自动选择规则和两种协议的用法见
 [服务商（英文）](docs/providers.md)。
 
 ## 可选 prompt cache retention
@@ -146,7 +159,7 @@ Enter 提交，Shift+Enter 换行（终端不上报时用 Ctrl+J），`Ctrl+Z` �
 |------|------|
 | [docs/index.md](docs/index.md) | 文档索引 |
 | [Configuration](docs/configuration.md) | 配置文件、环境变量、输出预算、重试 |
-| [Providers](docs/providers.md) | 预设、自动选择、任意 Responses 兼容端点 |
+| [Providers](docs/providers.md) | 预设、自动选择、Responses 与 Messages 兼容端点 |
 | [ChatGPT / Codex](docs/codex.md) | 订阅登录、模型、额度、凭据 |
 | [Interface](docs/ui.md) | 全屏会话、命令、历史、补全、菜单、渲染 |
 | [The agent loop](docs/agent-loop.md) | 工具链、完成判断、轮次如何结束 |

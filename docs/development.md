@@ -58,8 +58,9 @@ src/
     history.zig  — Prompt history: where it is stored, and when it is saved
     runtime.zig  — The one thread that owns the terminal; workers only enqueue
   model/         — The model client and its configuration
-    openai.zig   — OpenAI-compatible HTTP client and JSON serialisation
-    provider.zig — Built-in provider presets
+    openai.zig   — The HTTP client, retries, tracing and usage accounting
+    anthropic.zig — The Messages API: its request body, stream and answer
+    provider.zig — Built-in provider presets and the protocol each speaks
     config.zig   — Configuration loading from the config file and environment
     codex_auth.zig — ChatGPT/Codex device login and token refresh
     status.zig   — Status and quota formatting

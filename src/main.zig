@@ -217,7 +217,8 @@ pub fn main(init: std.process.Init) !void {
                 RED ++ "Error: unknown AI_PROVIDER." ++ RESET ++
                     "\n  Valid values: {s}\n" ++
                     "  To use another Responses-compatible vendor, set AI_PROVIDER=openai-compatible\n" ++
-                    "  together with AI_URL, AI_MODEL and AI_KEY.\n",
+                    "  together with AI_URL, AI_MODEL and AI_KEY; for a vendor speaking the\n" ++
+                    "  Anthropic Messages API, use anthropic-compatible instead.\n",
                 .{valid},
             );
             defer allocator.free(msg);
@@ -227,18 +228,26 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         },
         error.MissingProviderUrl, error.MissingProviderModel => {
-            // The compatible preset has no host of its own, so point at the
-            // exact setting that is missing rather than at an empty request.
+            // Both "-compatible" presets have no host of their own, so point at
+            // the exact setting that is missing rather than at an empty request.
             const missing = if (err == error.MissingProviderUrl) "AI_URL" else "AI_MODEL";
             const msg = try std.fmt.allocPrint(
                 allocator,
-                RED ++ "Error: AI_PROVIDER=openai-compatible needs {s}." ++ RESET ++
-                    "\n  AI_URL is the base URL without /responses, AI_MODEL is sent unchanged." ++
-                    "\n  Alibaba Cloud Model Studio (百炼):\n" ++
+                RED ++ "Error: the selected AI_PROVIDER needs {s}." ++ RESET ++
+                    "\n  AI_URL is the base URL without /responses or /messages," ++
+                    " AI_MODEL is sent unchanged.\n" ++
+                    "\n  Alibaba Cloud Model Studio (百炼), Responses API:\n" ++
                     "    export AI_PROVIDER=openai-compatible\n" ++
                     "    export AI_URL=https://dashscope.aliyuncs.com/compatible-mode/v1\n" ++
                     "    export AI_MODEL=qwen-plus\n" ++
-                    "    export AI_KEY=sk-your-dashscope-key\n",
+                    "    export AI_KEY=sk-your-dashscope-key\n" ++
+                    "\n  A gateway speaking the Anthropic Messages API:\n" ++
+                    "    export AI_PROVIDER=anthropic-compatible\n" ++
+                    "    export AI_URL=https://api.moonshot.cn/anthropic\n" ++
+                    "    export AI_MODEL=kimi-k2-turbo-preview\n" ++
+                    "    export AI_KEY=sk-your-key\n" ++
+                    "\n  Anthropic's own API needs neither: AI_PROVIDER=anthropic and" ++
+                    " ANTHROPIC_API_KEY.\n",
                 .{missing},
             );
             defer allocator.free(msg);

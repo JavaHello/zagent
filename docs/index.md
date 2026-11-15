@@ -9,7 +9,7 @@ overview.
 | Page | Read it when |
 |------|--------------|
 | [Configuration](configuration.md) | You are setting the config file, the environment variables, the output budget or the retries |
-| [Providers](providers.md) | You need to pick or autodetect a provider, or point zagent at any Responses-compatible endpoint |
+| [Providers](providers.md) | You need to pick or autodetect a provider, or point zagent at any Responses- or Messages-compatible endpoint |
 | [ChatGPT / Codex](codex.md) | You want to use a ChatGPT subscription with `zagent login` |
 | [Interface](ui.md) | You want to know what the screen, the prompt and the keyboard do |
 

@@ -356,8 +356,9 @@ fn resolveU32(
     return file_value orelse fallback;
 }
 
-/// `openai.zig` appends "/responses" to the base URL, so a trailing
-/// slash here would produce a doubled separator. Takes ownership of `url`.
+/// The client appends its protocol's path ("/responses" or "/messages") to the
+/// base URL, so a trailing slash here would produce a doubled separator. Takes
+/// ownership of `url`.
 fn trimTrailingSlashes(allocator: std.mem.Allocator, url: []u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, url, "/");
     if (trimmed.len == url.len) return url;
@@ -401,11 +402,9 @@ fn resolve(
 
     // A preset that cannot know the vendor has no defaults to fall back on,
     // so the settings it needs are reported by name instead of being sent to
-    // an empty host.
-    if (selected_provider == .openai_compatible) {
-        if (base_url.len == 0) return error.MissingProviderUrl;
-        if (model.len == 0) return error.MissingProviderModel;
-    }
+    // an empty host. Both compatible presets are in that position.
+    if (base_url.len == 0) return error.MissingProviderUrl;
+    if (model.len == 0) return error.MissingProviderModel;
 
     const reasoning_effort = try resolveOptionalSetting(allocator, env, "AI_REASONING_EFFORT", &file_config.reasoning_effort);
     errdefer if (reasoning_effort) |value| allocator.free(value);
@@ -470,6 +469,7 @@ fn resolve(
         .prompt_cache_retention = prompt_cache_retention,
         .max_tokens = max_tokens,
         .provider = selected_provider,
+        .protocol = spec.protocol,
         .debug = debug,
         .web_search_url = web_search_url,
         .web_search_key = web_search_key,
@@ -494,6 +494,10 @@ pub const Config = struct {
     max_tokens: u32,
     /// The built-in preset that supplied the defaults, if one was selected.
     provider: ?Provider,
+    /// The protocol the selected preset speaks, which decides the endpoint the
+    /// client posts to and the shape of the request and its answer. Defaults to
+    /// the Responses API, the only protocol there was before this choice.
+    protocol: provider.Protocol = .responses,
     codex_auth_path: ?[]const u8 = null,
     /// Whether to record a debug trace and render its report. `--debug` on the
     /// command line turns it on as well; nothing here can turn it off.
@@ -840,6 +844,85 @@ test "openai preset matches the built-in defaults" {
     try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
 }
 
+test "the preset decides which protocol the client speaks" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { provider: []const u8, expected: @import("provider.zig").Protocol }{
+        .{ .provider = "openai", .expected = .responses },
+        .{ .provider = "deepseek", .expected = .responses },
+        .{ .provider = "codex", .expected = .responses },
+        .{ .provider = "openai-compatible", .expected = .responses },
+        .{ .provider = "anthropic", .expected = .messages },
+        .{ .provider = "anthropic-compatible", .expected = .messages },
+    };
+    for (cases) |case| {
+        var env = try testEnv(allocator, &.{
+            .{ "AI_PROVIDER", case.provider },
+            .{ "AI_URL", "https://example.test/v1" },
+            .{ "AI_MODEL", "test-model" },
+            .{ "ANTHROPIC_API_KEY", "sk-ant" },
+        });
+        defer env.deinit();
+        var file_config = ConfigFile{};
+        defer file_config.deinit(allocator);
+        const config = try resolve(allocator, &file_config, &env);
+        defer config.deinit();
+        try std.testing.expectEqual(case.expected, config.protocol);
+    }
+
+    // Nothing selected at all keeps the Responses API, the only one there was
+    // before the Messages API was added.
+    var bare_env = try testEnv(allocator, &.{});
+    defer bare_env.deinit();
+    var bare_file = ConfigFile{};
+    defer bare_file.deinit(allocator);
+    const bare = try resolve(allocator, &bare_file, &bare_env);
+    defer bare.deinit();
+    try std.testing.expectEqual(@import("provider.zig").Protocol.responses, bare.protocol);
+}
+
+test "the anthropic preset supplies its own host, model and key variable" {
+    const allocator = std.testing.allocator;
+    var env = try testEnv(allocator, &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }});
+    defer env.deinit();
+    var file_config = ConfigFile{};
+    defer file_config.deinit(allocator);
+    const config = try resolve(allocator, &file_config, &env);
+    defer config.deinit();
+
+    // The key alone is enough to select it, as with DeepSeek.
+    try std.testing.expectEqual(@as(?Provider, Provider.anthropic), config.provider);
+    try std.testing.expectEqual(@import("provider.zig").Protocol.messages, config.protocol);
+    try std.testing.expectEqualStrings("https://api.anthropic.com/v1", config.base_url);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", config.model);
+    try std.testing.expectEqualStrings("sk-ant", config.api_key);
+}
+
+test "the anthropic-compatible preset reports the setting it still needs" {
+    const allocator = std.testing.allocator;
+
+    {
+        var env = try testEnv(allocator, &.{
+            .{ "AI_PROVIDER", "anthropic-compatible" },
+            .{ "AI_MODEL", "kimi-k2" },
+        });
+        defer env.deinit();
+        var file_config = ConfigFile{};
+        defer file_config.deinit(allocator);
+        try std.testing.expectError(error.MissingProviderUrl, resolve(allocator, &file_config, &env));
+    }
+
+    {
+        var env = try testEnv(allocator, &.{
+            .{ "AI_PROVIDER", "anthropic-compatible" },
+            .{ "AI_URL", "https://api.moonshot.cn/anthropic" },
+        });
+        defer env.deinit();
+        var file_config = ConfigFile{};
+        defer file_config.deinit(allocator);
+        try std.testing.expectError(error.MissingProviderModel, resolve(allocator, &file_config, &env));
+    }
+}
+
 test "provider key comes from the provider's own variable" {
     const allocator = std.testing.allocator;
     var env = try testEnv(allocator, &.{
@@ -1082,19 +1165,45 @@ test "unknown provider is an error" {
 
 test "autodetection selects the provider whose key is exported" {
     const allocator = std.testing.allocator;
-    var env = try testEnv(allocator, &.{.{ "DEEPSEEK_API_KEY", "sk-deepseek" }});
-    defer env.deinit();
+    const cases = [_]struct {
+        pairs: []const [2][]const u8,
+        provider: Provider,
+        base_url: []const u8,
+        model: []const u8,
+        key: []const u8,
+    }{
+        .{
+            .pairs = &.{.{ "DEEPSEEK_API_KEY", "sk-deepseek" }},
+            .provider = .deepseek,
+            .base_url = "https://api.deepseek.com",
+            .model = "deepseek-flash",
+            .key = "sk-deepseek",
+        },
+        .{
+            // The Anthropic key needs no other setting either: its preset
+            // carries the host and the Messages API protocol.
+            .pairs = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }},
+            .provider = .anthropic,
+            .base_url = "https://api.anthropic.com/v1",
+            .model = "claude-sonnet-4-5",
+            .key = "sk-ant",
+        },
+    };
+    for (cases) |case| {
+        var env = try testEnv(allocator, case.pairs);
+        defer env.deinit();
 
-    var file_config = ConfigFile{};
-    defer file_config.deinit(allocator);
+        var file_config = ConfigFile{};
+        defer file_config.deinit(allocator);
 
-    const config = try resolve(allocator, &file_config, &env);
-    defer config.deinit();
+        const config = try resolve(allocator, &file_config, &env);
+        defer config.deinit();
 
-    try std.testing.expectEqual(@as(?Provider, Provider.deepseek), config.provider);
-    try std.testing.expectEqualStrings("https://api.deepseek.com", config.base_url);
-    try std.testing.expectEqualStrings("deepseek-flash", config.model);
-    try std.testing.expectEqualStrings("sk-deepseek", config.api_key);
+        try std.testing.expectEqual(@as(?Provider, case.provider), config.provider);
+        try std.testing.expectEqualStrings(case.base_url, config.base_url);
+        try std.testing.expectEqualStrings(case.model, config.model);
+        try std.testing.expectEqualStrings(case.key, config.api_key);
+    }
 }
 
 test "autodetection prefers openai when both keys are exported" {

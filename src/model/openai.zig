@@ -2,6 +2,8 @@ const std = @import("std");
 const search_tools = @import("../tools/mod.zig");
 const codex_auth = @import("codex_auth.zig");
 const trace_mod = @import("../debug/trace.zig");
+const anthropic = @import("anthropic.zig");
+const provider = @import("provider.zig");
 const Config = @import("config.zig").Config;
 const ThinkingMode = @import("config.zig").ThinkingMode;
 pub const tool_schema = @import("../tools/schema.zig");
@@ -184,7 +186,11 @@ pub const Message = struct {
     reasoning_content: ?[]const u8,
     tool_calls: ?[]ToolCallData,
     tool_call_id: ?[]const u8,
-    /// Exact Responses output items, including encrypted reasoning.
+    /// The reply's own items, exactly as the server sent them: Responses output
+    /// items with their encrypted reasoning, or Messages content blocks with
+    /// their signed thinking. Replaying them keeps the turn as the model wrote
+    /// it; `content`, `reasoning_content` and `tool_calls` are the summary the
+    /// terminal and the tool loop read.
     response_items: ?[]const u8 = null,
     /// Sole owner of tool output and execution metadata; content stays null.
     tool_result: ?search_tools.ToolResult = null,
@@ -255,6 +261,12 @@ pub const StreamSink = struct {
     onReasoning: ?*const fn (context: *anyopaque, delta: []const u8) void = null,
 };
 
+/// The `Authorization` header of a request: the wire's bearer token when it has
+/// one, and nothing at all when the credential travels in a header of its own.
+fn authorizationHeader(wire: Client.Wire) std.http.Client.Request.Headers.Value {
+    return if (wire.authorization) |value| .{ .override = value } else .{ .omit = {} };
+}
+
 /// Attempts a request is given: the first try and two retries.
 const max_attempts: usize = 3;
 
@@ -285,6 +297,25 @@ const Delivery = struct {
         const self: *Delivery = @ptrCast(@alignCast(context));
         const target = self.target.onReasoning orelse return;
         target(self.target.context, delta);
+    }
+};
+
+/// What a streaming exchange accumulates while its events arrive: the terminal
+/// body a Responses stream sends outright, or the message a Messages stream has
+/// to be assembled into from its deltas.
+const StreamState = struct {
+    /// Set by the terminal Responses event, which carries the whole reply.
+    completed: ?[]u8 = null,
+    /// The blocks and counters of a Messages stream.
+    messages: anthropic.Stream,
+
+    fn init(allocator: std.mem.Allocator) StreamState {
+        return .{ .messages = .init(allocator) };
+    }
+
+    fn deinit(self: *StreamState, allocator: std.mem.Allocator) void {
+        if (self.completed) |body| allocator.free(body);
+        self.messages.deinit();
     }
 };
 
@@ -350,6 +381,11 @@ pub const Client = struct {
     base_url: []const u8,
     model: []const u8,
     max_tokens: u32,
+    /// Which wire protocol this client speaks: the Responses API, or the
+    /// Anthropic Messages API. It decides the path, the credential header, and
+    /// how a request and its answer are shaped; the retry, tracing and usage
+    /// accounting around it are shared.
+    protocol: provider.Protocol = .responses,
     /// The last HTTP-level failure, kept rather than printed when it happens.
     /// A request runs while the progress animation owns the terminal's line:
     /// a message written from in here would be glued onto a frame and then
@@ -402,6 +438,7 @@ pub const Client = struct {
             .base_url = config.base_url,
             .model = config.model,
             .max_tokens = config.max_tokens,
+            .protocol = config.protocol,
             .http_error = null,
         };
     }
@@ -413,24 +450,89 @@ pub const Client = struct {
         self.credentials = credentials;
     }
 
+    /// Where a request goes and how it is authenticated. Each protocol names
+    /// its own path and credential header; the exchange around it is shared.
+    ///
+    /// Every slice belongs to the caller and is released by `deinit`; the
+    /// header values themselves stay borrowed from the client, which outlives
+    /// the request they are sent with.
+    const Wire = struct {
+        url: []u8,
+        /// The `Authorization` header, for a bearer token. Null when the
+        /// credential travels in `extra` instead.
+        authorization: ?[]u8 = null,
+        extra: []std.http.Header = &.{},
+
+        fn deinit(self: *Wire, allocator: std.mem.Allocator) void {
+            allocator.free(self.url);
+            if (self.authorization) |value| allocator.free(value);
+            if (self.extra.len > 0) allocator.free(self.extra);
+        }
+    };
+
+    /// What a URL is being built for: the model request itself, or the list of
+    /// models the `/models` command prints.
+    const Purpose = enum { request, models };
+
+    fn buildWire(self: *Client, key: []const u8, purpose: Purpose) !Wire {
+        const base = std.mem.trimEnd(u8, self.base_url, "/");
+        const suffix = switch (purpose) {
+            .request => switch (self.protocol) {
+                .responses => "/responses",
+                .messages => "/messages",
+            },
+            .models => "/models",
+        };
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, suffix });
+        errdefer self.allocator.free(url);
+
+        var extra: std.ArrayList(std.http.Header) = .empty;
+        errdefer extra.deinit(self.allocator);
+        // The Codex backend wants the account and the CLI that asked for it
+        // alongside its token, on every path.
+        if (self.credentials) |credentials| {
+            try extra.append(self.allocator, .{ .name = "ChatGPT-Account-ID", .value = credentials.account_id });
+            try extra.append(self.allocator, .{ .name = "originator", .value = "codex_cli_rs" });
+        }
+        switch (self.protocol) {
+            .responses => {},
+            // The Messages API takes the key in a header of its own, next to
+            // the version of the protocol the request is written for.
+            .messages => {
+                try extra.append(self.allocator, .{ .name = "x-api-key", .value = key });
+                try extra.append(self.allocator, .{ .name = "anthropic-version", .value = anthropic.version });
+            },
+        }
+        const headers = try extra.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(headers);
+        return .{
+            .url = url,
+            .authorization = switch (self.protocol) {
+                .responses => try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key}),
+                .messages => null,
+            },
+            .extra = headers,
+        };
+    }
+
     pub fn listModels(self: *Client) ![]u8 {
         try self.authenticate();
         const key = if (self.credentials) |c| c.parsed.value.access_token else self.api_key;
-        const bearer = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
-        defer self.allocator.free(bearer);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/models{s}", .{ self.base_url, if (self.codex_auth_path != null) "?client_version=0.101.0" else "" });
+        var wire = try self.buildWire(key, .models);
+        defer wire.deinit(self.allocator);
+        // The Codex backend is the one the CLI's version is sent to.
+        const url = if (self.credentials != null)
+            try std.fmt.allocPrint(self.allocator, "{s}?client_version=0.101.0", .{wire.url})
+        else
+            try self.allocator.dupe(u8, wire.url);
         defer self.allocator.free(url);
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
-        const headers = [_]std.http.Header{
-            .{ .name = "ChatGPT-Account-ID", .value = if (self.credentials) |c| c.account_id else "" },
-            .{ .name = "originator", .value = "codex_cli_rs" },
-        };
         const result = try self.http_client.fetch(.{
             .location = .{ .url = url },
             .method = .GET,
-            .headers = .{ .authorization = .{ .override = bearer } },
-            .extra_headers = if (self.credentials != null) &headers else &.{},
+            .headers = .{ .authorization = authorizationHeader(wire) },
+            .extra_headers = wire.extra,
             .redirect_behavior = .unhandled,
             .response_writer = &out.writer,
         });
@@ -512,7 +614,25 @@ pub const Client = struct {
     fn recordResponseUsage(self: *Client, body: []const u8) void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return;
         defer parsed.deinit();
-        self.addUsage(parseUsage(parsed.value));
+        self.addUsage(self.parseUsageOf(parsed.value));
+    }
+
+    /// The token counters of a reply, in the shape this protocol reports them.
+    fn parseUsageOf(self: *Client, root: std.json.Value) ?Usage {
+        return switch (self.protocol) {
+            .responses => parseUsage(root),
+            .messages => anthropic.parseUsage(root),
+        };
+    }
+
+    /// Parse a complete reply in the shape this protocol sends. Text, calls and
+    /// the finish reason mean the same thing in both; only the spelling of the
+    /// members differs.
+    fn parseBody(self: *Client, body: []const u8) !ApiResponse {
+        return switch (self.protocol) {
+            .responses => parseResponse(self.allocator, body),
+            .messages => anthropic.parseResponse(self.allocator, body),
+        };
     }
 
     pub fn deinit(self: *Client) void {
@@ -546,11 +666,33 @@ pub const Client = struct {
         return message;
     }
 
-    /// Shared projection for sending. With none of the optional outer-level
-    /// fields set the original serialization is returned unchanged (including
-    /// for Codex).
+    /// The token budget a Messages request reserves for thinking, or null when
+    /// the request asks for none. `AI_THINKING=enabled` is the switch: unlike
+    /// DeepSeek, the Messages API thinks only when it is told to.
+    fn thinkingBudget(self: *const Client) ?u32 {
+        if (self.thinking != .enabled) return null;
+        return anthropic.thinkingBudget(self.max_tokens);
+    }
+
+    /// The body of one request, in the shape this protocol sends.
     fn buildWireRequest(self: *Client, messages: []const Message, extra_tools: []const []const u8) ![]u8 {
-        const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools }, true, self.search);
+        const selection: ToolSelection = .{ .builtin = self.builtin_tools, .omit = self.builtin_omit, .extra = extra_tools };
+        if (self.protocol == .messages) {
+            // The Messages API defines none of the Responses knobs below, so it
+            // is built on its own rather than projected from the same body.
+            var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            return anthropic.buildRequest(self.allocator, .{
+                .model = self.model,
+                .max_tokens = self.max_tokens,
+                .messages = messages,
+                .tools = try buildFunctions(arena, selection, self.search),
+                .stream = true,
+                .thinking_budget = self.thinkingBudget(),
+            });
+        }
+        const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, selection, true, self.search);
         const codex = self.codex_auth_path != null;
         const request = if (codex) adapted: {
             defer self.allocator.free(ordinary);
@@ -584,25 +726,23 @@ pub const Client = struct {
         return std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{});
     }
 
-    /// Stream a Responses request with built-in and MCP tools.
+    /// Stream a request with built-in and MCP tools, in the protocol this
+    /// client speaks.
     pub fn respondStreaming(
         self: *Client,
         messages: []const Message,
         extra_tools: []const []const u8,
         sink: StreamSink,
     ) !ApiResponse {
-        const response_url = try std.fmt.allocPrint(self.allocator, "{s}/responses", .{std.mem.trimEnd(u8, self.base_url, "/")});
-        defer self.allocator.free(response_url);
-
         try self.authenticate();
         const key = if (self.credentials) |c| c.parsed.value.access_token else self.api_key;
-        const auth_header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
-        defer self.allocator.free(auth_header);
+        var wire = try self.buildWire(key, .request);
+        defer wire.deinit(self.allocator);
 
         const req_json = try self.buildWireRequest(messages, extra_tools);
         defer self.allocator.free(req_json);
 
-        return try self.performResponseStream(response_url, auth_header, req_json, sink);
+        return try self.performResponseStream(&wire, req_json, sink);
     }
 
     /// The exchange, recorded when the run is being debugged.
@@ -612,15 +752,14 @@ pub const Client = struct {
     /// wrap the exchange is not compiled.
     fn performResponseStream(
         self: *Client,
-        response_url: []const u8,
-        auth_header: []const u8,
+        wire: *const Wire,
         req_json: []const u8,
         sink: StreamSink,
     ) !ApiResponse {
         if (comptime trace_mod.enabled) {
-            if (self.trace != null) return self.recordedResponseStream(response_url, auth_header, req_json, sink);
+            if (self.trace != null) return self.recordedResponseStream(wire, req_json, sink);
         }
-        return self.exchangeStreaming(response_url, auth_header, req_json, sink, null);
+        return self.exchangeStreaming(wire, req_json, sink, null);
     }
 
     /// The same exchange, with its bytes written into the trace the run holds.
@@ -630,20 +769,19 @@ pub const Client = struct {
     /// and the body has to be caught as it arrives, before the reader drops it.
     fn recordedResponseStream(
         self: *Client,
-        response_url: []const u8,
-        auth_header: []const u8,
+        wire: *const Wire,
         req_json: []const u8,
         sink: StreamSink,
     ) !ApiResponse {
         const trace = self.trace orelse
-            return self.exchangeStreaming(response_url, auth_header, req_json, sink, null);
+            return self.exchangeStreaming(wire, req_json, sink, null);
 
-        trace.request(self.trace_ctx, response_url, self.model, req_json, estimateTokens(req_json));
+        trace.request(self.trace_ctx, wire.url, self.model, req_json, estimateTokens(req_json));
         const started = std.Io.Timestamp.now(self.io, .awake);
         var raw: std.ArrayList(u8) = .empty;
         defer raw.deinit(self.allocator);
 
-        const parsed = self.exchangeStreaming(response_url, auth_header, req_json, sink, &raw) catch |err| {
+        const parsed = self.exchangeStreaming(wire, req_json, sink, &raw) catch |err| {
             // What the server said is more useful than the error's name, when
             // it said anything at all.
             const message = self.http_error orelse @errorName(err);
@@ -686,12 +824,12 @@ pub const Client = struct {
     /// Deltas are painted as they arrive, so text shown once must never arrive
     /// a second time: a stream that fails after the reply started ends the turn
     /// instead of being sent again.
-    fn exchangeStreaming(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
+    fn exchangeStreaming(self: *Client, wire: *const Wire, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             var delivery: Delivery = .{ .target = sink };
             const recorded = if (raw) |buffer| buffer.items.len else 0;
-            if (self.exchangeOnce(response_url, auth_header, req_json, delivery.sink(), raw)) |response| {
+            if (self.exchangeOnce(wire, req_json, delivery.sink(), raw)) |response| {
                 return response;
             } else |err| {
                 if (!shouldRetry(attempt, delivery.shown, self.retryable_status or isTransientNetworkError(err))) return err;
@@ -714,7 +852,7 @@ pub const Client = struct {
 
     /// One attempt at the exchange: the request, its response, and the stream
     /// that carries the answer to the sink.
-    fn exchangeOnce(self: *Client, response_url: []const u8, auth_header: []const u8, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
+    fn exchangeOnce(self: *Client, wire: *const Wire, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
         _ = self.requests.fetchAdd(1, .monotonic);
         self.retryable_status = false;
         if (self.transport) |transport| {
@@ -724,20 +862,16 @@ pub const Client = struct {
             if (raw) |buffer| buffer.appendSlice(self.allocator, body) catch {};
             self.discardHttpError();
             self.recordResponseUsage(body);
-            return parseResponse(self.allocator, body);
+            return self.parseBody(body);
         }
 
-        const headers = [_]std.http.Header{
-            .{ .name = "ChatGPT-Account-ID", .value = if (self.credentials) |c| c.account_id else "" },
-            .{ .name = "originator", .value = "codex_cli_rs" },
-        };
-        const uri = try std.Uri.parse(response_url);
+        const uri = try std.Uri.parse(wire.url);
         var req = try self.http_client.request(.POST, uri, .{
             .headers = .{
                 .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = auth_header },
+                .authorization = authorizationHeader(wire.*),
             },
-            .extra_headers = if (self.credentials != null) &headers else &.{},
+            .extra_headers = wire.extra,
             .redirect_behavior = .unhandled,
         });
         defer req.deinit();
@@ -793,15 +927,15 @@ pub const Client = struct {
             _ = try reader.streamRemaining(&buffered.writer);
             if (raw) |buffer| buffer.appendSlice(self.allocator, buffered.written()) catch {};
             self.recordResponseUsage(buffered.written());
-            return parseResponse(self.allocator, buffered.written());
+            return self.parseBody(buffered.written());
         }
 
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(self.allocator);
         var data: std.ArrayList(u8) = .empty;
         defer data.deinit(self.allocator);
-        var completed: ?[]u8 = null;
-        defer if (completed) |c| self.allocator.free(c);
+        var state: StreamState = .init(self.allocator);
+        defer state.deinit(self.allocator);
 
         while (true) {
             const avail = reader.buffered();
@@ -817,7 +951,7 @@ pub const Client = struct {
             while (i < avail.len) : (i += 1) {
                 const byte = avail[i];
                 if (byte == '\n') {
-                    try self.handleSseLine(line.items, &data, sink, &completed);
+                    try self.handleSseLine(line.items, &data, sink, &state);
                     line.clearRetainingCapacity();
                 } else if (byte != '\r') {
                     try line.append(self.allocator, byte);
@@ -826,13 +960,23 @@ pub const Client = struct {
             reader.toss(avail.len);
         }
         if (line.items.len > 0) {
-            try self.handleSseLine(line.items, &data, sink, &completed);
+            try self.handleSseLine(line.items, &data, sink, &state);
         }
 
-        if (data.items.len > 0) try self.dispatchSse(data.items, sink, &completed);
+        if (data.items.len > 0) try self.dispatchSse(data.items, sink, &state);
 
-        const final_body = completed orelse return error.ResponseNotCompleted;
-        const parsed = parseResponse(self.allocator, final_body) catch |err| {
+        // A Responses stream hands over its whole reply in the last event; a
+        // Messages stream has to be assembled into the message it described.
+        var assembled: ?[]u8 = null;
+        defer if (assembled) |rendered| self.allocator.free(rendered);
+        const final_body = switch (self.protocol) {
+            .responses => state.completed orelse return error.ResponseNotCompleted,
+            .messages => assembled: {
+                assembled = try state.messages.finish(self.allocator);
+                break :assembled assembled.?;
+            },
+        };
+        const parsed = self.parseBody(final_body) catch |err| {
             if (err == error.ApiError) self.recordHttpError(response.head.status, final_body);
             return err;
         };
@@ -844,7 +988,7 @@ pub const Client = struct {
         line: []const u8,
         data: *std.ArrayList(u8),
         sink: StreamSink,
-        completed: *?[]u8,
+        state: *StreamState,
     ) !void {
         if (line.len == 0) {
             // A blank line ends the event. Dispatch on the JSON object's own
@@ -852,7 +996,7 @@ pub const Client = struct {
             // may not always set.
             if (data.items.len == 0) return;
             defer data.clearRetainingCapacity();
-            try self.dispatchSse(data.items, sink, completed);
+            try self.dispatchSse(data.items, sink, state);
             return;
         }
         if (line[0] == ':') return;
@@ -869,12 +1013,28 @@ pub const Client = struct {
         self: *Client,
         data: []const u8,
         sink: StreamSink,
-        completed: *?[]u8,
+        state: *StreamState,
     ) !void {
+        if (self.protocol == .messages) {
+            // The events are the answer's own encoding, so the accumulator
+            // builds the message that a buffered reply would have carried.
+            state.messages.apply(data, sink) catch |err| {
+                if (err == error.ApiError) {
+                    self.recordApiError(
+                        state.messages.error_detail orelse "the stream reported an error",
+                        state.messages.transient,
+                    );
+                }
+                return err;
+            };
+            if (state.messages.takeUsage()) |usage| self.addUsage(usage);
+            return;
+        }
+
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
         defer parsed.deinit();
         const root = parsed.value;
-        if (root != .object or completed.* != null) return;
+        if (root != .object or state.completed != null) return;
 
         if (root.object.get("type")) |kind| {
             if (kind == .string and (std.mem.eql(u8, kind.string, "response.output_text.delta") or
@@ -911,13 +1071,22 @@ pub const Client = struct {
         const encoded = std.json.Stringify.valueAlloc(self.allocator, response_obj, .{}) catch return;
         // Persist usage at the terminal event, even if the connection later fails.
         self.addUsage(parseUsage(response_obj));
-        completed.* = encoded;
+        state.completed = encoded;
     }
 
     /// Keep what the server said, for the caller to report once no animation is
     /// using the terminal's line. The message is the server's own text when
     /// there is one, since "HTTP error: 429" alone is less useful than
     /// "rate limit reached".
+    /// Keep what a stream said when it failed after the response headers. The
+    /// status was fine, so the event's own message is all a reader can act on,
+    /// and the event's type decides whether another attempt may help.
+    fn recordApiError(self: *Client, message: []const u8, transient: bool) void {
+        if (self.http_error) |previous| self.allocator.free(previous);
+        self.http_error = std.fmt.allocPrint(self.allocator, "API error: {s}", .{message}) catch null;
+        self.retryable_status = transient;
+    }
+
     fn recordHttpError(self: *Client, status: std.http.Status, body: []const u8) void {
         // A failure overwrites the one before it: only the newest request's
         // outcome is being reported.
@@ -956,6 +1125,22 @@ const InputItem = union(enum) {
     }
 };
 
+/// Whether these recorded items were written by the Messages API rather than
+/// by Responses. A session that switched protocols keeps its history, and an
+/// item of the other protocol has to be left behind rather than replayed as if
+/// it were one of these.
+fn recordedByMessages(parsed: std.json.Value) bool {
+    for (parsed.array.items) |item| {
+        if (item != .object) continue;
+        const kind = item.object.get("type") orelse continue;
+        if (kind != .string) continue;
+        for ([_][]const u8{ "tool_use", "thinking", "redacted_thinking" }) |foreign| {
+            if (std.mem.eql(u8, kind.string, foreign)) return true;
+        }
+    }
+    return false;
+}
+
 /// All allocations belong to the caller's request-scoped arena.
 fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const InputItem {
     var input: std.ArrayList(InputItem) = .empty;
@@ -964,6 +1149,17 @@ fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const Inpu
             // Replay opaque items intact, including encrypted reasoning and IDs.
             const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, items, .{});
             if (parsed != .array) return error.InvalidResponseItems;
+            // Content blocks from the other protocol are not Responses items,
+            // so such a turn is rebuilt from its summary fields instead.
+            if (recordedByMessages(parsed)) {
+                if (message.content) |content| {
+                    try input.append(arena, .{ .message = .{ .role = message.role, .content = content } });
+                }
+                if (message.tool_calls) |calls| for (calls) |call| {
+                    try input.append(arena, .{ .call = .{ .call_id = call.id, .name = call.name, .arguments = call.arguments } });
+                };
+                continue;
+            }
             for (parsed.array.items) |item| {
                 if (item != .object) return error.InvalidResponseItems;
                 try input.append(arena, .{ .replay = item });
@@ -1025,41 +1221,52 @@ pub fn buildRequestWithToolSelection(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const input = try buildInput(arena, messages);
-    var functions: std.ArrayList(tool_schema.Function) = .empty;
-    if (selection) |selected| {
-        for (selected.builtin orelse &tool_schema.builtin) |tool| {
-            if (selected.builtin == null) {
-                if (std.mem.eql(u8, tool.name, "rg") and !search.rg) continue;
-                if (std.mem.eql(u8, tool.name, "grep") and search.rg) continue;
-                if (std.mem.eql(u8, tool.name, "fd") and !search.fd) continue;
-                if (std.mem.eql(u8, tool.name, "find") and search.fd) continue;
-                if (isOmitted(selected.omit, tool.name)) continue;
-            }
-            try functions.append(arena, try tool.function(arena));
-        }
-        const builtin_count = functions.items.len;
-        for (selected.extra) |entry| {
-            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, entry, .{});
-            try functions.append(arena, try readFunction(parsed));
-        }
-        std.mem.sort(tool_schema.Function, functions.items[builtin_count..], {}, struct {
-            fn lessThan(_: void, a: tool_schema.Function, b: tool_schema.Function) bool {
-                return std.mem.lessThan(u8, a.name, b.name);
-            }
-        }.lessThan);
-        for (functions.items, 0..) |function, i| {
-            for (functions.items[0..i]) |previous| {
-                if (std.mem.eql(u8, previous.name, function.name)) return error.DuplicateToolName;
-            }
-        }
-    }
+    const functions = try buildFunctions(arena, selection, search);
     return std.json.Stringify.valueAlloc(allocator, Request{
         .model = model,
         .max_output_tokens = max_tokens,
         .stream = stream,
         .input = input,
-        .tools = if (selection != null) functions.items else null,
+        .tools = if (selection != null) functions else null,
     }, .{ .emit_null_optional_fields = false });
+}
+
+/// Resolve a tool selection into the definitions a request carries, in the
+/// request-scoped arena. Both protocols offer the same tools; only the spelling
+/// of a definition differs.
+pub fn buildFunctions(
+    arena: std.mem.Allocator,
+    selection: ?ToolSelection,
+    search: search_tools.SearchBackends,
+) ![]const tool_schema.Function {
+    var functions: std.ArrayList(tool_schema.Function) = .empty;
+    const selected = selection orelse return functions.items;
+    for (selected.builtin orelse &tool_schema.builtin) |tool| {
+        if (selected.builtin == null) {
+            if (std.mem.eql(u8, tool.name, "rg") and !search.rg) continue;
+            if (std.mem.eql(u8, tool.name, "grep") and search.rg) continue;
+            if (std.mem.eql(u8, tool.name, "fd") and !search.fd) continue;
+            if (std.mem.eql(u8, tool.name, "find") and search.fd) continue;
+            if (isOmitted(selected.omit, tool.name)) continue;
+        }
+        try functions.append(arena, try tool.function(arena));
+    }
+    const builtin_count = functions.items.len;
+    for (selected.extra) |entry| {
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, entry, .{});
+        try functions.append(arena, try readFunction(parsed));
+    }
+    std.mem.sort(tool_schema.Function, functions.items[builtin_count..], {}, struct {
+        fn lessThan(_: void, a: tool_schema.Function, b: tool_schema.Function) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    for (functions.items, 0..) |function, i| {
+        for (functions.items[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, function.name)) return error.DuplicateToolName;
+        }
+    }
+    return functions.items;
 }
 
 /// Whether `name` is one of the tool names `omit` lists.
@@ -1600,14 +1807,14 @@ test "sse reasoning deltas reach the sink without counting as answer text" {
     defer capture.reasoning.deinit(allocator);
     const sink = StreamSink{ .context = &capture, .onText = Capture.onText, .onReasoning = Capture.onReasoning };
 
-    var completed: ?[]u8 = null;
-    defer if (completed) |c| allocator.free(c);
+    var state: StreamState = .init(allocator);
+    defer state.deinit(allocator);
 
     // Both shapes the protocol narrates thinking in: the model's own text and
     // the summary a reasoning request asks for.
-    try client.dispatchSse("{\"type\":\"response.reasoning_text.delta\",\"delta\":\"weigh \",\"item_id\":\"rs_1\",\"output_index\":0}", sink, &completed);
-    try client.dispatchSse("{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"the options\",\"item_id\":\"rs_1\",\"output_index\":0}", sink, &completed);
-    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}", sink, &completed);
+    try client.dispatchSse("{\"type\":\"response.reasoning_text.delta\",\"delta\":\"weigh \",\"item_id\":\"rs_1\",\"output_index\":0}", sink, &state);
+    try client.dispatchSse("{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"the options\",\"item_id\":\"rs_1\",\"output_index\":0}", sink, &state);
+    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}", sink, &state);
 
     try std.testing.expectEqualStrings("weigh the options", capture.reasoning.items);
     try std.testing.expectEqualStrings("answer", capture.text.items);
@@ -1618,7 +1825,7 @@ test "sse reasoning deltas reach the sink without counting as answer text" {
     };
     var nothing: u8 = 0;
     const plain = StreamSink{ .context = &nothing, .onText = Anonymous.onText };
-    try client.dispatchSse("{\"type\":\"response.reasoning_text.delta\",\"delta\":\"ignored\"}", plain, &completed);
+    try client.dispatchSse("{\"type\":\"response.reasoning_text.delta\",\"delta\":\"ignored\"}", plain, &state);
     try std.testing.expectEqualStrings("weigh the options", capture.reasoning.items);
 }
 
@@ -1680,16 +1887,16 @@ test "sse deltas stream to the sink and the final event is captured" {
     defer capture.seen.deinit(allocator);
     const sink = StreamSink{ .context = &capture, .onText = Capture.onText };
 
-    var completed: ?[]u8 = null;
-    defer if (completed) |c| allocator.free(c);
+    var state: StreamState = .init(allocator);
+    defer state.deinit(allocator);
 
-    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}", sink, &completed);
-    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"world\"}", sink, &completed);
-    try client.dispatchSse("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}", sink, &completed);
+    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}", sink, &state);
+    try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"world\"}", sink, &state);
+    try client.dispatchSse("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}", sink, &state);
 
     try std.testing.expectEqualStrings("Hello world", capture.seen.items);
-    try std.testing.expect(completed != null);
-    const parsed = try parseResponse(allocator, completed.?);
+    try std.testing.expect(state.completed != null);
+    const parsed = try parseResponse(allocator, state.completed.?);
     defer parsed.deinit(allocator);
     try std.testing.expectEqualStrings("Hello world", parsed.content.?);
     try std.testing.expectEqual(@as(u64, 12), parsed.usage.?.input_tokens);
@@ -1891,12 +2098,15 @@ test "buffered exchanges account usage before business errors and count every at
         .{ .body = "{\"status\":\"completed\",\"output\":[],\"usage\":{\"output_tokens\":2}}", .err = error.EmptyResponse },
         .{ .body = "{\"status\":\"failed\",\"error\":{}}", .err = error.ApiError },
     };
+    // Nothing is dialled: the transport stands in for the exchange, so only
+    // the request body and the answer it returns matter here.
+    var wire: Client.Wire = .{ .url = @constCast(@as([]const u8, "")) };
     for (cases) |case| {
         transport.body = case.body;
-        try std.testing.expectError(case.err, client.exchangeStreaming("", "", "{}", sink, null));
+        try std.testing.expectError(case.err, client.exchangeStreaming(&wire, "{}", sink, null));
     }
     transport.fail = true;
-    try std.testing.expectError(error.TestDisconnect, client.exchangeStreaming("", "", "{}", sink, null));
+    try std.testing.expectError(error.TestDisconnect, client.exchangeStreaming(&wire, "{}", sink, null));
     const counts = client.tokenCounts();
     try std.testing.expectEqual(@as(u64, 10), counts.input);
     try std.testing.expectEqual(@as(u64, 5), counts.output);
@@ -1929,24 +2139,24 @@ test "SSE counts only first terminal usage immediately even when output is inval
     const sink = StreamSink{ .context = &context, .onText = UsageTestTransport.onText };
     for ([_][]const u8{ "response.completed", "response.incomplete", "response.failed" }) |kind| {
         client.resetTokenCounters();
-        var completed: ?[]u8 = null;
-        defer if (completed) |body| a.free(body);
-        try client.dispatchSse("{\"type\":\"response.created\",\"response\":{\"usage\":{\"input_tokens\":900}}}", sink, &completed);
-        try client.dispatchSse("{\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":900}}}", sink, &completed);
-        try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"long text not estimated\"}", sink, &completed);
-        try std.testing.expect(completed == null);
+        var state: StreamState = .init(a);
+        defer state.deinit(a);
+        try client.dispatchSse("{\"type\":\"response.created\",\"response\":{\"usage\":{\"input_tokens\":900}}}", sink, &state);
+        try client.dispatchSse("{\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":900}}}", sink, &state);
+        try client.dispatchSse("{\"type\":\"response.output_text.delta\",\"delta\":\"long text not estimated\"}", sink, &state);
+        try std.testing.expect(state.completed == null);
         try std.testing.expectEqual(@as(u64, 0), client.tokenCounts().input);
         try std.testing.expectEqual(@as(u64, 0), client.tokenCounts().output);
         const event = try std.fmt.allocPrint(a, "{{\"type\":\"{s}\",\"response\":{{\"usage\":{{\"input_tokens\":5,\"total_tokens\":8}}}}}}", .{kind});
         defer a.free(event);
-        try client.dispatchSse(event, sink, &completed);
+        try client.dispatchSse(event, sink, &state);
         // Accounting has already happened; no final parse or clean EOF needed.
         try std.testing.expectEqual(@as(u64, 5), client.tokenCounts().input);
         try std.testing.expectEqual(@as(u64, 8), client.tokenCounts().total);
         try std.testing.expectEqual(@as(u64, 1), client.tokenCounts().usage_reports);
-        try client.dispatchSse(event, sink, &completed);
+        try client.dispatchSse(event, sink, &state);
         try std.testing.expectEqual(@as(u64, 1), client.tokenCounts().usage_reports);
-        try std.testing.expectError(error.InvalidResponse, parseResponse(a, completed.?));
+        try std.testing.expectError(error.InvalidResponse, parseResponse(a, state.completed.?));
     }
 }
 
