@@ -190,6 +190,24 @@ recommended. Number keys 1–9 select an option directly. Choose Other to type y
 own answer; Esc there goes back to the option list, so a mistyped start costs
 nothing.
 
+Long text is wrapped, never cut off at the right edge: a question, a label or the
+sentence describing an option continues on the next line, indented under its own
+text so the continuation is still read as part of that row. The form reserves the
+rows the wrapped text needs, so the whole question and its options are on screen
+even on a narrow terminal; when the screen has less than that, the row with the
+keyboard is the one kept whole, and a row that still does not fit ends in `…`:
+
+```
+   · 1   · Confirm
+  这个改动应该同时覆盖 macOS 与 Linux 上的换行行为，
+  请选择你希望我采用的处理方式
+    > 1) 完整实现并补测试 (recommended)  同时在 menu 与
+         render 两层实现换行，并补一个 pty 集成测试
+      2) 只改菜单渲染  只让 ask_user 表单换行
+      3) Other / 自定义回答
+  Tab/Shift+Tab · ↑/↓ select · Enter confirm · Esc cancel
+```
+
 The strip above the question names its tabs: a number per question and a final
 **Confirm**. The tab with the keyboard is cyan and underlined, `✓` marks an
 answered question, and the confirmation stays a `·` until every one of them has

@@ -278,21 +278,125 @@ const Form = struct {
     }
 };
 
-/// Flatten and bound every row so wrapping or embedded controls cannot break
-/// cursor movement, including with Chinese labels and narrow terminals.
-fn writeRow(w: *std.Io.Writer, allocator: std.mem.Allocator, raw: []const u8, columns: usize) !void {
+/// One styled run of a row: `style` is the SGR written before `text`, and the
+/// row resets the terminal at the end of every line it draws. Rows are built
+/// from these instead of hand-made escape strings so that styling survives
+/// wrapping, and so that only the styles named in this file reach the terminal.
+const Span = struct {
+    style: []const u8 = "",
+    text: []const u8 = "",
+};
+
+/// What one row came to: the terminal lines it took, and whether it had more
+/// text than the lines it was allowed to take.
+const Row = struct {
+    lines: usize = 1,
+    clipped: bool = false,
+};
+
+/// Write one logical row, wrapped onto as many lines as its text needs, and
+/// answer how many terminal lines it took.
+///
+/// A long question, option label or description continues on the next line,
+/// indented by `indent` spaces so that it lines up under the row's own text
+/// instead of under its marker. Text is sanitized as it is written, so a run
+/// may be model text as it arrives: controls are flattened and every sequence
+/// that is not one of ours is dropped, which keeps cursor movement exact even
+/// with Chinese labels and a narrow terminal.
+///
+/// `max_lines` bounds the height a row may take, and a row that is still not
+/// done when the lines run out ends with an ellipsis: pushing the rows below it
+/// out of the form would hide what the keys act on.
+fn writeRow(
+    w: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    spans: []const Span,
+    columns: usize,
+    indent: usize,
+    max_lines: usize,
+) !Row {
+    // The rightmost cell stays empty: a line that fills the terminal leaves it
+    // in the pending-wrap state, where the following newline moves down two
+    // rows on several emulators.
+    const limit = columns -| 1;
+    const continuation = @min(indent, limit -| 1);
+    var lines: usize = 1;
+    var col: usize = 0;
+    var style: []const u8 = "";
+    var clipped = false;
     var clean: std.Io.Writer.Allocating = .init(allocator);
     defer clean.deinit();
-    try sanitize.writeSanitized(&clean.writer, raw);
-    for (clean.written()) |*byte| {
-        if (byte.* == '\n' or byte.* == '\r' or byte.* == '\t') byte.* = ' ';
+    if (limit == 0) {
+        // A terminal this narrow has no room for text, and drawing it anyway
+        // would wrap the form into rows it never counted.
+        try w.writeAll(RESET ++ sgr.ERASE_LINE_END ++ "\r\n");
+        return .{};
     }
-    const bytes = clean.written();
-    const limit = columns -| 1;
-    const candidate = term.takeFit(bytes, limit);
-    const end = if (term.width(bytes[0..candidate]) <= limit) candidate else 0;
-    try w.writeAll(bytes[0..end]);
+
+    outer: for (spans) |span| {
+        if (span.text.len == 0) continue;
+        clean.clearRetainingCapacity();
+        try sanitize.writeSanitized(&clean.writer, span.text);
+        for (clean.written()) |*byte| {
+            if (byte.* == '\n' or byte.* == '\r' or byte.* == '\t') byte.* = ' ';
+        }
+        // A run with no style of its own ends the one before it, so a plain
+        // sentence after a bold label does not come out bold.
+        if (!std.mem.eql(u8, span.style, style)) {
+            try w.writeAll(if (span.style.len > 0) span.style else RESET);
+            style = span.style;
+        }
+        var rest: []const u8 = clean.written();
+        while (rest.len > 0) {
+            // A codepoint wider than the whole line fits nowhere: the row ends
+            // here rather than drawing past the terminal's edge.
+            if (term.codepointWidth(term.decodeAt(rest, 0)) > limit) {
+                clipped = true;
+                break :outer;
+            }
+            const room = limit -| col;
+            const take = term.takeFit(rest, room);
+            // A wide codepoint with only one cell left is wrapped to the next
+            // line rather than overflowing into the row below it.
+            const fits = col == 0 or term.width(rest[0..take]) <= room;
+            if (fits) {
+                var chunk: []const u8 = rest[0..take];
+                var next: []const u8 = rest[take..];
+                // Break between words when the line has a space to break at,
+                // so Latin text wraps the way it reads; Chinese and long paths
+                // break wherever the line ends.
+                if (next.len > 0) {
+                    if (std.mem.lastIndexOfScalar(u8, chunk, ' ')) |space| {
+                        if (space > 0) {
+                            chunk = rest[0..space];
+                            next = rest[space..];
+                        }
+                    }
+                    // Spaces the line was broken at leave nothing behind: they
+                    // are trailing blanks, and the next line is indented.
+                    chunk = std.mem.trimEnd(u8, chunk, " ");
+                }
+                try w.writeAll(chunk);
+                col += term.width(chunk);
+                rest = next;
+                if (rest.len == 0) break;
+            }
+            if (lines == max_lines) {
+                clipped = true;
+                break :outer;
+            }
+            try w.writeAll(RESET ++ sgr.ERASE_LINE_END ++ "\r\n");
+            lines += 1;
+            col = continuation;
+            for (0..continuation) |_| try w.writeByte(' ');
+            if (style.len > 0) try w.writeAll(style);
+            // The space the line was broken at does not start the next one.
+            while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+        }
+    }
+    if (clipped and col < limit) try w.writeAll("…");
     try w.writeAll(RESET ++ sgr.ERASE_LINE_END ++ "\r\n");
+    return .{ .lines = lines, .clipped = clipped };
 }
 
 /// What the user did at a menu. The free-text row, when offered, is the last
@@ -422,6 +526,31 @@ pub fn formRows(slots: []const Slot, allow_custom: bool, confirm_tab: bool) usiz
     return @as(usize, @intFromBool(slots.len > 1 or confirm_tab)) + options + 2;
 }
 
+/// The rows the form needs to draw every tab in full at `columns`: the strip,
+/// the question, all of its rows as they wrap, and the hint.
+///
+/// `formRows` counts rows, not lines, and is the floor a form asks for; this is
+/// what it asks for when the text does not fit a line. The dock gives what the
+/// screen can spare, and a form that has less than this draws what does fit.
+fn naturalRows(allocator: std.mem.Allocator, state: *Form, columns: usize) !usize {
+    const focus = state.focus;
+    defer state.focus = focus;
+    var probe: std.Io.Writer.Allocating = .init(allocator);
+    defer probe.deinit();
+    var tallest: usize = 0;
+    for (0..state.tabs()) |tab| {
+        state.focus = tab;
+        probe.clearRetainingCapacity();
+        const body = try drawBody(allocator, &probe.writer, state, columns, no_limit, state.tabs() > 1, true, visible_window, no_limit);
+        tallest = @max(tallest, body.lines);
+    }
+    return @as(usize, @intFromBool(state.tabs() > 1)) + tallest;
+}
+
+/// A height that bounds nothing, for the pass that measures how tall a form is
+/// before the space it will be drawn in is known.
+const no_limit: usize = 1_000;
+
 /// Put one or more questions to the user and let the form own the keyboard
 /// until every question is answered or the form is dismissed. Draw on stderr so
 /// redirected stdout receives no cursor control sequences.
@@ -485,16 +614,23 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var drawn: usize = 0;
+    // The height the dock was asked for last. It is carried from one redraw to
+    // the next: the floor is only what tells the form the width it draws at.
+    var reserved: usize = formRows(slots, allow_custom, confirm_tab);
     while (true) {
         aw.clearRetainingCapacity();
         if (dock) |target| {
-            const view = try target.prepare(target.context, formRows(slots, allow_custom, confirm_tab));
+            const view = try reserveDock(allocator, &state, target, &reserved);
             try aw.writer.writeAll(sgr.SYNC_BEGIN ++ sgr.HIDE_CURSOR);
             try drawDocked(allocator, &aw.writer, &state, view);
             try aw.writer.writeAll(sgr.RESTORE_CURSOR ++ sgr.SYNC_END);
         } else {
             if (drawn > 0) try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn});
-            const rows = try drawForm(allocator, &aw.writer, &state, term.columns(out), formRows(slots, allow_custom, confirm_tab));
+            const columns = term.columns(out);
+            const wanted = @max(formRows(slots, allow_custom, confirm_tab), try naturalRows(allocator, &state, columns));
+            // Without a screen to scroll in, a form taller than the window would
+            // push its own first rows out of reach of the redraw.
+            const rows = try drawForm(allocator, &aw.writer, &state, columns, @min(wanted, term.rows(out)));
             // Clear the tail of a taller standalone form.
             if (drawn > rows) {
                 for (0..drawn - rows) |_| try aw.writer.writeAll(sgr.ERASE_LINE_END ++ "\r\n");
@@ -524,6 +660,28 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
             }
         }
     }
+}
+
+/// Reserve the dock for one redraw and answer the view the form is drawn in.
+///
+/// The first request is what tells the form the width it will be drawn at, so
+/// the rows the wrapped text takes can be measured; the dock is then asked for
+/// those rows, if they are not the ones it was asked for already. It gives what
+/// the screen can spare, and the form draws what fits in that.
+///
+/// `reserved` carries the height asked for from one redraw to the next. Asking
+/// for the floor first on every redraw would make a dock that cannot grant the
+/// wrapped height swap between the two requests on each poll, and the screen
+/// repaints itself for every request it answers: a form far taller than the
+/// terminal would flicker for as long as it was open.
+fn reserveDock(allocator: std.mem.Allocator, state: *Form, dock: Dock, reserved: *usize) !Viewport {
+    var view = try dock.prepare(dock.context, reserved.*);
+    const natural = try naturalRows(allocator, state, view.columns);
+    if (natural != reserved.*) {
+        reserved.* = natural;
+        view = try dock.prepare(dock.context, natural);
+    }
+    return view;
 }
 
 /// Draw a form and read the line a free-text row asks for. Both the plain
@@ -706,51 +864,153 @@ fn drawDocked(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const For
 
 /// Draw the question tabs and the focused tab with its rows, returning the
 /// number of terminal rows used.
+///
+/// Rows wrap, so a row can be taller than one line and the answer rows may not
+/// all fit the space the form was given. The tab strip and the hint are
+/// reserved first; the question and its rows are then drawn into a buffer, and
+/// drawn again with one fewer option row while the row the keys act on is cut
+/// short. That row is drawn whole whenever the space allows it, and a
+/// neighbour that does not fit is clipped around it.
 fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, columns: usize, height: usize) !usize {
     if (height == 0) return 0;
     const show_tabs = state.tabs() > 1 and height >= 4;
-    var rows: usize = 0;
-    if (show_tabs) {
-        try drawTabs(allocator, w, state, columns);
-        rows += 1;
-    }
-    const slot = state.focusedSlot().*;
-    var header: std.Io.Writer.Allocating = .init(allocator);
-    defer header.deinit();
-    try header.writer.writeAll("  ");
-    if (state.slots.len > 1 and !state.onConfirm()) try header.writer.print("{d}/{d} ", .{ state.focus + 1, state.slots.len });
-    try header.writer.writeAll(slot.text);
-    if (slot.answered) {
-        if (slot.custom) |text|
-            try header.writer.print("  → {s}", .{text})
-        else if (slot.options.len > 0)
-            try header.writer.print("  → {s}", .{slot.options[@min(slot.selected, slot.options.len - 1)].label});
-    }
-    if (height >= 2) {
-        try w.writeAll(BOLD);
-        try writeRow(w, allocator, header.written(), columns);
-        rows += 1;
-    }
     const show_help = height >= 3;
-    const count = slot.rowCount(state.freeText());
-    const visible = @min(@min(count, visible_window), height - rows - @intFromBool(show_help));
-    const first = @min(slot.selected -| (visible / 2), count - visible);
-    for (first..first + visible) |i| {
-        var row: std.Io.Writer.Allocating = .init(allocator);
-        defer row.deinit();
-        try row.writer.print("    {s} {d}) ", .{ if (i == slot.selected) ">" else " ", i + 1 });
-        if (i < slot.options.len) {
-            const option = slot.options[i];
-            try row.writer.writeAll(option.label);
-            if (recommendedIndex(slot.options) == i) try row.writer.writeAll(" (recommended)");
-            if (option.description.len > 0) try row.writer.print("  " ++ DIM ++ "{s}" ++ RESET, .{option.description});
-        } else try row.writer.writeAll("Other / 自定义回答");
-        if (i == slot.selected) try w.writeAll(sgr.BOLD_CYAN);
-        try writeRow(w, allocator, row.written(), columns);
-        rows += 1;
+    const chrome: usize = @as(usize, @intFromBool(show_tabs)) + @intFromBool(show_help);
+    // What the question and its rows share: everything but the strip and the
+    // hint.
+    const body_height = height -| chrome;
+    // The question takes the lines its text needs, measured rather than guessed,
+    // but never the ones the answers are given in: two of those always stay,
+    // however long the question is.
+    var probe: std.Io.Writer.Allocating = .init(allocator);
+    defer probe.deinit();
+    const header_natural = (try drawHeader(allocator, &probe.writer, state, columns, no_limit)).lines;
+    const header_lines = @min(header_natural, @max(@as(usize, 1), body_height -| 2));
+    const count = state.focusedSlot().rowCount(state.freeText());
+
+    var visible = @min(count, visible_window);
+    var content: std.Io.Writer.Allocating = .init(allocator);
+    defer content.deinit();
+    var rows: usize = 0;
+    while (true) {
+        content.clearRetainingCapacity();
+        const body = try drawBody(allocator, &content.writer, state, columns, body_height, show_tabs, show_help, visible, header_lines);
+        rows = body.lines;
+        if (!body.focused_cut or visible <= 1) break;
+        visible -= 1;
     }
 
-    if (!show_help) return rows;
+    var drawn: usize = 0;
+    if (show_tabs) {
+        try drawTabs(allocator, w, state, columns);
+        drawn += 1;
+    }
+    try w.writeAll(content.written());
+    return drawn + rows;
+}
+
+/// What drawing the body came to.
+const Body = struct {
+    lines: usize,
+    /// The row the keys act on was cut short or left out because the space ran
+    /// out: one fewer option row would draw it whole.
+    focused_cut: bool = false,
+};
+
+/// The question of the focused tab, its number in the form, and — once it has
+/// an answer — what the answer was: the question carries the row's weight, the
+/// answer that follows it is dimmed, and the lines the question wraps onto sit
+/// under it, past the "1/2 " mark.
+fn drawHeader(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, columns: usize, max_lines: usize) !Row {
+    const slot = state.focusedSlot().*;
+    var prefix: std.Io.Writer.Allocating = .init(allocator);
+    defer prefix.deinit();
+    try prefix.writer.writeAll("  ");
+    if (state.slots.len > 1 and !state.onConfirm()) try prefix.writer.print("{d}/{d} ", .{ state.focus + 1, state.slots.len });
+    var answer: std.Io.Writer.Allocating = .init(allocator);
+    defer answer.deinit();
+    if (slot.answered) {
+        if (slot.custom) |text|
+            try answer.writer.print("  → {s}", .{text})
+        else if (slot.options.len > 0)
+            try answer.writer.print("  → {s}", .{slot.options[@min(slot.selected, slot.options.len - 1)].label});
+    }
+    const spans = [_]Span{
+        .{ .text = prefix.written() },
+        .{ .style = BOLD, .text = slot.text },
+        .{ .style = DIM, .text = answer.written() },
+    };
+    return writeRow(w, allocator, &spans, columns, term.width(prefix.written()), max_lines);
+}
+
+/// The focused question, the answer rows it offers, and the hint that names the
+/// keys: everything below the tab strip. `height` is the space the question and
+/// its rows share and no more than that is drawn from it; the strip is drawn by
+/// the caller and the hint comes on top of `height`, which is why the caller
+/// keeps a row for it.
+fn drawBody(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    state: *const Form,
+    columns: usize,
+    height: usize,
+    show_tabs: bool,
+    show_help: bool,
+    visible: usize,
+    header_lines: usize,
+) !Body {
+    var rows: usize = 0;
+    // Whether the row the keys act on was drawn whole: the caller gives it more
+    // space by drawing one fewer row.
+    var focused_cut = false;
+    var focused_drawn = false;
+    const slot = state.focusedSlot().*;
+
+    if (height >= 2) rows += (try drawHeader(allocator, w, state, columns, header_lines)).lines;
+
+    const count = slot.rowCount(state.freeText());
+    const shown = @min(visible, count);
+    const first = @min(slot.selected -| (shown / 2), count -| shown);
+    for (first..first + shown) |i| {
+        // A row may take what is left: the focused row is drawn whole before
+        // its neighbours get anything, and the caller shrinks the window when
+        // even that is not enough.
+        const remaining = height -| rows;
+        if (remaining == 0) break;
+        const selected = i == slot.selected;
+        const marker = if (selected) sgr.BOLD_CYAN else "";
+        var prefix_buf: [32]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_buf, "    {s} {d}) ", .{ if (selected) ">" else " ", i + 1 });
+        var body: std.Io.Writer.Allocating = .init(allocator);
+        defer body.deinit();
+        var description: std.Io.Writer.Allocating = .init(allocator);
+        defer description.deinit();
+        if (i < slot.options.len) {
+            const option = slot.options[i];
+            try body.writer.writeAll(option.label);
+            if (recommendedIndex(slot.options) == i) try body.writer.writeAll(" (recommended)");
+            if (option.description.len > 0) try description.writer.print("  {s}", .{option.description});
+        } else try body.writer.writeAll("Other / 自定义回答");
+
+        const spans = [_]Span{
+            .{ .style = marker, .text = prefix },
+            .{ .style = marker, .text = body.written() },
+            .{ .style = DIM, .text = description.written() },
+        };
+        // A wrapped label and description line up under the label, past the
+        // "   > 1) " marker that tells them apart from the question above.
+        const row = try writeRow(w, allocator, &spans, columns, term.width(prefix), remaining);
+        rows += row.lines;
+        if (i == slot.selected) {
+            focused_drawn = true;
+            focused_cut = row.clipped;
+        }
+    }
+    // A window too tall for the space leaves the focused row out altogether,
+    // which one fewer row would draw.
+    if (!focused_drawn) focused_cut = true;
+
+    if (!show_help) return .{ .lines = rows, .focused_cut = focused_cut };
     var hint: std.Io.Writer.Allocating = .init(allocator);
     defer hint.deinit();
     try hint.writer.writeAll("  ");
@@ -759,9 +1019,11 @@ fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form,
         "↑/↓ select · Enter submit · Esc cancel"
     else
         "↑/↓ select · Enter confirm · Esc cancel");
-    try w.writeAll(DIM);
-    try writeRow(w, allocator, hint.written(), columns);
-    return rows + 1;
+    const spans = [_]Span{.{ .style = DIM, .text = hint.written() }};
+    // The hint is one line by construction: it names keys, and a wrapped copy
+    // would take a row from the answers it is explaining.
+    rows += (try writeRow(w, allocator, &spans, columns, 2, 1)).lines;
+    return .{ .lines = rows, .focused_cut = focused_cut };
 }
 
 /// A closed menu with no free-text row; defaults to the first option. The
@@ -1024,7 +1286,9 @@ test "the form draws horizontal tabs and only the focused question" {
     // The strip is indented like the header and the hint under it, so it reads
     // as part of the form rather than as a row of the log.
     try std.testing.expect(std.mem.startsWith(u8, text, tabs_indent ++ sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 1 "));
-    try std.testing.expect(std.mem.indexOf(u8, text, "1/2 First question?") != null);
+    // The question carries the row's weight, and the answer that follows it is
+    // dimmed: the row is no longer one undifferentiated string.
+    try std.testing.expect(std.mem.indexOf(u8, text, "1/2 " ++ BOLD ++ "First question?") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 1 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Second question?") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "1) Alpha") != null);
@@ -1037,7 +1301,7 @@ test "the form draws horizontal tabs and only the focused question" {
     slots[0].answered = true;
     aw.clearRetainingCapacity();
     _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
-    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "First question?  → Beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "First question?" ++ DIM ++ "  → Beta") != null);
 }
 
 test "the strip ends on the confirmation, which submits or takes the words" {
@@ -1052,7 +1316,7 @@ test "the strip ends on the confirmation, which submits or takes the words" {
     _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
     const text = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, text, sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · Confirm ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "  Confirm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "  " ++ BOLD ++ "Confirm") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "> 1) Submit") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "2) Supplement") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Type your own words to add") != null);
@@ -1156,11 +1420,155 @@ test "short question forms keep the selected option and omit tabs before options
     }
 }
 
-test "menu rows fit CJK text and flatten model control characters" {
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+test "menu rows wrap CJK text and flatten model control characters" {
+    const allocator = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    try writeRow(&aw.writer, std.testing.allocator, "你\n好\x1b[2J世界", 7);
-    try std.testing.expectEqualStrings("你 好" ++ RESET ++ "\x1b[K\r\n", aw.written());
+
+    // Nothing is cut off at the right edge: a row that does not fit carries on
+    // the next line, indented under its own text.
+    const plain = [_]Span{.{ .text = "你好世界" }};
+    const two = try writeRow(&aw.writer, allocator, &plain, 7, 2, 4);
+    try std.testing.expectEqual(@as(usize, 2), two.lines);
+    try std.testing.expect(!two.clipped);
+    try std.testing.expectEqualStrings(
+        "你好世" ++ RESET ++ "\x1b[K\r\n" ++ "  界" ++ RESET ++ "\x1b[K\r\n",
+        aw.written(),
+    );
+
+    // Controls and escapes in model text are flattened rather than drawn, so a
+    // row may carry what a model wrote without moving the cursor.
+    aw.clearRetainingCapacity();
+    const controls = [_]Span{.{ .text = "你\n好\x1b[2J世界" }};
+    const flattened = try writeRow(&aw.writer, allocator, &controls, 80, 2, 4);
+    try std.testing.expectEqual(@as(usize, 1), flattened.lines);
+    try std.testing.expectEqualStrings("你 好世界" ++ RESET ++ "\x1b[K\r\n", aw.written());
+
+    // A row that runs out of the lines it may take says so with an ellipsis,
+    // instead of silently losing its tail.
+    aw.clearRetainingCapacity();
+    const long = [_]Span{.{ .text = "你好世界你好" }};
+    const clipped = try writeRow(&aw.writer, allocator, &long, 12, 0, 1);
+    try std.testing.expectEqual(@as(usize, 1), clipped.lines);
+    try std.testing.expect(clipped.clipped);
+    try std.testing.expectEqualStrings("你好世界你…" ++ RESET ++ "\x1b[K\r\n", aw.written());
+}
+
+test "a wrapped row breaks between words and keeps its style" {
+    const allocator = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    // Eleven columns of room: "one two" fits, and the space it was broken at
+    // does not start the next line, which is indented under the row's text.
+    const words = [_]Span{.{ .style = BOLD, .text = "one two three" }};
+    const broke = try writeRow(&aw.writer, allocator, &words, 12, 3, 4);
+    try std.testing.expectEqual(@as(usize, 2), broke.lines);
+    try std.testing.expectEqualStrings(
+        BOLD ++ "one two" ++ RESET ++ "\x1b[K\r\n" ++
+            "   " ++ BOLD ++ "three" ++ RESET ++ "\x1b[K\r\n",
+        aw.written(),
+    );
+
+    // Each run keeps its own colour across the wrap, and the description that
+    // follows it is dim: a row is no longer one undifferentiated line.
+    aw.clearRetainingCapacity();
+    const mixed = [_]Span{
+        .{ .style = sgr.BOLD_CYAN, .text = "    > 1) Alpha" },
+        .{ .style = DIM, .text = "  first choice" },
+    };
+    const described = try writeRow(&aw.writer, allocator, &mixed, 24, 9, 4);
+    try std.testing.expectEqual(@as(usize, 2), described.lines);
+    try std.testing.expectEqualStrings(
+        sgr.BOLD_CYAN ++ "    > 1) Alpha" ++ DIM ++ "  first" ++ RESET ++ "\x1b[K\r\n" ++
+            "         " ++ DIM ++ "choice" ++ RESET ++ "\x1b[K\r\n",
+        aw.written(),
+    );
+}
+
+test "the form asks for the rows long text wraps onto, and draws them all" {
+    const allocator = std.testing.allocator;
+    const long_options = [_]Option{
+        .{
+            .label = "完整实现并补测试",
+            .description = "同时在 menu 与 render 两层实现换行，并补一个 pty 集成测试验证窄终端下的表现。",
+            .recommended = true,
+        },
+        .{ .label = "只改菜单渲染", .description = "", .recommended = false },
+    };
+    var slots = [_]Slot{Slot.init("这个改动应该同时覆盖 macOS 与 Linux 上的换行行为，请选择你希望我采用的处理方式", &long_options)};
+    var state = Form{ .slots = &slots };
+
+    // Wrapped at a narrow width the form is taller than counting rows, not
+    // lines, would have it: that is the height it asks the dock for.
+    const narrow = 30;
+    const natural = try naturalRows(allocator, &state, narrow);
+    try std.testing.expect(natural > formRows(&slots, true, false));
+
+    // Drawn in that space the question and the answer rows are drawn whole —
+    // no ellipsis, no line wider than the terminal — and every row is there
+    // rather than only the focused one. The hint is the one row that is a key
+    // legend, and it is cut short instead of taking a row of its own.
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try std.testing.expectEqual(natural, try drawForm(allocator, &aw.writer, &state, narrow, natural));
+    var hint_row = false;
+    var lines = std.mem.splitSequence(u8, aw.written(), "\r\n");
+    while (lines.next()) |line| {
+        try std.testing.expect(term.width(line) <= narrow - 1);
+        if (std.mem.indexOf(u8, line, "↑/↓ select") != null) {
+            hint_row = true;
+            continue;
+        }
+        if (!hint_row) try std.testing.expect(std.mem.indexOf(u8, line, "…") == null);
+    }
+    try std.testing.expect(hint_row);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "只改菜单渲染") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "Other / 自定义回答") != null);
+}
+
+/// A dock that grants no more than `cap` rows and records the heights it was
+/// asked for, so one form's requests across redraws can be watched.
+const DockProbe = struct {
+    cap: usize,
+    width: usize,
+    asked: std.ArrayList(usize) = .empty,
+
+    fn prepare(context: *anyopaque, wanted: usize) anyerror!Viewport {
+        const self: *DockProbe = @ptrCast(@alignCast(context));
+        try self.asked.append(std.testing.allocator, wanted);
+        return .{ .top = 1, .height = @max(@as(usize, 1), @min(wanted, self.cap)), .columns = self.width };
+    }
+};
+
+test "a form taller than the dock asks for one height, however often it is redrawn" {
+    const allocator = std.testing.allocator;
+    const long_options = [_]Option{
+        .{ .label = "完整实现并补测试", .description = "同时在 menu 与 render 两层实现换行，并补一个集成测试。", .recommended = true },
+        .{ .label = "只改菜单渲染", .description = "", .recommended = false },
+    };
+    var slots = [_]Slot{Slot.init("这个改动应该同时覆盖 macOS 与 Linux 上的换行行为，请选择你希望我采用的处理方式", &long_options)};
+    var state = Form{ .slots = &slots };
+
+    var probe = DockProbe{ .cap = 6, .width = 30 };
+    defer probe.asked.deinit(allocator);
+    const dock = Dock{ .context = &probe, .prepare = DockProbe.prepare };
+
+    // The screen is polled while a form is open, so it is drawn again and again
+    // with nothing typed in between.
+    var reserved = formRows(&slots, true, false);
+    for (0..3) |_| _ = try reserveDock(allocator, &state, dock, &reserved);
+
+    // The floor comes first, because the width the form draws at is only known
+    // once the dock is asked. The wrapped height follows, and every redraw
+    // after that asks for the same one: a dock asked for two heights in turn
+    // would repaint the whole screen on every poll.
+    const natural = try naturalRows(allocator, &state, probe.width);
+    try std.testing.expect(natural > probe.cap);
+    try std.testing.expectEqual(4, probe.asked.items.len);
+    try std.testing.expectEqual(formRows(&slots, true, false), probe.asked.items[0]);
+    for (probe.asked.items[1..]) |wanted| try std.testing.expectEqual(natural, wanted);
+    try std.testing.expectEqual(natural, reserved);
 }
 
 test "the menu marks only the first recommended option" {
