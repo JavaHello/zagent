@@ -126,15 +126,34 @@ pub fn executeShellTimed(
     io: std.Io,
     allocator: std.mem.Allocator,
     command: []const u8,
+    cwd: ?[]const u8,
     env: ?*const std.process.Environ.Map,
     timeout_seconds: u32,
 ) !ToolResult {
     var collector: Collector = .{ .allocator = allocator };
     defer collector.deinit();
 
+    // The directory a call names is opened before the shell is started, and
+    // handed over as an open handle: a path that is not there is refused as the
+    // directory it asked for, rather than reported as a shell that could not be
+    // run.
+    var dir: ?std.Io.Dir = null;
+    defer if (dir) |open| open.close(io);
+    if (cwd) |path| {
+        dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch |err| return .{
+            .output = try std.fmt.allocPrint(
+                allocator,
+                "Error: '{s}' is not a directory the command can run in ({s}).",
+                .{ path, @errorName(err) },
+            ),
+            .is_error = true,
+        };
+    }
+
     const shell = host_exec.run(io, allocator, .{
         .argv = &.{ "bash", "--noprofile", "--norc", "-c", command },
         .env = env,
+        .cwd = if (dir) |open| .{ .dir = open } else .inherit,
         .timeout_seconds = timeout_seconds,
     }, &collector) catch |err| return .{
         .output = try std.fmt.allocPrint(allocator, "Error: the shell could not be run ({s}).", .{@errorName(err)}),
@@ -167,14 +186,14 @@ pub fn executeShellTimed(
     return ownedResult(try collector.take(), ending);
 }
 
-/// The bash tool: one command and one deadline. Its output is the command's
-/// own, whole; a long one is cached by the hook every tool's result passes
-/// through.
+/// The bash tool: one command, one directory and one deadline. Its output is
+/// the command's own, whole; a long one is cached by the hook every tool's
+/// result passes through.
 pub const spec: tool.Tool = .{
     .name = "bash",
     .description = "Execute a Bash command once. The whole output is returned; one larger than 8 KiB is cached, and the call answers with a preview of it, the cache id, its line count and its size, and ccr_retrieve reads the rest by id.",
     .parameters_json =
-    \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}
+    \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Directory to run the command in, absolute or relative to the working directory. Defaults to the working directory; name it here instead of writing 'cd dir && ...'."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}
     ,
     .label = "bash…",
     .summary = writeSummary,
@@ -183,18 +202,33 @@ pub const spec: tool.Tool = .{
 
 /// The command is the whole of what the call says, and it is worth reading to
 /// its end: the escaped JSON form of a line carrying quotes and newlines tells
-/// nobody what is about to run.
+/// nobody what is about to run. The directory follows it, because where a
+/// command runs is part of which command it is.
 fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
-    return summary.writeFields(w, ctx.allocator, arguments, &.{ "command", "timeout_seconds" });
+    return summary.writeFields(w, ctx.allocator, arguments, &.{ "command", "cwd", "timeout_seconds" });
 }
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
     const command = args_mod.requiredString(ctx.allocator, arguments, "command") catch
         return ctx.refuse("Error: missing 'command' argument");
     defer ctx.allocator.free(command);
+    const cwd = parseCwd(ctx.allocator, arguments) catch
+        return ctx.refuse("Invalid cwd: it is a directory path, as a string.");
+    defer if (cwd) |path| ctx.allocator.free(path);
     const timeout_seconds = parseTimeout(ctx.allocator, arguments) catch
         return ctx.refuse("Invalid timeout_seconds: use an integer from 1 to 3600.");
-    return executeShellTimed(ctx.io, ctx.allocator, command, ctx.env, timeout_seconds);
+    return executeShellTimed(ctx.io, ctx.allocator, command, cwd, ctx.env, timeout_seconds);
+}
+
+/// The directory a call named, owned by the caller, or null when it named none:
+/// the command then runs where this process does. An empty string counts as no
+/// directory, so a model that sends `"cwd": ""` runs in the working directory
+/// rather than being refused for it.
+fn parseCwd(allocator: std.mem.Allocator, arguments: []const u8) !?[]const u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+    return args_mod.optionalString(allocator, parsed.value.object.get("cwd"));
 }
 
 /// The deadline a call asked for, in seconds. Arguments that do not parse, or a
@@ -209,9 +243,58 @@ fn parseTimeout(allocator: std.mem.Allocator, arguments: []const u8) !u32 {
     return @intCast(value.integer);
 }
 
-/// One command run at the default deadline: what the tests below assert on.
+/// One command run at the default deadline, in the working directory: what the
+/// tests below assert on.
 fn runShell(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ToolResult {
-    return executeShellTimed(io, allocator, command, null, default_timeout_seconds);
+    return executeShellTimed(io, allocator, command, null, null, default_timeout_seconds);
+}
+
+test "a call's cwd is read from its arguments and shown on its line" {
+    const a = std.testing.allocator;
+    const arguments = "{\"command\":\"pwd\",\"cwd\":\"src\",\"timeout_seconds\":30}";
+
+    const cwd = (try parseCwd(a, arguments)).?;
+    defer a.free(cwd);
+    try std.testing.expectEqualStrings("src", cwd);
+    // An empty string is no directory, not one called "": the command runs
+    // where this process does.
+    try std.testing.expect((try parseCwd(a, "{\"command\":\"pwd\",\"cwd\":\"\"}")) == null);
+    // A cwd that is not a string is refused rather than guessed at.
+    try std.testing.expectError(error.InvalidArguments, parseCwd(a, "{\"command\":\"pwd\",\"cwd\":7}"));
+
+    // Where a command runs is part of which command it is, so the line says it.
+    const ctx: tool.Context = .{ .io = std.testing.io, .allocator = a };
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try std.testing.expect(try writeSummary(ctx, &aw.writer, arguments));
+    try std.testing.expectEqualStrings("pwd · cwd src · timeout_seconds 30", aw.written());
+}
+
+test "a command runs in the directory its call names, and only there" {
+    const a = std.testing.allocator;
+    // The directory is the shell's own, so `pwd` is the answer to which one it
+    // started in: a command that means to work in a subdirectory says so once,
+    // instead of carrying `cd ... &&` in front of everything it runs.
+    const nested = try executeShellTimed(std.testing.io, a, "pwd", "src/tools", null, default_timeout_seconds);
+    defer nested.deinit(a);
+    try std.testing.expect(!nested.is_error);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, nested.output, "\n"), "/src/tools"));
+
+    // The next call is unaffected: the directory was this call's, not the
+    // session's, so there is nothing to undo and nothing to remember.
+    const inherited = try executeShellTimed(std.testing.io, a, "pwd", null, null, default_timeout_seconds);
+    defer inherited.deinit(a);
+    const here = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(here);
+    try std.testing.expectEqualStrings(here, std.mem.trimEnd(u8, inherited.output, "\n"));
+
+    // A directory that is not there is refused as the directory it named, with
+    // the path in the message, and nothing is run.
+    const missing = try executeShellTimed(std.testing.io, a, "pwd", "no such directory", null, default_timeout_seconds);
+    defer missing.deinit(a);
+    try std.testing.expect(missing.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, missing.output, "no such directory") != null);
+    try std.testing.expectEqual(@as(?u8, null), missing.exit_code);
 }
 
 test "a long output is handed over whole, and the tool adds nothing to it" {
@@ -306,7 +389,7 @@ test "a command that prints without end is ended by its deadline" {
     const a = std.testing.allocator;
     // Printing slowly keeps the test about the deadline rather than about how
     // much this machine can hold: what the collector keeps is not bounded.
-    const result = try executeShellTimed(std.testing.io, a, "while :; do sleep 0.05; printf 'y\\n'; done", null, 1);
+    const result = try executeShellTimed(std.testing.io, a, "while :; do sleep 0.05; printf 'y\\n'; done", null, null, 1);
     defer result.deinit(a);
     try std.testing.expect(result.is_error and result.timed_out);
     try std.testing.expectEqualStrings("Tool timed out after 1s.", result.output);

@@ -58,6 +58,10 @@ pub const Options = struct {
     argv: []const []const u8,
     /// The environment the program runs with; null inherits this process's.
     env: ?*const std.process.Environ.Map = null,
+    /// Where the program runs. A caller that names a directory hands over an
+    /// open handle rather than a path, so the program starts in the directory
+    /// that was checked, whatever happens to the path in between.
+    cwd: std.process.Child.Cwd = .inherit,
     /// How long the program may run before its group is killed.
     timeout_seconds: u32,
 };
@@ -77,6 +81,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, options: Options, sink: any
     var child = try std.process.spawn(io, .{
         .argv = options.argv,
         .environ_map = options.env,
+        .cwd = options.cwd,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,

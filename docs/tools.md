@@ -32,14 +32,22 @@ selection, see [Searching](searching.md).
 
 ## `bash`
 
-Runs a command with `bash --noprofile --norc -c`, not `/bin/sh`, in the current
-working directory. The command inherits the host environment, permissions and
-network access — see [Security and state](security.md).
+Runs a command with `bash --noprofile --norc -c`, not `/bin/sh`, in the working
+directory unless the call names another. The command inherits the host
+environment, permissions and network access — see [Security and state](security.md).
 
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `command` | yes | The command line to run |
+| `cwd` | no | Directory to run it in, absolute or relative to the working directory |
 | `timeout_seconds` | no | Deadline for this call, 1–3600; the default is 180 |
+
+`cwd` is opened once, before the shell starts, and the shell is given that
+handle rather than a path; a directory that is not there is refused with the
+path it named, before anything runs. The directory belongs to that one call: the
+next call runs in the working directory again unless it names one too, and the
+other tools still resolve their paths from the working directory. It replaces
+the `cd … && …` a command would otherwise carry.
 
 The call returns the merged output and the exit status. A command that runs past
 the deadline is terminated with its process group, so a background child does
