@@ -23,7 +23,7 @@ the shell's own scrollback comes back untouched when zagent exits.
   Enter to send, Shift+Enter for newline, Ctrl+Z to suspend, Ctrl+D to exit. /help for commands.
 
 ❯ list all .zig files in the current directory
-  ⚙ bash find . -name '*.zig' -type f
+  ⚙ bash find . -name '*.zig' -type f · cwd .
   ✓ exit 0
     ./src/agent/mod.zig
     ./src/model/config.zig

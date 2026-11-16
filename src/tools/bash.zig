@@ -204,8 +204,14 @@ pub const spec: tool.Tool = .{
 /// its end: the escaped JSON form of a line carrying quotes and newlines tells
 /// nobody what is about to run. The directory follows it, because where a
 /// command runs is part of which command it is.
+///
+/// A call that names no directory runs in the working directory, so its line
+/// says `cwd .` rather than nothing: the line answers where this command runs
+/// for every call, not only for the ones that took the trouble to say.
 fn writeSummary(ctx: tool.Context, w: *std.Io.Writer, arguments: []const u8) !bool {
-    return summary.writeFields(w, ctx.allocator, arguments, &.{ "command", "cwd", "timeout_seconds" });
+    return summary.writeFieldsWithDefaults(w, ctx.allocator, arguments, &.{ "command", "cwd", "timeout_seconds" }, &.{
+        .{ .field = "cwd", .value = "." },
+    });
 }
 
 fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
@@ -268,6 +274,16 @@ test "a call's cwd is read from its arguments and shown on its line" {
     defer aw.deinit();
     try std.testing.expect(try writeSummary(ctx, &aw.writer, arguments));
     try std.testing.expectEqualStrings("pwd · cwd src · timeout_seconds 30", aw.written());
+
+    // A call that names no directory runs in the working directory, and its
+    // line says where rather than leaving the reader to know the default; an
+    // empty string is that same call, so it reads the same way.
+    aw.clearRetainingCapacity();
+    try std.testing.expect(try writeSummary(ctx, &aw.writer, "{\"command\":\"pwd\"}"));
+    try std.testing.expectEqualStrings("pwd · cwd .", aw.written());
+    aw.clearRetainingCapacity();
+    try std.testing.expect(try writeSummary(ctx, &aw.writer, "{\"command\":\"pwd\",\"cwd\":\"\"}"));
+    try std.testing.expectEqualStrings("pwd · cwd .", aw.written());
 }
 
 test "a command runs in the directory its call names, and only there" {

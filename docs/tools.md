@@ -47,7 +47,10 @@ handle rather than a path; a directory that is not there is refused with the
 path it named, before anything runs. The directory belongs to that one call: the
 next call runs in the working directory again unless it names one too, and the
 other tools still resolve their paths from the working directory. It replaces
-the `cd … && …` a command would otherwise carry.
+the `cd … && …` a command would otherwise carry. The call's line always states
+the directory — the one the call named, or `.` for the working directory — so
+where a command runs is read beside the command rather than inferred from a
+missing argument.
 
 The call returns the merged output and the exit status. A command that runs past
 the deadline is terminated with its process group, so a background child does

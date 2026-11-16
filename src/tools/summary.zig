@@ -32,7 +32,8 @@ const separator = " · ";
 /// after it carry their names, so that no two values are read as one. An
 /// argument the call did not send, an empty string and a flag that is off are
 /// left out: the line says what the call asked for, and a default is not
-/// something it asked for.
+/// something it asked for — unless the tool declares one for that argument, as
+/// `bash` does for `cwd` through `writeFieldsWithDefaults`.
 ///
 /// Answers whether anything was written. A tool whose arguments it cannot read
 /// says so, and its call keeps the raw text: that is the one case where the JSON
@@ -43,10 +44,50 @@ pub fn writeFields(
     arguments: []const u8,
     fields: []const []const u8,
 ) !bool {
+    return writeFieldsWithDefaults(w, allocator, arguments, fields, &.{});
+}
+
+/// What a tool does when a call says nothing about one of its arguments: the
+/// value `writeFieldsWithDefaults` writes in its place.
+///
+/// A default the call did not choose can still be part of what the call is.
+/// `bash` is the tool that has one: every command runs somewhere, and a call
+/// that names no directory runs in the working directory. Its line says `.`
+/// there, because "somewhere this program decided" is not what a reader of the
+/// line should have to guess.
+pub const Default = struct {
+    /// The argument the value stands in for, as the tool's spec spells it.
+    field: []const u8,
+    /// What to write when the call leaves the argument out or sends it empty.
+    value: []const u8,
+};
+
+/// `writeFields`, with the values a tool declared for the arguments a call says
+/// nothing about. Every field is written where the tool listed it, so a
+/// defaulted one sits between its neighbours exactly as a sent one would.
+pub fn writeFieldsWithDefaults(
+    w: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    arguments: []const u8,
+    fields: []const []const u8,
+    defaults: []const Default,
+) !bool {
     const parsed = parseObject(allocator, arguments) orelse return false;
     defer parsed.deinit();
     var line: Line = .{ .w = w, .allocator = allocator };
-    for (fields) |field| try line.field(field, parsed.value.object.get(field) orelse continue);
+    for (fields) |field| {
+        if (parsed.value.object.get(field)) |value| {
+            if (!saysNothing(value)) {
+                try line.field(field, value);
+                continue;
+            }
+        }
+        for (defaults) |default| {
+            if (!std.mem.eql(u8, default.field, field)) continue;
+            try line.field(field, .{ .string = default.value });
+            break;
+        }
+    }
     return line.written;
 }
 
@@ -91,6 +132,18 @@ fn parseObject(allocator: std.mem.Allocator, arguments: []const u8) ?std.json.Pa
     return parsed;
 }
 
+/// Whether this value is the call saying nothing about its argument: absent is
+/// handled by the caller, and here are the three ways a value says nothing.
+fn saysNothing(value: std.json.Value) bool {
+    return switch (value) {
+        .null => true,
+        .string => |text| text.len == 0,
+        // A flag that is off is the default, and says nothing.
+        .bool => |on| !on,
+        else => false,
+    };
+}
+
 /// One line being built: where it goes, and whether anything yet has.
 const Line = struct {
     w: *std.Io.Writer,
@@ -98,17 +151,7 @@ const Line = struct {
     written: bool = false,
 
     fn field(self: *Line, name: []const u8, value: std.json.Value) !void {
-        switch (value) {
-            .null => return,
-            .string => |text| {
-                if (text.len == 0) return;
-            },
-            // A flag that is off is the default, and says nothing.
-            .bool => |on| {
-                if (!on) return;
-            },
-            else => {},
-        }
+        if (saysNothing(value)) return;
         // A flag carries its name as the whole of what it says: `hidden`, not
         // `hidden true`.
         const flag = value == .bool;
@@ -142,6 +185,26 @@ const Line = struct {
         }
     }
 };
+
+test "a declared default is written where the call says nothing, in its place in the line" {
+    const a = std.testing.allocator;
+    const defaults: []const Default = &.{.{ .field = "cwd", .value = "." }};
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+
+    try std.testing.expect(try writeFieldsWithDefaults(&out.writer, a, "{\"command\":\"pwd\",\"timeout_seconds\":30}", &.{ "command", "cwd", "timeout_seconds" }, defaults));
+    try std.testing.expectEqualStrings("pwd · cwd . · timeout_seconds 30", out.written());
+
+    // A value the call did send stands: the default is only for silence.
+    out.clearRetainingCapacity();
+    try std.testing.expect(try writeFieldsWithDefaults(&out.writer, a, "{\"command\":\"pwd\",\"cwd\":\"src\"}", &.{ "command", "cwd" }, defaults));
+    try std.testing.expectEqualStrings("pwd · cwd src", out.written());
+
+    // An argument with no default declared stays out, as `writeFields` leaves it.
+    out.clearRetainingCapacity();
+    try std.testing.expect(try writeFieldsWithDefaults(&out.writer, a, "{\"command\":\"pwd\"}", &.{ "command", "cwd", "limit" }, defaults));
+    try std.testing.expectEqualStrings("pwd · cwd .", out.written());
+}
 
 test "the fields a tool names are written as one line, the first one bare" {
     const a = std.testing.allocator;
