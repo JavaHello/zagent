@@ -11,14 +11,10 @@ const ToolResult = result_mod.ToolResult;
 const ownedResult = result_mod.ownedResult;
 const no_output = result_mod.no_output;
 
-/// How long a shell call may run when it names no limit of its own: long
-/// enough for a build or a test run, short enough that a command which hangs is
-/// not the session.
-pub const default_timeout_seconds: u32 = 180;
-
-/// The most a call may ask for. A shell that runs for an hour is a choice the
-/// model makes on purpose, not a default anyone waits out by accident.
-pub const max_timeout_seconds: u32 = 3600;
+/// How long a shell call may run when it names no limit of its own: an hour,
+/// which is what a build or a test run of this project can take, so the
+/// ordinary long command is not cut short for having said nothing.
+pub const default_timeout_seconds: u32 = 3600;
 
 /// What a command's two streams are collected into while it runs.
 ///
@@ -193,7 +189,7 @@ pub const spec: tool.Tool = .{
     .name = "bash",
     .description = "Execute a Bash command once. The whole output is returned; one larger than 8 KiB is cached, and the call answers with a preview of it, the cache id, its line count and its size, and ccr_retrieve reads the rest by id.",
     .parameters_json =
-    \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Directory to run the command in, absolute or relative to the working directory. Defaults to the working directory; name it here instead of writing 'cd dir && ...'."},"timeout_seconds":{"type":"integer","minimum":1,"maximum":3600,"description":"Command time limit in seconds, default 180. Increase for long builds or tests."}},"required":["command"]}
+    \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Directory to run the command in, absolute or relative to the working directory. Defaults to the working directory; name it here instead of writing 'cd dir && ...'."},"timeout_seconds":{"type":"integer","minimum":1,"description":"Command time limit in seconds, default 3600 (one hour). Any larger number is honoured, so name the time a long build or test needs when an hour is not enough."}},"required":["command"]}
     ,
     .label = "bash…",
     .summary = writeSummary,
@@ -222,7 +218,7 @@ fn run(ctx: tool.Context, arguments: []const u8) !ToolResult {
         return ctx.refuse("Invalid cwd: it is a directory path, as a string.");
     defer if (cwd) |path| ctx.allocator.free(path);
     const timeout_seconds = parseTimeout(ctx.allocator, arguments) catch
-        return ctx.refuse("Invalid timeout_seconds: use an integer from 1 to 3600.");
+        return ctx.refuse("Invalid timeout_seconds: use a whole number of seconds, at least 1.");
     return executeShellTimed(ctx.io, ctx.allocator, command, cwd, ctx.env, timeout_seconds);
 }
 
@@ -237,16 +233,22 @@ fn parseCwd(allocator: std.mem.Allocator, arguments: []const u8) !?[]const u8 {
     return args_mod.optionalString(allocator, parsed.value.object.get("cwd"));
 }
 
-/// The deadline a call asked for, in seconds. Arguments that do not parse, or a
-/// number outside 1..3600, are refused rather than defaulted: a command that
-/// runs longer than the caller meant is worse than a failed call.
+/// The deadline a call asked for, in seconds, or an hour when it asked for
+/// none. Arguments that do not parse, and a number below one second, are
+/// refused rather than defaulted: a command that runs longer than the caller
+/// meant is worse than a failed call.
+///
+/// The tool sets no ceiling of its own — a call may wait as long as it says it
+/// needs, since only the caller knows whether a build outlasts the hour. What
+/// is left is the width of the field: a number of seconds this cannot hold is
+/// refused like any other, and no one reaches it.
 fn parseTimeout(allocator: std.mem.Allocator, arguments: []const u8) !u32 {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArguments;
     const value = parsed.value.object.get("timeout_seconds") orelse return default_timeout_seconds;
-    if (value != .integer or value.integer < 1 or value.integer > max_timeout_seconds) return error.InvalidTimeout;
-    return @intCast(value.integer);
+    if (value != .integer or value.integer < 1) return error.InvalidTimeout;
+    return std.math.cast(u32, value.integer) orelse error.InvalidTimeout;
 }
 
 /// One command run at the default deadline, in the working directory: what the
@@ -284,6 +286,27 @@ test "a call's cwd is read from its arguments and shown on its line" {
     aw.clearRetainingCapacity();
     try std.testing.expect(try writeSummary(ctx, &aw.writer, "{\"command\":\"pwd\",\"cwd\":\"\"}"));
     try std.testing.expectEqualStrings("pwd · cwd .", aw.written());
+}
+
+test "a call's deadline is the hour it did not ask for, or whatever longer it named" {
+    const a = std.testing.allocator;
+    // Silence means an hour: the long command is the one that says nothing.
+    try std.testing.expectEqual(@as(u32, 3600), try parseTimeout(a, "{\"command\":\"pwd\"}"));
+    // Nothing above it is the tool's business: a build that outlasts the hour
+    // says how long it needs, and the call is honoured rather than capped.
+    try std.testing.expectEqual(@as(u32, 7200), try parseTimeout(a, "{\"command\":\"pwd\",\"timeout_seconds\":7200}"));
+    try std.testing.expectEqual(@as(u32, 604800), try parseTimeout(a, "{\"command\":\"pwd\",\"timeout_seconds\":604800}"));
+    // A deadline is a whole number of seconds, and at least one of them.
+    for ([_][]const u8{
+        "{\"command\":\"pwd\",\"timeout_seconds\":0}",
+        "{\"command\":\"pwd\",\"timeout_seconds\":-5}",
+        "{\"command\":\"pwd\",\"timeout_seconds\":1.5}",
+        "{\"command\":\"pwd\",\"timeout_seconds\":\"30\"}",
+        // Wider than the field it is read into: refused like any other.
+        "{\"command\":\"pwd\",\"timeout_seconds\":4294967296}",
+    }) |arguments| {
+        try std.testing.expectError(error.InvalidTimeout, parseTimeout(a, arguments));
+    }
 }
 
 test "a command runs in the directory its call names, and only there" {

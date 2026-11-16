@@ -14,8 +14,9 @@ Tools can modify the host system with the current user's permissions. Local MCP
 servers also run directly and inherit the host environment; configured `env`
 entries add or override variables, see [MCP servers](mcp.md).
 
-Tool calls retain a 180-second default limit (`bash.timeout_seconds` accepts
-1–3600), output bounds and process-group cleanup. Commands use
+Tool calls retain output bounds and process-group cleanup, and `bash` ends a
+command at its deadline: an hour unless the call names another length, since
+the tool sets no ceiling above what the call asks for. Commands use
 `bash --noprofile --norc -c`, not `/bin/sh`. Output bounds are described in
 [Tools](tools.md#output-limit).
 
