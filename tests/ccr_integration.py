@@ -81,12 +81,13 @@ def dispatch(body):
     if count == 2:
         status, content = unpack(results[-1])
         assert not status['is_error'], results[-1]
-        assert f'1:{tag}-00000 payload' in content and f'2:{tag}-00001 payload' in content, content
+        # A page is the output as the command wrote it: no numbers of its own.
+        assert content.startswith(f'{tag}-00000 payload\n{tag}-00001 payload\n'), content
         assert f'{tag}-00002' not in content, content
         return 'ccr_retrieve', {'id': ids[role], 'query': f'{tag.lower()}-12345', 'limit': 2}
     if count == 3:
         status, content = unpack(results[-1])
-        assert not status['is_error'] and f'12346:{tag}-12345 payload' in content, results[-1]
+        assert not status['is_error'] and content.startswith(f'{tag}-12345 payload'), results[-1]
         if role == 'parent':
             return 'subagent', {'task': 'Generate a long bash result, retrieve it, and report.', 'title': 'Cache child output'}
         # The child cannot read its parent's cache, even knowing its id.

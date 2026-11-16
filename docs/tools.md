@@ -99,12 +99,15 @@ Read cached output without rerunning the call that produced it.
 | `limit` | no | Positive number of lines; defaults to the page capacity |
 
 For example, `{"id":"012345abcdef","query":"error","offset":1,"limit":20}`
-returns matching lines with their original line numbers. A partial page tells
-you the next offset. Cache entries are private to each agent's scratch folder;
-`/new` and process exit remove them, and resuming a conversation does not
-restore old cache entries. An entry is named after its content, so caching the
-same output twice — a command rerun, a page read again — is one file answered
-by one ID, and a long task does not fill the folder with copies.
+returns the matching lines as the output holds them. A page carries no line
+numbers of its own — what is read back is what the tool's result would have
+been had it fit — so `offset` counts lines, or matches when `query` is given,
+and a partial page tells you the next offset. Cache entries are private to each
+agent's scratch folder; `/new` and process exit remove them, and resuming a
+conversation does not restore old cache entries. An entry is named after its
+content, so caching the same output twice — a command rerun, a page read
+again — is one file answered by one ID, and a long task does not fill the
+folder with copies.
 
 ## `read`
 

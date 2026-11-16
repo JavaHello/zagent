@@ -2,8 +2,10 @@
 //! in when it is too long for one tool result to carry.
 //!
 //! The whole text is written to a file inside this run's scratch directory and
-//! the model is handed the last lines of it plus an id. `ccr_retrieve` pages
-//! that file the way `read` pages a source file, or finds lines in it by query.
+//! the model is handed the beginning of it plus an id. `ccr_retrieve` pages
+//! that file as it was written, or finds lines in it by query. An entry is a
+//! tool's own text, so a page of it carries no line numbers of its own: what a
+//! result would have been had it fit is what reading it back gives.
 //!
 //! An entry is named after its content, so a large task that caches the same
 //! output twice — a command rerun, a page read again, a file read again — keeps
@@ -317,7 +319,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, arguments: []const u8) !RetrieveA
 /// The ccr_retrieve tool: read back what a long result was cached as.
 pub const spec: tool.Tool = .{
     .name = "ccr_retrieve",
-    .description = "Read back cached output: the whole of a command's or a tool's result when that result was too long for one. It names an id and how many lines and bytes it holds; call this with that id to page through it, or with a query to find the lines that contain text (ignoring case). Without a query, offset is a 1-based line number and limit a count of lines, and the page names the offset the next one starts at; with a query, offset counts matching lines.",
+    .description = "Read back cached output: the whole of a command's or a tool's result when that result was too long for one. It names an id and how many lines and bytes it holds; call this with that id to page through it, or with a query to find the lines that contain text (ignoring case). A page is the output as it was written, without line numbers added: what a result would have been had it fit. Without a query, offset is a 1-based line number and limit a count of lines, and the page names the offset the next one starts at; with a query, offset counts matching lines.",
     .parameters_json =
     \\{"type":"object","properties":{"id":{"type":"string","description":"The hex id a cached result named"},"offset":{"type":"integer","minimum":1,"description":"1-based first line, or first matching line when query is given; defaults to 1"},"limit":{"type":"integer","minimum":1,"description":"Number of lines to return; defaults to as many as the page holds"},"query":{"type":"string","description":"Only the lines containing this text, matched without regard to case"}},"required":["id"],"additionalProperties":false}
     ,
@@ -365,7 +367,10 @@ pub fn retrieve(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, argum
     var page = if (args.query) |query|
         try queryPage(io, allocator, path, args.id, query, args.offset, args.limit)
     else
-        try read.readFilePage(io, allocator, path, .{ .offset = args.offset, .limit = args.limit });
+        // The entry is the text a tool produced, so it is paged as it stands:
+        // numbering it again would put a second number in front of lines that
+        // already carry one, or a number in front of output that never had one.
+        try read.readFilePage(io, allocator, path, .{ .offset = args.offset, .limit = args.limit, .numbered = false });
     // The page came out of this entry, not out of a tool: naming it keeps the
     // page from being cached as though it were fresh output.
     if (page.ccr_id == null and args.id.len == result_mod.ccr_id_len)
@@ -413,10 +418,8 @@ fn queryPage(
     var current: std.ArrayList(u8) = .empty;
     defer current.deinit(allocator);
 
-    // Line numbers are the ones the whole output has, so a match can be read
-    // again with an offset while the query is off; `matches` is the count the
-    // query's own offset is measured in.
-    var line: usize = 1;
+    // What the query's offset counts, and what fills the page: the matches
+    // themselves, not the lines they were found on.
     var matches: usize = 0;
     var shown: usize = 0;
     // The match the next call starts at, when this page stopped short of the
@@ -429,31 +432,28 @@ fn queryPage(
         if (ending == .eof) break;
         if (ending == .line and indexOfIgnoreCase(current.items, query) != null) {
             matches += 1;
-            if (matches < offset) {
-                line += 1;
-                continue;
-            }
+            if (matches < offset) continue;
             if (limit != null and shown == limit.?) {
                 resumes_at = matches;
                 break :scan;
             }
-            const width = read.linePrefixWidth(line);
+            // A match is shown as the entry holds it: no number goes in front
+            // of a line that may already carry one of its own.
             const room = page_room_bytes - body.items.len;
-            if (width + current.items.len + 1 > room) {
+            if (current.items.len + 1 > room) {
                 // The page is full on this line. A first match that does not
                 // fit is shown by its beginning, so the call is not empty.
-                if (shown == 0 and room > width + 1) {
-                    try read.appendNumberedLine(&body, allocator, line, truncateUtf8(current.items, room - width - 1));
+                if (shown == 0 and room > 1) {
+                    try read.appendPlainLine(&body, allocator, truncateUtf8(current.items, room - 1));
                     shown += 1;
                     clipped_line = true;
                 }
                 resumes_at = matches + @intFromBool(clipped_line);
                 break :scan;
             }
-            try read.appendNumberedLine(&body, allocator, line, current.items);
+            try read.appendPlainLine(&body, allocator, current.items);
             shown += 1;
         }
-        line += 1;
     }
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -592,7 +592,7 @@ test "cacheOversizedOutput caches materialized output, preserves status and retr
     const retrieved = try spec.execute(ctx, args);
     defer retrieved.deinit(a);
     try std.testing.expect(!retrieved.is_error);
-    try std.testing.expectEqualStrings("6001:uncut tail\n", retrieved.output);
+    try std.testing.expectEqualStrings("uncut tail\n", retrieved.output);
 }
 
 test "cacheOversizedOutput leaves short results and uncached fallbacks untouched and propagates errors" {
@@ -642,8 +642,8 @@ test "cached output is read back in pages and by query" {
     try std.testing.expectEqual(@as(usize, id_len), saved.id.len);
     for (saved.id) |char| try std.testing.expect(std.ascii.isHex(char) and !std.ascii.isUpper(char));
 
-    // A page is numbered by the line's place in the output, and names the
-    // offset the next one starts at.
+    // A page is the output as it was written, with no numbers in front of its
+    // lines, and it names the offset the next one starts at.
     const arguments = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"offset\":199,\"limit\":2}}", .{saved.id});
     defer a.free(arguments);
     const page = try retrieve(io, a, base, arguments);
@@ -653,7 +653,7 @@ test "cached output is read back in pages and by query" {
     // being cached again as though it were fresh output.
     try std.testing.expectEqual(saved.id, page.ccr_id.?);
     try std.testing.expectEqualStrings(
-        "199:line 199\n200:line 200\n[Output truncated; continue with offset=201 (1-based line number).]",
+        "line 199\nline 200\n[Output truncated; continue with offset=201 (1-based line number).]",
         page.output,
     );
 
@@ -661,7 +661,7 @@ test "cached output is read back in pages and by query" {
     defer a.free(last);
     const tail = try retrieve(io, a, base, last);
     defer tail.deinit(a);
-    try std.testing.expectEqualStrings("201:the last line has no terminator\n", tail.output);
+    try std.testing.expectEqualStrings("the last line has no terminator\n", tail.output);
     try std.testing.expectEqual(saved.id, tail.ccr_id.?);
 }
 
@@ -680,7 +680,7 @@ test "a query finds lines ignoring case and pages through the matches" {
     defer first.deinit(a);
     try std.testing.expect(!first.is_error and first.ccr_id != null);
     try std.testing.expectEqualStrings(
-        "2:ERROR one\n[More matches; continue with offset=2 (a 1-based count of matching lines when 'query' is given).]",
+        "ERROR one\n[More matches; continue with offset=2 (a 1-based count of matching lines when 'query' is given).]",
         first.output,
     );
 
@@ -688,7 +688,7 @@ test "a query finds lines ignoring case and pages through the matches" {
     defer a.free(rest);
     const second = try retrieve(io, a, base, rest);
     defer second.deinit(a);
-    const expected = try std.fmt.allocPrint(a, "4:Error two\n[End of ccr {s}: 2 matching line(s) for \"error\".]", .{saved.id});
+    const expected = try std.fmt.allocPrint(a, "Error two\n[End of ccr {s}: 2 matching line(s) for \"error\".]", .{saved.id});
     defer a.free(expected);
     try std.testing.expectEqualStrings(expected, second.output);
     try std.testing.expect(second.ccr_id != null);
@@ -731,7 +731,7 @@ test "a missing entry, a wrong id and an unknown query each say what is wrong" {
     defer a.free(copied);
     const page = try retrieve(io, a, base, copied);
     defer page.deinit(a);
-    try std.testing.expectEqualStrings("1:all good\n", page.output);
+    try std.testing.expectEqualStrings("all good\n", page.output);
 
     const nothing = try std.fmt.allocPrint(a, "{{\"id\":\"{s}\",\"query\":\"absent\"}}", .{saved.id});
     defer a.free(nothing);

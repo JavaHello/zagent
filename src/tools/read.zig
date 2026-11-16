@@ -9,12 +9,17 @@ const ToolResult = result_mod.ToolResult;
 const toolError = result_mod.toolError;
 const optionalUnsigned = args_mod.optionalUnsigned;
 
-/// One page of a file: where it starts, and how many lines it may hold.
+/// One page of a file: where it starts, how many lines it may hold, and whether
+/// each line carries the number it has in the file.
 pub const ReadPage = struct {
     /// 1-based number of the first line to read.
     offset: usize = 1,
     /// Number of lines to read; null reads all remaining lines.
     limit: ?usize = null,
+    /// Whether each line is prefixed with its 1-based number, as `42:`. A page
+    /// read out of cached output is not numbered: it is the text a tool
+    /// produced, which may carry numbers of its own already.
+    numbered: bool = true,
 };
 
 pub fn parseReadPage(allocator: std.mem.Allocator, arguments: []const u8) !ReadPage {
@@ -70,15 +75,6 @@ pub fn skipLine(reader: *std.Io.Reader) !bool {
     }
 }
 
-/// Bytes a numbered line spends before its text: the digits and a `:`. The
-/// digits are not padded, so the cost is measured per line.
-pub fn linePrefixWidth(number: usize) usize {
-    var digits: usize = 1;
-    var rest = number;
-    while (rest >= 10) : (rest /= 10) digits += 1;
-    return digits + 1;
-}
-
 /// Number a line as `42:`, so a model reading the page can copy a reference
 /// that reads as one, rather than a bare figure in a column it has to count.
 pub fn appendNumberedLine(body: *std.ArrayList(u8), allocator: std.mem.Allocator, number: usize, line_text: []const u8) !void {
@@ -86,6 +82,12 @@ pub fn appendNumberedLine(body: *std.ArrayList(u8), allocator: std.mem.Allocator
     const digits = std.fmt.bufPrint(&digits_buf, "{d}", .{number}) catch unreachable;
     try body.appendSlice(allocator, digits);
     try body.append(allocator, ':');
+    try body.appendSlice(allocator, line_text);
+    try body.append(allocator, '\n');
+}
+
+/// Append a line as the file holds it, with nothing in front of it.
+pub fn appendPlainLine(body: *std.ArrayList(u8), allocator: std.mem.Allocator, line_text: []const u8) !void {
     try body.appendSlice(allocator, line_text);
     try body.append(allocator, '\n');
 }
@@ -213,7 +215,8 @@ fn readKey(allocator: std.mem.Allocator, arguments: []const u8, content: []const
     return hash.finalResult();
 }
 
-/// Read a page of a file, each line carrying the number it has in the file.
+/// Read a page of a file, each line carrying the number it has in the file
+/// unless the page asks for the text alone.
 ///
 /// The page starts at `offset` and holds up to `limit` lines, or all remaining
 /// lines when no limit is supplied. It always ends on a line boundary, so the offset it reports
@@ -255,7 +258,11 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
         const ending = readLine(reader, allocator, &current, std.math.maxInt(usize)) catch |err|
             return toolError(allocator, "Error reading '{s}': {s}", .{ path, @errorName(err) });
         if (ending == .eof) break;
-        try appendNumberedLine(&body, allocator, line, current.items);
+        if (page.numbered) {
+            try appendNumberedLine(&body, allocator, line, current.items);
+        } else {
+            try appendPlainLine(&body, allocator, current.items);
+        }
         shown += 1;
         line += 1;
     }
@@ -292,12 +299,6 @@ test "read takes a 1-based offset and a line limit" {
     const page = try parseReadPage(a, "{\"offset\":100,\"limit\":50}");
     try std.testing.expectEqual(@as(usize, 100), page.offset);
     try std.testing.expectEqual(@as(?usize, 50), page.limit);
-}
-
-test "read prefixes every line with the number it has in the file" {
-    try std.testing.expectEqual(@as(usize, 2), linePrefixWidth(1));
-    try std.testing.expectEqual(@as(usize, 7), linePrefixWidth(999999));
-    try std.testing.expectEqual(@as(usize, 8), linePrefixWidth(1000000));
 }
 
 test "read streams a page from deep in a large file" {
@@ -403,6 +404,26 @@ test "read hands back the file's bytes as they are" {
     const result = try readFilePage(io, a, path, .{});
     defer result.deinit(a);
     try std.testing.expectEqualStrings("1:\x1b[2Jred\xff\n2:second\n", result.output);
+}
+
+test "a page asked for without numbers is the file's own text" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "lines.txt", .data = "one\ntwo\nthree\n" });
+    const path = try tmp.dir.realPathFileAlloc(io, "lines.txt", a);
+    defer a.free(path);
+
+    // The cache pages a tool's own text: a number in front of it is a second
+    // one when the text already carries numbers, and noise when it does not.
+    // The offset still counts lines, and the page still names the next one.
+    const page = try readFilePage(io, a, path, .{ .offset = 2, .limit = 1, .numbered = false });
+    defer page.deinit(a);
+    try std.testing.expectEqualStrings(
+        "two\n[Output truncated; continue with offset=3 (1-based line number).]",
+        page.output,
+    );
 }
 
 test "read missing file" {
