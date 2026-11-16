@@ -65,14 +65,14 @@ try:
             (b'\r\r', [], 'recommended option: Beta'),
             (b'\x1b[A\r\r', [], 'User selected: Alpha'),
             (b'1\r\r', [], 'User selected: Alpha'),
-            # The free-text row, then the Enter that submits it. Each step waits
-            # for what it draws before typing: the line editor's cursor probe
-            # reads its reply in one go, and a key sent with it would go with it.
-            (b'\x1b[B\r', [(b'choice', '自己的方案'.encode() + b'\r'), (b'1) Submit', b'\r')], '自己的方案'),
-            # Esc in the free-text row steps back to the options and the menu is
-            # drawn again; Enter then takes the recommendation, and the Enter on
-            # the confirmation submits it.
-            (b'\x1b[B\r', [(b'choice', b'\x1b'), (b'Enter confirm', b'\r'), (b'1) Submit', b'\r')], 'recommended option: Beta'),
+            # The free-text row is typed into where it is drawn: the words go
+            # in as they are typed, and the Enter that follows answers with
+            # them before the confirmation is submitted.
+            (b'\x1b[B\r', [(b'Ctrl+U clear', '自己的方案'.encode() + b'\r'), (b'1) Submit', b'\r')], '自己的方案'),
+            # Esc in that row steps back to the options with the words kept and
+            # the keyboard on the recommendation; Enter then answers with it,
+            # and the Enter on the confirmation submits it.
+            (b'\x1b[B\r', [(b'Ctrl+U clear', b'\x1b'), ('↑/↓ select'.encode(), b'\r'), (b'1) Submit', b'\r')], 'recommended option: Beta'),
             # Ctrl+C is not a way out of a question: it is ignored, and the
             # arrow that follows is what answers.
             (b'\x03\x1b[A\r\r', [], 'User selected: Alpha'),
@@ -91,8 +91,9 @@ try:
                                        env=env, stdin=slave, stdout=slave, stderr=slave)
             transcript = bytearray()
             sent = False
-            # Each step waits for its marker before typing: the free-text row and
-            # the menu that Esc brings back look nothing alike.
+            # Each step waits for its marker before typing: the row being typed
+            # into, the options Esc brings back and the confirmation that
+            # follows all look nothing alike.
             steps = list(custom)
             typed = 0
             deadline = time.monotonic() + 15
@@ -141,9 +142,9 @@ try:
         assert 'Enter confirm' not in piped.stdout + piped.stderr
         assert piped.stdout.count(task_description) == 1, piped.stdout
         assert '\x1b]2;' not in piped.stderr, piped.stderr
-        print('PASS: recommendation, arrows, number keys, custom text, the confirmation '
-              'every answer lands on, Esc in the free-text row stepping back, Ctrl+C '
-              'ignored, Esc stopping the run, Ctrl+D dismissing the form, terminal '
-              'restoration and piped fallback')
+        print('PASS: recommendation, arrows, number keys, words typed into the free-text '
+              'row itself, the confirmation every answer lands on, Esc there stepping back '
+              'to the recommendation, Ctrl+C ignored, Esc stopping the run, Ctrl+D '
+              'dismissing the form, terminal restoration and piped fallback')
 finally:
     server.shutdown()

@@ -59,7 +59,7 @@ const HELP_TAIL =
     \\  Wheel/PageUp/Down  Scroll output history
     \\  While running: commands remain available; typed text adjusts the task
     \\  Questions   The menu owns the keyboard; Esc or Ctrl+D dismisses it
-    \\  Own answer  Esc in the free-text row goes back to the options
+    \\  Own answer  Enter on the Other row types there; Esc returns to the options
     \\  Esc          Stop current task and discard input typed while it ran
     \\  Ctrl+Z       Suspend; resume with fg
     \\  Ctrl+D       Exit zagent

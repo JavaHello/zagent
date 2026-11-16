@@ -4,14 +4,15 @@
 One ask_user call carries two questions, drawn as horizontal tabs with only the
 focused question's rows visible. Tab and Shift+Tab walk between them — an answer
 given to an earlier question can be changed before the form is submitted. The last row of
-each question is free text, and nothing typed at the form reaches the running
-task as guidance. The strip ends on a Confirm tab, which either submits the
-answers or takes words of the user's own to send with them, and every answer
-lands there instead of being sent off on the last Enter. It is drawn from the
-start but cannot be walked to while a question is still open: Tab then cycles
-the questions, where typing an answer in your own words belongs. Esc in the
-free-text row steps back to the options; Esc at the questions cancels them and
-stops the run, and Ctrl+C is not a way out of a question at all.
+each question is free text, typed into that row where it is drawn rather than on
+a line below the form, and nothing typed at the form reaches the running task as
+guidance. The strip ends on a Confirm tab, which either submits the answers or
+takes words of the user's own to send with them, and every answer lands there
+instead of being sent off on the last Enter. It is drawn from the start but
+cannot be walked to while a question is still open: Tab then cycles the
+questions, where typing an answer in your own words belongs. Esc in the
+free-text row steps back to the options with the words kept; Esc at the questions
+cancels them and stops the run, and Ctrl+C is not a way out of a question at all.
 """
 import fcntl
 import http.server
@@ -173,24 +174,32 @@ try:
             until(lambda: drawn('1) Gamma', mark), b'the second question again')
             until(lambda: focused_tab('2', mark), b'the second tab again')
 
-            # The second question's last row types an answer.
+            # The second question's last row is typed into where it is drawn:
+            # the words take the place of its label, and the hint names the keys
+            # that are left.
             settle()
             os.write(master, b'3\r')
-            until(lambda: drawn('choice', mark), b'the free-text prompt')
-            if b'\x1b[6n' in transcript[mark:]:
-                os.write(master, b'\x1b[1;1R')
-            # Esc in the free-text row goes back to the options: it is neither a
-            # dismissal nor an interruption of the run.
+            until(lambda: drawn('Enter confirm \u00b7 Esc back'), b'the free-text row')
+            mark = len(transcript)
+            os.write(master, b'draft')
+            until(lambda: drawn('3) draft'), b'the words in the row')
+            assert not drawn('Other / \u81ea\u5b9a\u4e49\u56de\u7b54', mark), since(mark)
+            # Esc goes back to the options and keeps the words: it is neither a
+            # dismissal nor an interruption of the run. Enter on the row opens
+            # it again on the draft, which Ctrl+U then empties.
             mark = len(transcript)
             os.write(master, b'\x1b')
             until(lambda: drawn('1) Gamma', mark), b'the options again')
+            until(lambda: drawn('Other / \u81ea\u5b9a\u4e49\u56de\u7b54', mark), b'the label again')
             settle()
             assert b'interrupted' not in clean(), transcript
             os.write(master, b'3\r')
-            until(lambda: drawn('choice', mark), b'the free-text row again')
-            if b'\x1b[6n' in transcript[mark:]:
-                os.write(master, b'\x1b[1;1R')
-            os.write(master, b'my own words\r')
+            until(lambda: drawn('3) draft', mark), b'the draft kept')
+            # Ctrl+U empties the row, and the words typed after it are the
+            # answer: the form moves on to the confirmation.
+            mark = len(transcript)
+            os.write(master, b'\x15my own words\r')
+            until(lambda: focused_tab('Confirm', mark), b'the confirmation after the typed answer')
 
             # The last answer lands on the confirmation instead of sending the
             # answers off: the strip ends on it, and its two rows say what can
@@ -272,9 +281,10 @@ try:
             assert termios.tcgetattr(slave) == original, 'raw terminal was not restored'
             print('PASS: questions share the prompt rows, one form holds them all, Tab and '
                   'Shift+Tab revise an answer already given and cycle the questions until '
-                  'every one has an answer, the last row types an answer or steps back to '
-                  'the options, the Confirm tab submits the answers or takes words to add, '
-                  'Ctrl+C is ignored, and Esc cancels the questions and stops the run')
+                  'every one has an answer, the last row is typed into where it is drawn, '
+                  'Esc there steps back to the options keeping the words, the Confirm tab '
+                  'submits the answers or takes words to add, Ctrl+C is ignored, and Esc '
+                  'cancels the questions and stops the run')
         finally:
             if process.poll() is None:
                 process.kill()

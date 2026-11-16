@@ -186,9 +186,26 @@ decision only you can make — the agent calls `ask_user` and you get a form:
 
 Use ↑/↓ (or j/k) to move within a question, then Enter to confirm. The
 recommended option is selected initially, or the first option if none is
-recommended. Number keys 1–9 select an option directly. Choose Other to type your
-own answer; Esc there goes back to the option list, so a mistyped start costs
-nothing.
+recommended. Number keys 1–9 select an option directly. On the Other row Enter
+types the answer where the row is drawn — the words appear in place of the label,
+the form stays where it was, and the hint changes to the keys that are left:
+
+```
+  Which approach should I use?
+      1) Rewrite in place (recommended)  Keeps the history intact.
+      2) New file  Leaves the original alone.
+    > 3) 先重写，再补测试▏
+  Enter confirm · Esc back · Ctrl+U clear
+```
+
+The terminal's own cursor sits in the row while you type, so an input method
+opens its candidate window at the caret instead of somewhere else on the screen.
+
+There ←/→ (and Home/End) move inside the words, Backspace deletes a whole
+character even in Chinese, and Ctrl+U empties the row. Enter answers with what is
+typed. Esc goes back to the option list — on the recommended option, with the
+words kept, so ↓ Enter opens the row on them again — and a mistyped start costs
+nothing. Enter on an empty row does nothing rather than answering with nothing.
 
 Long text is wrapped, never cut off at the right edge: a question, a label or the
 sentence describing an option continues on the next line, indented under its own

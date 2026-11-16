@@ -1470,14 +1470,17 @@ pub const Agent = struct {
         return menu.form(self.allocator, self.io, slots, true, true, focus);
     }
 
-    /// Read the free text a free-text row asks for, on that same terminal.
+    /// Read the words the confirmation's Supplement row asks for, on that same
+    /// terminal.
     fn readOnTerminal(context: *anyopaque) anyerror!menu.Line {
         const self: *Agent = @ptrCast(@alignCast(context));
         return self.readChoiceLine();
     }
 
-    /// Read the free text the "type your own answer" row asks for. Owned by the
-    /// caller, trimmed, and never empty: an empty line is no answer at all.
+    /// Read the words the confirmation's Supplement row asks for. Owned by the
+    /// caller, trimmed, and never empty: an empty line adds nothing at all.
+    /// Answers typed into a question's free-text row are taken by the form
+    /// itself, so they never come through here.
     pub fn readChoiceLine(self: *Agent) !menu.Line {
         // A menu answer is free text, not a slash command, so completion and
         // hints are switched off for this read and restored afterwards.
@@ -1500,14 +1503,14 @@ pub const Agent = struct {
         while (true) {
             if (self.screen) |screen| try screen.prepareInput();
             raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {
-                // Esc is the way back to the options, not the end of the read.
+                // Esc goes back to the confirmation, not to the end of the read.
                 error.Escaped => {
                     if (self.screen) |screen| try screen.endInput();
                     return .back;
                 },
                 error.Suspend => {
-                    // The custom-answer read is a normal line edit; suspension
-                    // gives the terminal back and resumes on the same text.
+                    // The read is a normal line edit; suspension gives the
+                    // terminal back and resumes on the same text.
                     if (self.screen) |screen| {
                         try screen.suspendProcess();
                     } else {

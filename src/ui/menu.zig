@@ -94,6 +94,23 @@ const confirm_options = [_]Option{
     .{ .label = "Supplement", .description = "Type your own words to add", .recommended = false },
 };
 
+/// The free-text row typed into where it is drawn. It belongs to the form for
+/// as long as the form is open, so Esc can go back to the options and Enter can
+/// open the row again on what was typed before.
+const Edit = struct {
+    /// The question whose free-text row the words are for.
+    slot: usize = 0,
+    /// What has been typed, as it stands.
+    text: std.ArrayList(u8) = .empty,
+    /// Byte offset in `text` the next character goes at. It is always on a
+    /// codepoint boundary, so a two-cell character is never half-deleted.
+    caret: usize = 0,
+    /// A character still arriving: its bytes so far. A redraw shows what is in
+    /// `text`, so half of a Chinese one is never drawn as a stray byte.
+    pending: [4]u8 = undefined,
+    pending_len: usize = 0,
+};
+
 /// Keyboard state is independent of reads: a partial escape sequence never
 /// requires a blocking second read, and both CSI and application arrows work.
 /// Each question in `slots` keeps its own selection, so moving between them
@@ -112,12 +129,31 @@ const Form = struct {
     /// and forth loses nothing.
     submit: Slot = .{ .text = "Confirm", .options = &confirm_options },
     escape: enum { none, start, sequence } = .none,
+    /// Where the words typed into a free-text row are kept, and where the caret
+    /// in them sits. Owned here; freed by `deinit`.
+    edit: Edit = .{},
+    /// Whether the keyboard goes to that text rather than to the rows.
+    typing: bool = false,
+    /// Where drawing put the caret of that row: the real cursor is moved there,
+    /// because the cell the terminal says the cursor is in is where an input
+    /// method hangs its candidate window. Set by the read loop, written by
+    /// `drawForm`.
+    caret_report: ?*?Cell = null,
+    /// What the words typed into that text are held in. The form is given the
+    /// allocator of the run it belongs to; the default keeps a form built by a
+    /// test that never types from having to name one.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+
+    fn deinit(self: *Form) void {
+        self.edit.text.deinit(self.allocator);
+        self.edit.text = .empty;
+    }
 
     const Action = union(enum) {
         redraw,
-        /// Type the answer to question `custom` by hand; the form is drawn
-        /// again once that line has been read.
-        custom: usize,
+        /// The answer typed into question `custom`'s free-text row, with the
+        /// words it was answered in. Owned by whoever holds the action.
+        custom: Typed,
         /// Type the words that go with the answers, chosen on the last tab.
         supplement,
         /// Every question is answered and the answers were submitted.
@@ -129,7 +165,10 @@ const Form = struct {
         ignore,
     };
 
-    fn key(self: *Form, byte: u8) Action {
+    fn key(self: *Form, byte: u8) !Action {
+        // The free-text row takes the keys it is being typed into: arrows move
+        // inside the text there instead of between the rows.
+        if (self.typing) return self.editKey(byte);
         // Ctrl+C is not a way out of a question: it is pressed by habit, so it
         // is ignored here and the question stays open. Ctrl+D keeps its
         // end-of-input meaning, and the read loop turns a lone Esc into the
@@ -174,6 +213,185 @@ const Form = struct {
         return .redraw;
     }
 
+    /// One key while the free-text row has the keyboard. Enter answers with the
+    /// words as they stand and Esc — the lone one the read loop sees — goes
+    /// back to the options; nothing else leaves the row, so a letter that means
+    /// something among the rows is just a letter here.
+    fn editKey(self: *Form, byte: u8) !Action {
+        if (byte == 4) return .dismiss;
+        if (byte == '\r' or byte == '\n') return self.commitEdit();
+        if (byte == 0x1b) {
+            self.escape = .start;
+            return .ignore;
+        }
+        if (self.escape == .start and (byte == '[' or byte == 'O')) {
+            self.escape = .sequence;
+            return .ignore;
+        }
+        if (self.escape == .sequence) {
+            // A sequence this row does not know, such as Delete or Page Up,
+            // ends here and leaves the text alone.
+            if (byte < 0x40 or byte > 0x7e) return .ignore;
+            self.escape = .none;
+            switch (byte) {
+                'A', 'H' => self.edit.caret = 0,
+                'B', 'F' => self.edit.caret = self.edit.text.items.len,
+                'C' => self.caretRight(),
+                'D' => self.caretLeft(),
+                else => return .ignore,
+            }
+            return .redraw;
+        }
+        self.escape = .none;
+        // A key that is not a text byte ends a character that was still
+        // arriving, so no half of one is left waiting for the rest.
+        if (byte < 0x20 or byte == 0x7f) self.edit.pending_len = 0;
+        switch (byte) {
+            0x7f, 0x08 => self.deleteBack(),
+            // The keys the line editor gives the same meanings to.
+            0x15 => {
+                self.edit.text.clearRetainingCapacity();
+                self.edit.caret = 0;
+            },
+            0x01 => self.edit.caret = 0,
+            0x05 => self.edit.caret = self.edit.text.items.len,
+            // Text goes in where the caret is, a character at a time: a byte
+            // that starts one is held until the last of it has come.
+            0x20...0x7e, 0x80...0xff => return self.insertText(byte),
+            else => return .ignore,
+        }
+        return .redraw;
+    }
+
+    /// Take one byte of text. Nothing is drawn until it makes a whole
+    /// character: the row would otherwise show the `\xE8` of a Chinese one for
+    /// as long as the terminal takes to send the rest of it.
+    fn insertText(self: *Form, byte: u8) !Action {
+        const edit = &self.edit;
+        // A plain byte is a character of its own, and it ends whatever
+        // unfinished sequence came before it.
+        if (byte < 0x80) {
+            edit.pending_len = 0;
+            try self.insert(byte);
+            return .redraw;
+        }
+        if (edit.pending_len == 0) {
+            edit.pending[0] = byte;
+            edit.pending_len = 1;
+            const expected = std.unicode.utf8ByteSequenceLength(byte) catch {
+                // Not the lead byte of anything: it goes in as it came, and
+                // the row shows it the way any other stray byte is shown.
+                edit.pending_len = 0;
+                try self.insert(byte);
+                return .redraw;
+            };
+            // Nothing has changed yet: the rest of the character is what the
+            // row is waiting for.
+            if (expected > 1) return .ignore;
+            try self.releasePending();
+            return .redraw;
+        }
+        edit.pending[edit.pending_len] = byte;
+        edit.pending_len += 1;
+        const expected = std.unicode.utf8ByteSequenceLength(edit.pending[0]) catch {
+            // The first byte held settled this, so it cannot fail here; the
+            // bytes go in rather than being lost if it ever does.
+            try self.releasePending();
+            return .redraw;
+        };
+        if (edit.pending_len < expected) return .ignore;
+        try self.releasePending();
+        return .redraw;
+    }
+
+    /// Hand the bytes of a character that has fully arrived to the text.
+    fn releasePending(self: *Form) !void {
+        for (self.edit.pending[0..self.edit.pending_len]) |held| try self.insert(held);
+        self.edit.pending_len = 0;
+    }
+
+    /// Put one byte of text where the caret is and step over it.
+    fn insert(self: *Form, byte: u8) !void {
+        try self.edit.text.insert(self.allocator, self.edit.caret, byte);
+        self.edit.caret += 1;
+    }
+
+    /// The offset the character before `offset` starts at.
+    fn codepointStart(self: *const Form, offset: usize) usize {
+        var i = @min(offset, self.edit.text.items.len);
+        if (i == 0) return 0;
+        i -= 1;
+        while (i > 0 and (self.edit.text.items[i] & 0xc0) == 0x80) i -= 1;
+        return i;
+    }
+
+    fn caretLeft(self: *Form) void {
+        self.edit.caret = self.codepointStart(self.edit.caret);
+    }
+
+    fn caretRight(self: *Form) void {
+        const items = self.edit.text.items;
+        if (self.edit.caret >= items.len) return;
+        var i = self.edit.caret + 1;
+        while (i < items.len and (items[i] & 0xc0) == 0x80) i += 1;
+        self.edit.caret = i;
+    }
+
+    /// Backspace: the character before the caret goes whole, rather than a byte
+    /// of a Chinese one.
+    fn deleteBack(self: *Form) void {
+        if (self.edit.caret == 0) return;
+        const start = self.codepointStart(self.edit.caret);
+        self.edit.text.replaceRangeAssumeCapacity(start, self.edit.caret - start, &.{});
+        self.edit.caret = start;
+    }
+
+    /// Enter on the free-text row: the keys go to that text from now on, and
+    /// the answer is given there rather than on a line read below the form.
+    fn openEdit(self: *Form) void {
+        // Words typed for one question do not answer the next one.
+        if (self.edit.slot != self.focus) {
+            self.edit.text.clearRetainingCapacity();
+            self.edit.caret = 0;
+        }
+        self.edit.slot = self.focus;
+        self.edit.caret = @min(self.edit.caret, self.edit.text.items.len);
+        self.typing = true;
+    }
+
+    /// Esc in that row: back to the options, with the words kept for another
+    /// try at them. The keyboard lands on the recommendation rather than on the
+    /// row that asks for a line again, so Enter after Esc answers the question
+    /// instead of reopening the text.
+    fn closeEdit(self: *Form) void {
+        self.typing = false;
+        self.edit.pending_len = 0;
+        self.escape = .none;
+        const slot = self.focused();
+        slot.selected = recommendedIndex(slot.options) orelse 0;
+    }
+
+    /// Enter in the free-text row: the words as they stand are the answer. The
+    /// form is left as it is for any other answer, which is the caller drawing
+    /// it again and landing on the next question still without one.
+    fn commitEdit(self: *Form) !Action {
+        // An empty row is no answer at all: Enter there stays where it is
+        // rather than answering with nothing.
+        if (self.edit.text.items.len == 0) return .ignore;
+        const text = try self.edit.text.toOwnedSlice(self.allocator);
+        self.edit.text = .empty;
+        self.edit.caret = 0;
+        self.edit.pending_len = 0;
+        self.typing = false;
+        self.escape = .none;
+        const index = self.focus;
+        const slot = self.focused();
+        slot.custom = text;
+        slot.selected = slot.options.len;
+        slot.answered = true;
+        return .{ .custom = .{ .index = index, .text = text } };
+    }
+
     fn rows(self: *Form) usize {
         return self.focused().rowCount(self.freeText());
     }
@@ -211,7 +429,13 @@ const Form = struct {
             return if (self.submit.selected > 0) .supplement else .finish;
         }
         const slot = self.focused();
-        if (self.freeText() and slot.selected >= slot.options.len) return .{ .custom = self.focus };
+        if (self.freeText() and slot.selected >= slot.options.len) {
+            // Enter on the free-text row hands the keys to that row: the answer
+            // is typed where it will be shown, not read on a line below the
+            // form.
+            self.openEdit();
+            return .redraw;
+        }
         slot.custom = null;
         slot.answered = true;
         if (self.nextUnanswered()) |index| {
@@ -287,11 +511,21 @@ const Span = struct {
     text: []const u8 = "",
 };
 
+/// A cell of the drawn form: the line it is on, counted from the form's first
+/// line, and the column in it. Both are 0-based, which is what the terminal
+/// needs to put the real cursor there.
+const Cell = struct {
+    line: usize = 0,
+    column: usize = 0,
+};
+
 /// What one row came to: the terminal lines it took, and whether it had more
-/// text than the lines it was allowed to take.
+/// text than the lines it was allowed to take. `mark` is the cell the row was
+/// asked to report, when it was drawn at all.
 const Row = struct {
     lines: usize = 1,
     clipped: bool = false,
+    mark: ?Cell = null,
 };
 
 /// Write one logical row, wrapped onto as many lines as its text needs, and
@@ -315,6 +549,22 @@ fn writeRow(
     indent: usize,
     max_lines: usize,
 ) !Row {
+    return writeRowMarked(w, allocator, spans, columns, indent, max_lines, null);
+}
+
+/// `writeRow`, also saying where the first cell of span `mark_span` was drawn.
+/// The row being typed into needs the real cursor on its caret, because the
+/// cell the terminal thinks the cursor is in is where an input method puts its
+/// candidate window.
+fn writeRowMarked(
+    w: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    spans: []const Span,
+    columns: usize,
+    indent: usize,
+    max_lines: usize,
+    mark_span: ?usize,
+) !Row {
     // The rightmost cell stays empty: a line that fills the terminal leaves it
     // in the pending-wrap state, where the following newline moves down two
     // rows on several emulators.
@@ -324,6 +574,7 @@ fn writeRow(
     var col: usize = 0;
     var style: []const u8 = "";
     var clipped = false;
+    var mark: ?Cell = null;
     var clean: std.Io.Writer.Allocating = .init(allocator);
     defer clean.deinit();
     if (limit == 0) {
@@ -333,7 +584,7 @@ fn writeRow(
         return .{};
     }
 
-    outer: for (spans) |span| {
+    outer: for (spans, 0..) |span, index| {
         if (span.text.len == 0) continue;
         clean.clearRetainingCapacity();
         try sanitize.writeSanitized(&clean.writer, span.text);
@@ -347,6 +598,7 @@ fn writeRow(
             style = span.style;
         }
         var rest: []const u8 = clean.written();
+        var started = false;
         while (rest.len > 0) {
             // A codepoint wider than the whole line fits nowhere: the row ends
             // here rather than drawing past the terminal's edge.
@@ -376,6 +628,14 @@ fn writeRow(
                     // are trailing blanks, and the next line is indented.
                     chunk = std.mem.trimEnd(u8, chunk, " ");
                 }
+                // Where the marked run starts is the cell it was asked for,
+                // after the row has wrapped to get there.
+                if (!started and mark == null) {
+                    if (mark_span) |asked| {
+                        if (asked == index) mark = .{ .line = lines - 1, .column = col };
+                    }
+                }
+                started = true;
                 try w.writeAll(chunk);
                 col += term.width(chunk);
                 rest = next;
@@ -396,7 +656,7 @@ fn writeRow(
     }
     if (clipped and col < limit) try w.writeAll("…");
     try w.writeAll(RESET ++ sgr.ERASE_LINE_END ++ "\r\n");
-    return .{ .lines = lines, .clipped = clipped };
+    return .{ .lines = lines, .clipped = clipped, .mark = mark };
 }
 
 /// What the user did at a menu. The free-text row, when offered, is the last
@@ -411,7 +671,7 @@ pub const Choice = union(enum) {
     cancel,
 };
 
-/// What reading the line for a free-text row produced.
+/// What reading the line the confirmation asks for produced.
 pub const Line = union(enum) {
     /// The text the user typed. Owned by the caller of the reader.
     answer: []u8,
@@ -494,13 +754,22 @@ pub fn describeReply(allocator: std.mem.Allocator, reply: Reply, options: []cons
 /// question, so one key is never read as a sequence here and as Esc there.
 const escape_timeout_ms = 100;
 
+/// The answer typed into a question's free-text row: where it goes, and the
+/// words it was answered in. The words are owned by whoever holds this.
+pub const Typed = struct {
+    /// Index of the question the free-text row belongs to.
+    index: usize,
+    text: []u8,
+};
+
 /// What the form came to.
 pub const Outcome = union(enum) {
     /// Every question has an answer: read `Slot.answer` for each one.
     answered,
-    /// The user chose to type the answer to question `custom`: read the line,
-    /// store it on that slot, and call `form` again.
-    custom: usize,
+    /// The user typed the answer to question `index` into the free-text row
+    /// itself. The words are owned here: store them on that slot, and draw the
+    /// form again.
+    custom: Typed,
     /// The confirmation's Supplement row: read a line of the user's own words
     /// to send with the answers.
     supplement,
@@ -557,9 +826,9 @@ const no_limit: usize = 1_000;
 ///
 /// The questions of one message are drawn together: Tab and Shift+Tab move
 /// between them, so an answer given to a question further up can still be
-/// changed before the form is submitted. The free-text row is not typed here —
-/// choosing it returns `custom` and the caller reads the line, which is how Esc
-/// in that line gets back to the form.
+/// changed before the form is submitted. Enter on the free-text row types the
+/// answer into that row, where it will be shown: the form takes the keys until
+/// the words are given or Esc goes back to the options.
 ///
 /// `confirm_tab` closes the strip with a tab that submits the answers or takes
 /// words of the user's own to send with them; the trust prompt leaves it off,
@@ -586,7 +855,10 @@ pub fn formDocked(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow
 
 fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom: bool, confirm_tab: bool, focus: ?usize, dock: ?Dock) !Outcome {
     if (slots.len == 0) return .cancel;
-    var state = Form{ .slots = slots, .allow_custom = allow_custom, .confirm_tab = confirm_tab };
+    var state = Form{ .slots = slots, .allow_custom = allow_custom, .confirm_tab = confirm_tab, .allocator = allocator };
+    // The words typed into a free-text row live in the form until they are
+    // answered with; a form left half-typed frees them here.
+    defer state.deinit();
     if (focus) |index| {
         // `slots.len` is the confirmation, which a form with one only reaches
         // once every question has an answer.
@@ -614,6 +886,14 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var drawn: usize = 0;
+    // The line of the last form the real cursor was left on, or null when it
+    // was left below the form with no caret to sit on.
+    var caret_line: ?usize = null;
+    // Where drawing put the caret of a row being typed into. The real cursor is
+    // moved there: an input method puts its candidate window where the terminal
+    // says the cursor is, and a hidden cursor leaves it nowhere to go.
+    var caret_cell: ?Cell = null;
+    state.caret_report = &caret_cell;
     // The height the dock was asked for last. It is carried from one redraw to
     // the next: the floor is only what tells the form the width it draws at.
     var reserved: usize = formRows(slots, allow_custom, confirm_tab);
@@ -623,9 +903,22 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
             const view = try reserveDock(allocator, &state, target, &reserved);
             try aw.writer.writeAll(sgr.SYNC_BEGIN ++ sgr.HIDE_CURSOR);
             try drawDocked(allocator, &aw.writer, &state, view);
-            try aw.writer.writeAll(sgr.RESTORE_CURSOR ++ sgr.SYNC_END);
+            // The screen's own cursor is restored first, so the caret the form
+            // reports is what is left showing.
+            try aw.writer.writeAll(sgr.RESTORE_CURSOR);
+            if (caret_cell) |cell| {
+                if (cell.line < view.height) {
+                    try aw.writer.print(sgr.CURSOR_POSITION ++ sgr.SHOW_CURSOR, .{ view.top + cell.line, cell.column + 1 });
+                }
+            }
+            try aw.writer.writeAll(sgr.SYNC_END);
         } else {
-            if (drawn > 0) try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn});
+            if (drawn > 0) {
+                // The cursor may have been left on the caret rather than below
+                // the form, so it is put back there before the redraw starts.
+                if (caret_line) |line| try moveBelowForm(&aw.writer, drawn, line);
+                try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn});
+            }
             const columns = term.columns(out);
             const wanted = @max(formRows(slots, allow_custom, confirm_tab), try naturalRows(allocator, &state, columns));
             // Without a screen to scroll in, a form taller than the window would
@@ -637,6 +930,15 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
                 try aw.writer.print(sgr.CURSOR_UP ++ "\r", .{drawn - rows});
             }
             drawn = rows;
+            // The drawing ends one line below the form, in the first column.
+            caret_line = null;
+            if (caret_cell) |cell| {
+                if (cell.line < rows) {
+                    try showCaret(&aw.writer, rows, cell);
+                    caret_line = cell.line;
+                }
+            }
+            if (caret_line == null) try aw.writer.writeAll(sgr.HIDE_CURSOR);
         }
         try out.writeStreamingAll(io, aw.written());
 
@@ -646,12 +948,19 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
             if (dock != null and !try raw.waitReadable(io, 100)) break;
             const byte = try raw.readByte() orelse return .dismiss;
             // Esc opens a sequence only when more bytes follow; on its own it
-            // cancels the questions, and the run stops with them, as Esc at the
-            // prompt stops a task.
-            if (byte == 0x1b and !try raw.waitReadable(io, escape_timeout_ms)) return .cancel;
-            switch (state.key(byte)) {
+            // goes back to the options from the free-text row and cancels the
+            // questions anywhere else, where the run stops with them, as Esc at
+            // the prompt stops a task.
+            if (byte == 0x1b and !try raw.waitReadable(io, escape_timeout_ms)) {
+                if (state.typing) {
+                    state.closeEdit();
+                    break;
+                }
+                return .cancel;
+            }
+            switch (try state.key(byte)) {
                 .finish => return .answered,
-                .custom => |index| return .{ .custom = index },
+                .custom => |typed| return .{ .custom = typed },
                 .supplement => return .supplement,
                 .cancel => return .cancel,
                 .dismiss => return .dismiss,
@@ -660,6 +969,29 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
             }
         }
     }
+}
+
+/// Write the moves that put the real cursor on `cell` of a form `rows` lines
+/// tall, from the line below it where drawing ends, and show it.
+///
+/// The cursor has to be the real one: it is the cell the terminal reports, and
+/// an input method puts its candidate window beside it. A hidden cursor leaves
+/// the candidate window nowhere to go.
+fn showCaret(w: *std.Io.Writer, rows: usize, cell: Cell) !void {
+    // A count of zero is a move of one for these sequences, so neither is
+    // emitted unless it moves the cursor.
+    const up = rows -| cell.line;
+    if (up > 0) try w.print(sgr.CURSOR_UP, .{up});
+    if (cell.column > 0) try w.print(sgr.CURSOR_RIGHT, .{cell.column});
+    try w.writeAll(sgr.SHOW_CURSOR);
+}
+
+/// Write the moves that take the cursor from the caret it was left on, on line
+/// `caret_line`, back to the line below the form: what a redraw of `drawn`
+/// lines starts from.
+fn moveBelowForm(w: *std.Io.Writer, drawn: usize, caret_line: usize) !void {
+    const down = drawn -| caret_line;
+    if (down > 0) try w.print(sgr.CURSOR_DOWN, .{down});
 }
 
 /// Reserve the dock for one redraw and answer the view the form is drawn in.
@@ -684,7 +1016,7 @@ fn reserveDock(allocator: std.mem.Allocator, state: *Form, dock: Dock, reserved:
     return view;
 }
 
-/// Draw a form and read the line a free-text row asks for. Both the plain
+/// Draw a form and read the line the confirmation asks for. Both the plain
 /// terminal and the full-screen runtime hand in their own pair, so a form is
 /// answered the same way in either.
 pub const Reader = struct {
@@ -694,13 +1026,16 @@ pub const Reader = struct {
     /// start on the first unanswered question — and take the keys until one
     /// question is acted on.
     present: *const fn (*anyopaque, []Slot, ?usize) anyerror!Outcome,
-    /// Read the line of a free-text row, or the words added to the answers.
+    /// Read the words added to the answers, from the confirmation's Supplement
+    /// row. The free-text row of a question is typed into the form itself, so
+    /// nothing is read for it here.
     read: *const fn (*anyopaque) anyerror!Line,
 };
 
-/// Answer the questions of one form. The free-text row is resolved here rather
-/// than in `form`, which is what keeps Esc in that line returning to the form:
-/// the questions stay open until every one is answered or the form is left.
+/// Answer the questions of one form. The answers typed into a free-text row
+/// arrive with the outcome, already the user's words: only the supplement the
+/// confirmation asks for is read on a line of its own. The questions stay open
+/// until every one is answered or the form is left.
 pub fn resolve(allocator: std.mem.Allocator, slots: []Slot, reader: Reader) !Replies {
     // The typed answers live here, not on the stack of one iteration: the form
     // keeps showing them, and they must stay valid until the replies are made.
@@ -718,7 +1053,7 @@ pub fn resolve(allocator: std.mem.Allocator, slots: []Slot, reader: Reader) !Rep
     // to carry on at the first question still without an answer.
     var focus: ?usize = null;
 
-    loop: while (true) {
+    while (true) {
         switch (try reader.present(reader.context, slots, focus)) {
             // Submit, from the last tab: the answers as they stand.
             .answered => return submitted(allocator, slots, &note),
@@ -737,38 +1072,20 @@ pub fn resolve(allocator: std.mem.Allocator, slots: []Slot, reader: Reader) !Rep
                 // answered.
                 .none => return submitted(allocator, slots, &note),
             },
-            .custom => |index| switch (try reader.read(reader.context)) {
-                .answer => |text| {
-                    typed.append(allocator, text) catch |err| {
-                        allocator.free(text);
-                        return err;
-                    };
-                    const slot = &slots[index];
-                    slot.custom = text;
-                    slot.selected = slot.options.len;
-                    slot.answered = true;
-                    focus = null;
-                },
-                // Esc in the free-text row: back to the options of the same
-                // question, where Enter lands on the recommendation rather
-                // than asking for the same line again.
-                .back => {
-                    const slot = &slots[index];
-                    slot.selected = recommendedIndex(slot.options) orelse 0;
-                    focus = index;
-                },
-                // End of input: take the recommendation when the question has
-                // one, so a half-typed form still settles instead of stalling.
-                .none => {
-                    const slot = &slots[index];
-                    if (recommendedIndex(slot.options)) |option| {
-                        slot.selected = option;
-                        slot.answered = true;
-                        focus = null;
-                        continue :loop;
-                    }
-                    return repliesFrom(allocator, slots);
-                },
+            // The words typed into question `index`'s free-text row, which the
+            // form hands back with the answer instead of asking for them twice.
+            .custom => |answer| {
+                typed.append(allocator, answer.text) catch |err| {
+                    allocator.free(answer.text);
+                    return err;
+                };
+                const slot = &slots[answer.index];
+                slot.custom = answer.text;
+                slot.selected = slot.options.len;
+                slot.answered = true;
+                // The form is drawn again, landing on the next question still
+                // without an answer, or on the confirmation.
+                focus = null;
             },
             // Esc at the questions: the answers given so far go with them, and
             // the caller stops the run.
@@ -872,6 +1189,7 @@ fn drawDocked(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const For
 /// short. That row is drawn whole whenever the space allows it, and a
 /// neighbour that does not fit is clipped around it.
 fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form, columns: usize, height: usize) !usize {
+    if (state.caret_report) |report| report.* = null;
     if (height == 0) return 0;
     const show_tabs = state.tabs() > 1 and height >= 4;
     const show_help = height >= 3;
@@ -892,10 +1210,12 @@ fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form,
     var content: std.Io.Writer.Allocating = .init(allocator);
     defer content.deinit();
     var rows: usize = 0;
+    var caret: ?Cell = null;
     while (true) {
         content.clearRetainingCapacity();
         const body = try drawBody(allocator, &content.writer, state, columns, body_height, show_tabs, show_help, visible, header_lines);
         rows = body.lines;
+        caret = body.caret;
         if (!body.focused_cut or visible <= 1) break;
         visible -= 1;
     }
@@ -906,6 +1226,11 @@ fn drawForm(allocator: std.mem.Allocator, w: *std.Io.Writer, state: *const Form,
         drawn += 1;
     }
     try w.writeAll(content.written());
+    // The caret counts from the form's first line, so the strip above the body
+    // moves it down.
+    if (state.caret_report) |report| {
+        report.* = if (caret) |cell| .{ .line = cell.line + drawn, .column = cell.column } else null;
+    }
     return drawn + rows;
 }
 
@@ -915,6 +1240,9 @@ const Body = struct {
     /// The row the keys act on was cut short or left out because the space ran
     /// out: one fewer option row would draw it whole.
     focused_cut: bool = false,
+    /// Where the caret of the free-text row being typed into was drawn, when
+    /// that row was drawn at all: the real cursor belongs there.
+    caret: ?Cell = null,
 };
 
 /// The question of the focused tab, its number in the form, and — once it has
@@ -964,6 +1292,7 @@ fn drawBody(
     // space by drawing one fewer row.
     var focused_cut = false;
     var focused_drawn = false;
+    var caret_cell: ?Cell = null;
     const slot = state.focusedSlot().*;
 
     if (height >= 2) rows += (try drawHeader(allocator, w, state, columns, header_lines)).lines;
@@ -983,6 +1312,15 @@ fn drawBody(
         const prefix = try std.fmt.bufPrint(&prefix_buf, "    {s} {d}) ", .{ if (selected) ">" else " ", i + 1 });
         var body: std.Io.Writer.Allocating = .init(allocator);
         defer body.deinit();
+        var caret: std.Io.Writer.Allocating = .init(allocator);
+        defer caret.deinit();
+        var after: std.Io.Writer.Allocating = .init(allocator);
+        defer after.deinit();
+        var caret_style: []const u8 = "";
+        // The style the text after the caret is drawn in: the row's own, with
+        // the caret's attribute switched off again for it.
+        var style_buf: [64]u8 = undefined;
+        var after_style: []const u8 = marker;
         var description: std.Io.Writer.Allocating = .init(allocator);
         defer description.deinit();
         if (i < slot.options.len) {
@@ -990,16 +1328,36 @@ fn drawBody(
             try body.writer.writeAll(option.label);
             if (recommendedIndex(slot.options) == i) try body.writer.writeAll(" (recommended)");
             if (option.description.len > 0) try description.writer.print("  {s}", .{option.description});
+        } else if (state.typing and selected) {
+            // The free-text row being typed into: the words show where they
+            // will be answered, and the caret sits in them at a cell of its
+            // own, so nothing shifts as it moves.
+            const text = state.edit.text.items;
+            const at = @min(state.edit.caret, text.len);
+            try body.writer.writeAll(text[0..at]);
+            if (at < text.len) {
+                const step = term.decodeAt(text, at).len;
+                try caret.writer.writeAll(text[at..][0..step]);
+                try after.writer.writeAll(text[at + step ..]);
+                after_style = try std.fmt.bufPrint(&style_buf, "{s}{s}", .{ sgr.NO_INVERSE, marker });
+            } else try caret.writer.writeAll(" ");
+            caret_style = sgr.INVERSE;
         } else try body.writer.writeAll("Other / 自定义回答");
 
         const spans = [_]Span{
             .{ .style = marker, .text = prefix },
             .{ .style = marker, .text = body.written() },
+            .{ .style = if (caret_style.len > 0) caret_style else marker, .text = caret.written() },
+            .{ .style = after_style, .text = after.written() },
             .{ .style = DIM, .text = description.written() },
         };
         // A wrapped label and description line up under the label, past the
         // "   > 1) " marker that tells them apart from the question above.
-        const row = try writeRow(w, allocator, &spans, columns, term.width(prefix), remaining);
+        // The caret of the row being typed into is the second run after the
+        // prefix: where it lands is the cell the real cursor is put on.
+        const marked = state.typing and i == slot.options.len;
+        const row = try writeRowMarked(w, allocator, &spans, columns, term.width(prefix), remaining, if (marked) 2 else null);
+        if (row.mark) |mark| caret_cell = .{ .line = rows + mark.line, .column = mark.column };
         rows += row.lines;
         if (i == slot.selected) {
             focused_drawn = true;
@@ -1010,25 +1368,31 @@ fn drawBody(
     // which one fewer row would draw.
     if (!focused_drawn) focused_cut = true;
 
-    if (!show_help) return .{ .lines = rows, .focused_cut = focused_cut };
+    if (!show_help) return .{ .lines = rows, .focused_cut = focused_cut, .caret = caret_cell };
     var hint: std.Io.Writer.Allocating = .init(allocator);
     defer hint.deinit();
     try hint.writer.writeAll("  ");
-    if (show_tabs) try hint.writer.writeAll("Tab/Shift+Tab · ");
-    try hint.writer.writeAll(if (state.onConfirm())
-        "↑/↓ select · Enter submit · Esc cancel"
-    else
-        "↑/↓ select · Enter confirm · Esc cancel");
+    if (state.typing) {
+        // The row owns the keys while it is typed into: what is left of them
+        // is answering with the words and going back to the options.
+        try hint.writer.writeAll("Enter confirm · Esc back · Ctrl+U clear");
+    } else {
+        if (show_tabs) try hint.writer.writeAll("Tab/Shift+Tab · ");
+        try hint.writer.writeAll(if (state.onConfirm())
+            "↑/↓ select · Enter submit · Esc cancel"
+        else
+            "↑/↓ select · Enter confirm · Esc cancel");
+    }
     const spans = [_]Span{.{ .style = DIM, .text = hint.written() }};
     // The hint is one line by construction: it names keys, and a wrapped copy
     // would take a row from the answers it is explaining.
     rows += (try writeRow(w, allocator, &spans, columns, 2, 1)).lines;
-    return .{ .lines = rows, .focused_cut = focused_cut };
+    return .{ .lines = rows, .focused_cut = focused_cut, .caret = caret_cell };
 }
 
 /// A closed menu with no free-text row; defaults to the first option. The
 /// ask_user questions go through `resolve` instead, because an answer typed at
-/// them has to be read back with the line editor.
+/// them has to be kept until the replies are made.
 pub fn selectOnly(allocator: std.mem.Allocator, io: std.Io, question: []const u8, options: []const Option) !Choice {
     var slots = [_]Slot{Slot.init(question, options)};
     return switch (try form(allocator, io, &slots, false, false, null)) {
@@ -1039,7 +1403,11 @@ pub fn selectOnly(allocator: std.mem.Allocator, io: std.Io, question: []const u8
         },
         // Without a free-text row and without a confirmation, there is nothing
         // to type here.
-        .custom, .supplement, .cancel, .dismiss => .cancel,
+        .custom => |answer| blk: {
+            allocator.free(answer.text);
+            break :blk .cancel;
+        },
+        .supplement, .cancel, .dismiss => .cancel,
     };
 }
 
@@ -1119,31 +1487,31 @@ test "the form navigates options, arrows and both tabs" {
     try std.testing.expectEqual(@as(usize, 1), slots[1].selected);
 
     // Arrows, vim keys and numbers move inside the focused question only.
-    for ("\x1b[A") |byte| _ = state.key(byte);
+    for ("\x1b[A") |byte| _ = try state.key(byte);
     try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
-    try expectAction(.redraw, state.key('2'));
+    try expectAction(.redraw, try state.key('2'));
     try std.testing.expectEqual(@as(usize, 1), slots[0].selected);
-    _ = state.key('j');
+    _ = try state.key('j');
     try std.testing.expectEqual(@as(usize, 2), slots[0].selected);
-    _ = state.key('j');
+    _ = try state.key('j');
     try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
 
     // Tab goes to the next question, Shift+Tab back to the previous one.
-    try expectAction(.redraw, state.key('\t'));
+    try expectAction(.redraw, try state.key('\t'));
     try std.testing.expectEqual(@as(usize, 1), state.focus);
-    try expectAction(.redraw, state.key('j'));
+    try expectAction(.redraw, try state.key('j'));
     try std.testing.expectEqual(@as(usize, 2), slots[1].selected);
     // The first question kept the selection it had when the keyboard left it.
     try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
-    for ("\x1b[Z") |byte| _ = state.key(byte);
+    for ("\x1b[Z") |byte| _ = try state.key(byte);
     try std.testing.expectEqual(@as(usize, 0), state.focus);
     // Tab wraps around, so the last question leads back to the first.
-    for ("\x1b[Z") |byte| _ = state.key(byte);
+    for ("\x1b[Z") |byte| _ = try state.key(byte);
     try std.testing.expectEqual(@as(usize, 1), state.focus);
 
     // A habitual Ctrl+C leaves the form alone; Ctrl+D dismisses it.
-    try expectAction(.ignore, state.key(3));
-    try expectAction(.dismiss, state.key(4));
+    try expectAction(.ignore, try state.key(3));
+    try expectAction(.dismiss, try state.key(4));
 }
 
 test "an answered question can be changed before the form is submitted" {
@@ -1151,22 +1519,22 @@ test "an answered question can be changed before the form is submitted" {
     var state = Form{ .slots = &slots };
 
     // Enter answers the focused question and moves on to the next unanswered.
-    try expectAction(.redraw, state.key('\r'));
+    try expectAction(.redraw, try state.key('\r'));
     try std.testing.expect(slots[0].answered);
     try std.testing.expectEqual(@as(usize, 1), state.focus);
 
     // Shift+Tab goes back, the answer is still the one given, and it can be
     // replaced without the form forgetting the question already answered.
-    for ("\x1b[Z") |byte| _ = state.key(byte);
+    for ("\x1b[Z") |byte| _ = try state.key(byte);
     try std.testing.expectEqual(@as(usize, 0), state.focus);
-    _ = state.key('1');
+    _ = try state.key('1');
     try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
-    try expectAction(.redraw, state.key('\r'));
+    try expectAction(.redraw, try state.key('\r'));
     try std.testing.expectEqual(@as(usize, 1), state.focus);
     try std.testing.expectEqual(@as(usize, 0), slots[0].selected);
 
     // The last answer finishes the form.
-    try expectAction(.finish, state.key('\r'));
+    try expectAction(.finish, try state.key('\r'));
     try std.testing.expect(slots[1].answered);
 }
 
@@ -1176,8 +1544,8 @@ test "the last answer hands the keyboard to the confirmation" {
 
     // Enter answers the questions, and the last answer stops on the
     // confirmation instead of sending them off.
-    _ = state.key('\r');
-    try expectAction(.redraw, state.key('\r'));
+    _ = try state.key('\r');
+    try expectAction(.redraw, try state.key('\r'));
     try std.testing.expect(slots[1].answered);
     try std.testing.expectEqual(slots.len, state.focus);
     try std.testing.expect(state.onConfirm());
@@ -1185,11 +1553,11 @@ test "the last answer hands the keyboard to the confirmation" {
     // It starts on Submit, which Enter takes; Tab and Shift+Tab still walk back
     // to the questions, whose answers are unchanged.
     try std.testing.expectEqual(@as(usize, 0), state.submit.selected);
-    for ("\x1b[Z") |byte| _ = state.key(byte);
+    for ("\x1b[Z") |byte| _ = try state.key(byte);
     try std.testing.expectEqual(@as(usize, 1), state.focus);
-    try expectAction(.redraw, state.key('\t'));
+    try expectAction(.redraw, try state.key('\t'));
     try std.testing.expectEqual(slots.len, state.focus);
-    try expectAction(.finish, state.key('\r'));
+    try expectAction(.finish, try state.key('\r'));
 }
 
 test "the confirmation waits until every question has an answer" {
@@ -1199,61 +1567,142 @@ test "the confirmation waits until every question has an answer" {
     // While a question is still open, Tab and Shift+Tab cycle the questions:
     // there is nothing to submit, and no answer for words of the user's own to
     // be added to. Answering in words is a question's free-text row instead.
-    try expectAction(.redraw, state.key('\t'));
+    try expectAction(.redraw, try state.key('\t'));
     try std.testing.expectEqual(@as(usize, 1), state.focus);
-    try expectAction(.redraw, state.key('\t'));
+    try expectAction(.redraw, try state.key('\t'));
     try std.testing.expectEqual(@as(usize, 0), state.focus);
-    for ("\x1b[Z") |byte| _ = state.key(byte);
+    for ("\x1b[Z") |byte| _ = try state.key(byte);
     try std.testing.expectEqual(@as(usize, 1), state.focus);
     try std.testing.expect(!state.onConfirm());
 
     // The last answer hands the keyboard to the confirmation, which Tab then
     // reaches like any other tab.
     slots[0].answered = true;
-    try expectAction(.redraw, state.key('\r'));
+    try expectAction(.redraw, try state.key('\r'));
     try std.testing.expectEqual(slots.len, state.focus);
     try std.testing.expect(state.onConfirm());
-    try expectAction(.redraw, state.key('\t'));
+    try expectAction(.redraw, try state.key('\t'));
     try std.testing.expectEqual(@as(usize, 0), state.focus);
-    try expectAction(.redraw, state.key('\t'));
+    try expectAction(.redraw, try state.key('\t'));
     try std.testing.expectEqual(@as(usize, 1), state.focus);
-    try expectAction(.redraw, state.key('\t'));
+    try expectAction(.redraw, try state.key('\t'));
     try std.testing.expectEqual(slots.len, state.focus);
 }
 
 test "the confirmation offers the words to add instead of submitting" {
     var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
     var state = Form{ .slots = &slots, .confirm_tab = true };
-    _ = state.key('\r');
+    _ = try state.key('\r');
     try std.testing.expectEqual(@as(usize, 1), state.focus);
 
     // Down and the number both land on Supplement, which asks for a line
     // rather than sending the answers.
-    for ("\x1b[B") |byte| _ = state.key(byte);
+    for ("\x1b[B") |byte| _ = try state.key(byte);
     try std.testing.expectEqual(@as(usize, 1), state.submit.selected);
-    try expectAction(.supplement, state.key('\r'));
-    _ = state.key('1');
+    try expectAction(.supplement, try state.key('\r'));
+    _ = try state.key('1');
     try std.testing.expectEqual(@as(usize, 0), state.submit.selected);
     // The confirmation has two rows even when the questions have a free-text
     // row: down from Submit reaches Supplement and no further.
-    try expectAction(.redraw, state.key('j'));
-    _ = state.key('j');
+    try expectAction(.redraw, try state.key('j'));
+    _ = try state.key('j');
     try std.testing.expectEqual(@as(usize, 0), state.submit.selected);
 }
 
-test "the free-text row asks the caller for a line instead of answering" {
+test "Enter on the free-text row types in place, and Esc goes back to it" {
+    const allocator = std.testing.allocator;
     var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
-    var state = Form{ .slots = &slots };
+    var state = Form{ .slots = &slots, .allocator = allocator };
+    defer state.deinit();
+
     // Two options plus the free-text row, which is row 3.
-    _ = state.key('3');
+    _ = try state.key('3');
     try std.testing.expectEqual(@as(usize, 2), slots[0].selected);
-    const action = state.key('\r');
-    try expectAction(.custom, action);
-    try std.testing.expectEqual(@as(usize, 0), switch (action) {
-        .custom => |index| index,
-        else => unreachable,
-    });
+    // Enter on that row takes the keys into it rather than asking for a line
+    // below the form.
+    try expectAction(.redraw, try state.key('\r'));
+    try std.testing.expect(state.typing);
+    // Nothing is answered until there are words to answer with.
+    try expectAction(.ignore, try state.key('\r'));
     try std.testing.expect(!slots[0].answered);
+
+    for ("ok") |byte| try expectAction(.redraw, try state.key(byte));
+    try std.testing.expectEqualStrings("ok", state.edit.text.items);
+    try std.testing.expectEqual(@as(usize, 2), state.edit.caret);
+
+    // Enter again answers the question with the words as they stand, handed to
+    // the caller with the outcome.
+    const action = try state.key('\r');
+    try expectAction(.custom, action);
+    const answer = switch (action) {
+        .custom => |typed| typed,
+        else => unreachable,
+    };
+    defer allocator.free(answer.text);
+    try std.testing.expectEqual(@as(usize, 0), answer.index);
+    try std.testing.expectEqualStrings("ok", answer.text);
+    try std.testing.expect(slots[0].answered);
+    try std.testing.expectEqualStrings("ok", slots[0].custom.?);
+    try std.testing.expect(!state.typing);
+}
+
+test "the free-text row edits Chinese text, its caret and its draft" {
+    const allocator = std.testing.allocator;
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    var state = Form{ .slots = &slots, .allocator = allocator };
+    defer state.deinit();
+    _ = try state.key('3');
+    try expectAction(.redraw, try state.key('\r'));
+
+    // A Chinese character arrives as its bytes and is one character to the
+    // caret, so Backspace removes all of it and no half of it is left behind.
+    for ("中文") |byte| _ = try state.key(byte);
+    try std.testing.expectEqualStrings("中文", state.edit.text.items);
+    try expectAction(.redraw, try state.key(0x7f));
+    try std.testing.expectEqualStrings("中", state.edit.text.items);
+    try std.testing.expectEqual(@as(usize, 3), state.edit.caret);
+
+    // Left and Right walk codepoints, and text goes in where the caret is.
+    for ("\x1b[D") |byte| _ = try state.key(byte);
+    try std.testing.expectEqual(@as(usize, 0), state.edit.caret);
+    for ("\x1b[C") |byte| _ = try state.key(byte);
+    try std.testing.expectEqual(@as(usize, 3), state.edit.caret);
+    for ("\x1b[D") |byte| _ = try state.key(byte);
+    for ("ab") |byte| _ = try state.key(byte);
+    try std.testing.expectEqualStrings("ab中", state.edit.text.items);
+    // Back over the "b" and a character typed there lands between them.
+    for ("\x1b[D") |byte| _ = try state.key(byte);
+    for ("X") |byte| _ = try state.key(byte);
+    try std.testing.expectEqualStrings("aXb中", state.edit.text.items);
+
+    // Esc — the lone one the read loop closes the row with — goes back to the
+    // options and keeps the words, which the row opens on again.
+    state.closeEdit();
+    try std.testing.expect(!state.typing);
+    try std.testing.expectEqualStrings("aXb中", state.edit.text.items);
+    // The keyboard lands on the recommendation rather than on the row that
+    // would ask for the same words again.
+    try std.testing.expectEqual(@as(usize, 1), slots[0].selected);
+    // The rows, not the text, take the keys again.
+    try expectAction(.redraw, try state.key('1'));
+    try std.testing.expectEqualStrings("aXb中", state.edit.text.items);
+    _ = try state.key('3');
+    try expectAction(.redraw, try state.key('\r'));
+    try std.testing.expectEqualStrings("aXb中", state.edit.text.items);
+
+    // Tab-ing to another question leaves that draft behind rather than
+    // answering the new question with it.
+    var two = [_]Slot{ Slot.init("First?", &two_options_a), Slot.init("Second?", &two_options_b) };
+    var other = Form{ .slots = &two, .allocator = allocator };
+    defer other.deinit();
+    _ = try other.key('3');
+    _ = try other.key('\r');
+    for ("draft") |byte| _ = try other.key(byte);
+    other.closeEdit();
+    _ = try other.key('\t');
+    _ = try other.key('3');
+    _ = try other.key('\r');
+    try std.testing.expectEqualStrings("", other.edit.text.items);
 }
 
 test "a typed answer is the slot's answer until an option replaces it" {
@@ -1264,8 +1713,8 @@ test "a typed answer is the slot's answer until an option replaces it" {
 
     // Choosing an option row again drops the typed answer.
     var state = Form{ .slots = &slots };
-    _ = state.key('1');
-    _ = state.key('\r');
+    _ = try state.key('1');
+    _ = try state.key('\r');
     try std.testing.expect(slots[0].custom == null);
     try std.testing.expectEqual(Answer{ .option = 0 }, slots[0].answer());
 }
@@ -1302,6 +1751,130 @@ test "the form draws horizontal tabs and only the focused question" {
     aw.clearRetainingCapacity();
     _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "First question?" ++ DIM ++ "  → Beta") != null);
+}
+
+test "the real cursor is moved onto the caret and back below the form" {
+    const allocator = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    // Drawing ends one line below a six-line form, so a caret on its last line
+    // is one line up, and one on its first is six.
+    try showCaret(&aw.writer, 6, .{ .line = 5, .column = 0 });
+    try std.testing.expectEqualStrings("\x1b[1A" ++ sgr.SHOW_CURSOR, aw.written());
+    aw.clearRetainingCapacity();
+    try showCaret(&aw.writer, 6, .{ .line = 0, .column = 12 });
+    try std.testing.expectEqualStrings("\x1b[6A\x1b[12C" ++ sgr.SHOW_CURSOR, aw.written());
+
+    // From that caret back to the line below the form, which is where the next
+    // redraw counts its own lines from.
+    aw.clearRetainingCapacity();
+    try moveBelowForm(&aw.writer, 6, 0);
+    try std.testing.expectEqualStrings("\x1b[6B", aw.written());
+    aw.clearRetainingCapacity();
+    try moveBelowForm(&aw.writer, 6, 5);
+    try std.testing.expectEqualStrings("\x1b[1B", aw.written());
+    // The two cancel out, which is what keeps the redraw in place.
+    aw.clearRetainingCapacity();
+    try moveBelowForm(&aw.writer, 6, 3);
+    try showCaret(&aw.writer, 6, .{ .line = 3, .column = 0 });
+    try std.testing.expectEqualStrings("\x1b[3B\x1b[3A" ++ sgr.SHOW_CURSOR, aw.written());
+}
+
+test "the cell the caret is drawn in is reported for the real cursor" {
+    const allocator = std.testing.allocator;
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    var state = Form{ .slots = &slots, .allocator = allocator };
+    defer state.deinit();
+    var caret: ?Cell = null;
+    state.caret_report = &caret;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    // Nothing to type: no cell to put the real cursor on, so it stays hidden.
+    _ = try state.key('3');
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    try std.testing.expectEqual(@as(?Cell, null), caret);
+
+    // Typing in the row: the cell is on the row's line, past "    > 3) " and
+    // the words before the caret.
+    _ = try state.key('\r');
+    for ("ab") |byte| _ = try state.key(byte);
+    aw.clearRetainingCapacity();
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    // Question, two options, then the row being typed into, all one line each.
+    try std.testing.expectEqual(@as(usize, 3), caret.?.line);
+    try std.testing.expectEqual(term.width("    > 3) ab"), caret.?.column);
+
+    // The caret after a word that wrapped moves down with it, which is what
+    // keeps the cursor — and the candidate window behind it — on the caret.
+    const narrow = 20;
+    aw.clearRetainingCapacity();
+    _ = try drawForm(allocator, &aw.writer, &state, narrow, 40);
+    var lines = std.mem.splitSequence(u8, aw.written(), "\r\n");
+    var index: usize = 0;
+    while (lines.next()) |line| : (index += 1) {
+        if (index != caret.?.line) continue;
+        // The caret's cell is the one the terminal is told about: the column of
+        // the inverted character counted in cells.
+        const before = line[0..std.mem.indexOf(u8, line, sgr.INVERSE).?];
+        try std.testing.expectEqual(term.width(before), caret.?.column);
+    }
+    // Back to the options: nothing is being typed into, so nothing is reported.
+    state.closeEdit();
+    aw.clearRetainingCapacity();
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    try std.testing.expectEqual(@as(?Cell, null), caret);
+}
+
+test "the free-text row is drawn as it is typed into, with the caret in it" {
+    const allocator = std.testing.allocator;
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    var state = Form{ .slots = &slots, .allocator = allocator };
+    defer state.deinit();
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    // Before Enter the row is the label the form offers.
+    _ = try state.key('3');
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "Other / 自定义回答") != null);
+
+    // Typing happens in that row: the words take the label's place, the caret
+    // is a cell of its own, and the hint names the keys that are left.
+    _ = try state.key('\r');
+    for ("自己的答案") |byte| _ = try state.key(byte);
+    aw.clearRetainingCapacity();
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    const text = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "Other / 自定义回答") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "3) 自己的答案" ++ sgr.INVERSE ++ " ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Enter confirm · Esc back · Ctrl+U clear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "↑/↓ select") == null);
+
+    // Half a Chinese character is not drawn: the bytes of one are held until
+    // the last of them has come, so the row does not flicker with a stray byte
+    // between one keypress and the next.
+    aw.clearRetainingCapacity();
+    for ("\xe4") |byte| _ = try state.key(byte);
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "3) 自己的答案" ++ sgr.INVERSE ++ " ") != null);
+    for ("\xb8") |byte| _ = try state.key(byte);
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\\x") == null);
+
+    // A caret inside the words marks the character it goes before, so the text
+    // does not shift as it moves.
+    for ("\x1b[D\x1b[D") |byte| _ = try state.key(byte);
+    aw.clearRetainingCapacity();
+    _ = try drawForm(allocator, &aw.writer, &state, 80, 20);
+    // The character under the caret is drawn inverted, and the ones after it
+    // are not: the attribute is switched off again for them.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        aw.written(),
+        "3) 自己的" ++ sgr.INVERSE ++ "答" ++ sgr.NO_INVERSE ++ sgr.BOLD_CYAN ++ "案",
+    ) != null);
 }
 
 test "the strip ends on the confirmation, which submits or takes the words" {
@@ -1351,7 +1924,7 @@ test "question tabs follow keyboard focus and keep it visible on narrow terminal
     aw.clearRetainingCapacity();
     try drawTabs(allocator, &aw.writer, &state, 18);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 3 ") != null);
-    _ = state.key('\t');
+    _ = try state.key('\t');
     aw.clearRetainingCapacity();
     try drawTabs(allocator, &aw.writer, &state, 18);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), sgr.BOLD_CYAN ++ sgr.UNDERLINE ++ " · 4 ") != null);
@@ -1609,8 +2182,10 @@ test "the description names the recommendation" {
 }
 
 /// A stand-in for the terminal: it answers the first question still without an
-/// answer, and hands back the scripted lines for the free-text row.
+/// answer, and types `typed` into its free-text row instead of reading a line.
 const FakeReader = struct {
+    /// The words the free-text row is answered with.
+    typed: []const u8 = "typed",
     /// One entry per free-text read: the line to type, or null for Esc.
     lines: []const ?[]const u8 = &.{},
     /// What the first presentation comes to, for the confirmation's own line
@@ -1641,7 +2216,9 @@ const FakeReader = struct {
         }
         for (slots, 0..) |*slot, i| {
             if (slot.answered) continue;
-            if (slot.selected >= slot.options.len) return .{ .custom = i };
+            if (slot.selected >= slot.options.len) {
+                return .{ .custom = .{ .index = i, .text = try self.allocator.dupe(u8, self.typed) } };
+            }
             slot.answered = true;
             return .answered;
         }
@@ -1662,7 +2239,7 @@ test "typed answers are freed when resolve allocation fails" {
         fn run(allocator: std.mem.Allocator) !void {
             var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
             slots[0].selected = 2;
-            var reader = FakeReader{ .lines = &.{"custom"}, .allocator = allocator };
+            var reader = FakeReader{ .typed = "custom", .allocator = allocator };
             const replies = try resolve(allocator, &slots, .{
                 .context = &reader,
                 .present = FakeReader.present,
@@ -1674,40 +2251,23 @@ test "typed answers are freed when resolve allocation fails" {
     }.run, .{});
 }
 
-test "a typed answer is the reply, and Esc in that line goes back to the options" {
+test "a typed answer arrives with the outcome instead of on a line" {
     const allocator = std.testing.allocator;
 
-    // Typed text answers the question.
-    var typed_slots = [_]Slot{Slot.init("Which?", &two_options_a)};
-    typed_slots[0].selected = 2;
-    var typed_reader = FakeReader{ .lines = &.{"my own words"} };
-    const typed = try resolve(allocator, &typed_slots, .{
-        .context = &typed_reader,
+    var slots = [_]Slot{Slot.init("Which?", &two_options_a)};
+    slots[0].selected = 2;
+    var reader = FakeReader{ .typed = "my own words" };
+    const replies = try resolve(allocator, &slots, .{
+        .context = &reader,
         .present = FakeReader.present,
         .read = FakeReader.read,
     });
-    defer typed.deinit(allocator);
-    try std.testing.expectEqualStrings("my own words", typed.items[0].custom);
-    try std.testing.expect(typed_slots[0].answered);
-
-    // Esc returns to the options, where Enter takes the recommendation.
-    var escaped_slots = [_]Slot{Slot.init("Which?", &two_options_a)};
-    escaped_slots[0].selected = 2;
-    var escaped_reader = FakeReader{ .lines = &.{null} };
-    const escaped = try resolve(allocator, &escaped_slots, .{
-        .context = &escaped_reader,
-        .present = FakeReader.present,
-        .read = FakeReader.read,
-    });
-    defer escaped.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), escaped_reader.calls);
-    // The keyboard went back to the same question, not to the first one.
-    try std.testing.expectEqual(@as(?usize, 0), escaped_reader.focus);
-    try std.testing.expectEqual(@as(usize, 1), escaped_slots[0].selected);
-    try std.testing.expectEqual(@as(usize, 1), switch (escaped.items[0]) {
-        .option => |index| index,
-        else => unreachable,
-    });
+    defer replies.deinit(allocator);
+    try std.testing.expectEqualStrings("my own words", replies.items[0].custom);
+    try std.testing.expect(slots[0].answered);
+    // The form hands the words back with the answer, so nothing is read on a
+    // line below it.
+    try std.testing.expectEqual(@as(usize, 0), reader.reads);
 }
 
 test "the confirmation submits with the words the user added" {
