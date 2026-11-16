@@ -40,7 +40,7 @@ environment, permissions and network access — see [Security and state](securit
 |----------|----------|-------------|
 | `command` | yes | The command line to run |
 | `cwd` | no | Directory to run it in, absolute or relative to the working directory |
-| `timeout_seconds` | no | Deadline for this call, a whole number of seconds of at least 1; the default is 3600 (one hour) |
+| `timeout_seconds` | no | Deadline for this call, a whole number of seconds of at least 1; the default is 600 (ten minutes) |
 
 `cwd` is opened once, before the shell starts, and the shell is given that
 handle rather than a path; a directory that is not there is refused with the
@@ -55,10 +55,10 @@ missing argument.
 The call returns the merged output and the exit status. A command that runs past
 the deadline is terminated with its process group, so a background child does
 not outlive the call. Background processes are not kept across calls. A call
-that names no deadline gets an hour, which is what a build or a test run of this
-project can take; the tool sets no ceiling above what a call asks for, so a
-command expected to outlast the hour says how long it needs rather than being
-ended short.
+that names no deadline gets ten minutes, which is what a build or a test run of
+this project can take; the tool sets no ceiling above what a call asks for, so a
+command expected to outlast that says how long it needs rather than being ended
+short.
 
 The whole of the output is handed over: nothing is trimmed on the way out, so
 the collector holds what the machine can hold, and a command that prints without

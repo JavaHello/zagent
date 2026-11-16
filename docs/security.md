@@ -15,7 +15,7 @@ servers also run directly and inherit the host environment; configured `env`
 entries add or override variables, see [MCP servers](mcp.md).
 
 Tool calls retain output bounds and process-group cleanup, and `bash` ends a
-command at its deadline: an hour unless the call names another length, since
+command at its deadline: ten minutes unless the call names another length, since
 the tool sets no ceiling above what the call asks for. Commands use
 `bash --noprofile --norc -c`, not `/bin/sh`. Output bounds are described in
 [Tools](tools.md#output-limit).
