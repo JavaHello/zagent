@@ -210,6 +210,9 @@ try:
             until(lambda: drawn('choice', mark), b'the supplement prompt')
             if b'\x1b[6n' in transcript[mark:]:
                 os.write(master, b'\x1b[1;1R')
+            # Typed as the row opens, before it is drawn: words typed while the
+            # terminal is between the form and the editor still land in the
+            # answer, and the Enter they were typed with submits it.
             os.write(master, b'and mind the tests\r')
             until(lambda: b'Turn complete' in clean(), b'the answer')
             until(lambda: len(answers) == 1, b'the tool result')

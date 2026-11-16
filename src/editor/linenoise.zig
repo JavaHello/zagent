@@ -259,7 +259,16 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                 }
                 try state.refreshLine();
             },
-            10 => try state.editInsert("\n"), // Ctrl+J, and Shift+Enter where it is reported
+            // Ctrl+J, and Shift+Enter where it is reported — except in the
+            // free-text row of a question. The answer there is one line, and a
+            // newline is what it looks like when the terminal finished the line
+            // itself: an answer typed while the terminal was between readers is
+            // queued in the line discipline, and hands over the Enter it was
+            // typed with as a newline.
+            10 => if (ln.question_input) {
+                state.ln.history.pop();
+                return try ln.allocator.dupe(u8, state.buf.items);
+            } else try state.editInsert("\n"),
             key_enter => {
                 state.ln.history.pop();
                 return try ln.allocator.dupe(u8, state.buf.items);
@@ -550,7 +559,15 @@ fn linenoiseRaw(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]con
     // line the user just submitted.
     defer if (!ln.bottom_anchor) out.writeStreamingAll(ln.io, "\n") catch {};
 
-    const orig = try enableRawMode(in, out);
+    // The free-text row of a question takes the keyboard over from a menu, and
+    // an answer typed as the row opened is an answer like any other: flushing
+    // would swallow it, and on macOS the flush waits for the input it is about
+    // to throw away, so the row would not even be drawn until the user typed
+    // again. At the prompt the flush stays, where type-ahead is not history.
+    const orig = if (ln.question_input)
+        try enableRawModeKeepingInput(in, out)
+    else
+        try enableRawMode(in, out);
     defer disableRawMode(in, out, orig);
     try out.writeStreamingAll(ln.io, ansi.PASTE_ON);
     defer out.writeStreamingAll(ln.io, ansi.PASTE_OFF) catch {};
