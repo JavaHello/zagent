@@ -30,7 +30,8 @@ between runs.
 - **Session plan** — a checklist of the work in progress that survives `/clear`
   and comes back with a resumed session. [Plan](docs/plan.md)
 - **Durable conversations** — every launch is a saved session: `/new` starts
-  another, `--resume <id>` picks one up with its context and plan.
+  another, `--resume <id>` picks one up with its context and plan, and
+  `--resume` without an ID asks which saved session to open.
   [Sessions](docs/sessions.md)
 - **Memory** — durable notes scoped to the workspace, written by the model when
   a decision or convention matters, searched on demand. [Memory](docs/memory.md)

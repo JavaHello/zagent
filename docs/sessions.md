@@ -15,6 +15,20 @@ zagent --resume <session-id>
 zagent --resume <session-id> "Continue the task"
 ```
 
+Left without an ID, `--resume` asks which session to open:
+
+```sh
+zagent --resume
+```
+
+It offers the newest twenty sessions saved for this workspace, each with the
+first thing that was asked in it and how long ago it was saved; the newest is
+selected, and Esc cancels without opening anything. Files that are not
+snapshots of the current schema are left out rather than offered and then
+refused. The question needs a terminal: a pipe or a script has to name the ID.
+Older sessions stay on disk, so a known ID still resumes even when the list no
+longer shows it.
+
 Resume retains the ID and model context. Missing, invalid or corrupt IDs fail
 without creating an empty session. Snapshots must match the current schema;
 missing fields and removed fields are rejected rather than migrated.

@@ -241,6 +241,217 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Loaded 
     return .{ .messages = messages, .plan = plan, .child = child };
 }
 
+/// The ID of a resumable snapshot, taken from its file name: exactly
+/// `<32 lowercase hex>.json`. Child snapshots (`<id>.json.s1.json`) and the
+/// temporary file a save renames into place are not sessions of their own.
+pub fn idFromFileName(name: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, name, ".json")) return null;
+    const id = name[0 .. name.len - ".json".len];
+    validateId(id) catch return null;
+    return id;
+}
+
+/// How much of a conversation's first question a title keeps. A menu that
+/// scrolls through a paragraph per row is not a list a person reads.
+pub const max_title_codepoints: usize = 60;
+
+/// One saved conversation, as the session list shows it. `id` and `title` are
+/// owned by whoever holds the summary.
+pub const Summary = struct {
+    id: []u8,
+    /// When the snapshot was last written, in seconds since the epoch.
+    modified: i64,
+    messages: usize,
+    /// The first thing the user asked, on one line; empty when no turn was
+    /// completed before the session was left.
+    title: []u8,
+
+    pub fn deinit(self: *Summary, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.title);
+        self.* = undefined;
+    }
+};
+
+/// The sessions of one workspace, newest first.
+pub const Listing = struct {
+    items: []Summary,
+    /// Files among those read that are named like a session but could not be
+    /// read as one of the current schema. They are not offered, because
+    /// resuming them fails.
+    skipped: usize,
+
+    pub fn deinit(self: *Listing, allocator: std.mem.Allocator) void {
+        for (self.items) |*item| item.deinit(allocator);
+        if (self.items.len > 0) allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+/// What a listing needs to know about a snapshot. Unknown fields are ignored,
+/// so the list reads what it shows without adopting the whole schema.
+const ListMessage = struct {
+    role: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+};
+const ListSnapshot = struct {
+    version: ?u32 = null,
+    messages: ?[]const ListMessage = null,
+};
+
+/// Read the snapshots in `directory` as a session list, newest first. A
+/// missing directory is an empty listing: a workspace whose first session is
+/// starting has nothing saved yet. `limit` bounds how many summaries are
+/// parsed, not how many files are seen.
+pub fn list(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, limit: usize) !Listing {
+    var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .items = &.{}, .skipped = 0 },
+        else => return err,
+    };
+    defer dir.close(io);
+
+    const Candidate = struct {
+        name: []u8,
+        /// Kept at full resolution: two sessions saved in the same second are
+        /// still "newest last" to the person who saved them.
+        modified: std.Io.Timestamp,
+    };
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer {
+        for (candidates.items) |candidate| allocator.free(candidate.name);
+        candidates.deinit(allocator);
+    }
+    var skipped: usize = 0;
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        _ = idFromFileName(entry.name) orelse continue;
+        const stat = dir.statFile(io, entry.name, .{}) catch {
+            skipped += 1;
+            continue;
+        };
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        try candidates.append(allocator, .{ .name = name, .modified = stat.mtime });
+    }
+    // Only the newest few are read: their stat is what the order is made of,
+    // and parsing every conversation in the folder would be work nobody sees.
+    std.mem.sort(Candidate, candidates.items, {}, struct {
+        fn lt(_: void, a: Candidate, b: Candidate) bool {
+            if (a.modified.nanoseconds != b.modified.nanoseconds) return a.modified.nanoseconds > b.modified.nanoseconds;
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+
+    const keep = @min(limit, candidates.items.len);
+    var items: std.ArrayList(Summary) = .empty;
+    errdefer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit(allocator);
+    }
+    try items.ensureTotalCapacity(allocator, keep);
+    for (candidates.items[0..keep]) |candidate| {
+        const data = dir.readFileAlloc(io, candidate.name, allocator, .limited(64 * 1024 * 1024)) catch {
+            skipped += 1;
+            continue;
+        };
+        defer allocator.free(data);
+        const summary = summarize(allocator, candidate.name[0..32], candidate.modified.toSeconds(), data) catch {
+            skipped += 1;
+            continue;
+        };
+        items.appendAssumeCapacity(summary);
+    }
+    return .{ .items = try items.toOwnedSlice(allocator), .skipped = skipped };
+}
+
+fn summarize(allocator: std.mem.Allocator, id: []const u8, modified: i64, data: []const u8) !Summary {
+    const parsed = try std.json.parseFromSlice(ListSnapshot, allocator, data, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    // Only the current schema can be resumed, so only it is offered.
+    if (parsed.value.version != schema_version) return error.UnsupportedSessionVersion;
+    const messages = parsed.value.messages orelse return error.InvalidSessionSnapshot;
+    const owned_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(owned_id);
+    return .{
+        .id = owned_id,
+        .modified = modified,
+        .messages = messages.len,
+        .title = try titleOf(allocator, messages),
+    };
+}
+
+/// The first question the user asked, which is what a list of conversations can
+/// honestly say about one. Owned by the caller.
+fn titleOf(allocator: std.mem.Allocator, messages: []const ListMessage) ![]u8 {
+    for (messages) |message| {
+        const role = message.role orelse continue;
+        if (!std.mem.eql(u8, role, "user")) continue;
+        const content = message.content orelse continue;
+        const title = try oneLine(allocator, content);
+        if (title.len > 0) return title;
+        allocator.free(title);
+    }
+    return allocator.alloc(u8, 0);
+}
+
+/// `text` on one line, sanitised, with runs of whitespace collapsed and cut to
+/// `max_title_codepoints` so that it fits a menu row.
+fn oneLine(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try @import("../util/terminal/sanitize.zig").writeOnOneLine(&aw.writer, text);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var pending_space = false;
+    var points: usize = 0;
+    var cut = false;
+    const bytes = aw.written();
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const seq_len: usize = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 1;
+        const end = @min(i + seq_len, bytes.len);
+        const chunk = bytes[i..end];
+        i = end;
+        const scalar: u21 = std.unicode.utf8Decode(chunk) catch 0xFFFD;
+        const blank = scalar == ' ' or scalar == 0xa0 or scalar == 0x3000 or scalar < 0x20 or scalar == 0x7f;
+        if (blank) {
+            pending_space = out.items.len > 0;
+            continue;
+        }
+        if (pending_space) {
+            if (points == max_title_codepoints) {
+                cut = true;
+                break;
+            }
+            try out.append(allocator, ' ');
+            points += 1;
+            pending_space = false;
+        }
+        if (points == max_title_codepoints) {
+            cut = true;
+            break;
+        }
+        try out.appendSlice(allocator, chunk);
+        points += 1;
+    }
+    if (cut) try out.appendSlice(allocator, "…");
+    return out.toOwnedSlice(allocator);
+}
+
+/// How long ago a snapshot was written, in the shortest words that say it.
+/// Owned by the caller.
+pub fn ageLabel(allocator: std.mem.Allocator, now: i64, stamp: i64) ![]u8 {
+    const seconds = @max(now - stamp, 0);
+    if (seconds < 60) return allocator.dupe(u8, "just now");
+    if (seconds < 3600) return std.fmt.allocPrint(allocator, "{d}m ago", .{@divTrunc(seconds, 60)});
+    if (seconds < 86400) return std.fmt.allocPrint(allocator, "{d}h ago", .{@divTrunc(seconds, 3600)});
+    if (seconds < 30 * 86400) return std.fmt.allocPrint(allocator, "{d}d ago", .{@divTrunc(seconds, 86400)});
+    if (seconds < 365 * 86400) return std.fmt.allocPrint(allocator, "{d}mo ago", .{@divTrunc(seconds, 30 * 86400)});
+    return std.fmt.allocPrint(allocator, "{d}y ago", .{@divTrunc(seconds, 365 * 86400)});
+}
+
 test "session roundtrip retains tool calls, reasoning and the plan" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -418,4 +629,194 @@ test "sessions reject orphaned reordered and interrupted tool results" {
     try std.testing.expectEqualStrings("first", loaded.messages.items[1].tool_call_id.?);
     try std.testing.expectEqualStrings("second", loaded.messages.items[2].tool_call_id.?);
     try std.testing.expectEqualStrings("完成 ✓", loaded.messages.items[3].content.?);
+}
+
+test "session list file names are only plain current-format snapshots" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const id = try newId(io, a);
+    defer a.free(id);
+
+    const name = try std.fmt.allocPrint(a, "{s}.json", .{id});
+    defer a.free(name);
+    try std.testing.expectEqualStrings(id, idFromFileName(name).?);
+
+    const child = try std.fmt.allocPrint(a, "{s}.json.s1.json", .{id});
+    defer a.free(child);
+    try std.testing.expect(idFromFileName(child) == null);
+
+    const temporary = try std.fmt.allocPrint(a, "{s}.json.tmp", .{id});
+    defer a.free(temporary);
+    try std.testing.expect(idFromFileName(temporary) == null);
+
+    try std.testing.expect(idFromFileName("short.json") == null);
+    try std.testing.expect(idFromFileName("notes.txt") == null);
+
+    var upper_buf: [32]u8 = undefined;
+    const upper = try std.fmt.allocPrint(a, "{s}.json", .{std.ascii.upperString(&upper_buf, id)});
+    defer a.free(upper);
+    try std.testing.expect(idFromFileName(upper) == null);
+}
+
+test "the session list reads newest first and skips what cannot be resumed" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "sessions");
+    var sdir = try tmp.dir.openDir(io, "sessions", .{});
+    defer sdir.close(io);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const sessions = try std.fs.path.join(a, &.{ root, "sessions" });
+    defer a.free(sessions);
+
+    var plan = plan_mod.Plan.init(a);
+    defer plan.deinit();
+    try plan.setSteps(&.{
+        .{ .title = "read the code", .status = .completed },
+        .{ .title = "write the module", .status = .pending },
+    });
+
+    const stamp: i64 = 1_700_000_000;
+    const newest = try newId(io, a);
+    defer a.free(newest);
+    var newest_messages = [_]Message{.{ .role = "user", .content = "  Fix\n\tthe   build  ", .reasoning_content = null, .tool_calls = null, .tool_call_id = null }};
+    const newest_path = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ sessions, newest });
+    defer a.free(newest_path);
+    try save(io, a, newest_path, &newest_messages, &plan);
+
+    const middle = try newId(io, a);
+    defer a.free(middle);
+    var middle_messages = [_]Message{
+        .{ .role = "user", .content = "second question", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+        .{ .role = "assistant", .content = "answer", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
+    };
+    const middle_path = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ sessions, middle });
+    defer a.free(middle_path);
+    try save(io, a, middle_path, &middle_messages, &plan);
+
+    const empty = try newId(io, a);
+    defer a.free(empty);
+    const empty_path = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ sessions, empty });
+    defer a.free(empty_path);
+    try save(io, a, empty_path, &.{}, &plan);
+
+    // Older schema, corrupt snapshot and a child snapshot: none of them is a
+    // session this build can offer.
+    const stale = try newId(io, a);
+    defer a.free(stale);
+    const stale_name = try std.fmt.allocPrint(a, "{s}.json", .{stale});
+    defer a.free(stale_name);
+    try sdir.writeFile(io, .{ .sub_path = stale_name, .data = "{\"version\":3,\"workspace\":\"/w\",\"messages\":[],\"plan\":[]}" });
+
+    const broken = try newId(io, a);
+    defer a.free(broken);
+    const broken_name = try std.fmt.allocPrint(a, "{s}.json", .{broken});
+    defer a.free(broken_name);
+    try sdir.writeFile(io, .{ .sub_path = broken_name, .data = "{" });
+
+    const child_name = try std.fmt.allocPrint(a, "{s}.json.s1.json", .{newest});
+    defer a.free(child_name);
+    try sdir.writeFile(io, .{ .sub_path = child_name, .data = "{\"version\":4,\"workspace\":\"/w\",\"messages\":[],\"plan\":[],\"child\":null}" });
+
+    // Distinct write times, newest first.
+    const newest_name = try std.fmt.allocPrint(a, "{s}.json", .{newest});
+    defer a.free(newest_name);
+    const middle_name = try std.fmt.allocPrint(a, "{s}.json", .{middle});
+    defer a.free(middle_name);
+    const empty_name = try std.fmt.allocPrint(a, "{s}.json", .{empty});
+    defer a.free(empty_name);
+    try sdir.setTimestamps(io, newest_name, .{ .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds((stamp + 3) * std.time.ns_per_s) } });
+    try sdir.setTimestamps(io, middle_name, .{ .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds((stamp + 2) * std.time.ns_per_s) } });
+    try sdir.setTimestamps(io, empty_name, .{ .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds((stamp + 1) * std.time.ns_per_s) } });
+    // The unreadable files are older still, so a one-item listing reads the
+    // newest session rather than one of them.
+    try sdir.setTimestamps(io, stale_name, .{ .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds((stamp - 10) * std.time.ns_per_s) } });
+    try sdir.setTimestamps(io, broken_name, .{ .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds((stamp - 20) * std.time.ns_per_s) } });
+
+    var listing = try list(io, a, sessions, 10);
+    defer listing.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), listing.skipped);
+    try std.testing.expectEqual(@as(usize, 3), listing.items.len);
+    try std.testing.expectEqualStrings(newest, listing.items[0].id);
+    try std.testing.expectEqualStrings("Fix the build", listing.items[0].title);
+    try std.testing.expectEqual(@as(usize, 1), listing.items[0].messages);
+    try std.testing.expectEqual(stamp + 3, listing.items[0].modified);
+    try std.testing.expectEqualStrings(middle, listing.items[1].id);
+    try std.testing.expectEqualStrings("second question", listing.items[1].title);
+    try std.testing.expectEqual(@as(usize, 2), listing.items[1].messages);
+    try std.testing.expectEqualStrings(empty, listing.items[2].id);
+    try std.testing.expectEqualStrings("", listing.items[2].title);
+
+    // Only the newest file is read when the caller asks for one, so a broken
+    // older snapshot is not counted among the skips.
+    var limited = try list(io, a, sessions, 1);
+    defer limited.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), limited.items.len);
+    try std.testing.expectEqual(@as(usize, 0), limited.skipped);
+
+    // A workspace with no saved session yet has an empty listing, not an error.
+    const absent = try std.fs.path.join(a, &.{ root, "absent" });
+    defer a.free(absent);
+    var none = try list(io, a, absent, 10);
+    defer none.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
+    try std.testing.expectEqual(@as(usize, 0), none.skipped);
+}
+
+test "a session title is one short line of plain text" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "sessions");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const sessions = try std.fs.path.join(a, &.{ root, "sessions" });
+    defer a.free(sessions);
+
+    const id = try newId(io, a);
+    defer a.free(id);
+    var filler: [100]u8 = undefined;
+    @memset(&filler, 'x');
+    const content = try std.mem.concat(a, u8, &.{ "hello\n\x1b[31mworld\x1b[0m ", &filler });
+    defer a.free(content);
+    var messages = [_]Message{.{ .role = "user", .content = content, .reasoning_content = null, .tool_calls = null, .tool_call_id = null }};
+    var plan = plan_mod.Plan.init(a);
+    defer plan.deinit();
+    const path = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ sessions, id });
+    defer a.free(path);
+    try save(io, a, path, &messages, &plan);
+
+    var listing = try list(io, a, sessions, 10);
+    defer listing.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), listing.items.len);
+    const title = listing.items[0].title;
+    try std.testing.expect(std.mem.startsWith(u8, title, "hello world x"));
+    try std.testing.expect(std.mem.endsWith(u8, title, "…"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, title, 0x1b) == null);
+    try std.testing.expectEqual(max_title_codepoints + 1, try std.unicode.utf8CountCodepoints(title));
+}
+
+test "ages read as the shortest span that says them" {
+    const a = std.testing.allocator;
+    const now: i64 = 1_700_000_000;
+    const cases = [_]struct { ago: i64, expected: []const u8 }{
+        .{ .ago = 0, .expected = "just now" },
+        .{ .ago = 59, .expected = "just now" },
+        .{ .ago = 60, .expected = "1m ago" },
+        .{ .ago = 3599, .expected = "59m ago" },
+        .{ .ago = 3600, .expected = "1h ago" },
+        .{ .ago = 2 * 86400, .expected = "2d ago" },
+        .{ .ago = 40 * 86400, .expected = "1mo ago" },
+        .{ .ago = 400 * 86400, .expected = "1y ago" },
+        // A clock that moved backwards still reads as something.
+        .{ .ago = -120, .expected = "just now" },
+    };
+    for (cases) |case| {
+        const label = try ageLabel(a, now, now - case.ago);
+        defer a.free(label);
+        try std.testing.expectEqualStrings(case.expected, label);
+    }
 }

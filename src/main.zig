@@ -21,6 +21,10 @@ const RED = sgr.RED;
 const GREEN = sgr.GREEN;
 const YELLOW = sgr.YELLOW;
 
+/// How many saved sessions `--resume` offers to choose from. Newest first;
+/// older snapshots stay resumable by ID.
+const picker_listed: usize = 20;
+
 /// What a build that keeps no trace answers when it is asked to keep one. It
 /// is the whole of the tracing feature in such a binary: a flag, a command and
 /// a sentence, no recorder and no report renderer.
@@ -134,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
             "With no query, start an interactive conversation.\n\n" ++
             "  --help, -h          Show this help\n" ++
             "  --version           Show version\n" ++
-            "  --resume <id>       Resume a saved session in this workspace\n" ++
+            "  --resume [<id>]     Resume a saved session; without an ID, choose one\n" ++
             (if (debug.enabled) DEBUG_FLAGS else "") ++
             "  login / logout      Sign in with ChatGPT / remove local credentials\n" ++
             "  models              List models for the selected provider\n\n" ++
@@ -278,6 +282,9 @@ pub fn main(init: std.process.Init) !void {
     // Flags come before the query: the first word that is not one starts it.
     var query_start: usize = 1;
     var resume_id: ?[]const u8 = null;
+    // `--resume` on its own asks which saved session to open instead of naming
+    // one; the ID is chosen once there is a terminal to ask on.
+    var pick_session = false;
     // Asked for by the flag, the environment or the config file. A build
     // without tracing says so once and runs untouched, rather than quitting on
     // a switch it never had.
@@ -285,16 +292,29 @@ pub fn main(init: std.process.Init) !void {
     while (query_start < args.items.len) {
         const arg = args.items[query_start];
         if (std.mem.eql(u8, arg, "--resume")) {
-            if (query_start + 1 >= args.items.len) {
-                try std.Io.File.stderr().writeStreamingAll(io, "Usage: zagent --resume <session-id> [query ...]\n");
-                std.process.exit(1);
+            if (query_start + 1 < args.items.len and !std.mem.startsWith(u8, args.items[query_start + 1], "-")) {
+                // The word after --resume is the ID. A mistyped one is
+                // reported by `startSession` rather than read as a query.
+                resume_id = args.items[query_start + 1];
+                query_start += 2;
+            } else {
+                pick_session = true;
+                query_start += 1;
             }
-            resume_id = args.items[query_start + 1];
-            query_start += 2;
         } else if (std.mem.eql(u8, arg, "--debug")) {
             tracing_requested = true;
             query_start += 1;
         } else break;
+    }
+
+    // A session chosen from the list is resumed exactly as if its ID had been
+    // typed. The question comes before the editor and the MCP servers start,
+    // so nothing is started for a session the user then declines to open.
+    var picked_id: ?[]u8 = null;
+    defer if (picked_id) |id| allocator.free(id);
+    if (pick_session) {
+        picked_id = try chooseSession(allocator, io, env);
+        resume_id = picked_id;
     }
 
     // The terminal is created here rather than inside the REPL so that the
@@ -763,6 +783,71 @@ fn writeHeader(
         defer allocator.free(msg);
         try writeBlock(allocator, screen, std.Io.File.stderr(), io, msg);
     }
+}
+
+/// `zagent --resume` with no ID: the sessions saved for this workspace are
+/// offered by their first question, newest first, and the chosen ID is resumed
+/// as if it had been typed. Only a terminal can answer, so a pipe is told the
+/// usage instead of being left waiting for an answer that cannot come. The ID
+/// it returns is owned by the caller.
+fn chooseSession(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]u8 {
+    const session = @import("state/session.zig");
+    const menu = @import("ui/menu.zig");
+    const stderr = std.Io.File.stderr();
+    if (!(std.Io.File.stdin().isTty(io) catch false) or !(stderr.isTty(io) catch false)) {
+        try stderr.writeStreamingAll(io, "Usage: zagent --resume <session-id> [query ...]\n" ++
+            "Without an ID --resume asks which session to open, which needs a terminal.\n");
+        std.process.exit(1);
+    }
+
+    const dir_path = try @import("state/workspace.zig").filePath(allocator, io, env, "sessions");
+    defer allocator.free(dir_path);
+    var listing = try session.list(io, allocator, dir_path, picker_listed);
+    defer listing.deinit(allocator);
+    if (listing.items.len == 0) {
+        try stderr.writeStreamingAll(io, "No saved sessions in this workspace.\nRun zagent to start one.\n");
+        std.process.exit(1);
+    }
+    if (listing.skipped > 0) {
+        const note = try std.fmt.allocPrint(allocator, DIM ++ "{d} session file{s} could not be read and are not listed.\n" ++ RESET, .{
+            listing.skipped,
+            if (listing.skipped == 1) "" else "s",
+        });
+        defer allocator.free(note);
+        try stderr.writeStreamingAll(io, note);
+    }
+
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    var options: std.ArrayList(menu.Option) = .empty;
+    defer {
+        for (options.items) |option| option.deinit(allocator);
+        options.deinit(allocator);
+    }
+    try options.ensureTotalCapacity(allocator, listing.items.len);
+    for (listing.items, 0..) |item, i| {
+        const age = try session.ageLabel(allocator, now, item.modified);
+        defer allocator.free(age);
+        const title = if (item.title.len > 0) item.title else "(no turn yet)";
+        const label = try std.fmt.allocPrint(allocator, "{s}  {s}", .{ item.id[0..8], title });
+        errdefer allocator.free(label);
+        const details = try std.fmt.allocPrint(allocator, "{s} · {d} message{s}", .{
+            age,
+            item.messages,
+            if (item.messages == 1) "" else "s",
+        });
+        errdefer allocator.free(details);
+        // The newest is where Enter lands, so a straight Enter continues the
+        // conversation that was interrupted last.
+        options.appendAssumeCapacity(.{ .label = label, .description = details, .recommended = i == 0 });
+    }
+
+    return switch (try menu.selectOnly(allocator, io, "Resume which session?", options.items)) {
+        .option => |index| allocator.dupe(u8, listing.items[index].id),
+        .custom, .cancel => {
+            try stderr.writeStreamingAll(io, "No session selected.\n");
+            std.process.exit(0);
+        },
+    };
 }
 
 /// The editor reports how many rows it needs at the bottom. Reserving them is

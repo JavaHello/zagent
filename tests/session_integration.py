@@ -152,6 +152,51 @@ try:
         assert path.read_bytes() == old
         assert (Path(directory) / 'execution-count').read_text() == 'executed\n'
 
+        # `--resume` with no ID offers the sessions saved here, newest first.
+        # The first session is reached by moving down the list; Enter resumes it.
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 50, 120, 0, 0))
+        process = subprocess.Popen([str(binary), '--resume'], cwd=directory,
+                                   env=dict(env, TERM='xterm-256color'),
+                                   stdin=slave, stdout=slave, stderr=slave)
+        transcript = bytearray()
+        ansi = re.compile(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|[78])')
+        try:
+            deadline = time.monotonic() + 10
+            entry = re.compile(rb'(\d+)\) ' + first[:8].encode())
+            while not entry.search(ansi.sub(b'', transcript)):
+                assert time.monotonic() < deadline, transcript
+                assert process.poll() is None, transcript
+                if select.select([master], [], [], .1)[0]:
+                    transcript.extend(os.read(master, 65536))
+            index = int(entry.search(ansi.sub(b'', transcript))[1])
+            os.write(master, b'\x1b[B' * (index - 1) + b'\r')
+            while b'End of restored history' not in ansi.sub(b'', transcript):
+                assert time.monotonic() < deadline, transcript
+                assert process.poll() is None, transcript
+                if select.select([master], [], [], .1)[0]:
+                    transcript.extend(os.read(master, 65536))
+            laid_out = ansi.sub(b'', transcript).replace(b'\r', b'')
+            assert ('Session  ' + first).encode() in laid_out, laid_out
+            assert b'first-session-marker' in laid_out, laid_out
+            while b'\x1b[50;3H\x1b[?25h' not in transcript:
+                assert time.monotonic() < deadline, transcript
+                if select.select([master], [], [], .1)[0]:
+                    transcript.extend(os.read(master, 65536))
+            os.write(master, b'\x04')
+            deadline = time.monotonic() + 5
+            while process.poll() is None:
+                assert time.monotonic() < deadline, transcript
+                if select.select([master], [], [], .1)[0]:
+                    transcript.extend(os.read(master, 65536))
+            assert process.returncode == 0, transcript
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
         resumed = run('--resume', first, 'continue-session-marker')
         assert 'Restored session history' not in resumed  # keep batch stdout clean
         assert session_id(resumed) == first
@@ -163,7 +208,7 @@ try:
         assert json.loads(path.read_text())['messages'] == []
         run('--resume', '0' * 32, ok=False)
         run('--resume', '../escape', ok=False)
-        run('--resume', ok=False)
+        run('--resume', ok=False)  # no terminal to ask on, and no ID to use
         assert len(list(path.parent.glob('*.json'))) == 3
         path.write_text('{')
         run('--resume', first, ok=False)
