@@ -588,7 +588,7 @@ pub const LinenoiseState = struct {
         // The popup only appears above a single, unwrapped line, as inline.
         if (recompute_popup and !self.history_navigation and !self.ln.mask_mode and total_rows == 1) {
             if (self.ln.popup_callback) |callback| {
-                self.popup_items = try callback(self.allocator, self.ln.io, self.buf.items[0..self.pos]);
+                self.popup_items = try callback(self.ln.popup_context, self.allocator, self.ln.io, self.buf.items[0..self.pos]);
                 self.popup_selected = 0;
             }
         }
@@ -678,7 +678,7 @@ pub const LinenoiseState = struct {
         // The popup occupies rows below a horizontally scrolling input.
         if (!self.history_navigation and !self.usesMultiLine() and !self.ln.mask_mode) {
             if (self.ln.popup_callback) |callback| {
-                self.popup_items = try callback(self.allocator, self.ln.io, self.buf.items[0..self.pos]);
+                self.popup_items = try callback(self.ln.popup_context, self.allocator, self.ln.io, self.buf.items[0..self.pos]);
                 self.popup_selected = 0;
                 try self.drawPopup();
             }
@@ -1130,7 +1130,7 @@ fn recordLayout(context: ?*anyopaque, rows: usize, repaint: bool) anyerror!void 
     record.calls += 1;
 }
 
-fn testPopup(allocator: Allocator, io: std.Io, input: []const u8) ![]@import("linenoise.zig").PopupItem {
+fn testPopup(_: ?*anyopaque, allocator: Allocator, io: std.Io, input: []const u8) ![]@import("linenoise.zig").PopupItem {
     _ = io;
     _ = input;
     const items = try allocator.alloc(@import("linenoise.zig").PopupItem, 2);

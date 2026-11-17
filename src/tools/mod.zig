@@ -32,6 +32,8 @@ const grep_mod = @import("grep.zig");
 const rg_mod = @import("rg.zig");
 const fd_mod = @import("fd.zig");
 const ccr = @import("ccr.zig");
+const load_skill = @import("load_skill.zig");
+const read_skill_resource = @import("read_skill_resource.zig");
 
 /// What a built-in tool is, and what one is given besides its arguments.
 pub const Tool = tool_mod.Tool;

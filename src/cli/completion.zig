@@ -2,6 +2,8 @@
 const std = @import("std");
 const commands = @import("commands.zig");
 const fzy = @import("fzy.zig");
+const skills_mod = @import("../state/skills.zig");
+const Skills = skills_mod.Skills;
 const Item = @import("../editor/linenoise.zig").PopupItem;
 const Allocator = std.mem.Allocator;
 
@@ -40,7 +42,9 @@ fn append(allocator: Allocator, items: *std.ArrayList(Item), prefix: []const u8,
     try items.append(allocator, .{ .value = value, .label = owned_label, .description = owned_description });
 }
 
-pub fn candidates(allocator: Allocator, io: std.Io, prefix: []const u8) Allocator.Error![]Item {
+/// The candidates for the line being typed. `context` is the host's: the set of
+/// installed [skills](../state/skills.zig) a `$` mention offers, if any.
+pub fn candidates(context: ?*anyopaque, allocator: Allocator, io: std.Io, prefix: []const u8) Allocator.Error![]Item {
     var items: std.ArrayList(Item) = .empty;
     errdefer {
         for (items.items) |item| item.deinit(allocator);
@@ -53,10 +57,18 @@ pub fn candidates(allocator: Allocator, io: std.Io, prefix: []const u8) Allocato
                 try append(allocator, &items, "", command.name, command.description, true);
         },
         '@' => try files(allocator, io, &items, prefix[0..active.start], active.query),
-        '$' => try append(allocator, &items, "", "$", "待定 / Coming soon", false),
+        '$' => try skills(allocator, &items, prefix[0..active.start], active.query, context),
         else => unreachable,
     }
-    if (items.items.len == 0) try append(allocator, &items, "", if (active.kind == '/') "No matching commands" else "No matching files", "", false);
+    if (items.items.len == 0) {
+        const none = switch (active.kind) {
+            '/' => "No matching commands",
+            '@' => "No matching files",
+            '$' => "No matching skills",
+            else => unreachable,
+        };
+        try append(allocator, &items, "", none, "", false);
+    }
     return items.toOwnedSlice(allocator);
 }
 
@@ -95,6 +107,19 @@ fn ignored(name: []const u8) bool {
         if (std.mem.eql(u8, name, skip)) return true;
     }
     return false;
+}
+
+/// `$` mentions: the installed skills, by the name each is addressed with. A
+/// skill is offered with the description the catalog shows, because that is
+/// what tells one from another before it is loaded.
+fn skills(allocator: Allocator, items: *std.ArrayList(Item), before: []const u8, query: []const u8, context: ?*anyopaque) !void {
+    const installed: *const Skills = @ptrCast(@alignCast(context orelse return));
+    for (installed.items) |skill| {
+        if (!std.mem.startsWith(u8, skill.name, query)) continue;
+        const label = try std.fmt.allocPrint(allocator, "${s}", .{skill.name});
+        defer allocator.free(label);
+        try append(allocator, items, before, label, skill.description, true);
+    }
 }
 
 fn files(allocator: Allocator, io: std.Io, items: *std.ArrayList(Item), before: []const u8, query: []const u8) !void {
@@ -355,19 +380,52 @@ test "triggers follow a quoted reference over the spaces in a path" {
     try std.testing.expectEqual(@as(?Trigger, null), trigger("看了 \"a b\" 和"));
 }
 
-test "command filtering and reserved dollar entry" {
+test "command filtering and a dollar mention without skills" {
     const allocator = std.testing.allocator;
-    const commands_list = try candidates(allocator, std.testing.io, "/cl");
+    const commands_list = try candidates(null, allocator, std.testing.io, "/cl");
     defer {
         for (commands_list) |item| item.deinit(allocator);
         allocator.free(commands_list);
     }
     try std.testing.expectEqual(@as(usize, 1), commands_list.len);
     try std.testing.expectEqualStrings("/clear", commands_list[0].value.?);
-    const reserved = try candidates(allocator, std.testing.io, "$");
+    const none = try candidates(null, allocator, std.testing.io, "$");
     defer {
-        for (reserved) |item| item.deinit(allocator);
-        allocator.free(reserved);
+        for (none) |item| item.deinit(allocator);
+        allocator.free(none);
     }
-    try std.testing.expect(reserved[0].value == null);
+    try std.testing.expectEqualStrings("No matching skills", none[0].label);
+    try std.testing.expect(none[0].value == null);
+}
+
+test "dollar candidates list installed skills and complete to a mention" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "skills/demo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "skills/demo/SKILL.md", .data = "---\nname: demo\ndescription: Demo skill.\n---\nBody\n" });
+    try tmp.dir.createDirPath(io, "skills/other");
+    try tmp.dir.writeFile(io, .{ .sub_path = "skills/other/SKILL.md", .data = "---\nname: other\ndescription: Another skill.\n---\nBody\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, "skills", allocator);
+    defer allocator.free(root);
+    var installed = try skills_mod.initWithRoots(allocator, io, &.{root});
+    defer installed.deinit();
+
+    const items = try candidates(&installed, allocator, io, "run $de");
+    defer {
+        for (items) |item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("$demo", items[0].label);
+    try std.testing.expectEqualStrings("run $demo", items[0].value.?);
+    try std.testing.expectEqualStrings("Demo skill.", items[0].description);
+
+    const all = try candidates(&installed, allocator, io, "$");
+    defer {
+        for (all) |item| item.deinit(allocator);
+        allocator.free(all);
+    }
+    try std.testing.expectEqual(@as(usize, 2), all.len);
 }

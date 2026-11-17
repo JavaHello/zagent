@@ -51,6 +51,8 @@ pub const all = [_]tool.Tool{
     @import("subagent.zig").spec,
     @import("report.zig").spec,
     @import("load_mcp_tools.zig").spec,
+    @import("load_skill.zig").spec,
+    @import("read_skill_resource.zig").spec,
 };
 
 /// Run one built-in tool. `ctx` carries what a tool needs besides its arguments:

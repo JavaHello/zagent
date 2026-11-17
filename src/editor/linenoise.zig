@@ -29,7 +29,7 @@ pub const PopupItem = struct {
         allocator.free(self.description);
     }
 };
-pub const PopupCallback = *const fn (Allocator, Io, []const u8) Allocator.Error![]PopupItem;
+pub const PopupCallback = *const fn (?*anyopaque, Allocator, Io, []const u8) Allocator.Error![]PopupItem;
 
 /// Tells the host how many rows the editor needs at the bottom of the screen.
 ///
@@ -658,6 +658,8 @@ pub const Linenoise = struct {
     hints_callback: ?HintsCallback = null,
     completions_callback: ?CompletionsCallback = null,
     popup_callback: ?PopupCallback = null,
+    /// What the popup callback is given besides the line: the host's own state.
+    popup_context: ?*anyopaque = null,
     /// Keep the prompt and input at the last rows of the screen, with the
     /// conversation scrolling above them, instead of drawing at the cursor.
     bottom_anchor: bool = false,

@@ -88,7 +88,11 @@ Delete its `trusted` file to require approval again. Trust is consent to the
 execution policy above, not arbitrary-code isolation. Help, version and `models`
 management do not require workspace approval.
 
-Project-local `.zagent/` memory and sessions are not read or migrated.
+Project-local `.zagent/` memory and sessions are not read or migrated. Its
+`.zagent/skills` directory is, once the directory is trusted: a skill is
+configuration the repository ships, like an `mcp.json`-style description of how
+work is done here, and the trust decision is what lets it reach the model. See
+[Skills](skills.md#where-skills-are-found).
 
 Prompt history lives beside the workspaces, in
 `$XDG_STATE_HOME/zagent/history`, see

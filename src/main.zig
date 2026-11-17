@@ -6,6 +6,7 @@ const provider = @import("model/provider.zig");
 const history = @import("cli/history.zig");
 const commands = @import("cli/commands.zig");
 const mcp = @import("mcp/mod.zig");
+const skills_mod = @import("state/skills.zig");
 const banner = @import("ui/banner.zig");
 const term = @import("ui/term.zig");
 const sanitize = @import("util/terminal/sanitize.zig");
@@ -43,6 +44,7 @@ const HELP_HEAD =
     \\  /model       Show current model
     \\  /status      Show token usage and account quota
     \\  /mcp         List the MCP servers and their tools
+    \\  /skills      List the installed skills, where they were found and what was skipped
 ;
 
 /// Only a build that can record offers the command, and only that build lists
@@ -58,7 +60,7 @@ const DEBUG_ENV = "AI_DEBUG=1            Same as --debug\n";
 
 const HELP_TAIL =
     \\  /quit, /exit Exit zagent
-    \\  /, @, $      Command / project file / reserved candidates
+    \\  /, @, $      Command / project file / installed skill candidates
     \\  ↑/↓          Select candidate; Tab/Enter inserts; Esc closes
     \\  Wheel/PageUp/Down  Scroll output history
     \\  While running: commands remain available; typed text adjusts the task
@@ -147,6 +149,7 @@ pub fn main(init: std.process.Init) !void {
             "AI_URL / AI_MODEL / AI_KEY override provider settings.\n" ++
             (if (debug.enabled) DEBUG_ENV else "") ++
             "AI_MEMORY_FILE        Store memory in another file\n" ++
+            "AI_SKILLS_DIRS        Extra skill directories, colon-separated\n" ++
             "Tools and local MCP servers run on the host with inherited environment and network access.\n" ++
             "Build with Zig 0.17.0.\n");
         return;
@@ -317,13 +320,22 @@ pub fn main(init: std.process.Init) !void {
         resume_id = picked_id;
     }
 
+    // The skills the workspace and the user have installed. Discovered here,
+    // after the trust check and before the terminal, because the prompt's
+    // completion offers their names and the agent's tools borrow the set. A
+    // directory that cannot be read is a problem listed under the wordmark,
+    // not a reason to refuse the run.
+    var skills = try skills_mod.init(allocator, io, env);
+    defer skills.deinit();
+
     // The terminal is created here rather than inside the REPL so that the
     // ask_user menu also works in single-query mode.
     var ln = Linenoise.init(allocator, io, env);
     defer ln.deinit();
-    // Show command, file, and reserved-extension candidates as the user types.
+    // Show command, project-file and installed-skill candidates as the user types.
     ln.completions_callback = commands.complete;
     ln.popup_callback = @import("cli/completion.zig").candidates;
+    ln.popup_context = &skills;
 
     const history_path = try openHistory(allocator, io, env, &ln);
     defer if (history_path) |path| allocator.free(path);
@@ -365,7 +377,11 @@ pub fn main(init: std.process.Init) !void {
     var trace: ?*debug.Recorder = null;
     defer if (trace) |opened| publishTrace(allocator, io, opened);
 
-    var agent = try Agent.init(allocator, io, &config, &ln, env, &registry);
+    for (skills.problems) |problem| {
+        try report.writer.print(YELLOW ++ "  ⚠ skills: {s}\n" ++ RESET, .{problem});
+    }
+
+    var agent = try Agent.init(allocator, io, &config, &ln, env, &registry, &skills);
     defer agent.deinit();
 
     agent.startSession(resume_id) catch |err| {
@@ -639,6 +655,8 @@ fn runRepl(
             const msg = try std.fmt.allocPrint(allocator, "Model: {s}\n", .{config.model});
             defer allocator.free(msg);
             try writeBlock(allocator, &screen, stdout, io, msg);
+        } else if (std.mem.eql(u8, line, "/skills")) {
+            agent.listSkills() catch |err| try reportCommandError(allocator, &screen, io, "skills", err);
         } else if (std.mem.eql(u8, line, "/mcp")) {
             var aw: std.Io.Writer.Allocating = .init(allocator);
             defer aw.deinit();
@@ -1011,6 +1029,7 @@ test {
     _ = @import("cli/completion.zig");
     _ = @import("cli/commands.zig");
     _ = @import("state/memory.zig");
+    _ = @import("state/skills.zig");
     _ = @import("ui/style.zig");
     _ = @import("ui/term.zig");
     _ = @import("ui/screen.zig");

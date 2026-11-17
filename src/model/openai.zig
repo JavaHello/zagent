@@ -57,8 +57,8 @@ test "omitted names drop from the startup defaults and search selection still ap
         for (parsed.value.object.get("tools").?.array.items) |tool| {
             try names.put(tool.object.get("name").?.string, {});
         }
-        try std.testing.expectEqual(@as(usize, 13), names.count());
-        for ([_][]const u8{ "memory_search", "bash", "read", "write", "edit", "apply_patch", "ls", "web_fetch", "web_search", "report", "ccr_retrieve" }) |name| {
+        try std.testing.expectEqual(@as(usize, 15), names.count());
+        for ([_][]const u8{ "memory_search", "bash", "read", "write", "edit", "apply_patch", "ls", "web_fetch", "web_search", "report", "ccr_retrieve", "load_skill", "read_skill_resource" }) |name| {
             try std.testing.expect(names.contains(name));
         }
         for (omit) |name| try std.testing.expect(!names.contains(name));

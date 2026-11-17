@@ -27,6 +27,10 @@ between runs.
 - **MCP servers** — start the servers described in `mcp.json` and give their
   tools to the model beside the built-in ones, loaded on demand.
   [MCP servers](docs/mcp.md)
+- **Skills** — the open [Agent Skills](https://agentskills.io) format: a folder
+  with a `SKILL.md` is catalogued by name and description, loaded with
+  `load_skill` when a task matches, and its bundled files read on demand with
+  `read_skill_resource`. [Skills](docs/skills.md)
 - **Session plan** — a checklist of the work in progress that survives `/clear`
   and comes back with a resumed session. [Plan](docs/plan.md)
 - **Durable conversations** — every launch is a saved session: `/new` starts
@@ -155,12 +159,13 @@ summaries distinguish missing cache reports from a reported zero.
 | `/model`      | Show the current model           |
 | `/status`     | Show token usage and account quota |
 | `/mcp`        | List the MCP servers and their tools |
+| `/skills`     | List installed skills and what was skipped |
 | `/debug`      | Record every step and write an HTML report |
 | `/quit`       | Exit                             |
 
 Enter submits, Shift+Enter inserts a newline (Ctrl+J where the terminal does not
 report it), `Ctrl+Z` suspends, `Ctrl+D` exits, Esc interrupts a running task,
-and `/` or `@` open the completion popups.
+and `/`, `@` or `$` open the completion popups (`$name` activates an installed skill).
 The keyboard in full: [Interface](docs/ui.md).
 
 ## Before you run it
@@ -187,6 +192,7 @@ before pointing it at anything unfamiliar.
 | [Web search and fetching](docs/web.md) | The `web_search` and `web_fetch` tools |
 | [Sub-agents](docs/subagents.md) | A second agent, its self-checks and its deadline |
 | [MCP servers](docs/mcp.md) | `mcp.json` and lazy tool loading |
+| [Skills](docs/skills.md) | `SKILL.md` folders, the catalog, activation and bundled files |
 | [Debug tracing](docs/debug.md) | `--debug`: every step, and the HTML report of a run |
 | [Sessions](docs/sessions.md) | Durable conversations, `--resume`, context |
 | [Plan](docs/plan.md) | The checklist of the work in progress |

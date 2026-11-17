@@ -21,6 +21,10 @@
   [子 agent](docs/subagents.md)
 - **MCP 服务** — 启动 `mcp.json` 里描述的服务，把它们的工具按需加载给模型。
   [MCP](docs/mcp.md)
+- **技能（Skills）** — 支持开放的 [Agent Skills](https://agentskills.io) 格式：
+  带 `SKILL.md` 的目录只把名字和描述列进系统提示，任务匹配时用 `load_skill`
+  加载完整步骤，用 `read_skill_resource` 按需读取它自带的文件。
+  [技能](docs/skills.md)
 - **会话计划** — 进行中工作的清单，`/clear` 之后仍在，`--resume` 时还原。
   [计划](docs/plan.md)
 - **持久会话** — 每次启动都是被保存的会话：`/new` 开新会话，
@@ -138,11 +142,12 @@ Debug 请求事件包含输入字节数、工具 schema 字节数及工具集合
 | `/model` | 显示当前模型 |
 | `/status` | 显示本轮服务端 token 累计（输入、输出、总数、缓存命中、推理）、usage 返回调用数和账户额度 |
 | `/mcp` | 列出 MCP 服务及其工具 |
+| `/skills` | 列出已安装的技能和被跳过的原因 |
 | `/debug` | 记录每一步并写出 HTML 报告 |
 | `/quit` | 退出 |
 
 Enter 提交，Shift+Enter 换行（终端不上报时用 Ctrl+J），`Ctrl+Z` 挂起，`Ctrl+D` 退出，Esc 中断
-正在运行的任务，`/` 和 `@` 打开补全弹窗。完整键盘说明见
+正在运行的任务，`/`、`@` 和 `$` 打开补全弹窗（`$名字` 激活已安装技能）。完整键盘说明见
 [界面（英文）](docs/ui.md)。
 
 ## 运行前请知悉
@@ -170,6 +175,7 @@ Enter 提交，Shift+Enter 换行（终端不上报时用 Ctrl+J），`Ctrl+Z` �
 | [Web search and fetching](docs/web.md) | `web_search`、`web_fetch` 工具 |
 | [Sub-agents](docs/subagents.md) | 子 agent、自检与期限 |
 | [MCP servers](docs/mcp.md) | `mcp.json` 与工具懒加载 |
+| [Skills](docs/skills.md) | `SKILL.md` 目录、技能目录、激活与自带文件 |
 | [Debug tracing](docs/debug.md) | `--debug`：每一步记录与 HTML 报告 |
 | [Sessions](docs/sessions.md) | 持久会话、`--resume`、上下文 |
 | [Plan](docs/plan.md) | 进行中工作的清单 |

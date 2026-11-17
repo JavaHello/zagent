@@ -27,6 +27,9 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
     (root / 'zz/az.zig').write_text('')
     (root / 'node_modules').mkdir()
     (root / 'node_modules/hidden.zig').write_text('')
+    (root / '.zagent/skills/demo').mkdir(parents=True)
+    (root / '.zagent/skills/demo/SKILL.md').write_text(
+        '---\nname: demo\ndescription: A popup skill.\n---\nBody\n')
     state = root / 'state' / 'zagent'
     state.mkdir(parents=True)
     (state / 'history').write_text('older question\n/help\n/model\n')
@@ -91,7 +94,11 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         read_until(b'\x1b[?2004h', raw=True)
         send('check @ALPHA'.encode(), b'@src/alpha.zig  File')
         send(b'\t', '❯ check @src/alpha.zig'.encode())
-        send(b'\x15$', b'Coming soon')
+        # `$` lists the installed skills; Tab inserts the mention.
+        send(b'\x15$de', b'$demo  A popup skill.')
+        send(b'\t', '❯ $demo'.encode())
+        send(b' now', '❯ $demo now'.encode())
+        send(b'\x15$nope', 'No matching skills'.encode())
         transcript.clear()
         os.write(master, b'\x1b')
         read_until(b'\x1b8', raw=True)

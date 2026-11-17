@@ -96,14 +96,16 @@ pub const plan = hostDefinition(dispatch.specOf("plan"));
 pub const subagent = hostDefinition(dispatch.specOf("subagent"));
 
 pub const report = hostDefinition(dispatch.specOf("report"));
+pub const load_skill = hostDefinition(dispatch.specOf("load_skill"));
+pub const read_skill_resource = hostDefinition(dispatch.specOf("read_skill_resource"));
 
 /// Ordered default set. Copy individual definitions into arrays or ArrayLists
 /// to compose a different set without changing the definitions themselves.
 pub const builtin = [_]ToolDefinition{
-    memory_search, bash,         read,        write,         edit, apply_patch,
-    ls,            rg,           fd,          grep,          find, web_fetch,
-    web_search,    ask_user,     memory_save, announce_task, plan, subagent,
-    report,        ccr_retrieve,
+    memory_search, bash,         read,        write,               edit, apply_patch,
+    ls,            rg,           fd,          grep,                find, web_fetch,
+    web_search,    ask_user,     memory_save, announce_task,       plan, subagent,
+    report,        ccr_retrieve, load_skill,  read_skill_resource,
 };
 
 test "write and edit have separate required arguments" {

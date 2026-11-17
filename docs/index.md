@@ -24,6 +24,7 @@ overview.
 | [Web search and fetching](web.md) | The `web_search` and `web_fetch` tools, their services, redirects and limits |
 | [Sub-agents](subagents.md) | Handing a task to a second agent, its self-checks and deadline |
 | [MCP servers](mcp.md) | `mcp.json`, lazy tool loading and the protocol zagent speaks |
+| [Skills](skills.md) | Folders with a `SKILL.md`: the catalog, `load_skill` and `read_skill_resource` |
 | [Debug tracing](debug.md) | `--debug`: every request, response and tool call, and the HTML report of a run |
 
 ## What survives a turn

@@ -25,6 +25,7 @@ answer with the result — until the task is done, see
 | `announce_task` | Name the task on the terminal | [Interface](ui.md#task-announcement) |
 | `subagent`, `report` | Hand a task to a second agent | [Sub-agents](subagents.md) |
 | `load_mcp_tools` | Load an MCP service's tools on demand | [MCP servers](mcp.md) |
+| `load_skill`, `read_skill_resource` | Load a skill's instructions, then one of its bundled files | [Skills](skills.md) |
 
 Which search programs are offered is decided once at startup from `PATH`:
 `rg` is preferred over `grep`, and `fd` over `find`. The prompt follows the
@@ -216,8 +217,11 @@ another tool's arguments.
   tool like any other here — no private limit, no cache of its own, and no
   notice of its own to write.
 - A fetched page, an `apply_patch` summary, an MCP server's answer and
-  anything else that large is cached the same way. A [sub-agent's](subagents.md#not-cached)
-  report is the one exception: it reaches its caller whole at any size.
+  anything else that large is cached the same way. Two results are exceptions:
+  a [sub-agent's](subagents.md#not-cached) report, which reaches its caller
+  whole at any size, and `load_skill`'s instructions, which are the procedure
+  the rest of the turn follows rather than output to page through. See
+  [Skills](skills.md#activating-a-skill).
 
 No tool description quotes the number: the limit lives in the code, not in the
 prompt.

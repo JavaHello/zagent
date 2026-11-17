@@ -38,6 +38,7 @@ and `mcp.example.json` shows every member an MCP entry takes.
 | `AI_PROMPT_CACHE_RETENTION` | *(unset)*                   | Responses API only: sent as `prompt_cache_retention`; `in_memory` or `24h` |
 | `AI_THINKING`       | `enabled` for `deepseek` and `openai-compatible`, otherwise omitted | Thinking switch: `enabled`, `disabled`, or `omit`. On the Messages API, `enabled` reserves `AI_MAX_TOKENS / 2` for a thinking budget |
 | `AI_MEMORY_FILE`    | Global workspace state: `memory.md` | Override where the notes are stored             |
+| `AI_SKILLS_DIRS`    | *(unset)*                           | Extra [skill](skills.md#where-skills-are-found) directories, colon-separated; a leading `~/` is expanded |
 | `AI_DEBUG`          | *(unset)*                           | Any value but `0`/`false`/`off`/`no` records a debug trace; see [Debug tracing](debug.md) |
 | `WEB_SEARCH_URL`    | *(unset — DuckDuckGo)*              | Endpoint `web_search` puts a query to, with `{query}` and `{limit}` filled in |
 | `WEB_SEARCH_KEY`    | *(unset)*                           | Sent to that endpoint as `Authorization: Bearer` |

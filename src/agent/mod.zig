@@ -5,6 +5,7 @@ const tools = @import("../tools/mod.zig");
 const sanitize = @import("../util/terminal/sanitize.zig");
 const menu = @import("../ui/menu.zig");
 const memory_mod = @import("../state/memory.zig");
+const skills_mod = @import("../state/skills.zig");
 const plan_mod = @import("../state/plan.zig");
 const mcp = @import("../mcp/mod.zig");
 const scratch_mod = @import("../state/scratch.zig");
@@ -181,6 +182,13 @@ pub const Agent = struct {
     /// whoever started the agent outlives it, and the agent only reads this and
     /// calls through it.
     mcp_registry: *mcp.Registry,
+    /// The skills installed for this workspace. Borrowed for the same reason as
+    /// the registry: discovery happens before any agent exists, a sub-agent works
+    /// with the same skills its caller found, and the tools only read them.
+    skills: *const skills_mod.Skills,
+    /// The names kept out of this agent's tool list, owned: the role's own, plus
+    /// the skill tools when no skill is installed. The client holds this slice.
+    omit_names: []const []const u8 = &.{},
     /// Where a `--debug` run records what this agent did. Null otherwise, and
     /// borrowed when set: the run that opened the trace outlives the agent and
     /// renders the report from it.
@@ -222,8 +230,9 @@ pub const Agent = struct {
         linenoise: *Linenoise,
         env: *const std.process.Environ.Map,
         mcp_registry: *mcp.Registry,
+        skills: *const skills_mod.Skills,
     ) !Agent {
-        return initWith(allocator, io, config, linenoise, env, mcp_registry, .{});
+        return initWith(allocator, io, config, linenoise, env, mcp_registry, skills, .{});
     }
 
     fn initWith(
@@ -233,6 +242,7 @@ pub const Agent = struct {
         linenoise: *Linenoise,
         env: *const std.process.Environ.Map,
         mcp_registry: *mcp.Registry,
+        skills: *const skills_mod.Skills,
         options: InitOptions,
     ) !Agent {
         var history: std.ArrayList(Message) = .empty;
@@ -254,11 +264,19 @@ pub const Agent = struct {
         client.search = search;
         // Each role is described by the few tools it does not get: the caller
         // has no report to hand in, and a sub-agent has neither the call that
-        // started it nor the one that stops it.
-        client.builtin_omit = switch (options.role) {
+        // started it nor the one that stops it. A run with no skill installed
+        // also drops the two skill tools: a tool whose only answer would be
+        // "there are none" is a turn the model should never spend.
+        var omit: std.ArrayList([]const u8) = .empty;
+        defer omit.deinit(allocator);
+        try omit.appendSlice(allocator, switch (options.role) {
             .main => &main_omitted,
             .subagent => &subagent_omitted,
-        };
+        });
+        if (!skills.hasAny()) try omit.appendSlice(allocator, &agent_prompt.skills_omitted);
+        const omit_names = try omit.toOwnedSlice(allocator);
+        errdefer allocator.free(omit_names);
+        client.builtin_omit = omit_names;
         // A test transport is the one thing a sub-agent inherits that is not
         // settings: the loop is driven without a socket, so the requests the
         // sub-agent makes are scripted by the same test.
@@ -279,8 +297,8 @@ pub const Agent = struct {
         var scratch = try scratch_mod.Scratch.init(io, allocator, env);
         errdefer scratch.deinit(allocator);
         const system_content = switch (options.role) {
-            .main => try buildSystemPrompt(allocator, mcp_registry, memory.enabled, search, &host, workspace, scratch.path),
-            .subagent => try buildSubagentPrompt(allocator, mcp_registry, memory.enabled, search, &host, workspace, scratch.path),
+            .main => try buildSystemPrompt(allocator, mcp_registry, skills, memory.enabled, search, &host, workspace, scratch.path),
+            .subagent => try buildSubagentPrompt(allocator, mcp_registry, skills, memory.enabled, search, &host, workspace, scratch.path),
         };
         errdefer allocator.free(system_content);
         try history.append(allocator, .{
@@ -327,6 +345,8 @@ pub const Agent = struct {
                 (std.Io.File.stdout().isTty(io) catch false) and
                 (std.Io.File.stderr().isTty(io) catch false),
             .mcp_registry = mcp_registry,
+            .skills = skills,
+            .omit_names = omit_names,
             .trace = if (parent) |p| p.trace else null,
             .terminal_title = term.Title.init(io, interactive and linenoise.term_supported),
         };
@@ -347,6 +367,7 @@ pub const Agent = struct {
         self.host.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
         self.allocator.free(self.workspace);
+        self.allocator.free(self.omit_names);
         self.terminal_title.deinit();
         for (self.history.items) |msg| msg.deinit(self.allocator);
         self.history.deinit(self.allocator);
@@ -520,6 +541,15 @@ pub const Agent = struct {
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         try self.memory.writeList(&aw.writer);
+        try self.writeBlock(aw.written());
+    }
+
+    /// `/skills`: every skill discovered for this workspace, where it was found
+    /// and what is wrong with the ones that were skipped.
+    pub fn listSkills(self: *Agent) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try self.skills.writeList(&aw.writer);
         try self.writeBlock(aw.written());
     }
 
@@ -734,6 +764,11 @@ pub const Agent = struct {
     }
 
     pub fn processQuery(self: *Agent, query: []const u8) !void {
+        // A `$name` the user typed for an installed skill brings that skill's
+        // instructions with the request itself, so an explicit choice does not
+        // depend on the model deciding to load it.
+        const task = try self.withActivatedSkills(query);
+        defer self.allocator.free(task);
         self.query_started = std.Io.Timestamp.now(self.io, .awake);
         defer self.query_started = null;
         self.client.resetTokenCounters();
@@ -742,7 +777,7 @@ pub const Agent = struct {
         // announced stays until the model announces a new one: the title
         // describes the work in progress, not the line that started it.
         self.terminal_title.update("thinking…", self.current_task);
-        self.processQueryInner(query) catch |err| {
+        self.processQueryInner(task) catch |err| {
             self.terminal_title.update("error", self.current_task);
             return err;
         };
@@ -766,6 +801,46 @@ pub const Agent = struct {
         try self.checkInterrupted();
         // The final answer settles the turn; its text is not a status protocol.
         try self.emit(std.Io.File.stderr(), BOLD ++ GREEN ++ "  ✓ Turn finished" ++ RESET ++ "\n", .{});
+    }
+
+    /// The task as the model receives it: a `$name` for an installed skill is
+    /// replaced above the request by that skill's instructions, and an unknown
+    /// `$word` stays where the user typed it. Instructions already in the
+    /// conversation are not added again — the model still has them, and a
+    /// second copy is the same context spent twice.
+    fn withActivatedSkills(self: *Agent, query: []const u8) ![]u8 {
+        const names = try self.skills.mentioned(self.allocator, query);
+        defer self.allocator.free(names);
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer aw.deinit();
+        for (names) |name| {
+            if (self.skillInstructionsInContext(name)) continue;
+            const loaded = self.skills.load(self.allocator, name) catch continue;
+            defer self.allocator.free(loaded);
+            try aw.writer.print(
+                "The user activated the skill '{s}' for this request with ${s}; follow its instructions for this task.\n{s}\n\n",
+                .{ name, name, loaded },
+            );
+        }
+        try aw.writer.writeAll(query);
+        return aw.toOwnedSlice();
+    }
+
+    /// Whether one skill's instructions are somewhere in the conversation: the
+    /// activation block `load_skill` returns is the same one a `$name` adds.
+    fn skillInstructionsInContext(self: *const Agent, name: []const u8) bool {
+        var buffer: [skills_mod.max_name_bytes + 32]u8 = undefined;
+        const tag = std.fmt.bufPrint(&buffer, "<skill_content name=\"{s}\">", .{name}) catch return false;
+        for (self.history.items) |message| {
+            if (message.content) |content| {
+                if (std.mem.indexOf(u8, content, tag) != null) return true;
+            }
+            if (message.tool_result) |result| {
+                if (std.mem.indexOf(u8, result.output, tag) != null) return true;
+            }
+        }
+        return false;
     }
 
     fn progressOptions(self: *Agent) spinner.Options {
@@ -827,7 +902,7 @@ pub const Agent = struct {
 
         const child = try self.allocator.create(Agent);
         errdefer self.allocator.destroy(child);
-        child.* = try Agent.initWith(self.allocator, self.io, self.config, self.linenoise, self.tool_env, self.mcp_registry, .{
+        child.* = try Agent.initWith(self.allocator, self.io, self.config, self.linenoise, self.tool_env, self.mcp_registry, self.skills, .{
             .role = .subagent,
             .parent = self,
             .capture = &run.capture,
@@ -1741,6 +1816,10 @@ pub const Agent = struct {
         // which is cached in that child's scratch directory, read back by the
         // child through `ccr_retrieve`, and deleted with the child.
         if (std.mem.eql(u8, name, "subagent")) return outcome;
+        // Skill instructions are not output to page through: they are the
+        // procedure the rest of the turn follows, and replacing them with a
+        // preview would leave the model holding the beginning of a recipe.
+        if (std.mem.eql(u8, name, "load_skill")) return outcome;
         return @import("../tools/ccr.zig").cacheOversizedOutput(ctx, name, arguments, outcome);
     }
 
@@ -2467,6 +2546,7 @@ const TestHarness = struct {
     config: Config,
     linenoise: Linenoise,
     registry: mcp.Registry,
+    skills: skills_mod.Skills,
     agent: Agent,
 
     fn init(allocator: std.mem.Allocator, io: std.Io) !*TestHarness {
@@ -2496,12 +2576,16 @@ const TestHarness = struct {
         self.registry = mcp.Registry.empty(allocator, io);
         errdefer self.registry.deinit();
 
-        self.agent = try Agent.init(allocator, io, &self.config, &self.linenoise, &self.env, &self.registry);
+        self.skills = try skills_mod.initWithRoots(allocator, io, &.{});
+        errdefer self.skills.deinit();
+
+        self.agent = try Agent.init(allocator, io, &self.config, &self.linenoise, &self.env, &self.registry, &self.skills);
         return self;
     }
 
     fn deinit(self: *TestHarness, allocator: std.mem.Allocator) void {
         self.agent.deinit();
+        self.skills.deinit();
         self.registry.deinit();
         self.linenoise.deinit();
         self.config.deinit();

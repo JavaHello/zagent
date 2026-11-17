@@ -79,6 +79,8 @@ src/
     find.zig     — find
     web_fetch.zig — web_fetch: a page read as text, or saved to a file
     web_search.zig — web_search: a query and its results
+    load_skill.zig — load_skill: a skill's instructions, its directory and its files
+    read_skill_resource.zig — read_skill_resource: one bundled file, inside the skill
     web.zig      — The HTTP client both web tools ask through, and its deadline
     html.zig     — HTML read as text: markdown for a page, a fragment for a title
     search.zig   — What the four search tools share: backends, arguments, paging
@@ -112,6 +114,7 @@ src/
     report.zig   — The self-contained HTML flowchart rendered from a trace
   state/         — What outlives a turn
     memory.zig   — Durable notes: file format, local retrieval, edits
+    skills.zig   — Agent Skills: discovery, frontmatter, activation, bundled files
     plan.zig     — The session plan: steps, snapshot form, prompt bullet
     session.zig  — Session snapshots
     workspace.zig — Trusted directories and the state directory inside them

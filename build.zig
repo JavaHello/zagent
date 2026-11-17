@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
         "tests/workspace_integration.py",
         "tests/search_dispatch_integration.py",
         "tests/memory_integration.py",
+        "tests/skill_integration.py",
         "tests/plan_integration.py",
         "tests/subagent_integration.py",
         "tests/subagent_checkin_integration.py",

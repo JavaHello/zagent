@@ -138,9 +138,14 @@ session carries on without it.
 ## Completion popups
 
 Typing `/` at the start of the prompt opens system command candidates. Typing
-`@` at a word boundary searches project file paths, and `$` shows a reserved
-"Coming soon" entry. Candidates filter as you type. Use ↑/↓ to select, Tab or
-Enter to insert, and Esc to dismiss; press Enter again to submit the line.
+`@` at a word boundary searches project file paths, and `$` lists the installed
+[skills](skills.md) by name, with the description the catalog shows. Candidates
+filter as you type. Use ↑/↓ to select, Tab or Enter to insert, and Esc to
+dismiss; press Enter again to submit the line.
+
+`$name` in a submitted line is not only a completion: it activates that skill
+for the task, so its instructions reach the model with the request itself. See
+[Skills](skills.md#activating-a-skill-yourself).
 
 File search ranks paths with the [fzy](https://github.com/jhawthorn/fzy)
 scoring algorithm: a query is a subsequence of the path, so `@sz` finds

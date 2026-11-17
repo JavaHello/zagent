@@ -28,6 +28,7 @@ pub const all = [_]Command{
     .{ .name = "/model", .description = "Show current model" },
     .{ .name = "/status", .description = "Show token usage and account quota" },
     .{ .name = "/mcp", .description = "List the MCP servers and their tools" },
+    .{ .name = "/skills", .description = "List installed skills and what was skipped" },
     .{ .name = "/debug", .description = if (tracing)
         "Record every step and write an HTML report"
     else
