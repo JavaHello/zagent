@@ -330,11 +330,17 @@ fn shouldRetry(attempt: usize, shown: bool, transient: bool) bool {
 /// connection the server had already closed, a reset, a timeout, a network that
 /// went away. A URL that does not parse or a certificate that does not verify
 /// would fail the same way however often it is sent, and is not here.
+///
+/// `WriteFailed` and `ReadFailed` belong here as well: they are the only names
+/// the buffered writer and reader interfaces offer, so the reason a socket
+/// write or read failed arrives under one of them.
 fn isTransientNetworkError(err: anyerror) bool {
     return switch (err) {
         error.HttpConnectionClosing, // the keep-alive connection was closed under us
         error.HttpRequestTruncated,
         error.HttpChunkTruncated,
+        error.WriteFailed,
+        error.ReadFailed,
         error.ConnectionResetByPeer,
         error.BrokenPipe,
         error.ConnectionTimedOut,
@@ -342,6 +348,27 @@ fn isTransientNetworkError(err: anyerror) bool {
         error.NetworkSubsystemFailed,
         => true,
         else => false,
+    };
+}
+
+/// The reason the socket itself failed, when the interface could only say that
+/// something did.
+///
+/// A buffered writer reports every failure as `WriteFailed` and a reader as
+/// `ReadFailed`; the errno — a reset, a pipe the peer closed, a timeout — is
+/// kept on the connection that owns the socket. Reading it back is what lets a
+/// caller unwind from a poisoned keep-alive connection in the same breath as
+/// from a reset, and what makes the reported error say what happened.
+///
+/// Anything else is passed through untouched: an error that came from an
+/// allocating writer is out of memory, not the socket's, and the connection's
+/// stale record must not be mistaken for it.
+fn transportError(req: *const std.http.Client.Request, err: anyerror) anyerror {
+    const connection = req.connection orelse return err;
+    return switch (err) {
+        error.WriteFailed => connection.stream_writer.err orelse err,
+        error.ReadFailed => connection.stream_reader.err orelse err,
+        else => err,
     };
 }
 
@@ -394,6 +421,15 @@ pub const Client = struct {
     /// Whether the last response's status was one a retry may fix. Written by
     /// the exchange and read by the retry loop around it; nothing else uses it.
     retryable_status: bool = false,
+    /// Set when the attempt failed on the socket rather than on the request.
+    ///
+    /// A buffered writer says only `WriteFailed` and a reader only `ReadFailed`,
+    /// so the name that comes back is not enough to tell a dead keep-alive
+    /// connection from anything else, and the reason behind it — a reset, a
+    /// socket the peer had closed, a timeout — differs by platform. What makes
+    /// such a failure a transport failure is that it came off the connection at
+    /// all, which is what this records.
+    socket_failure: bool = false,
     search: search_tools.SearchBackends = .{},
     /// Borrowed definitions; callers may replace this slice between requests.
     /// The slice and its strings must remain valid for each request's duration.
@@ -832,7 +868,18 @@ pub const Client = struct {
             if (self.exchangeOnce(wire, req_json, delivery.sink(), raw)) |response| {
                 return response;
             } else |err| {
-                if (!shouldRetry(attempt, delivery.shown, self.retryable_status or isTransientNetworkError(err))) return err;
+                // A failure that came off the socket is the transport's,
+                // whatever name it came back under, and the connection it
+                // happened on must not be reused.
+                const transient = self.retryable_status or self.socket_failure or isTransientNetworkError(err);
+                if (!shouldRetry(attempt, delivery.shown, transient)) {
+                    // The turn ends here, but the connection it failed on is
+                    // still in the pool: without dropping it the next request
+                    // would be written to the same dead socket and fail the
+                    // same way, one turn after another.
+                    if (self.socket_failure or isTransientNetworkError(err)) self.resetHttpClient();
+                    return err;
+                }
                 // The bytes and the message of this attempt belong to a request
                 // that is being sent again: the trace keeps what counts, and
                 // only the final failure is worth reporting.
@@ -850,11 +897,27 @@ pub const Client = struct {
         }
     }
 
+    /// The failure to report for a read or write the connection itself failed,
+    /// recorded so that the retry loop can tell it apart from a failure of the
+    /// request.
+    ///
+    /// Only the socket operations of an exchange call this: an allocating
+    /// writer that runs out of memory is not the transport's, and reports
+    /// itself instead.
+    fn transportFailure(self: *Client, req: *const std.http.Client.Request, err: anyerror) anyerror {
+        const reason = transportError(req, err);
+        // A canceled request is the user's doing, not the transport's: it is
+        // neither sent again nor allowed to cost the pool its connections.
+        if (reason != error.Canceled) self.socket_failure = true;
+        return reason;
+    }
+
     /// One attempt at the exchange: the request, its response, and the stream
     /// that carries the answer to the sink.
     fn exchangeOnce(self: *Client, wire: *const Wire, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
         _ = self.requests.fetchAdd(1, .monotonic);
         self.retryable_status = false;
+        self.socket_failure = false;
         if (self.transport) |transport| {
             // Tests drive the buffered path; streaming is a network detail.
             const body = try transport.send(transport.context, self.allocator, req_json);
@@ -877,13 +940,16 @@ pub const Client = struct {
         defer req.deinit();
 
         req.transfer_encoding = .{ .content_length = req_json.len };
-        var body = try req.sendBodyUnflushed(&.{});
-        try body.writer.writeAll(req_json);
-        try body.end();
-        try req.connection.?.flush();
+        // The request is written to the socket here, and a failure of that
+        // write is described only as `WriteFailed`: the reason is read back off
+        // the connection so that it can be recognised, retried and reported.
+        var body = req.sendBodyUnflushed(&.{}) catch |err| return self.transportFailure(&req, err);
+        body.writer.writeAll(req_json) catch |err| return self.transportFailure(&req, err);
+        body.end() catch |err| return self.transportFailure(&req, err);
+        req.connection.?.flush() catch |err| return self.transportFailure(&req, err);
 
         var redirect_buffer: [8192]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buffer);
+        var response = req.receiveHead(&redirect_buffer) catch |err| return self.transportFailure(&req, err);
 
         // Inspect headers before creating the body reader, which invalidates
         // the response head's borrowed storage.
@@ -924,7 +990,12 @@ pub const Client = struct {
         if (json_response) {
             var buffered: std.Io.Writer.Allocating = .init(self.allocator);
             defer buffered.deinit();
-            _ = try reader.streamRemaining(&buffered.writer);
+            _ = reader.streamRemaining(&buffered.writer) catch |err| switch (err) {
+                error.ReadFailed => return self.transportFailure(&req, err),
+                // The writer here collects the body in memory, so the only way
+                // it can fail is that the allocation did.
+                error.WriteFailed => return error.OutOfMemory,
+            };
             if (raw) |buffer| buffer.appendSlice(self.allocator, buffered.written()) catch {};
             self.recordResponseUsage(buffered.written());
             return self.parseBody(buffered.written());
@@ -942,7 +1013,7 @@ pub const Client = struct {
             if (avail.len == 0) {
                 reader.fillMore() catch |err| switch (err) {
                     error.EndOfStream => break,
-                    error.ReadFailed => return response.bodyErr() orelse err,
+                    error.ReadFailed => return response.bodyErr() orelse self.transportFailure(&req, err),
                 };
                 continue;
             }
@@ -1586,6 +1657,10 @@ test "a failed request is sent again only when that can work" {
     try std.testing.expect(isTransientNetworkError(error.ConnectionResetByPeer));
     try std.testing.expect(isTransientNetworkError(error.BrokenPipe));
     try std.testing.expect(isTransientNetworkError(error.ConnectionTimedOut));
+    // The names a buffered writer and reader fail under stand for the same
+    // transport failures, so a failed write is worth another connection too.
+    try std.testing.expect(isTransientNetworkError(error.WriteFailed));
+    try std.testing.expect(isTransientNetworkError(error.ReadFailed));
     try std.testing.expect(isTransientStatus(.too_many_requests));
     try std.testing.expect(isTransientStatus(.service_unavailable));
     try std.testing.expect(isTransientStatus(.gateway_timeout));

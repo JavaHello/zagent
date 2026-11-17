@@ -40,6 +40,13 @@ pause, each attempt on a fresh connection. A retry is only sent while no answer
 text has been shown: once the reply is streaming onto the screen, a failure ends
 the turn with its error rather than printing the answer twice.
 
+A request fails at the write as often as at the read: a keep-alive connection
+the server or a proxy has dropped is still in the pool, and the next request is
+written into a socket that is already gone. The buffered writer only knows how
+to say `WriteFailed`, so the reason is read back off the connection itself, and
+the failure is treated as the transport failure it is — retried on a fresh
+connection, and never left in the pool for the turn after it.
+
 Output that hits the token budget is continued, and eventually reported as
 `ResponseTruncated`; the budget and its growth are described in
 [Configuration](configuration.md#output-budget-and-truncation).
