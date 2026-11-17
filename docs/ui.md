@@ -145,12 +145,16 @@ Enter to insert, and Esc to dismiss; press Enter again to submit the line.
 File search ranks paths with the [fzy](https://github.com/jhawthorn/fzy)
 scoring algorithm: a query is a subsequence of the path, so `@sz` finds
 `src/zagent.zig`, and matches at a path separator, word boundary or after a dot
-score highest while inner gaps cost least. The 100 best matches across the whole
-walk are kept, so a good match late in the tree still appears. Search skips
-`.git`, build caches and `node_modules`, and bounds traversal to keep large
-workspaces responsive. File selection inserts an `@path` reference (paths with
-spaces are quoted); it does not attach file contents automatically. These popups
-apply only to the REPL prompt.
+score highest while inner gaps cost least. A query that names a directory —
+`@docs`, `@docs/`, `@site/docs/gu` — searches that subtree first, so every file
+under a `docs/` directory is reachable however large the workspace is; the walk
+otherwise runs breadth first, so a shallow directory is looked at before a deep
+subtree can spend the search budget. The 100 best matches are kept, so a good
+match late in the tree still appears. Search skips `.git`, build caches and
+`node_modules`, and bounds traversal to keep large workspaces responsive. File
+selection inserts an `@path` reference (a path with a space is quoted as
+`@"a b.txt"`, and typing inside such a quote keeps filtering); it does not
+attach file contents automatically. These popups apply only to the REPL prompt.
 
 ## Steering a running task
 

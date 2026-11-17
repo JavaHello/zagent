@@ -74,6 +74,11 @@ const Ranking = struct {
     }
 
     fn add(self: *Ranking, allocator: Allocator, path: []const u8, score: f64) !void {
+        // Two walks can reach the same file; the first sighting is already the
+        // better ranked one, so the duplicate would only crowd out another.
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.path, path)) return;
+        }
         const entry: Ranked = .{ .path = path, .score = score };
         var index: usize = 0;
         while (index < self.entries.items.len and !better(entry, self.entries.items[index])) index += 1;
@@ -93,32 +98,90 @@ fn ignored(name: []const u8) bool {
 }
 
 fn files(allocator: Allocator, io: std.Io, items: *std.ArrayList(Item), before: []const u8, query: []const u8) !void {
-    const root = std.Io.Dir.cwd();
-    // Bound traversal so a large workspace cannot stall the editor indefinitely.
-    var budget: usize = 10000;
+    return filesIn(allocator, io, std.Io.Dir.cwd(), items, before, query);
+}
+
+fn filesIn(allocator: Allocator, io: std.Io, root: std.Io.Dir, items: *std.ArrayList(Item), before: []const u8, query: []const u8) !void {
     var scratch: fzy.Scratch = .{};
     defer scratch.deinit(allocator);
     try scratch.initQuery(allocator, query);
     var ranking: Ranking = .{};
     defer ranking.deinit(allocator);
-    try search(allocator, io, root, "", &ranking, &scratch, 0, &budget);
+    // A query that names a directory searches that directory first, so its
+    // whole subtree is reachable however large the workspace is; the budgeted
+    // walk from the top of the workspace then only adds what else matches.
+    if (try directory(allocator, io, root, query)) |named| {
+        defer allocator.free(named);
+        var named_budget: usize = 12000;
+        try search(allocator, io, root, named, &ranking, &scratch, &named_budget);
+        var rest: usize = 5000;
+        if (ranking.entries.items.len < 100) try search(allocator, io, root, "", &ranking, &scratch, &rest);
+    } else {
+        var budget: usize = 10000;
+        try search(allocator, io, root, "", &ranking, &scratch, &budget);
+    }
     for (ranking.entries.items) |entry| try appendFile(allocator, items, before, entry.path);
 }
 
-fn search(allocator: Allocator, io: std.Io, root: std.Io.Dir, path: []const u8, ranking: *Ranking, scratch: *fzy.Scratch, depth: usize, budget: *usize) Allocator.Error!void {
-    var dir = root.openDir(io, if (path.len == 0) "." else path, .{ .iterate = true }) catch return;
-    defer dir.close(io);
-    var iterator = dir.iterate();
-    while (iterator.next(io) catch null) |entry| {
-        if (budget.* == 0) return;
-        budget.* -= 1;
-        if (ignored(entry.name) or std.mem.indexOfAny(u8, entry.name, "\x00\r\n\t\x1b") != null or !std.unicode.utf8ValidateSlice(entry.name)) continue;
-        const relative = if (path.len == 0) try allocator.dupe(u8, entry.name) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
-        defer allocator.free(relative);
-        if (entry.kind == .directory) {
-            if (depth < 12) try search(allocator, io, root, relative, ranking, scratch, depth + 1, budget);
-        } else if (entry.kind == .file) {
-            if (try scratch.score(allocator, relative)) |score| try ranking.add(allocator, relative, score);
+/// The directory a query names, or null when it names none.
+///
+/// `docs`, `docs/` and `site/docs/gu` all name a directory to search, and the
+/// longest prefix that exists wins, so a half-typed component still narrows the
+/// walk. Anything absolute or reaching outside the workspace names nothing.
+fn directory(allocator: Allocator, io: std.Io, root: std.Io.Dir, query: []const u8) Allocator.Error!?[]u8 {
+    if (query.len == 0 or query[0] == '/' or std.mem.indexOf(u8, query, "..") != null) return null;
+    var end = std.mem.lastIndexOfScalar(u8, query, '/') orelse query.len;
+    while (true) {
+        const candidate = std.mem.trimEnd(u8, query[0..end], "/");
+        if (candidate.len == 0) return null;
+        if (root.openDir(io, candidate, .{})) |dir| {
+            dir.close(io);
+            return try allocator.dupe(u8, candidate);
+        } else |_| {}
+        end = std.mem.lastIndexOfScalar(u8, query[0..end], '/') orelse return null;
+    }
+}
+
+const Pending = struct { path: []u8, depth: usize };
+
+/// Walk the tree below `base` breadth first.
+///
+/// The budget is spent level by level, so every shallow directory is looked at
+/// before the deep subtrees of its neighbours are: a depth-first walk finishes
+/// the first large subtree it meets and can exhaust its budget without ever
+/// reaching a sibling such as `docs/`, which then offers no candidate at all.
+fn search(allocator: Allocator, io: std.Io, root: std.Io.Dir, base: []const u8, ranking: *Ranking, scratch: *fzy.Scratch, budget: *usize) Allocator.Error!void {
+    var queue: std.ArrayList(Pending) = .empty;
+    defer {
+        for (queue.items) |pending| allocator.free(pending.path);
+        queue.deinit(allocator);
+    }
+    try queue.append(allocator, .{ .path = try allocator.dupe(u8, base), .depth = 0 });
+    var head: usize = 0;
+    while (head < queue.items.len and budget.* > 0) : (head += 1) {
+        const pending = queue.items[head];
+        var dir = root.openDir(io, if (pending.path.len == 0) "." else pending.path, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (budget.* > 0) {
+            const entry = (iterator.next(io) catch break) orelse break;
+            budget.* -= 1;
+            if (ignored(entry.name) or std.mem.indexOfAny(u8, entry.name, "\x00\r\n\t\x1b") != null or !std.unicode.utf8ValidateSlice(entry.name)) continue;
+            const relative = if (pending.path.len == 0) try allocator.dupe(u8, entry.name) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pending.path, entry.name });
+            switch (entry.kind) {
+                // The queue takes the path over, so it outlives the entry.
+                .directory => if (pending.depth < 12) {
+                    queue.append(allocator, .{ .path = relative, .depth = pending.depth + 1 }) catch |err| {
+                        allocator.free(relative);
+                        return err;
+                    };
+                } else allocator.free(relative),
+                .file => {
+                    defer allocator.free(relative);
+                    if (try scratch.score(allocator, relative)) |score| try ranking.add(allocator, relative, score);
+                },
+                else => allocator.free(relative),
+            }
         }
     }
 }
@@ -173,6 +236,102 @@ test "file candidates transfer ownership and clean up allocation failures" {
             try std.testing.expectEqualStrings("File", items.items[1].description);
         }
     }.run, .{});
+}
+
+test "search covers a shallow directory before a deep subtree spends the budget" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A subtree far bigger than the budget, next to the directory a reader is
+    // likelier to name: a depth-first walk would never leave the subtree.
+    try tmp.dir.createDirPath(io, "aaa/nested");
+    for (0..40) |index| {
+        var name: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&name, "aaa/nested/f{d:0>2}", .{index});
+        const file = try tmp.dir.createFile(io, path, .{});
+        file.close(io);
+    }
+    try tmp.dir.createDirPath(io, "docs");
+    const guide = try tmp.dir.createFile(io, "docs/guide.md", .{});
+    guide.close(io);
+
+    var scratch: fzy.Scratch = .{};
+    defer scratch.deinit(allocator);
+    try scratch.initQuery(allocator, "guide");
+    var ranking: Ranking = .{};
+    defer ranking.deinit(allocator);
+    var budget: usize = 6;
+    try search(allocator, io, tmp.dir, "", &ranking, &scratch, &budget);
+    try std.testing.expectEqual(@as(usize, 1), ranking.entries.items.len);
+    try std.testing.expectEqualStrings("docs/guide.md", ranking.entries.items[0].path);
+}
+
+test "a query names the directory whose subtree it searches" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "docs");
+    try tmp.dir.createDirPath(io, "site/docs");
+    const file = try tmp.dir.createFile(io, "docs/guide.md", .{});
+    file.close(io);
+
+    const cases = [_]struct { query: []const u8, expected: ?[]const u8 }{
+        .{ .query = "docs", .expected = "docs" },
+        .{ .query = "docs/", .expected = "docs" },
+        .{ .query = "docs/gu", .expected = "docs" },
+        .{ .query = "site/docs/re", .expected = "site/docs" },
+        // A component that is only being typed narrows to the directory above
+        // it, and a path that names no directory keeps the walk at the top.
+        .{ .query = "site/do", .expected = "site" },
+        .{ .query = "nosuch/x", .expected = null },
+        .{ .query = "", .expected = null },
+        // Absolute paths and ones that climb out of the workspace name nothing.
+        .{ .query = "/etc", .expected = null },
+        .{ .query = "../docs", .expected = null },
+    };
+    for (cases) |case| {
+        const found = try directory(allocator, io, tmp.dir, case.query);
+        defer if (found) |path| allocator.free(path);
+        if (case.expected) |expected| {
+            try std.testing.expectEqualStrings(expected, found orelse return error.TestUnexpectedResult);
+        } else try std.testing.expect(found == null);
+    }
+}
+
+test "a reference names the files under the directory it points at" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "docs/guides");
+    try tmp.dir.createDirPath(io, "src");
+    for ([_][]const u8{ "docs/index.md", "docs/guides/setup.md", "src/main.zig", "README.md" }) |path| {
+        const file = try tmp.dir.createFile(io, path, .{});
+        file.close(io);
+    }
+
+    const cases = [_]struct { query: []const u8, expected: []const []const u8 }{
+        .{ .query = "docs", .expected = &.{ "@docs/index.md", "@docs/guides/setup.md" } },
+        .{ .query = "docs/", .expected = &.{ "@docs/index.md", "@docs/guides/setup.md" } },
+        .{ .query = "docs/gui", .expected = &.{"@docs/guides/setup.md"} },
+    };
+    for (cases) |case| {
+        var items: std.ArrayList(Item) = .empty;
+        defer {
+            for (items.items) |item| item.deinit(allocator);
+            items.deinit(allocator);
+        }
+        try filesIn(allocator, io, tmp.dir, &items, "read ", case.query);
+        for (case.expected) |label| {
+            var found = false;
+            for (items.items) |item| {
+                if (std.mem.eql(u8, item.label, label)) found = true;
+            }
+            try std.testing.expect(found);
+        }
+    }
 }
 
 test "triggers recognize commands and references at token boundaries" {
