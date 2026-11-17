@@ -11,9 +11,23 @@ pub fn trigger(prefix: []const u8) ?Trigger {
     var start = prefix.len;
     while (start > 0 and !std.ascii.isWhitespace(prefix[start - 1])) start -= 1;
     if (start == prefix.len) return null;
+    // A path with a space is inserted as `@"a b.txt"`, so the quote holds the
+    // reference together: it runs to the closing quote, and a closed one is a
+    // finished reference that no longer wants a popup.
+    if (prefix[start] == '@' and start + 1 < prefix.len and prefix[start + 1] == '"') {
+        const rest = prefix[start + 2 ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse rest.len;
+        return .{ .start = start, .kind = '@', .query = rest[0..end] };
+    }
     const kind = prefix[start];
-    if (kind != '@' and kind != '$' and !(kind == '/' and start == 0)) return null;
-    return .{ .start = start, .kind = kind, .query = prefix[start + 1 ..] };
+    if (kind == '@' or kind == '$' or (kind == '/' and start == 0))
+        return .{ .start = start, .kind = kind, .query = prefix[start + 1 ..] };
+    // While `@"sub dir` is still being typed the space splits the word, so the
+    // open quote has to be found behind it; a quote that is not the last one,
+    // or that does not follow a `@`, belongs to prose instead.
+    const quote = std.mem.lastIndexOfScalar(u8, prefix, '"') orelse return null;
+    if (quote == 0 or prefix[quote - 1] != '@') return null;
+    return .{ .start = quote - 1, .kind = '@', .query = prefix[quote + 1 ..] };
 }
 
 fn append(allocator: Allocator, items: *std.ArrayList(Item), prefix: []const u8, label: []const u8, description: []const u8, selectable: bool) !void {
@@ -167,6 +181,19 @@ test "triggers recognize commands and references at token boundaries" {
     try std.testing.expectEqual(@as(?Trigger, null), trigger("hello /"));
     try std.testing.expectEqualStrings("src", trigger("看看 @src").?.query);
     try std.testing.expectEqual(@as(u8, '$'), trigger("$skill").?.kind);
+}
+
+test "triggers follow a quoted reference over the spaces in a path" {
+    const quoted = trigger("看看 @\"sub dir/de") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 7), quoted.start);
+    try std.testing.expectEqualStrings("sub dir/de", quoted.query);
+    try std.testing.expectEqualStrings("a b", trigger("@\"a b").?.query);
+    // A closed reference is finished, so it keeps the popup shut.
+    try std.testing.expectEqual(@as(?Trigger, null), trigger("@\"a b.txt\""));
+    try std.testing.expectEqual(@as(?Trigger, null), trigger("看了 @\"a b.txt\" 再改"));
+    // A quote that starts no reference, or that closed an earlier one, is prose.
+    try std.testing.expectEqual(@as(?Trigger, null), trigger("say \"hi there"));
+    try std.testing.expectEqual(@as(?Trigger, null), trigger("看了 \"a b\" 和"));
 }
 
 test "command filtering and reserved dollar entry" {

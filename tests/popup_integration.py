@@ -99,6 +99,12 @@ with tempfile.TemporaryDirectory(prefix='zagent-popup-') as directory:
         send(b'\x15@hidden', b'No matching files')
         send('\x15@中文'.encode(), '@src/中文 file.zig  File'.encode())
         send(b'\t', '❯ @"src/中文 file.zig"'.encode())
+        # A quote holds a path together, so the popup keeps filtering after the
+        # space a path like this one contains.
+        send('\x15@"src/中文 file'.encode(), '@src/中文 file.zig  File'.encode())
+        send(b'\t', '❯ @"src/中文 file.zig"'.encode())
+        # A closed reference is a finished one, so nothing is offered for it.
+        send(b' tail', '❯ @"src/中文 file.zig" tail'.encode())
         # Queries are fzy subsequences, not substrings: "saz" has no contiguous
         # occurrence anywhere, yet still finds src/alpha.zig.
         send(b'\x15@saz', b'@src/alpha.zig  File')
