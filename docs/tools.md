@@ -152,19 +152,25 @@ A write is atomic and keeps the file's permissions.
 
 ## `edit`
 
-Replaces one exact block in an existing file. The non-empty `old_text` must match
-exactly once; no match or multiple matches leaves the file untouched. `new_text`
-may be empty to delete the matched block.
+Replaces exact text in an existing file. The non-empty `old_text` must match
+exactly once unless `replace_all` is true; no match changes nothing, and a match
+that is not unique is refused rather than guessed at. `new_text` may be empty to
+delete the matched text.
 
 | Argument | Required | Description |
 |----------|----------|-------------|
 | `path` | yes | The file to edit |
-| `old_text` | yes | The exact, non-empty block to replace |
+| `old_text` | yes | The exact, non-empty text to replace |
 | `new_text` | yes | Its replacement |
+| `replace_all` | no | Replace every occurrence instead of requiring a unique match (default `false`) |
+
+Occurrences do not overlap: `replace_all` replaces each place the text is found
+in what was read, and does not then search the text it inserted.
 
 An edit is atomic and keeps the file's permissions.
 
-The call is drawn as the diff it makes, at the line the old text starts on:
+The call is drawn as the diff it makes, at the line the old text starts on — one
+hunk per occurrence when every one of them is replaced:
 
 ```
 ❯ rename the greeting in greet.txt to hello

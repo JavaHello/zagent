@@ -1580,23 +1580,49 @@ pub fn render(w: *std.Io.Writer, patch_text: []const u8) !void {
 /// says what the file loses and gains. A diff says both, in the colours a
 /// reader already reads changes in.
 pub fn renderEdit(w: *std.Io.Writer, path: []const u8, start: ?usize, old_text: []const u8, new_text: []const u8) !void {
+    const starts = [_]?usize{start};
+    try renderEdits(w, path, &starts, old_text, new_text);
+}
+
+/// Draw the same block edit at every place the call makes it, which is what an
+/// `edit` that replaces all occurrences changes: one pair of file headers, and
+/// one hunk per occurrence, at the line each of them starts on. A `null` start
+/// is an occurrence the file cannot place — it is gone, or cannot be read — and
+/// is drawn without a hunk header, the way a lone edit with no line is.
+///
+/// The terminal's budget is shared out hunk by hunk, so that the second
+/// occurrence is not what the size of the first one hides. What does not fit
+/// says how much of it was held back.
+pub fn renderEdits(w: *std.Io.Writer, path: []const u8, starts: []const ?usize, old_text: []const u8, new_text: []const u8) !void {
     const removed = lineCount(old_text);
     const added = lineCount(new_text);
-    const head: usize = 2 + @as(usize, @intFromBool(start != null));
-
-    // The headers of a diff this long are never the part to cut, so what the
-    // terminal's budget has left goes to the two blocks — half each when the
-    // whole change does not fit, because a long removal must not be what hides
-    // the lines that arrive in its place.
-    const budget = render_max_lines -| head;
-    const removed_shown = @min(removed, if (removed + added <= budget) budget else budget / 2);
-    const added_shown = @min(added, budget - removed_shown);
 
     try writeHeader(w, "--- ", path);
     try writeHeader(w, "+++ ", path);
-    if (start) |first| try w.print("  " ++ sgr.CYAN ++ "@@ -{d},{d} +{d},{d} @@" ++ sgr.RESET ++ "\n", .{ first, removed, first, added });
-    try writeBlock(w, '-', old_text, sgr.DIM ++ sgr.RED, removed_shown);
-    try writeBlock(w, '+', new_text, sgr.GREEN, added_shown);
+    if (starts.len == 0) return;
+
+    // Two file headers, and the hunk header of each occurrence the file can
+    // place: what a preview that drew every one of them would need before a
+    // single line of the change itself. When not even a share of the rest is
+    // left, the occurrences are counted rather than drawn one header each.
+    var heads: usize = 2;
+    for (starts) |start| heads += @intFromBool(start != null);
+    const per_hunk = if (heads < render_max_lines) (render_max_lines - heads) / starts.len else 0;
+    if (per_hunk == 0) {
+        try noteWithheldEdits(w, starts.len);
+        return;
+    }
+
+    for (starts) |start| {
+        if (start) |first| try w.print("  " ++ sgr.CYAN ++ "@@ -{d},{d} +{d},{d} @@" ++ sgr.RESET ++ "\n", .{ first, removed, first, added });
+        // Half of a hunk's share each when the whole change does not fit there,
+        // because a long removal must not be what hides the lines that arrive
+        // in its place.
+        const removed_shown = @min(removed, if (removed + added <= per_hunk) per_hunk else per_hunk / 2);
+        const added_shown = @min(added, per_hunk - removed_shown);
+        try writeBlock(w, '-', old_text, sgr.DIM ++ sgr.RED, removed_shown);
+        try writeBlock(w, '+', new_text, sgr.GREEN, added_shown);
+    }
 }
 
 fn writeHeader(w: *std.Io.Writer, marker: []const u8, path: []const u8) !void {
@@ -1628,6 +1654,12 @@ fn writeBlock(w: *std.Io.Writer, marker: u8, text: []const u8, style: []const u8
 /// than left out so that a cut change does not read as the whole change.
 fn noteWithheld(w: *std.Io.Writer, count: usize) !void {
     try w.print("{s}  … {d} more line(s) of the diff are not shown{s}\n", .{ sgr.DIM, count, sgr.RESET });
+}
+
+/// The same for occurrences the budget had no room for at all: it is the edits
+/// left out whole that are counted, not lines of them.
+fn noteWithheldEdits(w: *std.Io.Writer, count: usize) !void {
+    try w.print("{s}  … {d} more occurrence(s) of the edit are not shown{s}\n", .{ sgr.DIM, count, sgr.RESET });
 }
 
 /// Draw one line of a preview: indented under the call it belongs to, in
@@ -2880,6 +2912,50 @@ test "an edit whose line is unknown is drawn without a hunk header" {
     try renderEdit(&aw.writer, "note.txt", 1, "one\n", "");
     try testing.expect(std.mem.indexOf(u8, aw.written(), "@@ -1,1 +1,0 @@") != null);
     try testing.expect(std.mem.endsWith(u8, aw.written(), "-one" ++ sgr.RESET ++ "\n"));
+}
+
+test "an edit that replaces every occurrence is drawn at each of them" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    // One pair of file headers, and the line of each occurrence as its own
+    // hunk: what the file loses and gains reads the same way as for a single
+    // edit, once for every place the call changes.
+    const starts = [_]?usize{ 2, 7 };
+    try renderEdits(&aw.writer, "note.txt", &starts, "old", "new");
+
+    try testing.expectEqualStrings(
+        "  " ++ sgr.DIM ++ "--- note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ "+++ note.txt" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.CYAN ++ "@@ -2,1 +2,1 @@" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ sgr.RED ++ "-old" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.GREEN ++ "+new" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.CYAN ++ "@@ -7,1 +7,1 @@" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.DIM ++ sgr.RED ++ "-old" ++ sgr.RESET ++ "\n" ++
+            "  " ++ sgr.GREEN ++ "+new" ++ sgr.RESET ++ "\n",
+        aw.written(),
+    );
+}
+
+test "occurrences the terminal has no room for are counted, not dropped" {
+    const allocator = testing.allocator;
+    const starts = try allocator.alloc(?usize, render_max_lines);
+    defer allocator.free(starts);
+    for (starts, 0..) |*start, index| start.* = index + 1;
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try renderEdits(&aw.writer, "note.txt", starts, "old", "new");
+
+    // Every occurrence gets a hunk header of its own before a line of the
+    // change would be drawn, which is what this many of them cannot afford:
+    // they are counted under the headers rather than drawn one header each.
+    try testing.expect(std.mem.endsWith(
+        u8,
+        aw.written(),
+        "  … 400 more occurrence(s) of the edit are not shown" ++ sgr.RESET ++ "\n",
+    ));
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "@@") == null);
 }
 
 test "a drawn edit carries nothing a terminal would act on, path included" {

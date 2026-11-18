@@ -92,5 +92,7 @@ refused, because that is also what a mistyped path looks like.
   lines to apply; each comes back with the section and the reason rather than
   half applied.
 
-A single-file exact block replacement can also be made with `edit(path, old_text, new_text)`,
-see [Tools](tools.md#edit). Use `write(path, content)` to create or overwrite a whole file.
+A single-file exact block replacement can also be made with `edit(path, old_text,
+new_text, replace_all)`, where `replace_all` defaults to false and replaces one
+unique block when it is not set; see [Tools](tools.md#edit). Use
+`write(path, content)` to create or overwrite a whole file.

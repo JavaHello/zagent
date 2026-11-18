@@ -377,6 +377,34 @@ test "write and edit reject missing or mixed arguments" {
     }
 }
 
+test "an edit reaches every occurrence only when the call asks for it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "note.txt", .data = "tick tock tick\n" });
+    const path = try tmp.dir.realPathFileAlloc(io, "note.txt", a);
+    defer a.free(path);
+
+    // The flag defaults to false, so a call that does not name it is still the
+    // unique-match edit it always was.
+    const once = try std.json.Stringify.valueAlloc(a, .{ .path = path, .old_text = "tick", .new_text = "TOCK" }, .{});
+    defer a.free(once);
+    const refused = try call("edit", once);
+    defer refused.deinit(a);
+    try std.testing.expect(refused.is_error);
+
+    const every = try std.json.Stringify.valueAlloc(a, .{ .path = path, .old_text = "tick", .new_text = "TOCK", .replace_all = true }, .{});
+    defer a.free(every);
+    const edited = try call("edit", every);
+    defer edited.deinit(a);
+    try std.testing.expect(!edited.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, edited.output, "Replaced 2 occurrences") != null);
+    const content = try tmp.dir.readFileAlloc(io, "note.txt", a, .limited(1024));
+    defer a.free(content);
+    try std.testing.expectEqualStrings("TOCK tock TOCK\n", content);
+}
+
 test "the web tools dispatch to their argument validation" {
     const a = std.testing.allocator;
     const fetch = try call("web_fetch", "{}");

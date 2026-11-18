@@ -124,6 +124,14 @@ test "write and edit have separate required arguments" {
     try std.testing.expectEqualStrings("new_text", er[2].string);
     try std.testing.expect(!w.parameters.object.get("properties").?.object.contains("old_text"));
     try std.testing.expect(!e.parameters.object.get("properties").?.object.contains("content"));
+
+    // `replace_all` is offered, and is what the call says rather than what it
+    // must say: the three strings stay the required arguments.
+    try std.testing.expect(e.parameters.object.get("properties").?.object.contains("replace_all"));
+    try std.testing.expectEqualStrings("boolean", e.parameters.object.get("properties").?.object.get("replace_all").?.object.get("type").?.string);
+    // Absent is false, and the schema says so: the model is told the default
+    // it would otherwise have to infer from the description.
+    try std.testing.expectEqual(false, e.parameters.object.get("properties").?.object.get("replace_all").?.object.get("default").?.bool);
 }
 
 test "built-in definitions have valid schemas and unique names" {

@@ -52,6 +52,8 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
         ('edit', {'path': 'notes.md', 'old_text': 'not present', 'new_text': 'MUST_NOT_APPEAR'}),
         ('edit', {'path': 'escape', 'old_text': 'SHOULD_NOT_ESCAPE', 'new_text': 'DIRECT_EDIT_WORKED'}),
         ('bash', {'command': '/bin/echo HOST_WRITE > host-write.txt && cat host-write.txt'}),
+        ('write', {'path': 'twice.txt', 'content': 'tick\nTICK\ntick\n'}),
+        ('edit', {'path': 'twice.txt', 'old_text': 'tick', 'new_text': 'tock', 'replace_all': True}),
     ])
     observed = []
     requests = []
@@ -151,6 +153,11 @@ with tempfile.TemporaryDirectory(prefix='zagent-boundary-', dir='/tmp') as tempo
     assert 'HOST_WRITE' in observed[14], observed[14]
     assert 'Replaced one exact text block' in observed[11], observed[11]
     assert 'not found' in observed[12] and 'Replaced one exact text block' in observed[13], observed[12:14]
+    # `replace_all` is what the call says, and every occurrence of it is
+    # replaced: the text that did not match is left as it was.
+    assert not statuses[16]['is_error'], statuses[16]
+    assert (workspace / 'twice.txt').read_text() == 'tock\nTICK\ntock\n', observed[16]
+    assert 'Replaced 2 occurrences' in observed[16], observed[16]
     assert 'timed out' in observed[10] and 'SHOULD_HAVE_TIMED_OUT' not in observed[10], observed[10]
     assert observed[9] == '', observed[9]
     # Host tools and local MCP startup need no isolation configuration.
