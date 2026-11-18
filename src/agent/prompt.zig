@@ -37,10 +37,6 @@ pub const restart_prompt =
 pub const steering_note =
     "The user typed this while you were working on the current task. Treat it as guidance for the work in progress: adjust what you are doing now and continue the same task.";
 
-// Prompt for the choice menu. Colour codes are fine here because linenoize's
-// width() implementation correctly ignores ANSI SGR sequences.
-pub const CHOICE_PROMPT = sgr.BOLD ++ sgr.YELLOW ++ "choice" ++ sgr.RESET ++ " \xe2\x9d\xaf ";
-
 // What a dismissed question tells the model. Dismissing a question is not a
 // reason to stop the run: the model is told to carry on by itself.
 pub const dismissed_question_message = "The question was dismissed without an answer. If you can, decide yourself; otherwise explain what you need and stop.";

@@ -211,18 +211,21 @@ try:
             # An answered question is checked in green beside its number.
             until(lambda: b'\x1b[32m \xe2\x9c\x93 1 ' in transcript[mark:], b'the answered tab')
 
-            # Supplement asks for words to send with the answers, and they are
-            # submitted with them rather than answering a question.
+            # Supplement takes words of the user's own in the row itself, the
+            # way a question's Other row does: the words take the place of its
+            # label, and the Enter that follows sends them with the answers
+            # rather than answering a question.
             settle()
             os.write(master, b'2\r')
             mark = len(transcript)
-            until(lambda: drawn('choice', mark), b'the supplement prompt')
-            if b'\x1b[6n' in transcript[mark:]:
-                os.write(master, b'\x1b[1;1R')
-            # Typed as the row opens, before it is drawn: words typed while the
-            # terminal is between the form and the editor still land in the
-            # answer, and the Enter they were typed with submits it.
-            os.write(master, b'and mind the tests\r')
+            until(lambda: drawn('Enter confirm \u00b7 Esc back', mark), b'the supplement row')
+            # From the frame that opened the row: the description it carried
+            # before is gone, because the words now stand in its place.
+            mark = len(transcript)
+            os.write(master, b'and mind the tests')
+            until(lambda: drawn('2) and mind the tests', mark), b'the words in the row')
+            assert not drawn('Type your own words to add', mark), since(mark)
+            os.write(master, b'\r')
             until(lambda: b'Turn complete' in clean(), b'the answer')
             until(lambda: len(answers) == 1, b'the tool result')
 
@@ -283,7 +286,8 @@ try:
                   'Shift+Tab revise an answer already given and cycle the questions until '
                   'every one has an answer, the last row is typed into where it is drawn, '
                   'Esc there steps back to the options keeping the words, the Confirm tab '
-                  'submits the answers or takes words to add, Ctrl+C is ignored, and Esc '
+                  'submits the answers or takes words of its own in its Supplement row, '
+                  'Ctrl+C is ignored, and Esc '
                   'cancels the questions and stops the run')
         finally:
             if process.poll() is None:

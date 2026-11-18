@@ -5,8 +5,8 @@ const Agent = @import("../agent/mod.zig").Agent;
 const dismissed_question_message = @import("../agent/prompt.zig").dismissed_question_message;
 const tool = @import("tool.zig");
 
-/// The line that carries the words typed on the confirmation's Supplement row,
-/// which add to the answers rather than answering a question.
+/// The line of the result that carries the words typed into the confirmation's
+/// Supplement row, which add to the answers rather than answering a question.
 const note_line = "The user added: ";
 
 pub const spec: tool.Tool = .{

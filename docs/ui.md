@@ -250,9 +250,22 @@ keyboard there instead of sending it off:
   Tab/Shift+Tab · ↑/↓ select · Enter submit · Esc cancel
 ```
 
-**Submit** sends the answers as they are; **Supplement** asks for a line of your
-own words, which is sent with them, so a decision can carry the detail the
-options left out. Esc in that line goes back to the confirmation.
+**Submit** sends the answers as they are; **Supplement** takes words of your own,
+which are sent with them, so a decision can carry the detail the options left
+out. Its row is typed into the way a question's Other row is: the words take the
+place of its label, and the hint switches to the keys that are left.
+
+```
+   ✓ 1   ✓ Confirm
+  Confirm
+      1) Submit  Send the answers as they stand
+    > 2) 再看一眼测试▏
+  Enter confirm · Esc back · Ctrl+U clear
+```
+
+Enter sends the answers with the words added, and Esc goes back to the
+confirmation's rows with the words kept, on **Submit** — so Enter there sends the
+answers as they stand, and stepping into the row again opens it on the words.
 
 Tab and Shift+Tab move between the tabs and wrap around, so an earlier answer can
 be revised: answered questions show what they were answered with, and only the

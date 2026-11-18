@@ -41,7 +41,6 @@ const max_empty_continuations = agent_prompt.max_empty_continuations;
 const continue_prompt = agent_prompt.continue_prompt;
 const restart_prompt = agent_prompt.restart_prompt;
 const steering_note = agent_prompt.steering_note;
-const CHOICE_PROMPT = agent_prompt.CHOICE_PROMPT;
 const error_preview_max = agent_prompt.error_preview_max;
 const self_check_prompt = agent_prompt.self_check_prompt;
 const deadline_prompt = agent_prompt.deadline_prompt;
@@ -1527,7 +1526,6 @@ pub const Agent = struct {
         const replies = try menu.resolve(self.allocator, slots, .{
             .context = self,
             .present = presentOnTerminal,
-            .read = readOnTerminal,
         });
         if (replies.canceled) {
             // Esc at the questions is a stop here too: nothing is answered, and
@@ -1543,75 +1541,6 @@ pub const Agent = struct {
     fn presentOnTerminal(context: *anyopaque, slots: []menu.Slot, focus: ?usize) anyerror!menu.Outcome {
         const self: *Agent = @ptrCast(@alignCast(context));
         return menu.form(self.allocator, self.io, slots, true, true, focus);
-    }
-
-    /// Read the words the confirmation's Supplement row asks for, on that same
-    /// terminal.
-    fn readOnTerminal(context: *anyopaque) anyerror!menu.Line {
-        const self: *Agent = @ptrCast(@alignCast(context));
-        return self.readChoiceLine();
-    }
-
-    /// Read the words the confirmation's Supplement row asks for. Owned by the
-    /// caller, trimmed, and never empty: an empty line adds nothing at all.
-    /// Answers typed into a question's free-text row are taken by the form
-    /// itself, so they never come through here.
-    pub fn readChoiceLine(self: *Agent) !menu.Line {
-        // A menu answer is free text, not a slash command, so completion and
-        // hints are switched off for this read and restored afterwards.
-        const saved_completions = self.linenoise.completions_callback;
-        const saved_hints = self.linenoise.hints_callback;
-        const saved_popup = self.linenoise.popup_callback;
-        const saved_question = self.linenoise.question_input;
-        self.linenoise.completions_callback = null;
-        self.linenoise.hints_callback = null;
-        self.linenoise.popup_callback = null;
-        self.linenoise.question_input = true;
-        defer {
-            self.linenoise.completions_callback = saved_completions;
-            self.linenoise.hints_callback = saved_hints;
-            self.linenoise.popup_callback = saved_popup;
-            self.linenoise.question_input = saved_question;
-        }
-
-        var raw_line: ?[]const u8 = null;
-        while (true) {
-            if (self.screen) |screen| try screen.prepareInput();
-            raw_line = self.linenoise.linenoise(CHOICE_PROMPT) catch |err| switch (err) {
-                // Esc goes back to the confirmation, not to the end of the read.
-                error.Escaped => {
-                    if (self.screen) |screen| try screen.endInput();
-                    return .back;
-                },
-                error.Suspend => {
-                    // The read is a normal line edit; suspension gives the
-                    // terminal back and resumes on the same text.
-                    if (self.screen) |screen| {
-                        try screen.suspendProcess();
-                    } else {
-                        @import("../ui/screen.zig").stopProcess();
-                    }
-                    continue;
-                },
-                else => return err,
-            };
-            if (self.screen) |screen| try screen.endInput();
-            break;
-        }
-        const line = raw_line orelse return .none;
-        defer self.allocator.free(line);
-
-        // The answer is part of the record even though the editor's rows are
-        // cleared once it is read.
-        if (self.screen) |screen| {
-            const echo = try std.fmt.allocPrint(self.allocator, "{s}{s}\n", .{ CHOICE_PROMPT, line });
-            defer self.allocator.free(echo);
-            try screen.writeLog(echo);
-        }
-
-        const answer = std.mem.trim(u8, line, " \t\r\n");
-        if (answer.len == 0) return .none;
-        return .{ .answer = try self.allocator.dupe(u8, answer) };
     }
 
     /// Give the history a message whose fields are already owned. The history

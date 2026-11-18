@@ -128,13 +128,6 @@ fn cursorKey(state: *LinenoiseState, byte: u8) !void {
 
 /// Esc on its own: step back out of a popup, or stop what is running.
 fn escapePressed(state: *LinenoiseState, ln: *Linenoise) !void {
-    // The free-text row of a question is not a place to interrupt the run: Esc
-    // steps back to the option list, so the read ends and the caller draws the
-    // menu again.
-    if (ln.question_input) {
-        ln.history.pop();
-        return error.Escaped;
-    }
     // A question can take the keyboard in the moment this Esc is pressed. The
     // menu comes first, and the run it belongs to must not be killed by the
     // answer to its own dismissal.
@@ -224,10 +217,6 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
             key_ctrl_a => try state.editMoveHome(),
             key_ctrl_b => try state.editMoveLeft(),
             key_ctrl_c => {
-                // A question has no way out on Ctrl+C: the key is pressed by
-                // habit, so it is ignored there rather than throwing the
-                // question away.
-                if (ln.question_input) continue;
                 // The empty entry added below stands in for the line being
                 // edited; it is not history until Enter accepts it. Dropping it
                 // here mirrors Ctrl+D, and keeps an abandoned line out of a
@@ -259,16 +248,9 @@ fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]co
                 }
                 try state.refreshLine();
             },
-            // Ctrl+J, and Shift+Enter where it is reported — except in the
-            // free-text row of a question. The answer there is one line, and a
-            // newline is what it looks like when the terminal finished the line
-            // itself: an answer typed while the terminal was between readers is
-            // queued in the line discipline, and hands over the Enter it was
-            // typed with as a newline.
-            10 => if (ln.question_input) {
-                state.ln.history.pop();
-                return try ln.allocator.dupe(u8, state.buf.items);
-            } else try state.editInsert("\n"),
+            // Ctrl+J, and Shift+Enter where it is reported: a newline in the
+            // line being typed.
+            10 => try state.editInsert("\n"),
             key_enter => {
                 state.ln.history.pop();
                 return try ln.allocator.dupe(u8, state.buf.items);
@@ -559,15 +541,9 @@ fn linenoiseRaw(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]con
     // line the user just submitted.
     defer if (!ln.bottom_anchor) out.writeStreamingAll(ln.io, "\n") catch {};
 
-    // The free-text row of a question takes the keyboard over from a menu, and
-    // an answer typed as the row opened is an answer like any other: flushing
-    // would swallow it, and on macOS the flush waits for the input it is about
-    // to throw away, so the row would not even be drawn until the user typed
-    // again. At the prompt the flush stays, where type-ahead is not history.
-    const orig = if (ln.question_input)
-        try enableRawModeKeepingInput(in, out)
-    else
-        try enableRawMode(in, out);
+    // Type-ahead is not history: what was typed while nothing was reading is
+    // dropped rather than taken as the start of this line.
+    const orig = try enableRawMode(in, out);
     defer disableRawMode(in, out, orig);
     try out.writeStreamingAll(ln.io, ansi.PASTE_ON);
     defer out.writeStreamingAll(ln.io, ansi.PASTE_OFF) catch {};
@@ -679,11 +655,6 @@ pub const Linenoise = struct {
     /// The line being edited when Ctrl-Z suspended it, restored and freed by
     /// the next `linenoise` call.
     pending_input: ?[]u8 = null,
-    /// Set while the free-text row of a question is being read. There the keys
-    /// do not mean what they mean at the prompt: Ctrl+C is ignored instead of
-    /// abandoning the line, and a lone Esc steps back to the option list
-    /// (`error.Escaped`) instead of interrupting the run.
-    question_input: bool = false,
 
     /// A completion popup gets first refusal; escape sequences never call this.
     pub fn escape(self: *Linenoise, popup_open: bool) !void {

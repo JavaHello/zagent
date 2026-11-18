@@ -212,14 +212,13 @@ pub const Runtime = struct {
     }
 
     /// One form, from its questions to either an answer for every one of them
-    /// or a dismissal. Esc in the free-text row steps back to the form, so it
-    /// is drawn again until it is settled; Esc at the questions cancels them
+    /// or a dismissal. Esc in a row being typed into steps back to the form, so
+    /// it is drawn again until it is settled; Esc at the questions cancels them
     /// and stops the run, as Esc at the prompt stops a task.
     fn serveForm(self: *Runtime, slots: []menu.Slot) !void {
         const replies = menu.resolve(self.agent.allocator, slots, .{
             .context = self,
             .present = presentOnScreen,
-            .read = readOnScreen,
         }) catch |err| {
             self.screen.endInput() catch {};
             // The worker must not be left waiting for an answer that is never
@@ -253,12 +252,6 @@ pub const Runtime = struct {
         const self: *Runtime = @ptrCast(@alignCast(context));
         try self.screen.reserveQuestion(wanted);
         return .{ .top = self.screen.questionTop(), .height = self.screen.questionRows(), .columns = self.screen.cols };
-    }
-
-    /// Read the free text a free-text row asks for, with the same editor.
-    fn readOnScreen(context: *anyopaque) anyerror!menu.Line {
-        const self: *Runtime = @ptrCast(@alignCast(context));
-        return self.agent.readChoiceLine();
     }
 
     /// Publish the answers to the worker waiting in `presentForm`.
