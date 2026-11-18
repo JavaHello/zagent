@@ -13,7 +13,7 @@ pub const spec: tool.Tool = .{
     .name = "apply_patch",
     .description = "Apply a Git unified diff patch.",
     .parameters_json =
-    \\{"type":"object","properties":{"patch":{"type":"string","description":"The Git Unified Diff to apply, with its newlines"}},"required":["patch"]}
+    \\{"type":"object","properties":{"patch":{"type":"string","description":"The Git Unified Diff to apply, with its newlines: one or more file sections, each a header pair `--- a/old_path` and `+++ b/new_path` (`--- /dev/null` creates a file, `+++ /dev/null` deletes one), then hunks headed `@@ -old_start,old_count +new_start,new_count @@` whose lines start with a space for context, `-` for removed and `+` for added text"}},"required":["patch"]}
     ,
     .label = "apply_patch…",
     .summary = writeSummary,

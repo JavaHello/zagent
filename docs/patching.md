@@ -21,7 +21,7 @@ terminal's own red and green:
 
 | Argument | Required | Description                                        |
 |----------|----------|----------------------------------------------------|
-| `patch`  | yes      | The Git Unified Diff to apply, with its newlines    |
+| `patch`  | yes      | The Git Unified Diff to apply, with its newlines: per file a `--- a/old_path` / `+++ b/new_path` header pair, then hunks headed `@@ -old_start,old_count +new_start,new_count @@` |
 
 Added lines are green, removed lines are red held back to a faint shade, hunk
 headers are cyan, and everything that is not a change — the `---`/`+++` file
