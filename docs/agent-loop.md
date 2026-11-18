@@ -34,11 +34,17 @@ Transport errors and truncation still return errors.
 ## Retries and truncation
 
 Transient network errors (`HttpConnectionClosing`, a reset connection, a broken
-pipe, a timeout, an unreachable network) and HTTP 408/429/500/502/503/504
-responses are retried, up to three attempts with a one and then two second
-pause, each attempt on a fresh connection. A retry is only sent while no answer
-text has been shown: once the reply is streaming onto the screen, a failure ends
-the turn with its error rather than printing the answer twice.
+pipe, a timeout, an unreachable network, a name lookup no nameserver answered
+for) and HTTP 408/429/500/502/503/504 responses are retried, up to three
+attempts with a one and then two second pause, each attempt on a fresh
+connection. A retry is only sent while no answer text has been shown: once the
+reply is streaming onto the screen, a failure ends the turn with its error
+rather than printing the answer twice.
+
+A lookup that times out on every nameserver in `/etc/resolv.conf` arrives as
+`NameServerFailure`, which is a roaming access point or a network still coming
+up rather than a wrong name: the retry resolves it again. A name that does not
+exist is `UnknownHostName` and ends the turn as it is.
 
 A request fails at the write as often as at the read: a keep-alive connection
 the server or a proxy has dropped is still in the pool, and the next request is

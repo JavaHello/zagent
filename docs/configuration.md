@@ -81,15 +81,15 @@ produced.
 ## Retries
 
 Transient network errors (`HttpConnectionClosing`, a reset connection, a broken
-pipe, a timeout, an unreachable network) and HTTP 408/429/500/502/503/504
-responses are retried, up to three attempts with a one and then two second
-pause, each attempt on a fresh connection. A retry is only sent while no answer
-text has been shown; a stream that fails after the reply started ends the turn
-with its error. A request that fails while it is being written is retried the
-same way: the reason behind `WriteFailed` is read off the connection, and the
-dead socket is dropped rather than pooled for the next request. Output still cut
-off after bounded continuations returns an error instead of reporting
-completion.
+pipe, a timeout, an unreachable network, a name lookup no nameserver answered
+for) and HTTP 408/429/500/502/503/504 responses are retried, up to three
+attempts with a one and then two second pause, each attempt on a fresh
+connection. A retry is only sent while no answer text has been shown; a stream
+that fails after the reply started ends the turn with its error. A request that
+fails while it is being written is retried the same way: the reason behind
+`WriteFailed` is read off the connection, and the dead socket is dropped rather
+than pooled for the next request. Output still cut off after bounded
+continuations returns an error instead of reporting completion.
 
 ## Session and workspace state
 

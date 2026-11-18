@@ -328,8 +328,9 @@ fn shouldRetry(attempt: usize, shown: bool, transient: bool) bool {
 
 /// Connection failures that say the transport failed, not the request: a pooled
 /// connection the server had already closed, a reset, a timeout, a network that
-/// went away. A URL that does not parse or a certificate that does not verify
-/// would fail the same way however often it is sent, and is not here.
+/// went away, a name that no nameserver answered for. A URL that does not parse,
+/// a certificate that does not verify, or a name that does not exist would fail
+/// the same way however often it is sent, and is not here.
 ///
 /// `WriteFailed` and `ReadFailed` belong here as well: they are the only names
 /// the buffered writer and reader interfaces offer, so the reason a socket
@@ -346,6 +347,13 @@ fn isTransientNetworkError(err: anyerror) bool {
         error.ConnectionTimedOut,
         error.NetworkUnreachable,
         error.NetworkSubsystemFailed,
+        // Every nameserver in /etc/resolv.conf went unanswered in time — a
+        // wireless network still coming up, a roaming access point, a router
+        // that stopped answering. The name is resolved again on the retry, so
+        // one bad lookup does not cost the turn; `UnknownHostName` is absent
+        // because a name that does not exist stays missing however often it is
+        // looked up.
+        error.NameServerFailure,
         => true,
         else => false,
     };
@@ -1661,13 +1669,18 @@ test "a failed request is sent again only when that can work" {
     // transport failures, so a failed write is worth another connection too.
     try std.testing.expect(isTransientNetworkError(error.WriteFailed));
     try std.testing.expect(isTransientNetworkError(error.ReadFailed));
+    // A lookup no nameserver answered is the network's failure, not the
+    // request's: the retry resolves the name again.
+    try std.testing.expect(isTransientNetworkError(error.NameServerFailure));
     try std.testing.expect(isTransientStatus(.too_many_requests));
     try std.testing.expect(isTransientStatus(.service_unavailable));
     try std.testing.expect(isTransientStatus(.gateway_timeout));
     // A request the server refused, and a status that says it was wrong, are
-    // not: they fail the same way however often they are sent.
+    // not: they fail the same way however often they are sent. Neither is a
+    // name that does not exist, which no number of lookups will find.
     try std.testing.expect(!isTransientNetworkError(error.ApiError));
     try std.testing.expect(!isTransientNetworkError(error.ConnectionRefused));
+    try std.testing.expect(!isTransientNetworkError(error.UnknownHostName));
     try std.testing.expect(!isTransientStatus(.bad_request));
     try std.testing.expect(!isTransientStatus(.unauthorized));
 
@@ -1679,6 +1692,46 @@ test "a failed request is sent again only when that can work" {
     try std.testing.expect(!shouldRetry(0, true, true));
     // A failure a retry cannot fix is reported as it is.
     try std.testing.expect(!shouldRetry(0, false, false));
+}
+
+/// A transport whose first attempts fail the way a lookup does when no
+/// nameserver answers before the timeout, and which then answers.
+const LookupTransport = struct {
+    lookups_lost: usize,
+    attempts: usize = 0,
+
+    fn send(context: *anyopaque, allocator: std.mem.Allocator, _: []const u8) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.attempts += 1;
+        if (self.lookups_lost > 0) {
+            self.lookups_lost -= 1;
+            return error.NameServerFailure;
+        }
+        return allocator.dupe(u8,
+            \\{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}]}
+        );
+    }
+
+    fn onText(_: *anyopaque, _: []const u8) void {}
+};
+
+test "a request whose name lookup reached no nameserver is sent again" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const config = try Config.load(a, std.testing.io, &env);
+    defer config.deinit();
+    var client = Client.init(a, std.testing.io, config);
+    defer client.deinit();
+    var transport = LookupTransport{ .lookups_lost = 1 };
+    client.transport = .{ .context = &transport, .send = LookupTransport.send };
+    const sink = StreamSink{ .context = &transport, .onText = LookupTransport.onText };
+    // However the request failed, the turn has an answer: the name that went
+    // unanswered is looked up again on a fresh attempt.
+    const response = try client.respondStreaming(&.{}, &.{}, sink);
+    defer response.deinit(a);
+    try std.testing.expectEqualStrings("recovered", response.content.?);
+    try std.testing.expectEqual(@as(usize, 2), transport.attempts);
 }
 
 test "an http failure is kept until the caller asks for it" {
