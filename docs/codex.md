@@ -44,8 +44,9 @@ client.
 
 ## Credentials
 
-Tokens are stored separately in `$HOME/.config/zagent/codex-auth.json` with mode
-`0600`. Access tokens are checked before requests and refreshed near expiration;
+Tokens are stored separately, beside the config file, in
+`$XDG_CONFIG_HOME/zagent/codex-auth.json` or `~/.config/zagent/codex-auth.json`,
+with mode `0600`. Access tokens are checked before requests and refreshed near expiration;
 rotated refresh tokens are saved. Do not share this file or run concurrent
 logins/refreshes against it. Run `login` again after a refresh failure. `logout`
 deletes local credentials without revoking the server grant. Existing Codex CLI

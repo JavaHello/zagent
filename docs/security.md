@@ -96,5 +96,6 @@ work is done here, and the trust decision is what lets it reach the model. See
 
 Prompt history lives beside the workspaces, in
 `$XDG_STATE_HOME/zagent/history`, see
-[Interface](ui.md#prompt-history). ChatGPT credentials live in
-`$HOME/.config/zagent/codex-auth.json`, see [ChatGPT / Codex](codex.md).
+[Interface](ui.md#prompt-history). ChatGPT credentials live beside the config
+file, in `$XDG_CONFIG_HOME/zagent/codex-auth.json` or
+`~/.config/zagent/codex-auth.json`, see [ChatGPT / Codex](codex.md).

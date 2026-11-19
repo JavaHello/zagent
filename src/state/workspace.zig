@@ -1,11 +1,10 @@
 //! Global, canonical-directory-scoped state and explicit workspace trust.
 const std = @import("std");
+const paths = @import("../util/paths.zig");
 
 pub fn rootForPath(a: std.mem.Allocator, env: *const std.process.Environ.Map, canonical: []const u8) ![]u8 {
-    const history = (try @import("../cli/history.zig").statePath(a, env)) orelse return error.HomeNotSet;
-    defer a.free(history);
-    const base = std.fs.path.dirname(history).?;
-    if (!std.fs.path.isAbsolute(base)) return error.StateDirectoryMustBeAbsolute;
+    const base = (try paths.statePath(a, env, "zagent")) orelse return error.HomeNotSet;
+    defer a.free(base);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(canonical, &digest, .{});
     return std.fmt.allocPrint(a, "{s}/workspaces/{s}", .{ base, std.fmt.bytesToHex(digest, .lower) });

@@ -1,4 +1,5 @@
 const std = @import("std");
+const paths = @import("../util/paths.zig");
 const Linenoise = @import("../editor/linenoise.zig").Linenoise;
 
 /// Prompts are remembered between runs, so ↑ recalls what was asked in an
@@ -9,17 +10,8 @@ const Linenoise = @import("../editor/linenoise.zig").Linenoise;
 /// `$XDG_STATE_HOME/zagent/history`, or `~/.local/state/zagent/history` when
 /// `XDG_STATE_HOME` is not set. Null when the environment names no home
 /// directory, which leaves the REPL without a history on disk.
-///
-/// State rather than config: this is data the program produces, not something
-/// the user writes, and it is not worth carrying between machines.
 pub fn statePath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
-    if (nonEmpty(env, "XDG_STATE_HOME")) |state_home| {
-        return try std.fmt.allocPrint(allocator, "{s}/zagent/history", .{state_home});
-    }
-    if (nonEmpty(env, "HOME")) |home| {
-        return try std.fmt.allocPrint(allocator, "{s}/.local/state/zagent/history", .{home});
-    }
-    return null;
+    return try paths.statePath(allocator, env, "zagent/history");
 }
 
 /// Recall the prompts stored at `path` into `ln`, creating the directory the
@@ -43,12 +35,6 @@ pub fn load(io: std.Io, ln: *Linenoise, path: []const u8) bool {
 /// useful to tell the user about a file they did not ask for.
 pub fn save(io: std.Io, ln: *Linenoise, path: []const u8) void {
     ln.history.save(io, path) catch {};
-}
-
-/// The value of an environment variable, treating an empty one as unset.
-fn nonEmpty(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
-    const value = env.get(name) orelse return null;
-    return if (value.len == 0) null else value;
 }
 
 fn prepareDir(io: std.Io, path: []const u8) !void {

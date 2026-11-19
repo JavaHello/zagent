@@ -9,6 +9,7 @@
 //! written for another client loads as long as its name is usable and it has a
 //! description, and every cosmetic problem is reported rather than hidden.
 const std = @import("std");
+const paths = @import("../util/paths.zig");
 
 /// The longest skill name, in bytes: the spec's 64 characters are ASCII here.
 pub const max_name_bytes: usize = 64;
@@ -176,7 +177,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.En
         while (entries.next()) |entry| {
             const chosen = std.mem.trim(u8, entry, " \t");
             if (chosen.len == 0) continue;
-            try roots.append(allocator, try expandHome(allocator, env, chosen));
+            try roots.append(allocator, try paths.expandHome(allocator, env, chosen));
         }
     }
 
@@ -190,11 +191,9 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.En
         try appendJoin(allocator, &roots, path, ".agents/skills");
     }
 
-    if (env.get("HOME")) |home| {
-        if (home.len > 0 and std.fs.path.isAbsolute(home)) {
-            try appendJoin(allocator, &roots, home, ".zagent/skills");
-            try appendJoin(allocator, &roots, home, ".agents/skills");
-            try appendJoin(allocator, &roots, home, ".claude/skills");
+    if (paths.home(env)) |home_dir| {
+        for ([_][]const u8{ ".zagent/skills", ".agents/skills", ".claude/skills" }) |relative| {
+            try appendJoin(allocator, &roots, home_dir, relative);
         }
     }
 
@@ -229,17 +228,6 @@ fn appendJoin(
     const joined = try std.fs.path.join(allocator, &.{ base, relative });
     errdefer allocator.free(joined);
     try roots.append(allocator, joined);
-}
-
-/// A configured directory, with a leading `~` spelled out so a line in a shell
-/// profile does not depend on the shell expanding it.
-fn expandHome(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8) ![]u8 {
-    if (path.len > 1 and path[0] == '~' and path[1] == '/') {
-        if (env.get("HOME")) |home| {
-            if (home.len > 0) return std.fs.path.join(allocator, &.{ home, path[2..] });
-        }
-    }
-    return allocator.dupe(u8, path);
 }
 
 /// Read every root and keep what is installed. The roots are this call's from
@@ -735,21 +723,21 @@ fn writeResources(
     w: *std.Io.Writer,
     skill: *const Skill,
 ) !void {
-    var paths: std.ArrayList([]u8) = .empty;
+    var resources: std.ArrayList([]u8) = .empty;
     defer {
-        for (paths.items) |path| allocator.free(path);
-        paths.deinit(allocator);
+        for (resources.items) |path| allocator.free(path);
+        resources.deinit(allocator);
     }
     var extra: usize = 0;
-    collectResources(allocator, io, skill.dir, "", 0, &paths, &extra) catch {};
-    if (paths.items.len == 0) return;
-    std.mem.sort([]u8, paths.items, {}, struct {
+    collectResources(allocator, io, skill.dir, "", 0, &resources, &extra) catch {};
+    if (resources.items.len == 0) return;
+    std.mem.sort([]u8, resources.items, {}, struct {
         fn lessThan(_: void, a: []u8, b: []u8) bool {
             return std.mem.lessThan(u8, a, b);
         }
     }.lessThan);
     try w.writeAll("Files bundled with this skill:\n");
-    for (paths.items) |path| try w.print("  {s}\n", .{path});
+    for (resources.items) |path| try w.print("  {s}\n", .{path});
     if (extra > 0) try w.print("  ... and {d} more\n", .{extra});
 }
 
@@ -759,7 +747,7 @@ fn collectResources(
     base: []const u8,
     prefix: []const u8,
     depth: usize,
-    paths: *std.ArrayList([]u8),
+    resources: *std.ArrayList([]u8),
     extra: *usize,
 ) !void {
     if (depth > max_resource_depth) return;
@@ -779,15 +767,15 @@ fn collectResources(
         switch (entry.kind) {
             .directory => {
                 defer allocator.free(relative);
-                try collectResources(allocator, io, base, relative, depth + 1, paths, extra);
+                try collectResources(allocator, io, base, relative, depth + 1, resources, extra);
             },
             .file, .sym_link => {
-                if (paths.items.len >= max_listed_resources) {
+                if (resources.items.len >= max_listed_resources) {
                     extra.* += 1;
                     allocator.free(relative);
                     continue;
                 }
-                try paths.append(allocator, relative);
+                try resources.append(allocator, relative);
             },
             else => allocator.free(relative),
         }

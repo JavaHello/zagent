@@ -1035,6 +1035,7 @@ test {
     _ = @import("ui/screen.zig");
     _ = @import("ui/banner.zig");
     _ = @import("util/text.zig");
+    _ = @import("util/paths.zig");
     _ = @import("util/terminal/ansi.zig");
     _ = @import("util/terminal/sanitize.zig");
     _ = @import("util/terminal/normalize.zig");

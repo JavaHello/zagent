@@ -1,4 +1,5 @@
 const std = @import("std");
+const paths = @import("../util/paths.zig");
 const provider = @import("provider.zig");
 
 const Provider = provider.Provider;
@@ -112,15 +113,7 @@ fn autodetectProvider(env: *const std.process.Environ.Map) ?Provider {
 /// config file itself is read from — or a directory, which is also where
 /// `mcp.json` is looked for.
 pub fn configBasePath(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]u8 {
-    if (try envVarOwned(allocator, env, "XDG_CONFIG_HOME")) |xdg_dir| {
-        defer allocator.free(xdg_dir);
-        return try std.fmt.allocPrint(allocator, "{s}/zagent", .{xdg_dir});
-    }
-    if (try envVarOwned(allocator, env, "HOME")) |home_dir| {
-        defer allocator.free(home_dir);
-        return try std.fmt.allocPrint(allocator, "{s}/.config/zagent", .{home_dir});
-    }
-    return null;
+    return try paths.configPath(allocator, env, "zagent");
 }
 
 /// Open the configuration, which is either the path itself or a file named
