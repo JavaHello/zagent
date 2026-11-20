@@ -27,16 +27,19 @@ line editor and the Unicode width tables. `zig build test-integration` builds
 the binary and runs the Python 3 suites in `tests/`: streamed output, host tool
 execution, main-model completion status, response failures, menus and prompt
 popups, steering, sessions, memory, plans and sub-agents. They drive the real
-binary against a local mock model endpoint, and cover file editing, patching,
-searching, working-directory isolation, symlink escapes, environment isolation,
-network isolation, API retries, session recovery, input typed into a running
-task, binary replacement during a run, the debug trace and its HTML report, and
-the exit status at the execution limit. No isolation backend is required.
+binary against a local mock model endpoint, and cover file editing, patching
+(including the patch formats that are refused, and the example the tool is
+described with), searching, working-directory isolation, symlink escapes,
+environment isolation, network isolation, API retries, session recovery, input
+typed into a running task, binary replacement during a run, the debug trace and
+its HTML report, and the exit status at the execution limit. No isolation
+backend is required.
 
 A single suite can also be run directly:
 
 ```bash
 python3 tests/execution_integration.py
+python3 tests/patch_format_integration.py
 python3 tests/completion_integration.py
 python3 tests/responses_failure_integration.py
 python3 tests/debug_integration.py

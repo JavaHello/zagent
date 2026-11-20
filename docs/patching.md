@@ -46,6 +46,46 @@ permissions as well as the text, and a section that carries those two lines and
 nothing else changes only the mode. Git writes no headers at all for an empty
 file that is created or deleted, and those sections apply as well.
 
+## The format that is refused
+
+Some models write a patch as a `*** Begin Patch` block of
+`*** Update File: path` sections — `*** Add File:`, `*** Delete File:` and
+`*** Move to:` open the others — and send it to `apply_patch` as though it were
+a diff. It is not one, and nothing in it is read: the patch is refused before a
+file is opened, so the tree is untouched. The refusal is the part that earns the
+next call — it names the line that gives the format away, and carries the same
+change in the format this tool reads, with the header pair for the path the
+patch named. The markers are what decide it: a Git diff between
+`*** Begin Patch` and `*** End Patch` applies as it comes — the envelope is
+tolerated — while one `*** Update File:` line inside it makes the patch that
+other format and nothing else.
+
+
+```
+Error: nothing was applied: this patch is written as a '*** Begin Patch' /
+'*** Update File: path' block, and apply_patch reads a Git unified diff only —
+line 2 is the marker that gives it away.
+
+The same change, in the format this tool reads:
+
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -1,3 +1,3 @@
+ context line, exactly as the file has it
+-old line
++new line
+```
+
+A context diff (`diff -c`, whose hunks are separated by a line of asterisks) is
+refused the same way, with the flag that writes the form this tool reads:
+`diff -u old new`, or `git diff`. The description the model is offered carries
+a minimal patch of its own, and a test applies it to a real file, so the example
+can be copied and work.
+
+What none of this changes is how strictly a patch is matched. A refusal never
+makes a patch apply; it makes the next one the right shape, with its context
+and its counts as the file really has them.
+
 ## Renames
 
 A rename is one of those things `git diff` writes around a diff, and it is

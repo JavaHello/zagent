@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
         "tests/write_failure_integration.py",
         "tests/token_usage_integration.py",
         "tests/execution_integration.py",
+        "tests/patch_format_integration.py",
         "tests/web_integration.py",
         "tests/ccr_integration.py",
         "tests/completion_integration.py",
