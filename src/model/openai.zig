@@ -429,6 +429,12 @@ pub const Client = struct {
     /// Whether the last response's status was one a retry may fix. Written by
     /// the exchange and read by the retry loop around it; nothing else uses it.
     retryable_status: bool = false,
+    /// The status of the last exchange the server answered with a failure.
+    ///
+    /// A 401 is the one case the client can repair rather than report: the
+    /// token it sent is no longer one the backend accepts, and the refresh
+    /// token in the credential file can buy another. Nothing else reads this.
+    last_status: ?std.http.Status = null,
     /// Set when the attempt failed on the socket rather than on the request.
     ///
     /// A buffered writer says only `WriteFailed` and a reader only `ReadFailed`,
@@ -492,6 +498,33 @@ pub const Client = struct {
         const credentials = try codex_auth.load(self.allocator, self.io, path);
         if (self.credentials) |previous| previous.deinit(self.allocator);
         self.credentials = credentials;
+    }
+
+    /// Trade the token the backend has just refused for a new one.
+    ///
+    /// The file is what the refresh is read from and written back to, so this
+    /// is only possible while the credentials came from there. A refusal that
+    /// survives the refresh is the end of the sign-in, and says so instead of
+    /// leaving the 401 as the last word.
+    fn reauthenticate(self: *Client) !void {
+        const path = self.codex_auth_path orelse return;
+        const rejected = if (self.credentials) |credentials| credentials.parsed.value.access_token else return;
+        const credentials = codex_auth.refresh(self.allocator, self.io, path, rejected) catch |err| {
+            self.setHttpError("Codex sign-in expired and could not be refreshed: run `zagent login`");
+            return err;
+        };
+        if (self.credentials) |previous| previous.deinit(self.allocator);
+        self.credentials = credentials;
+    }
+
+    /// Whether a failed request is one where a fresh token is worth spending.
+    /// Only a refusal of the credential itself, once per request, and only for
+    /// credentials this client can refresh.
+    fn shouldReauthenticate(self: *Client, err: anyerror, retried: bool) bool {
+        if (retried or err != error.ApiError) return false;
+        if (self.codex_auth_path == null) return false;
+        const status = self.last_status orelse return false;
+        return @backingInt(status) == 401;
     }
 
     /// Where a request goes and how it is authenticated. Each protocol names
@@ -772,6 +805,13 @@ pub const Client = struct {
 
     /// Stream a request with built-in and MCP tools, in the protocol this
     /// client speaks.
+    ///
+    /// A request the backend answers with 401 is sent once more with the token
+    /// the refresh token buys: the credential can be stale in a way its clock
+    /// does not show — another client of the same ChatGPT sign-in refreshed it,
+    /// and the backend no longer accepts the copy this one holds. Nothing has
+    /// been shown to the caller when a request is refused, so the second
+    /// attempt costs no repeated text.
     pub fn respondStreaming(
         self: *Client,
         messages: []const Message,
@@ -779,14 +819,28 @@ pub const Client = struct {
         sink: StreamSink,
     ) !ApiResponse {
         try self.authenticate();
-        const key = if (self.credentials) |c| c.parsed.value.access_token else self.api_key;
-        var wire = try self.buildWire(key, .request);
-        defer wire.deinit(self.allocator);
 
         const req_json = try self.buildWireRequest(messages, extra_tools);
         defer self.allocator.free(req_json);
 
-        return try self.performResponseStream(&wire, req_json, sink);
+        var retried = false;
+        while (true) {
+            const key = if (self.credentials) |c| c.parsed.value.access_token else self.api_key;
+            var wire = try self.buildWire(key, .request);
+            const attempt = self.performResponseStream(&wire, req_json, sink);
+            wire.deinit(self.allocator);
+            const response = attempt catch |err| {
+                if (!self.shouldReauthenticate(err, retried)) return err;
+                retried = true;
+                // The refusal is the credential's, not the request's: the
+                // message saying so is written over by the one the failed
+                // refresh leaves behind.
+                self.discardHttpError();
+                try self.reauthenticate();
+                continue;
+            };
+            return response;
+        }
     }
 
     /// The exchange, recorded when the run is being debugged.
@@ -925,6 +979,7 @@ pub const Client = struct {
     fn exchangeOnce(self: *Client, wire: *const Wire, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
         _ = self.requests.fetchAdd(1, .monotonic);
         self.retryable_status = false;
+        self.last_status = null;
         self.socket_failure = false;
         if (self.transport) |transport| {
             // Tests drive the buffered path; streaming is a network detail.
@@ -989,6 +1044,7 @@ pub const Client = struct {
             if (raw) |buffer| buffer.appendSlice(self.allocator, aw.written()) catch {};
             self.recordResponseUsage(aw.written());
             self.retryable_status = isTransientStatus(response.head.status);
+            self.last_status = response.head.status;
             self.recordHttpError(response.head.status, aw.written());
             return error.ApiError;
         }
@@ -1157,6 +1213,12 @@ pub const Client = struct {
     /// using the terminal's line. The message is the server's own text when
     /// there is one, since "HTTP error: 429" alone is less useful than
     /// "rate limit reached".
+    fn setHttpError(self: *Client, message: []const u8) void {
+        if (self.http_error) |previous| self.allocator.free(previous);
+        self.http_error = self.allocator.dupe(u8, message) catch null;
+        self.retryable_status = false;
+    }
+
     /// Keep what a stream said when it failed after the response headers. The
     /// status was fine, so the event's own message is all a reader can act on,
     /// and the event's type decides whether another attempt may help.
@@ -1762,6 +1824,40 @@ test "an http failure is kept until the caller asks for it" {
     const message = client.takeHttpError() orelse return error.TestUnexpectedResult;
     defer allocator.free(message);
     try std.testing.expectEqualStrings("API error (HTTP 429): rate limit reached", message);
+}
+
+test "only a refused credential is worth refreshing and sending again" {
+    const allocator = std.testing.allocator;
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const config = try Config.load(allocator, std.testing.io, &env);
+    defer config.deinit();
+
+    var client = Client.init(allocator, std.testing.io, config);
+    defer client.deinit();
+
+    client.last_status = .unauthorized;
+    // Nothing to refresh without a credential file to refresh from.
+    try std.testing.expect(!client.shouldReauthenticate(error.ApiError, false));
+
+    client.codex_auth_path = "/tmp/codex-auth.json";
+    try std.testing.expect(client.shouldReauthenticate(error.ApiError, false));
+    // One new token per request: a second refusal is the sign-in's, not the
+    // clock's, and is reported.
+    try std.testing.expect(!client.shouldReauthenticate(error.ApiError, true));
+    // Other failures are not the credential's.
+    try std.testing.expect(!client.shouldReauthenticate(error.OutOfMemory, false));
+    client.last_status = .too_many_requests;
+    try std.testing.expect(!client.shouldReauthenticate(error.ApiError, false));
+
+    // When the refresh fails instead, its message is the one the turn reports:
+    // it says what the reader has to do, which the 401 cannot.
+    client.discardHttpError();
+    client.setHttpError("Codex sign-in expired and could not be refreshed: run `zagent login`");
+    const reported = client.takeHttpError() orelse return error.TestUnexpectedResult;
+    defer allocator.free(reported);
+    try std.testing.expectEqualStrings("Codex sign-in expired and could not be refreshed: run `zagent login`", reported);
 }
 
 test "Responses request uses typed items and flat non-strict function schemas" {

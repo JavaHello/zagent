@@ -47,10 +47,16 @@ client.
 Tokens are stored separately, beside the config file, in
 `$XDG_CONFIG_HOME/zagent/codex-auth.json` or `~/.config/zagent/codex-auth.json`,
 with mode `0600`. Access tokens are checked before requests and refreshed near expiration;
-rotated refresh tokens are saved. Do not share this file or run concurrent
-logins/refreshes against it. Run `login` again after a refresh failure. `logout`
-deletes local credentials without revoking the server grant. Existing Codex CLI
-credentials are untouched.
+rotated refresh tokens are saved. One exchange is made at a time: sub-agents hold
+their own credentials but share the file, and a refresh token can be spent once,
+so a turn that waits finds the token the other turn wrote instead of retiring it.
+For the same reason the file is read again after a refusal — a token there that
+the failed request did not send is a refresh someone else already made. A request
+the backend refuses with 401 is sent once more with a freshly refreshed token;
+when the refresh itself is refused, the turn reports that `zagent login` is what
+is needed. Do not run concurrent logins against one file. `logout` deletes local
+credentials without revoking the server grant. Existing Codex CLI credentials are
+untouched.
 
 ## Optional request fields
 

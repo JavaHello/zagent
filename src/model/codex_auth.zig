@@ -39,13 +39,22 @@ fn jwt(a: std.mem.Allocator, token: []const u8) !std.json.Parsed(std.json.Value)
     try decoder.decode(bytes, payload);
     return std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always });
 }
+/// A temporary path no other writer can be using: two turns that refresh at
+/// the same moment each save to their own file, and one left behind by a crash
+/// never stops the next save. Exclusive creation still keeps the write off a
+/// pre-existing path.
+var save_sequence: std.atomic.Value(u64) = .init(0);
+fn temporaryPath(a: std.mem.Allocator, io: std.Io, auth_path: []const u8) ![]u8 {
+    const stamp = std.Io.Timestamp.now(io, .real);
+    const sequence = save_sequence.fetchAdd(1, .monotonic);
+    return std.fmt.allocPrint(a, "{s}.{d}.{d}.tmp", .{ auth_path, stamp.nanoseconds, sequence });
+}
 fn save(a: std.mem.Allocator, io: std.Io, auth_path: []const u8, tokens: Tokens) !void {
     const data = try std.json.Stringify.valueAlloc(a, tokens, .{});
     defer a.free(data);
     const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(auth_path)) |parent| try cwd.createDirPath(io, parent);
-    // Exclusive temporary creation avoids following a pre-existing symlink.
-    const temporary = try std.fmt.allocPrint(a, "{s}.tmp", .{auth_path});
+    const temporary = try temporaryPath(a, io, auth_path);
     defer a.free(temporary);
     const file = try cwd.createFile(io, temporary, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
@@ -147,51 +156,276 @@ pub fn login(a: std.mem.Allocator, io: std.Io, auth_path: []const u8) !void {
     }
     return error.DeviceLoginTimedOut;
 }
-pub fn load(a: std.mem.Allocator, io: std.Io, auth_path: []const u8) !Credentials {
+/// Read what the file holds, without contacting the server.
+fn read(a: std.mem.Allocator, io: std.Io, auth_path: []const u8) !std.json.Parsed(Tokens) {
     const data = std.Io.Dir.cwd().readFileAlloc(io, auth_path, a, .limited(128 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return error.CodexLoginRequired,
         else => return err,
     };
     defer a.free(data);
-    var tokens = try std.json.parseFromSlice(Tokens, a, data, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
-    errdefer tokens.deinit();
-    const claims = try jwt(a, tokens.value.access_token);
-    defer claims.deinit();
-    const expiration = if (claims.value == .object) claims.value.object.get("exp") else null;
-    const now = std.Io.Timestamp.now(io, .real).toSeconds();
-    if (expiration == null or expiration.? != .integer or expiration.?.integer <= now + 60) {
-        var http: std.http.Client = .{ .allocator = a, .io = io };
-        defer http.deinit();
-        const refreshed = try post(a, &http, issuer ++ "/oauth/token", .{
-            .grant_type = "refresh_token",
-            .client_id = client_id,
-            .refresh_token = tokens.value.refresh_token,
-        });
-        defer a.free(refreshed.body);
-        if (refreshed.status != .ok) return error.CodexLoginRequired;
-        const value = try std.json.parseFromSlice(std.json.Value, a, refreshed.body, .{});
-        defer value.deinit();
-        const updated = Tokens{
-            .access_token = try field(value.value, "access_token"),
-            .refresh_token = field(value.value, "refresh_token") catch tokens.value.refresh_token,
-            .id_token = field(value.value, "id_token") catch tokens.value.id_token,
-        };
-        try save(a, io, auth_path, updated);
-        const encoded = try std.json.Stringify.valueAlloc(a, updated, .{});
-        defer a.free(encoded);
-        const replacement = try std.json.parseFromSlice(Tokens, a, encoded, .{ .allocate = .alloc_always });
-        tokens.deinit();
-        tokens = replacement;
-    }
-    const account_claims = try jwt(a, tokens.value.access_token);
-    defer account_claims.deinit();
-    if (account_claims.value != .object) return error.InvalidToken;
-    const auth = account_claims.value.object.get("https://api.openai.com/auth") orelse return error.InvalidToken;
-    return .{ .parsed = tokens, .account_id = try a.dupe(u8, try field(auth, "chatgpt_account_id")) };
+    return std.json.parseFromSlice(Tokens, a, data, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
 }
+
+/// When the access token stops working, from the token itself. A token whose
+/// claim cannot be read is treated as expired.
+fn expiresAt(a: std.mem.Allocator, access_token: []const u8) ?i64 {
+    const claims = jwt(a, access_token) catch return null;
+    defer claims.deinit();
+    if (claims.value != .object) return null;
+    const expiration = claims.value.object.get("exp") orelse return null;
+    return if (expiration == .integer) expiration.integer else null;
+}
+
+/// The account a token belongs to, which the Codex backend wants beside the
+/// token on every request.
+fn accountOf(a: std.mem.Allocator, access_token: []const u8) ![]u8 {
+    const claims = try jwt(a, access_token);
+    defer claims.deinit();
+    if (claims.value != .object) return error.InvalidToken;
+    const auth = claims.value.object.get("https://api.openai.com/auth") orelse return error.InvalidToken;
+    return a.dupe(u8, try field(auth, "chatgpt_account_id"));
+}
+
+fn wrap(a: std.mem.Allocator, tokens: std.json.Parsed(Tokens)) !Credentials {
+    errdefer tokens.deinit();
+    return .{ .parsed = tokens, .account_id = try accountOf(a, tokens.value.access_token) };
+}
+
+/// Exchange the refresh token for a new pair, and save it.
+///
+/// `error.RefreshRejected` is the server refusing the grant itself, which no
+/// further attempt with the same token can repair.
+fn refreshTokens(a: std.mem.Allocator, io: std.Io, auth_path: []const u8, current: Tokens) !std.json.Parsed(Tokens) {
+    var http: std.http.Client = .{ .allocator = a, .io = io };
+    defer http.deinit();
+    const reply = try post(a, &http, issuer ++ "/oauth/token", .{
+        .grant_type = "refresh_token",
+        .client_id = client_id,
+        .refresh_token = current.refresh_token,
+    });
+    defer a.free(reply.body);
+    if (reply.status != .ok) return error.RefreshRejected;
+    const value = try std.json.parseFromSlice(std.json.Value, a, reply.body, .{});
+    defer value.deinit();
+    const updated = Tokens{
+        .access_token = try field(value.value, "access_token"),
+        // A rotated grant comes with a new refresh token; one that does not
+        // still leaves the old token as the one to use next time.
+        .refresh_token = field(value.value, "refresh_token") catch current.refresh_token,
+        .id_token = field(value.value, "id_token") catch current.id_token,
+    };
+    try save(a, io, auth_path, updated);
+    const encoded = try std.json.Stringify.valueAlloc(a, updated, .{});
+    defer a.free(encoded);
+    return std.json.parseFromSlice(Tokens, a, encoded, .{ .allocate = .alloc_always });
+}
+
+/// One exchange at a time in this process.
+///
+/// A sub-agent holds its own credentials but shares the file with its caller,
+/// and a refresh token can be spent only once: two turns refreshing at the same
+/// moment would retire each other's. Whoever waits finds the new token in the
+/// file instead of spending the old one.
+var refresh_lock: std.Io.Mutex = .init;
+
+/// Whether the file's token has to be exchanged before it can be sent.
+///
+/// A token a request was just refused with is no longer worth sending, whatever
+/// its clock says; otherwise the token is refreshed a minute early, so that a
+/// request starting now cannot expire while it is in flight.
+fn needsRefresh(a: std.mem.Allocator, io: std.Io, access_token: []const u8, rejected: ?[]const u8) bool {
+    if (rejected) |refused| return std.mem.eql(u8, access_token, refused);
+    const expiration = expiresAt(a, access_token) orelse return true;
+    return expiration <= std.Io.Timestamp.now(io, .real).toSeconds() + 60;
+}
+
+/// The credentials to use, refreshed only when the file's own token cannot be
+/// sent.
+///
+/// `rejected` is the token a request was just refused with: a different token
+/// in the file was written after that request left, which is the refresh some
+/// other turn — or another zagent — already made, and it is used as it is.
+fn resolve(a: std.mem.Allocator, io: std.Io, auth_path: []const u8, rejected: ?[]const u8) !Credentials {
+    refresh_lock.lockUncancelable(io);
+    defer refresh_lock.unlock(io);
+
+    const tokens = try read(a, io, auth_path);
+    if (!needsRefresh(a, io, tokens.value.access_token, rejected)) return wrap(a, tokens);
+
+    // Every path below owns the tokens it read and frees them exactly once:
+    // `wrap` takes them over, and an error on the way out frees them here.
+    const refreshed = refreshTokens(a, io, auth_path, tokens.value) catch |err| {
+        if (err != error.RefreshRejected) {
+            tokens.deinit();
+            return err;
+        }
+        // Another process of zagent may have won this same exchange: its token
+        // is in the file a moment from now.
+        const won = awaitAnotherRefresh(a, io, auth_path, tokens.value.access_token) catch |waited_err| {
+            tokens.deinit();
+            return waited_err;
+        };
+        tokens.deinit();
+        return won;
+    };
+    tokens.deinit();
+    return wrap(a, refreshed);
+}
+
+/// A refused exchange ends the sign-in unless a second client of the same file
+/// won the same race: a token this request did not send is that client's
+/// refresh, and using it costs nothing.
+fn awaitAnotherRefresh(a: std.mem.Allocator, io: std.Io, auth_path: []const u8, sent: []const u8) !Credentials {
+    var attempt: usize = 0;
+    while (attempt < 5) : (attempt += 1) {
+        if (attempt > 0) io.sleep(.fromMilliseconds(150), .awake) catch {};
+        const tokens = try read(a, io, auth_path);
+        if (!std.mem.eql(u8, tokens.value.access_token, sent)) return wrap(a, tokens);
+        tokens.deinit();
+    }
+    return error.CodexLoginRequired;
+}
+
+pub fn load(a: std.mem.Allocator, io: std.Io, auth_path: []const u8) !Credentials {
+    return resolve(a, io, auth_path, null);
+}
+
+/// Replace an access token the backend has just rejected with a fresh one.
+///
+/// `rejected` is the token the failed request carried. A token the server
+/// refuses while its clock still says it is valid usually means the same
+/// sign-in was refreshed by another turn, so the file is read again before the
+/// refresh token is spent: whoever refreshed it last has already written out
+/// the token to use.
+pub fn refresh(a: std.mem.Allocator, io: std.Io, auth_path: []const u8, rejected: []const u8) !Credentials {
+    return resolve(a, io, auth_path, rejected);
+}
+
 pub fn logout(io: std.Io, auth_path: []const u8) !void {
     std.Io.Dir.cwd().deleteFile(io, auth_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
+}
+
+test "the account and its expiration are read from the access token" {
+    const a = std.testing.allocator;
+    const payload =
+        \\{"exp":1700000000,"https://api.openai.com/auth":{"chatgpt_account_id":"acct_1"}}
+    ;
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const encoded = try a.alloc(u8, encoder.calcSize(payload.len));
+    defer a.free(encoded);
+    _ = encoder.encode(encoded, payload);
+    const token = try std.fmt.allocPrint(a, "header.{s}.signature", .{encoded});
+    defer a.free(token);
+
+    try std.testing.expectEqual(@as(?i64, 1700000000), expiresAt(a, token));
+    const account = try accountOf(a, token);
+    defer a.free(account);
+    try std.testing.expectEqualStrings("acct_1", account);
+
+    // A token whose claims cannot be read is treated as expired, so it is
+    // refreshed instead of being sent, and it belongs to no account.
+    try std.testing.expectEqual(@as(?i64, null), expiresAt(a, "not-a-token"));
+    try std.testing.expectError(error.InvalidToken, accountOf(a, "not-a-token"));
+}
+
+/// A signed-looking token that carries an expiration and an account, which is
+/// all this module reads before it sends one.
+fn testToken(a: std.mem.Allocator, expiration: i64) ![]u8 {
+    const payload = try std.fmt.allocPrint(a, "{{\"exp\":{d},\"https://api.openai.com/auth\":{{\"chatgpt_account_id\":\"acct_1\"}}}}", .{expiration});
+    defer a.free(payload);
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const encoded = try a.alloc(u8, encoder.calcSize(payload.len));
+    defer a.free(encoded);
+    _ = encoder.encode(encoded, payload);
+    return std.fmt.allocPrint(a, "header.{s}.signature", .{encoded});
+}
+
+/// A credential file of the shape `login` writes, in a directory of its own.
+fn testAuthFile(a: std.mem.Allocator, expiration: i64) !struct { tmp: std.testing.TmpDir, path: []u8, access: []u8 } {
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(directory);
+    const auth_path = try std.fs.path.join(a, &.{ directory, "codex-auth.json" });
+    errdefer a.free(auth_path);
+    const access = try testToken(a, expiration);
+    errdefer a.free(access);
+    const file = try std.Io.Dir.createFileAbsolute(std.testing.io, auth_path, .{ .permissions = .fromMode(0o600) });
+    defer file.close(std.testing.io);
+    const body = try std.fmt.allocPrint(a, "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt.1.test\",\"id_token\":\"\"}}", .{access});
+    defer a.free(body);
+    try file.writeStreamingAll(std.testing.io, body);
+    return .{ .tmp = tmp, .path = auth_path, .access = access };
+}
+
+test "a token that is still good is used without an exchange" {
+    const a = std.testing.allocator;
+    const now = std.Io.Timestamp.now(std.testing.io, .real).toSeconds();
+    var file = try testAuthFile(a, now + 3600);
+    defer a.free(file.path);
+    defer a.free(file.access);
+    defer file.tmp.cleanup();
+
+    const credentials = try load(a, std.testing.io, file.path);
+    defer credentials.deinit(a);
+    // The token the file holds is the one handed out: no exchange was made,
+    // and the account the backend needs came with it.
+    try std.testing.expectEqualStrings(file.access, credentials.parsed.value.access_token);
+    try std.testing.expectEqualStrings("acct_1", credentials.account_id);
+
+    // No credential file at all is a sign-in that has to be made, not a fault.
+    const missing = try std.fs.path.join(a, &.{ std.fs.path.dirname(file.path).?, "absent.json" });
+    defer a.free(missing);
+    try std.testing.expectError(error.CodexLoginRequired, load(a, std.testing.io, missing));
+}
+
+test "a token is exchanged when its clock or the server says it is spent" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    const good = try testToken(a, now + 3600);
+    defer a.free(good);
+    const spent = try testToken(a, now - 1);
+    defer a.free(spent);
+
+    // A token that has expired, or one whose expiration cannot be read, is
+    // exchanged before it is sent.
+    try std.testing.expect(needsRefresh(a, io, spent, null));
+    try std.testing.expect(needsRefresh(a, io, "not-a-token", null));
+    // So is one that is about to expire, rather than one that expires after
+    // the request it is sent with.
+    const nearly = try testToken(a, now + 30);
+    defer a.free(nearly);
+    try std.testing.expect(needsRefresh(a, io, nearly, null));
+    try std.testing.expect(!needsRefresh(a, io, good, null));
+
+    // A token a request was just refused with is exchanged whatever its clock
+    // says; the same token in the file is that one, another is a refresh
+    // someone else already made.
+    try std.testing.expect(needsRefresh(a, io, good, good));
+    try std.testing.expect(!needsRefresh(a, io, good, spent));
+}
+
+test "a refused exchange waits for the refresh another process already made" {
+    const a = std.testing.allocator;
+    const now = std.Io.Timestamp.now(std.testing.io, .real).toSeconds();
+    var file = try testAuthFile(a, now + 3600);
+    defer a.free(file.path);
+    defer a.free(file.access);
+    defer file.tmp.cleanup();
+
+    // The file holds a token this request did not send, so it is another
+    // writer's refresh: it is worth more than the refusal, and costs nothing.
+    const stale = try testToken(a, now + 60);
+    defer a.free(stale);
+    const credentials = try awaitAnotherRefresh(a, std.testing.io, file.path, stale);
+    defer credentials.deinit(a);
+    try std.testing.expectEqualStrings(file.access, credentials.parsed.value.access_token);
+
+    // The token the request sent is still the only one there is: the sign-in
+    // itself is gone, which is the one thing waiting cannot fix.
+    try std.testing.expectError(error.CodexLoginRequired, awaitAnotherRefresh(a, std.testing.io, file.path, file.access));
 }
