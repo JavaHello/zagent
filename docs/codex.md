@@ -29,6 +29,21 @@ not interrupt the conversation.
 `models` prints the server's original JSON, so pick a name from it with
 `AI_MODEL`.
 
+The list is gated by the client version `models` reports, and the parameter is
+not optional: the backend answers only with the models a client of that version
+may use. zagent reports the version its `codex_auth.client_version` was written
+against, and `AI_CODEX_CLIENT_VERSION` overrides it for an account that has
+moved on:
+
+```sh
+codex --version                                   # codex-cli 0.172.0
+AI_CODEX_CLIENT_VERSION=$(codex --version | awk '{print $2}') zagent models
+```
+
+A version reported as too old does not fail — the list quietly shrinks, and a
+model named from it is refused with `model_not_in_accessible_catalog`. The
+setting affects model discovery only; the request itself carries no version.
+
 ## Endpoint and limits
 
 ChatGPT credentials use `https://chatgpt.com/backend-api/codex/responses` and
@@ -41,6 +56,19 @@ Codex requests always stream, move system instructions into `instructions`, and
 omit the unsupported `max_output_tokens` field. Available models and limits
 depend on the account. Backend compatibility may change with the official
 client.
+
+## Overload, and what is retried
+
+This backend sheds load rather than queueing it, and it says so inside an
+answer it has already accepted: a `200` whose body reads `Our servers are
+currently overloaded. Please try again later.`, or an SSE `error` event with
+the code `server_overloaded`. The status page reports incidents, not this.
+
+Such an answer is retried — up to five attempts in all — because it describes a
+server that is busy rather than a request that is wrong. The first wait is one
+second and doubles each time (1s, 2s, 4s, 8s); a `Retry-After` header is
+honoured instead, capped at 30 seconds. Text that has already been printed is
+never sent again: a stream that fails after the reply started ends the turn.
 
 ## Credentials
 

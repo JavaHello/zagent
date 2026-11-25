@@ -2,6 +2,18 @@
 const std = @import("std");
 const paths = @import("../util/paths.zig");
 pub const base_url = "https://chatgpt.com/backend-api/codex";
+
+/// The Codex CLI version this client reports to the backend when
+/// `AI_CODEX_CLIENT_VERSION` sets nothing else.
+///
+/// `/models` requires the parameter and answers only with the models whose own
+/// `minimal_client_version` such a client satisfies. A stale value here does
+/// not fail: the list quietly shrinks — at 0.101.0 it held one hidden
+/// auto-review model — and a name picked from it is one the backend then
+/// refuses with `model_not_in_accessible_catalog`. Bump this when the installed
+/// CLI moves on (`codex --version`); it only affects model discovery, because
+/// the request itself is sent without it.
+pub const client_version = "0.172.0";
 const issuer = "https://auth.openai.com";
 const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
 const Tokens = struct {

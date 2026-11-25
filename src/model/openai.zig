@@ -267,12 +267,22 @@ fn authorizationHeader(wire: Client.Wire) std.http.Client.Request.Headers.Value 
     return if (wire.authorization) |value| .{ .override = value } else .{ .omit = {} };
 }
 
-/// Attempts a request is given: the first try and two retries.
-const max_attempts: usize = 3;
+/// Attempts a request is given: the first try and four retries.
+///
+/// A backend shedding load says so for seconds at a time, so the last attempts
+/// are the ones that outlast the window; a failure the server repeats five
+/// times over fifteen seconds is not one more patience would have fixed.
+const max_attempts: usize = 5;
 
 /// How long the first retry waits for the network to settle; every later one
-/// waits twice as long again.
-const retry_delay_ms: i64 = 1000;
+/// waits twice as long again — 1s, 2s, 4s, 8s, and no longer than the cap below
+/// unless the server asks for it.
+const retry_base_delay_ms: i64 = 1000;
+
+/// The longest wait one retry may take, however long the server says to. A
+/// `Retry-After` on a shed request names the queue it wants the client out of
+/// and can be minutes; a turn is worth waiting out only so much of it.
+const retry_max_delay_ms: i64 = 30_000;
 
 /// Forwards deltas to the caller's sink and remembers whether any of them got
 /// through. The answer is painted as it arrives, so a retry is only safe while
@@ -389,6 +399,132 @@ fn isTransientStatus(status: std.http.Status) bool {
     };
 }
 
+/// The codes the backends use for "not now, but again in a moment".
+///
+/// They are read from the answer's body because the answer is so often a
+/// successful one: the ChatGPT backend accepts the request, opens the stream,
+/// and only then sheds it, so the status alone (200) says nothing about
+/// whether the model was busy. Every code here is one where sending the same
+/// request again can work; usage and quota limits are not, because waiting out
+/// a billing window is not a retry.
+const transient_error_codes = [_][]const u8{
+    "server_overloaded",
+    "queue_full",
+    "policy_capacity_unavailable",
+    "flex_unavailable",
+    "rate_limit_exceeded",
+    "rate_limit",
+    "retryable_api_error",
+    "connection_timeout",
+    "internal_server_error",
+    "response_stream_disconnected",
+    "overloaded",
+    "timeout",
+};
+
+/// The same failures in the words of a backend that sends no code. Matched
+/// without regard to case: the phrasing is the server's, not this client's.
+const transient_error_phrases = [_][]const u8{
+    "try again later",
+    "at capacity",
+    "overloaded",
+    "temporarily unavailable",
+    "queue is full",
+    "server is busy",
+};
+
+/// How much of a failure body is searched for those words. A backend's refusal
+/// is a line or two; anything longer is not one, and scanning all of it would
+/// cost a request's worth of time on a body that cannot say anything new.
+const max_scanned_error_bytes: usize = 4096;
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn isTransientErrorCode(code: []const u8) bool {
+    for (transient_error_codes) |known| {
+        if (std.ascii.eqlIgnoreCase(code, known)) return true;
+    }
+    return false;
+}
+
+fn isTransientErrorText(text: []const u8) bool {
+    for (transient_error_phrases) |phrase| {
+        if (containsIgnoreCase(text, phrase)) return true;
+    }
+    return false;
+}
+
+/// Whether a failure's body says the server was busy rather than the request
+/// wrong, and is therefore worth sending again.
+///
+/// The prose is searched before the JSON is parsed, so a body that is not JSON
+/// at all is still read for its words. A code is looked for in both shapes the
+/// backends use: an `error` object beside the type, and a whole failed
+/// response whose `error` member is that same object.
+fn isTransientErrorBody(allocator: std.mem.Allocator, body: []const u8) bool {
+    // A refusal is a short answer at the front of the body, and the words of a
+    // web page are not the backend's: a proxy's challenge says "try again
+    // later" about itself, and retrying a turn against it fixes nothing.
+    const head = body[0..@min(body.len, max_scanned_error_bytes)];
+    if (looksLikeHtml(head)) return false;
+    if (isTransientErrorText(head)) return true;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const holder = blk: {
+        if (parsed.value.object.get("error")) |inner| {
+            if (inner == .object) break :blk inner;
+        }
+        break :blk parsed.value;
+    };
+    for ([_][]const u8{ "code", "type" }) |field| {
+        const value = holder.object.get(field) orelse continue;
+        if (value == .string and isTransientErrorCode(value.string)) return true;
+    }
+    if (holder.object.get("message")) |message| {
+        if (message == .string and isTransientErrorText(message.string)) return true;
+    }
+    return false;
+}
+
+/// Whether the body is a web page rather than the API's own answer.
+fn looksLikeHtml(body: []const u8) bool {
+    const head = body[0..@min(body.len, 256)];
+    return containsIgnoreCase(head, "<html") or containsIgnoreCase(head, "<!doctype html");
+}
+
+/// The delay a `Retry-After` header asks for, in milliseconds.
+///
+/// Only the delta-seconds form is read. It is the one a request refused for
+/// being too early to serve carries; the HTTP-date form describes a scheduled
+/// downtime, which is not something a turn waits out.
+fn parseRetryAfter(value: []const u8) ?i64 {
+    const seconds = std.fmt.parseInt(i64, std.mem.trim(u8, value, " \t"), 10) catch return null;
+    if (seconds <= 0) return null;
+    return seconds * 1000;
+}
+
+/// How long to wait before the attempt after `attempt`, or the server's own
+/// word for it when the answer gave one, capped so no turn stalls on it.
+fn retryDelayMs(attempt: usize, server_hint_ms: ?i64) i64 {
+    const backoff = retry_base_delay_ms * (@as(i64, 1) << @intCast(attempt));
+    return @min(@max(server_hint_ms orelse backoff, 0), retry_max_delay_ms);
+}
+
+/// The `/models` URL. The Codex backend requires the version parameter and
+/// answers with the models a client of that version may use.
+fn modelsUrl(allocator: std.mem.Allocator, base: []const u8, version: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}?client_version={s}", .{ base, version });
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -410,6 +546,10 @@ pub const Client = struct {
     /// Whether the request asks the backend to think, sent as the outer-level
     /// `thinking` member. The presets decide the default; see `ThinkingMode`.
     thinking: ThinkingMode = .omit,
+    /// The version reported to the Codex backend's `/models`; null uses
+    /// `codex_auth.client_version`. Model discovery is the only thing it
+    /// decides — the request itself carries no version.
+    codex_client_version: ?[]const u8 = null,
     /// Borrowed from Config, with the same lifetime as model and the fields above.
     prompt_cache_retention: ?[]const u8 = null,
     credentials: ?codex_auth.Credentials = null,
@@ -429,6 +569,10 @@ pub const Client = struct {
     /// Whether the last response's status was one a retry may fix. Written by
     /// the exchange and read by the retry loop around it; nothing else uses it.
     retryable_status: bool = false,
+    /// How long the last failure's `Retry-After` asked to wait, in
+    /// milliseconds. Null when the answer did not say, which leaves the retry
+    /// loop its own backoff.
+    retry_after_ms: ?i64 = null,
     /// The status of the last exchange the server answered with a failure.
     ///
     /// A 401 is the one case the client can repair rather than report: the
@@ -484,6 +628,7 @@ pub const Client = struct {
             },
             .service_tier = config.service_tier,
             .thinking = config.thinking,
+            .codex_client_version = config.codex_client_version,
             .prompt_cache_retention = config.prompt_cache_retention,
             .base_url = config.base_url,
             .model = config.model,
@@ -591,15 +736,17 @@ pub const Client = struct {
             .extra = headers,
         };
     }
-
     pub fn listModels(self: *Client) ![]u8 {
         try self.authenticate();
         const key = if (self.credentials) |c| c.parsed.value.access_token else self.api_key;
         var wire = try self.buildWire(key, .models);
         defer wire.deinit(self.allocator);
-        // The Codex backend is the one the CLI's version is sent to.
+        // The Codex backend is the one the CLI's version is sent to, and it
+        // will not answer without it: the list it returns is the models whose
+        // own minimum version this client satisfies.
+        const version = self.codex_client_version orelse codex_auth.client_version;
         const url = if (self.credentials != null)
-            try std.fmt.allocPrint(self.allocator, "{s}?client_version=0.101.0", .{wire.url})
+            try modelsUrl(self.allocator, wire.url, version)
         else
             try self.allocator.dupe(u8, wire.url);
         defer self.allocator.free(url);
@@ -916,7 +1063,8 @@ pub const Client = struct {
     /// The request is retried while the failure is one the network or the
     /// server can be expected to recover from: a connection the server had
     /// already closed, a reset, a timeout, or a status that says the server was
-    /// busy (408, 429, 5xx).
+    /// busy (408, 429, 5xx). A body that names a full queue or an overloaded
+    /// model counts as that even when it arrived under a 200.
     ///
     /// A retry is only sent while none of the answer has reached the caller.
     /// Deltas are painted as they arrive, so text shown once must never arrive
@@ -942,18 +1090,22 @@ pub const Client = struct {
                     if (self.socket_failure or isTransientNetworkError(err)) self.resetHttpClient();
                     return err;
                 }
+                // The wait the server asked for, when it asked for one, and
+                // this client's own backoff otherwise. Read before the failure
+                // is discarded: the hint belongs to the attempt that failed.
+                const delay = retryDelayMs(attempt, self.retry_after_ms);
                 // The bytes and the message of this attempt belong to a request
                 // that is being sent again: the trace keeps what counts, and
                 // only the final failure is worth reporting.
                 if (raw) |buffer| buffer.shrinkRetainingCapacity(recorded);
                 self.discardHttpError();
                 if (comptime trace_mod.enabled) {
-                    if (self.trace) |trace| trace.note(self.trace_ctx, "warn", "the request failed before any answer text arrived; it was sent again on a new connection");
+                    if (self.trace) |trace| trace.note(self.trace_ctx, "warn", "the request failed before any answer text arrived; it was sent again after a wait");
                 }
                 // The failure may have been the pooled connection the request
                 // reused, so the retry has to reach the server on a fresh one.
                 self.resetHttpClient();
-                try self.io.sleep(.fromMilliseconds(retry_delay_ms * (@as(i64, 1) << @intCast(attempt))), .awake);
+                try self.io.sleep(.fromMilliseconds(delay), .awake);
                 continue;
             }
         }
@@ -979,6 +1131,7 @@ pub const Client = struct {
     fn exchangeOnce(self: *Client, wire: *const Wire, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
         _ = self.requests.fetchAdd(1, .monotonic);
         self.retryable_status = false;
+        self.retry_after_ms = null;
         self.last_status = null;
         self.socket_failure = false;
         if (self.transport) |transport| {
@@ -1017,14 +1170,20 @@ pub const Client = struct {
         // Inspect headers before creating the body reader, which invalidates
         // the response head's borrowed storage.
         var json_response = false;
+        // Read here for the same reason: a shed request says how long to wait
+        // in a header of its own.
+        var retry_after_ms: ?i64 = null;
         var header_it = response.head.iterateHeaders();
         while (header_it.next()) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "content-type") and
-                std.mem.indexOf(u8, header.value, "application/json") != null)
-            {
-                json_response = true;
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+                if (std.mem.indexOf(u8, header.value, "application/json") != null) json_response = true;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+                retry_after_ms = parseRetryAfter(header.value);
             }
         }
+        // Remembered for the whole attempt: whichever way it then fails, the
+        // wait the answer asked for is the one the retry loop takes.
+        self.retry_after_ms = retry_after_ms;
         const decompress_buffer: []u8 = switch (response.head.content_encoding) {
             .identity => &.{},
             .zstd => try self.allocator.alloc(u8, std.compress.zstd.default_window_len),
@@ -1043,8 +1202,10 @@ pub const Client = struct {
             _ = reader.streamRemaining(&aw.writer) catch {};
             if (raw) |buffer| buffer.appendSlice(self.allocator, aw.written()) catch {};
             self.recordResponseUsage(aw.written());
-            self.retryable_status = isTransientStatus(response.head.status);
             self.last_status = response.head.status;
+            // The body decides as well as the status: a failure the server
+            // describes as a full queue is worth sending again whatever number
+            // it arrived under.
             self.recordHttpError(response.head.status, aw.written());
             return error.ApiError;
         }
@@ -1062,7 +1223,10 @@ pub const Client = struct {
             };
             if (raw) |buffer| buffer.appendSlice(self.allocator, buffered.written()) catch {};
             self.recordResponseUsage(buffered.written());
-            return self.parseBody(buffered.written());
+            return self.parseBody(buffered.written()) catch |err| {
+                if (err == error.ApiError) self.recordHttpError(response.head.status, buffered.written());
+                return err;
+            };
         }
 
         var line: std.ArrayList(u8) = .empty;
@@ -1171,6 +1335,14 @@ pub const Client = struct {
         const root = parsed.value;
         if (root != .object or state.completed != null) return;
 
+        // An `error` event is how a stream that was opened and then refused
+        // says why. Nothing else follows it, so it ends the exchange here with
+        // the server's own words rather than leaving the caller to report a
+        // stream that merely stopped without a terminal event.
+        if (root.object.get("type")) |kind| {
+            if (kind == .string and std.mem.eql(u8, kind.string, "error")) return self.reportStreamError(root);
+        }
+
         if (root.object.get("type")) |kind| {
             if (kind == .string and (std.mem.eql(u8, kind.string, "response.output_text.delta") or
                 std.mem.eql(u8, kind.string, "response.refusal.delta")))
@@ -1209,6 +1381,34 @@ pub const Client = struct {
         state.completed = encoded;
     }
 
+    /// Report an `error` event, which carries the backend's code and message
+    /// either beside the event's type or nested under `error`.
+    ///
+    /// The code is what says whether another attempt may help: the same stream
+    /// carries `server_overloaded` and `invalid_request`, and one of them is
+    /// worth waiting out. A backend that sends only a message is read for its
+    /// words instead.
+    fn reportStreamError(self: *Client, root: std.json.Value) error{ApiError} {
+        const holder = blk: {
+            if (root.object.get("error")) |inner| {
+                if (inner == .object) break :blk inner;
+            }
+            break :blk root;
+        };
+        var code: ?[]const u8 = null;
+        if (holder.object.get("code")) |value| {
+            if (value == .string) code = value.string;
+        }
+        var message: ?[]const u8 = null;
+        if (holder.object.get("message")) |value| {
+            if (value == .string) message = value.string;
+        }
+        const transient = (code != null and isTransientErrorCode(code.?)) or
+            (message != null and isTransientErrorText(message.?));
+        self.recordApiError(message orelse "the stream reported an error", transient);
+        return error.ApiError;
+    }
+
     /// Keep what the server said, for the caller to report once no animation is
     /// using the terminal's line. The message is the server's own text when
     /// there is one, since "HTTP error: 429" alone is less useful than
@@ -1228,11 +1428,18 @@ pub const Client = struct {
         self.retryable_status = transient;
     }
 
+    /// Keep what the server said about a failed request, and decide there
+    /// whether another attempt may help.
+    ///
+    /// The status alone is not enough to answer that: the ChatGPT backend sheds
+    /// a request it has already accepted, so the answer is a 200 and the
+    /// refusal is in the body.
     fn recordHttpError(self: *Client, status: std.http.Status, body: []const u8) void {
         // A failure overwrites the one before it: only the newest request's
         // outcome is being reported.
         if (self.http_error) |previous| self.allocator.free(previous);
         self.http_error = null;
+        self.retryable_status = isTransientStatus(status) or isTransientErrorBody(self.allocator, body);
 
         const detail = tryParseApiErrorMessage(self.allocator, body);
         defer if (detail) |message| self.allocator.free(message);
@@ -1745,11 +1952,27 @@ test "a failed request is sent again only when that can work" {
     try std.testing.expect(!isTransientNetworkError(error.UnknownHostName));
     try std.testing.expect(!isTransientStatus(.bad_request));
     try std.testing.expect(!isTransientStatus(.unauthorized));
+    // A body that names a full queue or an overloaded model is worth another
+    // attempt whatever number it arrived under: the ChatGPT backend sheds a
+    // request it has already accepted, so that answer is a 200.
+    try std.testing.expect(isTransientErrorBody(std.testing.allocator, "{\"error\":{\"code\":\"server_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}"));
+    try std.testing.expect(isTransientErrorBody(std.testing.allocator, "{\"status\":\"failed\",\"error\":{\"code\":\"queue_full\"}}"));
+    // The server's own words, when it sends no code at all.
+    try std.testing.expect(isTransientErrorBody(std.testing.allocator, "Selected model is at capacity. Please try a different model."));
+    // A model that does not exist, and a request that was wrong, fail the same
+    // way however often they are sent.
+    try std.testing.expect(!isTransientErrorBody(std.testing.allocator, "{\"error\":{\"code\":\"model_not_found\",\"message\":\"The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.\"}}"));
+    try std.testing.expect(!isTransientErrorBody(std.testing.allocator, "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}"));
+    // A proxy's challenge page says "try again later" about itself; the model
+    // was never asked.
+    try std.testing.expect(!isTransientErrorBody(std.testing.allocator, "<html><head><title>403</title></head><body>Please try again later.</body></html>"));
 
     try std.testing.expect(shouldRetry(0, false, true));
     try std.testing.expect(shouldRetry(1, false, true));
-    // The third attempt is the last one.
-    try std.testing.expect(!shouldRetry(2, false, true));
+    try std.testing.expect(shouldRetry(2, false, true));
+    try std.testing.expect(shouldRetry(3, false, true));
+    // The fifth attempt is the last one.
+    try std.testing.expect(!shouldRetry(4, false, true));
     // Text that already reached the screen must never arrive twice.
     try std.testing.expect(!shouldRetry(0, true, true));
     // A failure a retry cannot fix is reported as it is.
@@ -1824,6 +2047,98 @@ test "an http failure is kept until the caller asks for it" {
     const message = client.takeHttpError() orelse return error.TestUnexpectedResult;
     defer allocator.free(message);
     try std.testing.expectEqualStrings("API error (HTTP 429): rate limit reached", message);
+
+    // A failure the backend delivers inside a successful answer: the status
+    // says nothing, and the body says the model is busy. It is worth another
+    // attempt, and the wait it asked for is kept with it.
+    client.recordHttpError(
+        .ok,
+        "{\"error\":{\"code\":\"server_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}",
+    );
+    const busy = client.takeHttpError() orelse return error.TestUnexpectedResult;
+    defer allocator.free(busy);
+    try std.testing.expectEqualStrings("API error (HTTP 200): Our servers are currently overloaded. Please try again later.", busy);
+    try std.testing.expect(client.retryable_status);
+    // The same status with a request the backend refused is the end of the
+    // turn, not a wait.
+    client.recordHttpError(.ok, "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad input\"}}");
+    try std.testing.expect(!client.retryable_status);
+}
+
+test "a retry waits the server's own time when it gave one" {
+    // This client's backoff, for an answer that said nothing.
+    try std.testing.expectEqual(@as(i64, 1000), retryDelayMs(0, null));
+    try std.testing.expectEqual(@as(i64, 2000), retryDelayMs(1, null));
+    try std.testing.expectEqual(@as(i64, 8000), retryDelayMs(3, null));
+    // Capped: a turn is not worth waiting minutes out, however busy the model.
+    try std.testing.expectEqual(@as(i64, 30_000), retryDelayMs(6, null));
+    // The server's own hint wins, and the cap applies to it too.
+    try std.testing.expectEqual(@as(i64, 5000), retryDelayMs(0, 5000));
+    try std.testing.expectEqual(@as(i64, 30_000), retryDelayMs(0, 600_000));
+
+    try std.testing.expectEqual(@as(?i64, 2000), parseRetryAfter("2"));
+    try std.testing.expectEqual(@as(?i64, 2000), parseRetryAfter(" 2 "));
+    // A date names a maintenance window rather than a wait, a zero says "now",
+    // and a negative count is not a delay at all.
+    try std.testing.expectEqual(@as(?i64, null), parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT"));
+    try std.testing.expectEqual(@as(?i64, null), parseRetryAfter("0"));
+    try std.testing.expectEqual(@as(?i64, null), parseRetryAfter("-5"));
+}
+
+test "the codex model list is asked for as the configured client version" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+
+    const url = try modelsUrl(a, "https://chatgpt.com/backend-api/codex/models", "0.170.0");
+    defer a.free(url);
+    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex/models?client_version=0.170.0", url);
+
+    try env.put("AI_CODEX_CLIENT_VERSION", "9.9.9");
+    const config = try Config.load(a, std.testing.io, &env);
+    defer config.deinit();
+    try std.testing.expectEqualStrings("9.9.9", config.codex_client_version.?);
+    var client = Client.init(a, std.testing.io, config);
+    defer client.deinit();
+    // The client asks as the configured version, which is what decides how much
+    // of the catalogue the backend offers.
+    try std.testing.expectEqualStrings("9.9.9", (client.codex_client_version orelse codex_auth.client_version));
+    // With nothing configured it asks as the CLI version this build was written
+    // against, which is dotted the way the backend expects.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, codex_auth.client_version, "."));
+}
+
+test "an error event ends the stream with the server's own words" {
+    const a = std.testing.allocator;
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const config = try Config.load(a, std.testing.io, &env);
+    defer config.deinit();
+    var client = Client.init(a, std.testing.io, config);
+    defer client.deinit();
+    var context: u8 = 0;
+    const sink = StreamSink{ .context = &context, .onText = UsageTestTransport.onText };
+    var state: StreamState = .init(a);
+    defer state.deinit(a);
+
+    // A stream that was opened and then shed says so in an event of its own.
+    const overloaded = "{\"type\":\"error\",\"error\":{\"code\":\"server_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}";
+    try std.testing.expectError(error.ApiError, client.dispatchSse(overloaded, sink, &state));
+    const message = client.takeHttpError() orelse return error.TestUnexpectedResult;
+    defer a.free(message);
+    try std.testing.expectEqualStrings("API error: Our servers are currently overloaded. Please try again later.", message);
+    // The code decides whether the turn waits the stream out or ends on it.
+    try std.testing.expect(client.retryable_status);
+    // Nothing completed, so the caller is never handed a half-built answer.
+    try std.testing.expect(state.completed == null);
+
+    // The same shape with a request the backend refused outright.
+    try std.testing.expectError(error.ApiError, client.dispatchSse(
+        "{\"type\":\"error\",\"code\":\"invalid_request\",\"message\":\"bad input\"}",
+        sink,
+        &state,
+    ));
+    try std.testing.expect(!client.retryable_status);
 }
 
 test "only a refused credential is worth refreshing and sending again" {

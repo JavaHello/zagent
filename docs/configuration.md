@@ -35,6 +35,7 @@ and `mcp.example.json` shows every member an MCP entry takes.
 | `AI_MAX_TOKENS`     | `8192`                              | Initial output token budget per response (`max_output_tokens`, or `max_tokens` for the Messages API) |
 | `AI_REASONING_EFFORT` | *(unset)*                         | Responses API only: sent as a top-level `reasoning.effort`; OpenAI and Codex are also asked for a reasoning summary |
 | `AI_SERVICE_TIER`   | *(unset)*                           | Codex only: sent as `service_tier`              |
+| `AI_CODEX_CLIENT_VERSION` | the version this build was written against | Codex only: the CLI version reported to `/models`, which decides which models that list offers |
 | `AI_PROMPT_CACHE_RETENTION` | *(unset)*                   | Responses API only: sent as `prompt_cache_retention`; `in_memory` or `24h` |
 | `AI_THINKING`       | `enabled` for `deepseek` and `openai-compatible`, otherwise omitted | Thinking switch: `enabled`, `disabled`, or `omit`. On the Messages API, `enabled` reserves `AI_MAX_TOKENS / 2` for a thinking budget |
 | `AI_MEMORY_FILE`    | Global workspace state: `memory.md` | Override where the notes are stored             |

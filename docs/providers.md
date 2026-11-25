@@ -202,6 +202,10 @@ read from the API's own counters: the cached part of the prompt
 input the terminal reports, so the input figure is the whole prompt and the
 cached figure names the part of it that came from the cache.
 
+`AI_CODEX_CLIENT_VERSION` is not a request field at all: it is the version
+`zagent models` reports to the Codex backend, which answers with the models such
+a client may use. See [ChatGPT / Codex](codex.md#models-and-quotas).
+
 A reply cut off by `max_tokens` is read like a truncated Responses reply: its
 text is kept and continued, and a tool call whose arguments were still arriving
 is dropped rather than executed or replayed.

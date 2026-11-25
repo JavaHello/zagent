@@ -41,6 +41,7 @@ const ConfigFile = struct {
     reasoning_effort: ?[]u8 = null,
     service_tier: ?[]u8 = null,
     thinking: ?[]u8 = null,
+    codex_client_version: ?[]u8 = null,
     prompt_cache_retention: ?[]u8 = null,
     max_tokens: ?u32 = null,
     debug: ?bool = null,
@@ -57,6 +58,7 @@ const ConfigFile = struct {
         if (self.reasoning_effort) |value| allocator.free(value);
         if (self.service_tier) |value| allocator.free(value);
         if (self.thinking) |value| allocator.free(value);
+        if (self.codex_client_version) |value| allocator.free(value);
         if (self.prompt_cache_retention) |value| allocator.free(value);
         if (self.web_search_url) |value| allocator.free(value);
         if (self.web_search_key) |value| allocator.free(value);
@@ -178,6 +180,8 @@ fn applyConfigValue(allocator: std.mem.Allocator, config: *ConfigFile, key: []co
         try setString(allocator, &config.service_tier, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_THINKING")) {
         try setString(allocator, &config.thinking, value);
+    } else if (std.ascii.eqlIgnoreCase(key, "AI_CODEX_CLIENT_VERSION")) {
+        try setString(allocator, &config.codex_client_version, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_PROMPT_CACHE_RETENTION")) {
         try setString(allocator, &config.prompt_cache_retention, value);
     } else if (std.ascii.eqlIgnoreCase(key, "AI_MAX_TOKENS")) {
@@ -404,6 +408,8 @@ fn resolve(
     const service_tier = try resolveOptionalSetting(allocator, env, "AI_SERVICE_TIER", &file_config.service_tier);
     errdefer if (service_tier) |value| allocator.free(value);
     const thinking = try resolveThinking(allocator, env, &file_config.thinking, selected_provider);
+    const codex_client_version = try resolveOptionalSetting(allocator, env, "AI_CODEX_CLIENT_VERSION", &file_config.codex_client_version);
+    errdefer if (codex_client_version) |value| allocator.free(value);
     const prompt_cache_retention = try resolveOptionalSetting(allocator, env, "AI_PROMPT_CACHE_RETENTION", &file_config.prompt_cache_retention);
     errdefer if (prompt_cache_retention) |value| allocator.free(value);
     if (prompt_cache_retention) |value| {
@@ -459,6 +465,7 @@ fn resolve(
         .reasoning_effort = reasoning_effort,
         .service_tier = service_tier,
         .thinking = thinking,
+        .codex_client_version = codex_client_version,
         .prompt_cache_retention = prompt_cache_retention,
         .max_tokens = max_tokens,
         .provider = selected_provider,
@@ -482,6 +489,10 @@ pub const Config = struct {
     /// compatible preset ask for it by default; the OpenAI and Codex backends
     /// do not define the field and leave it out.
     thinking: ThinkingMode = .omit,
+    /// The version reported to the Codex backend's `/models`, which decides
+    /// which models that list offers. Null means the constant beside
+    /// `codex_auth.base_url`.
+    codex_client_version: ?[]const u8 = null,
     /// Only "in_memory" and "24h" are accepted; null leaves server defaults.
     prompt_cache_retention: ?[]const u8 = null,
     max_tokens: u32,
@@ -525,6 +536,7 @@ pub const Config = struct {
         if (self.web_fetch_key) |value| self.allocator.free(value);
         if (self.reasoning_effort) |value| self.allocator.free(value);
         if (self.service_tier) |value| self.allocator.free(value);
+        if (self.codex_client_version) |value| self.allocator.free(value);
         if (self.prompt_cache_retention) |value| self.allocator.free(value);
         self.allocator.free(self.api_key);
         self.allocator.free(self.base_url);
