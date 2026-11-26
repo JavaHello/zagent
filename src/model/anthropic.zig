@@ -370,7 +370,17 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !openai.Api
     errdefer if (thoughts) |value| allocator.free(value);
     // Incomplete blocks must not be replayed: a partial call would be sent back
     // to the model as if it had finished.
-    const items = if (truncated) null else try std.json.Stringify.valueAlloc(allocator, blocks, .{});
+    //
+    // Complete blocks are kept as they came, apart from a text block that says
+    // nothing: the turn carries that block from now on, and an endpoint that
+    // wrote it can still refuse to read it back (see
+    // `openai.withoutEmptyText`).
+    var kept_arena = std.heap.ArenaAllocator.init(allocator);
+    defer kept_arena.deinit();
+    const items = if (truncated) null else blk: {
+        const kept = try openai.withoutEmptyText(kept_arena.allocator(), blocks);
+        break :blk if (kept) |value| try std.json.Stringify.valueAlloc(allocator, value, .{}) else null;
+    };
     errdefer if (items) |value| allocator.free(value);
     const reason = try allocator.dupe(u8, if (truncated) "length" else if (calls.items.len > 0) "tool_calls" else "stop");
     errdefer allocator.free(reason);
@@ -742,6 +752,30 @@ test "recorded blocks are replayed with their signature, and thinking only when 
             try std.testing.expectEqualStrings("sig-1", blocks[0].object.get("signature").?.string);
         } else try std.testing.expect(parsed.value.object.get("thinking") == null);
     }
+}
+
+test "a reply is recorded without a text block that says nothing" {
+    const a = std.testing.allocator;
+    // A Messages endpoint that writes a text block and then has no words for
+    // it: the block carries nothing, and an endpoint that wrote it can still
+    // refuse to read it back. The recorded turn keeps the thinking and the
+    // call, and drops only the empty block.
+    const body =
+        \\{"type":"message","role":"assistant","stop_reason":"tool_use","content":[
+        \\ {"type":"thinking","thinking":"look first","signature":"sig-1"},
+        \\ {"type":"text","text":""},
+        \\ {"type":"tool_use","id":"toolu_7","name":"read","input":{"path":"a.zig"}}]}
+    ;
+    const response = try parseResponse(a, body);
+    defer response.deinit(a);
+    try std.testing.expect(response.content == null);
+    const items = response.response_items.?;
+    try std.testing.expect(std.mem.indexOf(u8, items, "\"text\":\"\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "sig-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "toolu_7") != null);
+    const kept = try std.json.parseFromSlice(std.json.Value, a, items, .{});
+    defer kept.deinit();
+    try std.testing.expectEqual(@as(usize, 2), kept.value.array.items.len);
 }
 
 test "a reply is read as text, calls, thinking and usage" {

@@ -1531,6 +1531,50 @@ fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const Inpu
     return input.items;
 }
 
+/// Whether this block, on its own, says nothing: a text block with no words in
+/// it, or one whose only words are whitespace, which the endpoint trims away
+/// before it decides whether there is anything to read.
+fn saysNothing(block: std.json.Value) bool {
+    if (block != .object) return false;
+    const text = block.object.get("text") orelse return false;
+    if (text != .string) return false;
+    return std.mem.trim(u8, text.string, " \t\r\n").len == 0;
+}
+
+/// A reply's own items as they may be kept, with the parts that say nothing
+/// left out — or null when nothing is left to keep.
+///
+/// A backend can answer a tool-only turn with an empty `output_text` block
+/// beside its calls, and then refuse to read that block back: Kimi answers the
+/// next request with `400 Invalid request: text content is empty`. A reply
+/// becomes the conversation here, at the one moment it arrives, so the empty
+/// part is dropped there and every later request sends back exactly what was
+/// stored. Both wire shapes are handled by the one pass: a Responses `message`
+/// item carries its blocks under `content`, a Messages `text` block carries its
+/// own. Everything else — encrypted reasoning, signatures, call IDs — is kept
+/// as it came.
+///
+/// Allocations belong to `arena`.
+pub fn withoutEmptyText(arena: std.mem.Allocator, items: std.json.Value) !?std.json.Value {
+    if (items != .array) return items;
+    var kept: std.json.Array = .init(arena);
+    for (items.array.items) |item| {
+        if (saysNothing(item)) continue;
+        const content = if (item == .object) item.object.get("content") else null;
+        if (content == null or content.? != .array) {
+            try kept.append(item);
+            continue;
+        }
+        // A `message` item left without blocks says nothing either.
+        const blocks = (try withoutEmptyText(arena, content.?)) orelse continue;
+        var object = item.object;
+        try object.put(arena, "content", blocks);
+        try kept.append(.{ .object = object });
+    }
+    if (kept.items.len == 0) return null;
+    return .{ .array = kept };
+}
+
 const Request = struct {
     model: []const u8,
     max_output_tokens: u32,
@@ -1782,7 +1826,16 @@ pub fn parseResponse(allocator: std.mem.Allocator, body: []const u8) !ApiRespons
     errdefer if (text) |value| allocator.free(value);
     // Incomplete output items must not be replayed: a partial call or message
     // would be sent back to the model as if it had been completed.
-    const raw_items = if (truncated) null else try std.json.Stringify.valueAlloc(allocator, output, .{});
+    //
+    // What is complete is stored as it came, apart from the parts that say
+    // nothing: the conversation carries this reply from now on, and an empty
+    // text block is refused when it comes back (see `withoutEmptyText`).
+    var kept_arena = std.heap.ArenaAllocator.init(allocator);
+    defer kept_arena.deinit();
+    const raw_items = if (truncated) null else blk: {
+        const kept = try withoutEmptyText(kept_arena.allocator(), output);
+        break :blk if (kept) |value| try std.json.Stringify.valueAlloc(allocator, value, .{}) else null;
+    };
     errdefer if (raw_items) |items| allocator.free(items);
     // Keep the chain-of-thought as plain text. Incomplete output items are not
     // replayed, but the reasoning is complete and thinking mode requires it to
@@ -2289,6 +2342,47 @@ test "Responses parsing keeps call_id separate from item IDs and replays all out
     try std.testing.expectEqual(@as(usize, 4), replayed.len);
     try std.testing.expectEqualStrings("opaque-token", replayed[0].object.get("encrypted_content").?.string);
     try std.testing.expectEqualStrings("fc_1", replayed[2].object.get("id").?.string);
+}
+
+test "a reply is recorded without the text blocks that say nothing" {
+    const a = std.testing.allocator;
+    // What Kimi writes for a turn that only calls tools: an assistant message
+    // whose only block is empty, beside the call. Sending that block back is
+    // what the endpoint refuses with "Invalid request: text content is empty",
+    // so the reply is stored without it — and only it.
+    const body =
+        \\{"status":"completed","output":[
+        \\ {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"},
+        \\ {"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"","annotations":[]}]},
+        \\ {"type":"function_call","id":"fc_1","status":"completed","call_id":"call_1","name":"shell","arguments":"{}"},
+        \\ {"type":"message","id":"msg_2","status":"completed","role":"assistant","content":[{"type":"output_text","text":"kept"}]}]}
+    ;
+    const response = try parseResponse(a, body);
+    defer response.deinit(a);
+    try std.testing.expectEqualStrings("kept", response.content.?);
+    const items = response.response_items.?;
+    try std.testing.expect(std.mem.indexOf(u8, items, "msg_1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "\"text\":\"\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "opaque") != null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "call_1") != null);
+    // The request carries exactly what was kept, in the order it arrived.
+    const messages = [_]Message{.{ .role = "assistant", .content = response.content, .reasoning_content = null, .tool_calls = response.tool_calls, .tool_call_id = null, .response_items = items }};
+    const encoded = try buildRequestWithToolSelection(a, "m", &messages, 8, null, false, .{});
+    defer a.free(encoded);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), input.len);
+    try std.testing.expectEqualStrings("reasoning", input[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("function_call", input[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("msg_2", input[2].object.get("id").?.string);
+
+    // A message whose only words are whitespace says nothing either.
+    const blank = try parseResponse(a, "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg_3\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\" \\n\"}]},{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"n\",\"arguments\":\"{}\"}]}");
+    defer blank.deinit(a);
+    const blank_items = blank.response_items.?;
+    try std.testing.expect(std.mem.indexOf(u8, blank_items, "msg_3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, blank_items, "\"c\"") != null);
 }
 
 test "Responses refuses nonterminal, malformed and ambiguous outputs" {
