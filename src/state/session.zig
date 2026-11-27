@@ -288,17 +288,6 @@ pub const Listing = struct {
     }
 };
 
-/// What a listing needs to know about a snapshot. Unknown fields are ignored,
-/// so the list reads what it shows without adopting the whole schema.
-const ListMessage = struct {
-    role: ?[]const u8 = null,
-    content: ?[]const u8 = null,
-};
-const ListSnapshot = struct {
-    version: ?u32 = null,
-    messages: ?[]const ListMessage = null,
-};
-
 /// Read the snapshots in `directory` as a session list, newest first. A
 /// missing directory is an empty listing: a workspace whose first session is
 /// starting has nothing saved yet. `limit` bounds how many summaries are
@@ -365,34 +354,156 @@ pub fn list(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, lim
     return .{ .items = try items.toOwnedSlice(allocator), .skipped = skipped };
 }
 
+/// The snapshot as a row of the list: the schema it was written with, how many
+/// messages it holds, and the first thing the user asked.
+///
+/// Unknown fields are ignored, so the list reads what it shows without adopting
+/// the whole schema, and the messages themselves are stepped over rather than
+/// parsed. A snapshot is as large as its conversation, and the list shows a
+/// title and a count; reading every message's text to find those is what made
+/// opening a session list slow.
 fn summarize(allocator: std.mem.Allocator, id: []const u8, modified: i64, data: []const u8) !Summary {
-    const parsed = try std.json.parseFromSlice(ListSnapshot, allocator, data, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
+    // The strings the scan does read are kept in one arena and freed together,
+    // whatever ends the scan: the file's own bytes stay borrowed from `data`.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const scan = arena_state.allocator();
+
+    var scanner = std.json.Scanner.initCompleteInput(allocator, data);
+    defer scanner.deinit();
+
+    var version: ?u32 = null;
+    var messages: ?usize = null;
+    var asked: ?[]const u8 = null;
+
+    try expectToken(&scanner, .object_begin);
+    while (true) {
+        const key = try fieldName(&scanner, scan);
+        if (key == null) break;
+        if (std.mem.eql(u8, key.?, "version")) {
+            if (try scanner.peekNextTokenType() != .number) return error.UnsupportedSessionVersion;
+            const written = switch (try scanner.next()) {
+                .number => |text| text,
+                else => return error.UnsupportedSessionVersion,
+            };
+            version = std.fmt.parseInt(u32, written, 10) catch return error.UnsupportedSessionVersion;
+        } else if (std.mem.eql(u8, key.?, "messages")) {
+            var count: usize = 0;
+            try readMessages(&scanner, scan, &count, &asked);
+            messages = count;
+        } else try scanner.skipValue();
+    }
     // Only the current schema can be resumed, so only it is offered.
-    if (parsed.value.version != schema_version) return error.UnsupportedSessionVersion;
-    const messages = parsed.value.messages orelse return error.InvalidSessionSnapshot;
+    if (version == null or version.? != schema_version) return error.UnsupportedSessionVersion;
+    if (messages == null) return error.InvalidSessionSnapshot;
     const owned_id = try allocator.dupe(u8, id);
     errdefer allocator.free(owned_id);
     return .{
         .id = owned_id,
         .modified = modified,
-        .messages = messages.len,
-        .title = try titleOf(allocator, messages),
+        .messages = messages.?,
+        .title = try titleOf(allocator, asked),
     };
+}
+
+/// The next token, which must open the structure the caller expects.
+fn expectToken(scanner: *std.json.Scanner, comptime wanted: std.json.TokenType) !void {
+    if (try scanner.peekNextTokenType() != wanted) return error.InvalidSessionSnapshot;
+    _ = try scanner.next();
+}
+
+/// The next key of an object, or null at its end. A key is only ever used for
+/// the length of one field, so it is copied into `scan`, which outlives the
+/// scan's own buffers.
+fn fieldName(scanner: *std.json.Scanner, scan: std.mem.Allocator) !?[]const u8 {
+    switch (try scanner.peekNextTokenType()) {
+        .object_end => {
+            _ = try scanner.next();
+            return null;
+        },
+        .string => return try nextString(scanner, scan),
+        else => return error.InvalidSessionSnapshot,
+    }
+}
+
+/// The next string, owned by `scan`. A string with escapes in it is unescaped
+/// into memory the caller keeps; one without is borrowed from the input.
+fn nextString(scanner: *std.json.Scanner, scan: std.mem.Allocator) ![]const u8 {
+    if (try scanner.peekNextTokenType() != .string) return error.InvalidSessionSnapshot;
+    const token = try scanner.nextAlloc(scan, .alloc_if_needed);
+    return switch (token) {
+        .string => |text| text,
+        .allocated_string => |text| text,
+        else => error.InvalidSessionSnapshot,
+    };
+}
+
+/// Count the messages and keep the first one the user asked, stepping over
+/// every other value the conversation holds.
+fn readMessages(scanner: *std.json.Scanner, scan: std.mem.Allocator, count: *usize, asked: *?[]const u8) !void {
+    try expectToken(scanner, .array_begin);
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .array_end => {
+                _ = try scanner.next();
+                return;
+            },
+            // An element that is not an object is counted with the rest and
+            // has nothing a list can show.
+            else => {},
+        }
+        count.* += 1;
+        if (try scanner.peekNextTokenType() != .object_begin) {
+            try scanner.skipValue();
+            continue;
+        }
+        _ = try scanner.next();
+        var role: ?[]const u8 = null;
+        var content: ?[]const u8 = null;
+        // Once the question is found there is nothing else to read in any
+        // message: the rest of the conversation is stepped over as bytes.
+        const looking = asked.* == null;
+        while (true) {
+            const key = try fieldName(scanner, scan) orelse break;
+            if (looking and std.mem.eql(u8, key, "role")) {
+                role = if (try scanner.peekNextTokenType() == .string) try nextString(scanner, scan) else null;
+                if (role == null) try scanner.skipValue();
+            } else if (looking and std.mem.eql(u8, key, "content")) {
+                content = if (try scanner.peekNextTokenType() == .string) try nextString(scanner, scan) else null;
+                if (content == null) try scanner.skipValue();
+            } else try scanner.skipValue();
+        }
+        // The first question is what a list of conversations can honestly say
+        // about one. A question that says nothing — only blanks — is passed
+        // over for the next one, the way a title that came out empty was.
+        if (asked.* != null) continue;
+        if (role == null or content == null) continue;
+        if (!std.mem.eql(u8, role.?, "user")) continue;
+        if (!hasWords(content.?)) continue;
+        asked.* = content.?;
+    }
+}
+
+/// Whether `text` holds anything a title could be made of: the blanks a line
+/// drops, and no more, is what `oneLine` has nothing to say about.
+fn hasWords(text: []const u8) bool {
+    var i: usize = 0;
+    while (i < text.len) {
+        const len: usize = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const end = @min(i + len, text.len);
+        const scalar: u21 = std.unicode.utf8Decode(text[i..end]) catch 0xFFFD;
+        i = end;
+        const blank = scalar == ' ' or scalar == 0xa0 or scalar == 0x3000 or scalar < 0x20 or scalar == 0x7f;
+        if (!blank) return true;
+    }
+    return false;
 }
 
 /// The first question the user asked, which is what a list of conversations can
 /// honestly say about one. Owned by the caller.
-fn titleOf(allocator: std.mem.Allocator, messages: []const ListMessage) ![]u8 {
-    for (messages) |message| {
-        const role = message.role orelse continue;
-        if (!std.mem.eql(u8, role, "user")) continue;
-        const content = message.content orelse continue;
-        const title = try oneLine(allocator, content);
-        if (title.len > 0) return title;
-        allocator.free(title);
-    }
-    return allocator.alloc(u8, 0);
+fn titleOf(allocator: std.mem.Allocator, asked: ?[]const u8) ![]u8 {
+    const content = asked orelse return allocator.alloc(u8, 0);
+    return oneLine(allocator, content);
 }
 
 /// `text` on one line, sanitised, with runs of whitespace collapsed and cut to
@@ -763,6 +874,51 @@ test "the session list reads newest first and skips what cannot be resumed" {
     defer none.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), none.items.len);
     try std.testing.expectEqual(@as(usize, 0), none.skipped);
+}
+
+test "a listing counts the messages it does not read" {
+    const a = std.testing.allocator;
+    // A checkpoint holds calls, results and reasoning far larger than anything
+    // a list shows; they are stepped over, and only the count and the first
+    // question come out of it.
+    const data =
+        "{\"version\":4,\"workspace\":\"/w\",\"messages\":[" ++
+        "{\"role\":\"user\",\"content\":null}," ++
+        "{\"role\":\"user\",\"content\":\"line\\nnext\"}," ++
+        "{\"role\":\"assistant\",\"content\":\"answer\",\"reasoning_content\":\"why\"," ++
+        "\"tool_calls\":[{\"id\":\"1\",\"name\":\"bash\",\"arguments\":\"{}\"}]}," ++
+        "{\"role\":\"tool\",\"tool_call_id\":\"1\"," ++
+        "\"tool_result\":{\"output\":\"ok\",\"is_error\":false,\"exit_code\":0}}" ++
+        "],\"plan\":[{\"title\":\"step\",\"status\":\"pending\"}],\"child\":null}";
+    const summary = try summarize(a, "0123456789abcdef0123456789abcdef", 7, data);
+    defer a.free(summary.id);
+    defer a.free(summary.title);
+    try std.testing.expectEqual(@as(usize, 4), summary.messages);
+    try std.testing.expectEqualStrings("line next", summary.title);
+
+    // A question that says nothing is passed over for the next one, and a
+    // snapshot of another schema is not offered at all.
+    const latter =
+        "{\"version\":4,\"workspace\":\"/w\"," ++
+        "\"messages\":[{\"role\":\"user\",\"content\":\"   \"},{\"role\":\"user\",\"content\":\"real one\"}]," ++
+        "\"plan\":[]}";
+    const found = try summarize(a, "0123456789abcdef0123456789abcdef", 7, latter);
+    defer a.free(found.id);
+    defer a.free(found.title);
+    try std.testing.expectEqualStrings("real one", found.title);
+    try std.testing.expectEqual(@as(usize, 2), found.messages);
+    try std.testing.expectError(error.UnsupportedSessionVersion, summarize(
+        a,
+        "0123456789abcdef0123456789abcdef",
+        7,
+        "{\"version\":3,\"messages\":[]}",
+    ));
+    try std.testing.expectError(error.InvalidSessionSnapshot, summarize(
+        a,
+        "0123456789abcdef0123456789abcdef",
+        7,
+        "{\"version\":4}",
+    ));
 }
 
 test "a session title is one short line of plain text" {
