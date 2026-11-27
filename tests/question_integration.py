@@ -203,8 +203,9 @@ try:
 
             # The last answer lands on the confirmation instead of sending the
             # answers off: the strip ends on it, and its two rows say what can
-            # be done there.
-            mark = len(transcript)
+            # be done there. That is the same frame the answer produced — a form
+            # is not drawn again when nothing about it has changed — so the
+            # mark taken before the words were typed is the one to read from.
             until(lambda: drawn('1) Submit', mark), b'the confirmation')
             until(lambda: drawn('2) Supplement', mark), b'the supplement row')
             until(lambda: focused_tab('Confirm', mark), b'the confirmation tab')

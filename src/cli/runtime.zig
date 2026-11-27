@@ -251,7 +251,11 @@ pub const Runtime = struct {
     fn prepareQuestion(context: *anyopaque, wanted: usize) anyerror!menu.Viewport {
         const self: *Runtime = @ptrCast(@alignCast(context));
         try self.screen.reserveQuestion(wanted);
-        return .{ .top = self.screen.questionTop(), .height = self.screen.questionRows(), .columns = self.screen.cols };
+        // Draining the screen writes to the terminal whenever there is
+        // something new to show, and that takes the cursor off the caret the
+        // form left. The form is told so it draws itself again.
+        const painted = self.screen.takePainted();
+        return .{ .top = self.screen.questionTop(), .height = self.screen.questionRows(), .columns = self.screen.cols, .painted = painted };
     }
 
     /// Publish the answers to the worker waiting in `presentForm`.

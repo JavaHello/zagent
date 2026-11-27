@@ -150,6 +150,10 @@ const Form = struct {
     /// allocator of the run it belongs to; the default keeps a form built by a
     /// test that never types from having to name one.
     allocator: std.mem.Allocator = std.heap.page_allocator,
+    /// How tall the form was measured to be, and the width it was measured at.
+    /// Cleared by every key, because a key is what can change what the form
+    /// says and how far the text wraps.
+    measured: ?struct { columns: usize, rows: usize } = null,
 
     fn deinit(self: *Form) void {
         self.edit.text.deinit(self.allocator);
@@ -174,6 +178,7 @@ const Form = struct {
     };
 
     fn key(self: *Form, byte: u8) !Action {
+        self.measured = null;
         // The free-text row takes the keys it is being typed into: arrows move
         // inside the text there instead of between the rows.
         if (self.typing) return self.editKey(byte);
@@ -815,6 +820,12 @@ pub fn formRows(slots: []const Slot, allow_custom: bool, confirm_tab: bool) usiz
 /// what it asks for when the text does not fit a line. The dock gives what the
 /// screen can spare, and a form that has less than this draws what does fit.
 fn naturalRows(allocator: std.mem.Allocator, state: *Form, columns: usize) !usize {
+    // Measuring draws every tab in full, and a form that is drawn again
+    // without a key in between would measure the same thing again. Every key
+    // clears the answer, so it is never older than the content it describes.
+    if (state.measured) |measured| {
+        if (measured.columns == columns) return measured.rows;
+    }
     const focus = state.focus;
     defer state.focus = focus;
     var probe: std.Io.Writer.Allocating = .init(allocator);
@@ -826,7 +837,9 @@ fn naturalRows(allocator: std.mem.Allocator, state: *Form, columns: usize) !usiz
         const body = try drawBody(allocator, &probe.writer, state, columns, no_limit, state.tabs() > 1, true, visible_window, no_limit);
         tallest = @max(tallest, body.lines);
     }
-    return @as(usize, @intFromBool(state.tabs() > 1)) + tallest;
+    const rows = @as(usize, @intFromBool(state.tabs() > 1)) + tallest;
+    state.measured = .{ .columns = columns, .rows = rows };
+    return rows;
 }
 
 /// A height that bounds nothing, for the pass that measures how tall a form is
@@ -856,7 +869,14 @@ pub fn form(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custo
     return runForm(allocator, io, slots, allow_custom, confirm_tab, focus, null);
 }
 
-pub const Viewport = struct { top: usize, height: usize, columns: usize };
+/// The rows the screen gave the form, and whether it painted them: a repaint
+/// moves the terminal's cursor away from the caret the form left it on.
+pub const Viewport = struct {
+    top: usize,
+    height: usize,
+    columns: usize,
+    painted: bool = false,
+};
 pub const Dock = struct {
     context: *anyopaque,
     prepare: *const fn (*anyopaque, usize) anyerror!Viewport,
@@ -910,10 +930,14 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
     // The height the dock was asked for last. It is carried from one redraw to
     // the next: the floor is only what tells the form the width it draws at.
     var reserved: usize = formRows(slots, allow_custom, confirm_tab);
+    // The view the form was last drawn in, so a tick that changes nothing on
+    // the screen does not draw it again.
+    var drawn_view: ?Viewport = null;
     while (true) {
         aw.clearRetainingCapacity();
         if (dock) |target| {
             const view = try reserveDock(allocator, &state, target, &reserved);
+            drawn_view = .{ .top = view.top, .height = view.height, .columns = view.columns };
             try aw.writer.writeAll(sgr.SYNC_BEGIN ++ sgr.HIDE_CURSOR);
             try drawDocked(allocator, &aw.writer, &state, view);
             // The screen's own cursor is restored first, so the caret the form
@@ -958,7 +982,24 @@ fn runForm(allocator: std.mem.Allocator, io: std.Io, slots: []Slot, allow_custom
         while (true) {
             // Poll only in screen mode so resize and queued panel updates are
             // serviced even when the user has not pressed another key.
-            if (dock != null and !try raw.waitReadable(io, 100)) break;
+            if (dock) |target| {
+                if (!try raw.waitReadable(io, 100)) {
+                    // Nothing was typed. The screen may still have changed
+                    // under the form — a resize, or output that moved the log
+                    // up — so the dock is asked for its rows again, and the
+                    // form is drawn again only when its answer or the screen
+                    // itself changed since the last frame.
+                    const view = try target.prepare(target.context, reserved);
+                    if (drawn_view) |last| {
+                        // The rows the form draws in are the same, and the
+                        // screen has painted nothing: the frame on the terminal
+                        // is still the one this form drew, caret and all.
+                        if (!view.painted and view.top == last.top and
+                            view.height == last.height and view.columns == last.columns) continue;
+                    }
+                    break;
+                }
+            }
             const byte = try raw.readByte() orelse return .dismiss;
             // Esc opens a sequence only when more bytes follow; on its own it
             // goes back to the options from the free-text row and cancels the
@@ -2224,6 +2265,28 @@ test "a form taller than the dock asks for one height, however often it is redra
     try std.testing.expectEqual(formRows(&slots, true, false), probe.asked.items[0]);
     for (probe.asked.items[1..]) |wanted| try std.testing.expectEqual(natural, wanted);
     try std.testing.expectEqual(natural, reserved);
+}
+
+test "a form is measured once for a width, and again once a key changes it" {
+    const allocator = std.testing.allocator;
+    var slots = [_]Slot{ Slot.init("First question?", &two_options_a), Slot.init("Second?", &two_options_b) };
+    var state = Form{ .slots = &slots };
+
+    // Every tab is drawn in full to find the tallest one; a redraw with the
+    // same width and no key in between must not do that work again.
+    const wide = try naturalRows(allocator, &state, 40);
+    try std.testing.expectEqual(@as(?usize, 40), if (state.measured) |m| m.columns else null);
+    try std.testing.expectEqual(wide, try naturalRows(allocator, &state, 40));
+    // A narrower window wraps further, so it is a measurement of its own.
+    const narrow = try naturalRows(allocator, &state, 20);
+    try std.testing.expectEqual(@as(?usize, 20), if (state.measured) |m| m.columns else null);
+    try std.testing.expect(narrow >= wide);
+    // A key can change what a tab says and how far it wraps, so the answer
+    // is dropped rather than kept as though nothing had happened.
+    _ = try state.key('j');
+    try std.testing.expect(state.measured == null);
+    _ = try naturalRows(allocator, &state, 20);
+    try std.testing.expectEqual(@as(?usize, 20), if (state.measured) |m| m.columns else null);
 }
 
 test "the menu marks only the first recommended option" {
