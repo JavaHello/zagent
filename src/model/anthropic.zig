@@ -429,9 +429,15 @@ const StreamedMessage = struct {
 /// here lets a stream be parsed exactly like a buffered reply, without a second
 /// reader for the same fields.
 pub const Stream = struct {
-    /// Everything parsed out of an event lives here, so a block's own JSON
-    /// stays valid for as long as the stream does.
+    /// What the answer keeps: the text of each block, the tool call as it is
+    /// assembled, and the one block that arrived whole. A block's own JSON stays
+    /// valid for as long as the stream does.
     arena: std.heap.ArenaAllocator,
+    /// What one event's parse needs, thrown away before the next event. An
+    /// event's JSON is a document per delta, and a long answer sends thousands
+    /// of them: keeping them here made the stream's memory grow to twice the
+    /// answer it was reading.
+    scratch: std.heap.ArenaAllocator,
     blocks: std.ArrayList(Block) = .empty,
     stop_reason: ?[]const u8 = null,
     started: bool = false,
@@ -447,10 +453,11 @@ pub const Stream = struct {
     transient: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Stream {
-        return .{ .arena = .init(allocator) };
+        return .{ .arena = .init(allocator), .scratch = .init(allocator) };
     }
 
     pub fn deinit(self: *Stream) void {
+        self.scratch.deinit();
         self.arena.deinit();
     }
 
@@ -458,7 +465,11 @@ pub const Stream = struct {
     /// arrive; an `error` event ends the exchange with `error.ApiError`.
     pub fn apply(self: *Stream, data: []const u8, sink: openai.StreamSink) !void {
         const arena = self.arena.allocator();
-        const root = std.json.parseFromSliceLeaky(std.json.Value, arena, data, .{}) catch return;
+        // The event is parsed in a buffer that is emptied before the next one.
+        // Everything that outlives the event is copied into `arena` below.
+        _ = self.scratch.reset(.retain_capacity);
+        const scratch = self.scratch.allocator();
+        const root = std.json.parseFromSliceLeaky(std.json.Value, scratch, data, .{}) catch return;
         if (root != .object) return;
         const kind = stringValue(root.object.get("type")) orelse return;
 
@@ -470,14 +481,19 @@ pub const Stream = struct {
         }
         if (std.mem.eql(u8, kind, "content_block_start")) {
             const index = integer(root.object.get("index")) orelse return;
-            const block = root.object.get("content_block") orelse return;
+            // The start of a block is kept whole — a `redacted_thinking` block
+            // is handed back to the API as it arrived — so this one event is
+            // parsed again, into the arena the answer lives in: what the first
+            // parse borrowed is gone with the next event.
+            const block = std.json.parseFromSliceLeaky(std.json.Value, arena, data, .{}) catch return;
             if (block != .object) return;
-            const block_kind = stringValue(block.object.get("type")) orelse return;
+            const kept = block.object.get("content_block") orelse return;
+            if (kept != .object) return;
             const entry = try self.blockAt(index);
-            entry.kind = block_kind;
-            entry.start = block;
-            entry.id = stringValue(block.object.get("id")) orelse "";
-            entry.name = stringValue(block.object.get("name")) orelse "";
+            entry.kind = stringValue(kept.object.get("type")) orelse return;
+            entry.start = kept;
+            entry.id = stringValue(kept.object.get("id")) orelse "";
+            entry.name = stringValue(kept.object.get("name")) orelse "";
             return;
         }
         if (std.mem.eql(u8, kind, "content_block_delta")) {
@@ -521,7 +537,8 @@ pub const Stream = struct {
         if (std.mem.eql(u8, kind, "message_delta")) {
             if (root.object.get("delta")) |delta| {
                 if (delta == .object) {
-                    if (stringValue(delta.object.get("stop_reason"))) |reason| self.stop_reason = reason;
+                    // The reason outlives the event it arrived in.
+                    if (stringValue(delta.object.get("stop_reason"))) |reason| self.stop_reason = try arena.dupe(u8, reason);
                 }
             }
             self.absorbUsage(root.object.get("usage"));
@@ -534,17 +551,19 @@ pub const Stream = struct {
             return;
         }
         if (std.mem.eql(u8, kind, "error")) {
-            return self.fail(root);
+            return self.fail(arena, root);
         }
         // `ping`, `content_block_stop` and any event this client does not know
         // carry nothing the caller needs.
     }
 
-    fn fail(self: *Stream, root: std.json.Value) error{ApiError} {
+    fn fail(self: *Stream, arena: std.mem.Allocator, root: std.json.Value) error{ApiError} {
         self.error_detail = "the stream reported an error without saying why";
         if (root.object.get("error")) |api_error| {
             if (api_error == .object) {
-                if (stringValue(api_error.object.get("message"))) |detail| self.error_detail = detail;
+                // The message is read again by the retry that reports it, long
+                // after the event's own buffer is gone.
+                if (stringValue(api_error.object.get("message"))) |detail| self.error_detail = arena.dupe(u8, detail) catch return error.ApiError;
                 const kind = stringValue(api_error.object.get("type")) orelse "";
                 self.transient = isTransientError(kind);
             }
@@ -912,6 +931,31 @@ test "a streamed answer is the same message as a buffered one" {
     try std.testing.expectEqualStrings(".", arguments.value.object.get("path").?.string);
     // The signature the server appended returns with the block.
     try std.testing.expect(std.mem.indexOf(u8, response.response_items.?, "sig-abc") != null);
+}
+
+test "a long stream keeps only what the answer is, not the events it read" {
+    const a = std.testing.allocator;
+    var recorder = Recorder.init(a);
+    defer recorder.deinit();
+    var stream: Stream = .init(a);
+    defer stream.deinit();
+
+    // One event per word, the way a long answer arrives. Each event's own JSON
+    // is read and dropped: what the stream holds afterwards is the answer, not
+    // a document per delta.
+    const event = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"word \"}}";
+    var count: usize = 0;
+    while (count < 500) : (count += 1) try stream.apply(event, recorder.sink());
+    try std.testing.expectEqual(@as(usize, 500 * "word ".len), recorder.text.written().len);
+    try std.testing.expect(stream.arena.queryCapacity() < 16 * 1024);
+
+    try stream.apply("{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}", recorder.sink());
+    try stream.apply("{\"type\":\"message_stop\"}", recorder.sink());
+    const body = try stream.finish(a);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "end_turn") != null);
+    // The answer is the text of every delta, in the block it was sent for.
+    try std.testing.expectEqual(@as(usize, 500), std.mem.count(u8, body, "word "));
 }
 
 test "a block announced only by its deltas is still read" {
