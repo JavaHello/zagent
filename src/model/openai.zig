@@ -284,6 +284,107 @@ const retry_base_delay_ms: i64 = 1000;
 /// and can be minutes; a turn is worth waiting out only so much of it.
 const retry_max_delay_ms: i64 = 30_000;
 
+/// How long one request may stay silent before its answer is given up on.
+///
+/// A backend that takes the request, holds the connection open and then sends
+/// nothing at all — a proxy buffering the stream, a queue that never reaches
+/// the front — would otherwise hold the turn for as long as the socket stays
+/// up: the read that waits for the reply has no deadline of its own.
+const stall_timeout_ms: i64 = 10 * std.time.ms_per_min;
+
+/// How often the watch below looks at the clock. The limit is minutes long, so
+/// a look every second costs nothing and keeps the overshoot out of sight.
+const stall_tick_ms: i64 = std.time.ms_per_s;
+
+/// Ends a request whose answer has stopped arriving.
+///
+/// `std.http` reads through `std.Io` operations of its own and takes no
+/// deadline for a read, so there is nowhere to hang a timeout on the read
+/// itself. What there is, is a second task: this one watches the clock while
+/// the request's own thread waits in `poll` on the socket, and shuts the socket
+/// down once no byte has arrived for the whole limit. The read then ends the
+/// way a connection closed by the far end ends, and the exchange around it
+/// reports `error.RequestTimeout` in its place.
+///
+/// The limit is counted from the last byte rather than from the start of the
+/// request: an answer that keeps streaming is a slow one, not a stalled one,
+/// and is left alone however long it takes.
+const Stall = struct {
+    io: std.Io,
+    /// The connection the request reads from. Shutting it down is what wakes
+    /// the waiting read; it is not closed here, because the request still owns
+    /// it and closes it on the way out.
+    stream: std.Io.net.Stream,
+    /// Set by the watch when it gives up, and read by the retry loop once the
+    /// request has failed. Atomic because the two run on different threads.
+    expired: *std.atomic.Value(bool),
+    /// How long the connection may stay quiet, counted from its last byte.
+    idle_ms: i64 = stall_timeout_ms,
+    /// How often the clock is looked at, so that a test can watch a limit that
+    /// is shorter than a second.
+    tick_ms: i64 = stall_tick_ms,
+    /// Set by the request whenever bytes arrived.
+    bytes: std.atomic.Value(bool) = .init(true),
+    /// Clear once the request is over: a shutdown must never land on the
+    /// connection the next request is given.
+    armed: std.atomic.Value(bool) = .init(false),
+    future: ?std.Io.Future(void) = null,
+
+    /// Starts watching `stream`.
+    ///
+    /// A runtime that cannot run the watch alongside the read leaves the
+    /// request waiting as it always did: a deadline is not worth refusing to
+    /// send a request over.
+    fn watch(self: *Stall) void {
+        self.armed.store(true, .release);
+        self.future = self.io.concurrent(run, .{self}) catch null;
+    }
+
+    /// Stops the watch. The request is over, one way or the other, so a
+    /// shutdown from here on could only catch a connection that has already
+    /// been handed back to the pool.
+    fn stop(self: *Stall) void {
+        self.armed.store(false, .release);
+        const future = self.future orelse return;
+        self.future = null;
+        var taken = future;
+        taken.cancel(self.io);
+    }
+
+    /// Records bytes that arrived: the limit is counted from the last of them.
+    fn received(self: *Stall) void {
+        self.bytes.store(true, .release);
+    }
+
+    /// The watch itself, on its own thread.
+    fn run(self: *Stall) void {
+        var deadline = std.Io.Timestamp.addDuration(std.Io.Timestamp.now(self.io, .awake), .fromMilliseconds(self.idle_ms));
+        while (self.armed.load(.acquire)) {
+            self.io.sleep(.fromMilliseconds(self.tick_ms), .awake) catch return;
+            if (!self.armed.load(.acquire)) return;
+            if (!self.ranOut(std.Io.Timestamp.now(self.io, .awake), &deadline)) continue;
+            self.expired.store(true, .release);
+            self.stream.shutdown(self.io, .both) catch {};
+            return;
+        }
+    }
+
+    /// Whether the limit has run out by `now`, which is where the decision to
+    /// give up on the connection is made.
+    ///
+    /// Bytes that arrived since the last look buy the request another limit's
+    /// worth of patience, so the answer this gives up on is one that has
+    /// stopped rather than one that is slow.
+    fn ranOut(self: *Stall, now: std.Io.Timestamp, deadline: *std.Io.Timestamp) bool {
+        if (self.bytes.swap(false, .acq_rel)) {
+            deadline.* = std.Io.Timestamp.addDuration(now, .fromMilliseconds(self.idle_ms));
+            return false;
+        }
+        // A moment is in the past once no time is left before it.
+        return std.Io.Timestamp.durationTo(deadline.*, now).nanoseconds >= 0;
+    }
+};
+
 /// Forwards deltas to the caller's sink and remembers whether any of them got
 /// through. The answer is painted as it arrives, so a retry is only safe while
 /// this says nothing has been shown yet.
@@ -588,6 +689,11 @@ pub const Client = struct {
     /// such a failure a transport failure is that it came off the connection at
     /// all, which is what this records.
     socket_failure: bool = false,
+    /// Set by the watch that bounds a silent request, once it has given up on
+    /// the connection and shut it down. Written from the watch's own thread
+    /// while the request reads, so it is atomic; the retry loop around the
+    /// request reads it once, and reports `error.RequestTimeout` for it.
+    stall_expired: std.atomic.Value(bool) = .init(false),
     search: search_tools.SearchBackends = .{},
     /// Borrowed definitions; callers may replace this slice between requests.
     /// The slice and its strings must remain valid for each request's duration.
@@ -1070,6 +1176,10 @@ pub const Client = struct {
     /// Deltas are painted as they arrive, so text shown once must never arrive
     /// a second time: a stream that fails after the reply started ends the turn
     /// instead of being sent again.
+    ///
+    /// A request the backend leaves silent for ten minutes is neither retried
+    /// nor waited on: its watch shuts the connection down, and the turn ends
+    /// with `error.RequestTimeout`.
     fn exchangeStreaming(self: *Client, wire: *const Wire, req_json: []const u8, sink: StreamSink, raw: ?*std.ArrayList(u8)) !ApiResponse {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
@@ -1078,6 +1188,15 @@ pub const Client = struct {
             if (self.exchangeOnce(wire, req_json, delivery.sink(), raw)) |response| {
                 return response;
             } else |err| {
+                // The answer stopped arriving for the whole limit and the
+                // watch shut the connection down under the read: there is no
+                // reply to read, no connection left worth keeping, and nothing
+                // a second attempt could find sooner than another ten minutes
+                // of the same silence.
+                if (self.stall_expired.swap(false, .acq_rel)) {
+                    self.resetHttpClient();
+                    return error.RequestTimeout;
+                }
                 // A failure that came off the socket is the transport's,
                 // whatever name it came back under, and the connection it
                 // happened on must not be reused.
@@ -1134,6 +1253,8 @@ pub const Client = struct {
         self.retry_after_ms = null;
         self.last_status = null;
         self.socket_failure = false;
+        // The previous attempt's watch, if any, said what it had to say.
+        self.stall_expired.store(false, .release);
         if (self.transport) |transport| {
             // Tests drive the buffered path; streaming is a network detail.
             const body = try transport.send(transport.context, self.allocator, req_json);
@@ -1164,8 +1285,22 @@ pub const Client = struct {
         body.end() catch |err| return self.transportFailure(&req, err);
         req.connection.?.flush() catch |err| return self.transportFailure(&req, err);
 
+        // Everything below waits on the backend's answer. A backend that has
+        // sent nothing for the whole limit is not going to, so the wait runs
+        // under a watch that shuts the connection down instead of leaving the
+        // turn hanging on a socket nobody speaks on again.
+        var stall: Stall = .{
+            .io = self.io,
+            .stream = req.connection.?.stream_reader.stream,
+            .expired = &self.stall_expired,
+        };
+        stall.watch();
+        defer stall.stop();
+
         var redirect_buffer: [8192]u8 = undefined;
         var response = req.receiveHead(&redirect_buffer) catch |err| return self.transportFailure(&req, err);
+        // The head is the answer's first byte, and the limit counts from it.
+        stall.received();
 
         // Inspect headers before creating the body reader, which invalidates
         // the response head's borrowed storage.
@@ -1243,6 +1378,9 @@ pub const Client = struct {
                     error.EndOfStream => break,
                     error.ReadFailed => return response.bodyErr() orelse self.transportFailure(&req, err),
                 };
+                // Every chunk that arrives restarts the limit: this is what
+                // tells a slow answer from one that has stopped coming.
+                stall.received();
                 continue;
             }
             if (raw) |buffer| buffer.appendSlice(self.allocator, avail) catch {};
@@ -2821,4 +2959,47 @@ test "public streaming buffered response preserves full usage and missing usage 
     try std.testing.expectEqual(before.output, after.output);
     try std.testing.expectEqual(@as(u64, 2), after.requests);
     try std.testing.expectEqual(@as(u64, 1), after.usage_reports);
+}
+
+/// A stream the watch holds but never reads, for the tests that only ask it
+/// when it would have given up: that decision is about the clock, not about the
+/// connection.
+fn silentStream() std.Io.net.Stream {
+    return .{ .socket = .{ .handle = 0, .address = .{ .ip4 = .unspecified(0) } } };
+}
+
+test "a request that goes quiet is given up on once the limit has run out" {
+    const io = std.testing.io;
+    var expired: std.atomic.Value(bool) = .init(false);
+    var stall: Stall = .{ .io = io, .stream = silentStream(), .expired = &expired, .idle_ms = 60_000 };
+    defer stall.stop();
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    var deadline = std.Io.Timestamp.addDuration(start, .fromMilliseconds(stall.idle_ms));
+    // The watch is armed with one limit's worth of patience the moment it
+    // starts, and spends it on its first look. The test spends it here, so the
+    // arithmetic below is the one a request that has gone quiet goes through.
+    stall.bytes.store(false, .release);
+    // Nothing arrives, so the watch holds out for exactly the limit it was
+    // armed with and no longer.
+    try std.testing.expect(!stall.ranOut(std.Io.Timestamp.addDuration(start, .fromMilliseconds(1)), &deadline));
+    try std.testing.expect(!stall.ranOut(std.Io.Timestamp.addDuration(start, .fromMilliseconds(stall.idle_ms - 1)), &deadline));
+    try std.testing.expect(stall.ranOut(std.Io.Timestamp.addDuration(start, .fromMilliseconds(stall.idle_ms)), &deadline));
+}
+
+test "a request that is still receiving starts its limit again" {
+    const io = std.testing.io;
+    var expired: std.atomic.Value(bool) = .init(false);
+    var stall: Stall = .{ .io = io, .stream = silentStream(), .expired = &expired, .idle_ms = 60_000 };
+    defer stall.stop();
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    var deadline = std.Io.Timestamp.addDuration(start, .fromMilliseconds(stall.idle_ms));
+    // Bytes arrive just before the limit would have run out, and the count
+    // starts again from there: an answer that keeps coming is never given up
+    // on, however long it takes.
+    stall.received();
+    try std.testing.expect(!stall.ranOut(std.Io.Timestamp.addDuration(start, .fromMilliseconds(stall.idle_ms)), &deadline));
+    try std.testing.expect(!stall.ranOut(std.Io.Timestamp.addDuration(start, .fromMilliseconds(2 * stall.idle_ms - 1)), &deadline));
+    try std.testing.expect(stall.ranOut(std.Io.Timestamp.addDuration(start, .fromMilliseconds(2 * stall.idle_ms)), &deadline));
 }

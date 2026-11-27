@@ -53,6 +53,18 @@ to say `WriteFailed`, so the reason is read back off the connection itself, and
 the failure is treated as the transport failure it is — retried on a fresh
 connection, and never left in the pool for the turn after it.
 
+An answer that stops arriving is given up on rather than waited out. A backend
+that takes the request, holds the connection open and then sends nothing at all
+— a proxy buffering the stream, a queue that never reaches the front — would
+otherwise hold the turn for as long as the socket stays up, because the read
+waiting for the reply has no deadline of its own. So each request is watched:
+when no byte has come back for ten minutes, the connection is shut down and the
+turn ends with `the provider sent nothing for ten minutes` instead of waiting.
+The limit counts from the last byte, so a long answer that keeps streaming is
+never cut short, and a silence is not retried — the next attempt would only
+wait the same ten minutes again. Esc still stops the turn at once; the watcher
+is not the only way out of a request.
+
 Output that hits the token budget is continued, and eventually reported as
 `ResponseTruncated`; the budget and its growth are described in
 [Configuration](configuration.md#output-budget-and-truncation).

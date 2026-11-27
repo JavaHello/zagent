@@ -1288,7 +1288,7 @@ pub const Agent = struct {
                 // The reasoning stops where the request did, before the line
                 // that says it failed.
                 self.thinking.close(self);
-                try self.emit(std.Io.File.stderr(), RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{@errorName(err)});
+                try self.emit(std.Io.File.stderr(), RED ++ "Error: failed to call API: {s}\n" ++ RESET, .{modelFailure(err)});
                 return err;
             };
             defer response.deinit(self.allocator);
@@ -2409,6 +2409,18 @@ fn printFmt(file: std.Io.File, io: std.Io, allocator: std.mem.Allocator, comptim
     const message = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(message);
     try file.writeStreamingAll(io, message);
+}
+
+/// Why a call to the model failed, in the words a reader of the conversation
+/// can act on: the failures whose names mean nothing outside the model layer
+/// are spelled out here, and everything else keeps the name it failed under.
+fn modelFailure(err: anyerror) []const u8 {
+    return switch (err) {
+        // The request's watch gave up on a backend that had sent nothing for
+        // ten minutes, and shut the connection down rather than wait on it.
+        error.RequestTimeout => "the provider sent nothing for ten minutes",
+        else => @errorName(err),
+    };
 }
 
 /// Why a sub-agent stopped, in words a reader of the caller's conversation can
