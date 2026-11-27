@@ -71,6 +71,27 @@ pub fn buildRequest(
     }, .{ .emit_null_optional_fields = false });
 }
 
+/// Build a JSON-RPC request around params that are being rendered anyway.
+///
+/// The envelope and the params are written together, in one pass: a `tools/call`
+/// carries a call's whole arguments, and handing them over as JSON text for this
+/// layer to read back would copy them a second time before the request that
+/// carries them was even written. What comes out is JSON this process wrote, so
+/// the binding that reads one message per line still holds.
+pub fn buildRequestWith(
+    allocator: std.mem.Allocator,
+    id: i64,
+    method: []const u8,
+    params: anytype,
+) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = method,
+        .params = params,
+    }, .{ .emit_null_optional_fields = false });
+}
+
 /// Parse the already-rendered params this layer carries. They must be an
 /// object, so a malformed splice can never become part of the envelope.
 fn readParams(allocator: std.mem.Allocator, params_json: ?[]const u8) !?std.json.Parsed(std.json.Value) {
@@ -1019,6 +1040,29 @@ test "RPC envelopes reject invalid embedded JSON" {
     for ([_][]const u8{ "{", "{} , \"injected\":true", "{}\n{}", "[]", "\"text\"", "42" }) |params| {
         try std.testing.expectError(error.McpInvalidArguments, buildRequest(a, 1, "tools/list", params));
     }
+}
+
+test "a request renders params it was handed without reading them back" {
+    const a = std.testing.allocator;
+    const name = "echo\"\\\n测试";
+    const arguments = try std.json.parseFromSlice(std.json.Value, a, "{\n \"text\": \"line\\nquote\\\"\", \"nested\":{\"value\":null}}", .{});
+    defer arguments.deinit();
+    const message = try buildRequestWith(a, 7, "tools/call", .{
+        .name = name,
+        .arguments = arguments.value,
+        ._meta = .{ .revision = "2026-01-01" },
+    });
+    defer a.free(message);
+    // One message per line, whatever the arguments looked like when they came.
+    try std.testing.expect(std.mem.indexOfScalar(u8, message, '\n') == null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, message, .{});
+    defer parsed.deinit();
+    const params = parsed.value.object.get("params").?.object;
+    try std.testing.expectEqualStrings(name, params.get("name").?.string);
+    try std.testing.expectEqualStrings("line\nquote\"", params.get("arguments").?.object.get("text").?.string);
+    try std.testing.expect(params.get("arguments").?.object.get("nested").?.object.get("value").? == .null);
+    try std.testing.expectEqualStrings("2026-01-01", params.get("_meta").?.object.get("revision").?.string);
 }
 
 test "build request carries the id, the method and the params" {

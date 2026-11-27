@@ -605,12 +605,9 @@ pub const Connection = struct {
 
         var page: usize = 0;
         while (page < max_pages) : (page += 1) {
-            const params = try listParams(allocator, cursor);
-            defer allocator.free(params);
-
             const response = try self.request(.{
                 .method = "tools/list",
-                .params_json = params,
+                .params = .{ .list = cursor },
                 .timeout_ms = self.timeout_ms,
             });
             defer response.deinit(self.allocator);
@@ -640,27 +637,46 @@ pub const Connection = struct {
 
     /// Call one tool. The result is the JSON text of the `result` member, for
     /// the caller to shape into something the model can read.
-    /// The response is owned by `self.allocator`, not the params allocator.
+    /// The response is owned by `self.allocator`.
     pub fn callTool(
         self: *Connection,
         allocator: std.mem.Allocator,
         name: []const u8,
         arguments_json: []const u8,
     ) !transport.Response {
-        const params = try callParams(allocator, name, arguments_json);
-        defer allocator.free(params);
+        // The arguments are read here, once, and the request that carries them
+        // is written from what was read: the arguments of a call can be a whole
+        // file, and copying them into a string for a layer below to read back
+        // would copy them twice more before they reached the wire.
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arguments = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), arguments_json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.McpInvalidArguments,
+        };
+        if (arguments != .object) return error.McpInvalidArguments;
 
         return self.request(.{
             .method = "tools/call",
-            .params_json = params,
+            .params = .{ .call = .{ .name = name, .arguments = arguments } },
             .name = name,
             .timeout_ms = self.timeout_ms,
         });
     }
 
+    /// What one request carries beside its method. The parts are rendered with
+    /// the envelope, in one pass, so a request is never read back to add
+    /// something to it.
+    const Params = union(enum) {
+        /// `_meta` alone: the request that asks which revision is spoken.
+        meta,
+        list: ?[]const u8,
+        call: struct { name: []const u8, arguments: std.json.Value },
+    };
+
     const Request = struct {
         method: []const u8,
-        params_json: ?[]const u8 = null,
+        params: Params = .meta,
         name: ?[]const u8 = null,
         timeout_ms: i64,
     };
@@ -674,18 +690,18 @@ pub const Connection = struct {
         const id = self.next_id;
         self.next_id += 1;
 
-        const params = if (options.params_json == null)
-            try metaParams(self.allocator)
-        else
-            null;
-        defer if (params) |text| self.allocator.free(text);
-
-        const message = try transport.buildRequest(
-            self.allocator,
-            id,
-            options.method,
-            options.params_json orelse params,
-        );
+        const message = switch (options.params) {
+            .meta => try transport.buildRequestWith(self.allocator, id, options.method, .{ ._meta = RequestMeta{} }),
+            .list => |cursor| try transport.buildRequestWith(self.allocator, id, options.method, .{
+                .cursor = cursor,
+                ._meta = RequestMeta{},
+            }),
+            .call => |call| try transport.buildRequestWith(self.allocator, id, options.method, .{
+                .name = call.name,
+                .arguments = call.arguments,
+                ._meta = RequestMeta{},
+            }),
+        };
         defer self.allocator.free(message);
 
         return self.transport.request(self.allocator, .{
@@ -856,50 +872,6 @@ const ClientInfo = struct {
     name: []const u8 = client_name,
     version: []const u8 = client_version,
 };
-
-fn metaParams(allocator: std.mem.Allocator) ![]u8 {
-    return std.json.Stringify.valueAlloc(allocator, .{ ._meta = RequestMeta{} }, .{});
-}
-
-fn listParams(allocator: std.mem.Allocator, cursor: ?[]const u8) ![]u8 {
-    return std.json.Stringify.valueAlloc(allocator, .{
-        .cursor = cursor,
-        ._meta = RequestMeta{},
-    }, .{ .emit_null_optional_fields = false });
-}
-
-fn callParams(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    arguments_json: []const u8,
-) ![]u8 {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.McpInvalidArguments;
-    return std.json.Stringify.valueAlloc(allocator, .{
-        .name = name,
-        .arguments = parsed.value,
-        ._meta = RequestMeta{},
-    }, .{ .emit_null_optional_fields = false });
-}
-
-/// Re-render the arguments a model sent for a tool call.
-///
-/// The model's text is JSON, but it is not necessarily one line: a newline
-/// between two tokens is legal JSON and would break the stdio binding, where
-/// one message is one line. Reading and writing it back settles that, and
-/// settles that it is an object at all.
-pub fn normalizeArguments(allocator: std.mem.Allocator, arguments_json: []const u8) ![]u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments_json, .{}) catch
-        return error.McpInvalidArguments;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.McpInvalidArguments;
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    try std.json.Stringify.value(parsed.value, .{}, &aw.writer);
-    return aw.toOwnedSlice();
-}
 
 // ---------------------------------------------------------------------------
 // Results
@@ -1339,16 +1311,14 @@ pub const Registry = struct {
             return errorResult(allocator, "The MCP server \"{s}\" is not connected.", .{server.config.name});
         };
 
-        const arguments = normalizeArguments(allocator, arguments_json) catch {
-            return errorResult(
-                allocator,
-                "The arguments for '{s}' are not a JSON object.",
-                .{alias},
-            );
-        };
-        defer allocator.free(arguments);
-
-        var response = connection.callTool(allocator, tool.remote_name, arguments) catch |err| {
+        var response = connection.callTool(allocator, tool.remote_name, arguments_json) catch |err| {
+            if (err == error.McpInvalidArguments) {
+                return errorResult(
+                    allocator,
+                    "The arguments for '{s}' are not a JSON object.",
+                    .{alias},
+                );
+            }
             var result = try errorResult(
                 allocator,
                 "Calling '{s}' on \"{s}\" failed: {s}",
@@ -1641,26 +1611,9 @@ test "an alias fits what an endpoint accepts" {
     for (long_a) |byte| try std.testing.expect(isNameByte(byte));
 }
 
-test "MCP params and schemas round trip escaped strings and optional fields" {
+test "schemas round trip escaped strings and optional fields" {
     const a = std.testing.allocator;
     const name = "echo\"\\\n测试";
-    {
-        const params = try callParams(a, name, "{\n\"nested\":{\"value\":null},\"text\":\"line\\nquote\\\"\"}");
-        defer a.free(params);
-        const decoded = try std.json.parseFromSlice(std.json.Value, a, params, .{});
-        defer decoded.deinit();
-        const object = decoded.value.object;
-        try std.testing.expectEqualStrings(name, object.get("name").?.string);
-        try std.testing.expect(object.contains("_meta"));
-        try std.testing.expect(object.get("arguments").?.object.get("nested").?.object.get("value").? == .null);
-        try std.testing.expect(std.mem.indexOfScalar(u8, params, '\n') == null);
-        const listing = try listParams(a, name);
-        defer a.free(listing);
-        const page = try std.json.parseFromSlice(std.json.Value, a, listing, .{});
-        defer page.deinit();
-        try std.testing.expectEqualStrings(name, page.value.object.get("cursor").?.string);
-        try std.testing.expect(page.value.object.contains("_meta"));
-    }
     const function = try buildFunction(a, name, "server\"", "description\n\\", "{\n\"type\":\"object\",\"x-custom\":null}");
     defer a.free(function);
     const decoded = try std.json.parseFromSlice(std.json.Value, a, function, .{});
@@ -1669,24 +1622,37 @@ test "MCP params and schemas round trip escaped strings and optional fields" {
     try std.testing.expectEqualStrings(name, object.get("name").?.string);
     try std.testing.expectEqualStrings("server\": description\n\\", object.get("description").?.string);
     try std.testing.expect(object.get("parameters").?.object.get("x-custom").? == .null);
-    try std.testing.expectError(error.McpInvalidArguments, callParams(a, name, "[]"));
-    try std.testing.expectError(error.SyntaxError, callParams(a, name, "{} , \"injected\":true"));
     try std.testing.expectError(error.InvalidToolSchema, buildFunction(a, name, "s", "d", "[]"));
 }
 
-test "arguments are written back as one line of JSON" {
+test "a call's arguments reach the wire as one line, and only objects are sent" {
     const allocator = std.testing.allocator;
+    const page = "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}";
+
+    var connection = scriptedConnection(allocator, &.{.{ .result = page }});
+    defer connection.deinit();
 
     // A newline between two tokens is legal JSON and would break the stdio
-    // binding, which is one message per line.
-    const spread = try normalizeArguments(allocator, "{\n \"path\": \"/tmp\"\n}");
-    defer allocator.free(spread);
-    try std.testing.expectEqualStrings("{\"path\":\"/tmp\"}", spread);
+    // binding, which is one message per line. The copy that reaches the wire is
+    // written from the arguments, so it is one line whatever they looked like,
+    // and it still carries what the model sent.
+    var response = try connection.callTool(allocator, "echo\"", "{\n \"path\": \"/tmp\"\n}");
+    defer response.deinit(allocator);
+    const sent = connection.transport.scripted.sent.items;
+    try std.testing.expectEqual(@as(usize, 1), sent.len);
+    try std.testing.expect(std.mem.indexOfScalar(u8, sent[0], '\n') == null);
+    const message = try std.json.parseFromSlice(std.json.Value, allocator, sent[0], .{});
+    defer message.deinit();
+    const params = message.value.object.get("params").?.object;
+    try std.testing.expectEqualStrings("echo\"", params.get("name").?.string);
+    try std.testing.expectEqualStrings("/tmp", params.get("arguments").?.object.get("path").?.string);
+    try std.testing.expect(params.contains("_meta"));
 
-    // Anything that is not a JSON object is refused rather than sent on.
-    try std.testing.expectError(error.McpInvalidArguments, normalizeArguments(allocator, "[]"));
-    try std.testing.expectError(error.McpInvalidArguments, normalizeArguments(allocator, "not json"));
-    try std.testing.expectError(error.McpInvalidArguments, normalizeArguments(allocator, ""));
+    // Anything that is not a JSON object is refused before a server is asked.
+    for ([_][]const u8{ "[]", "not json", "", "{} , \"injected\":true" }) |arguments| {
+        try std.testing.expectError(error.McpInvalidArguments, connection.callTool(allocator, "echo", arguments));
+    }
+    try std.testing.expectEqual(@as(usize, 1), connection.transport.scripted.sent.items.len);
 }
 
 test "a text result is what the model reads" {
