@@ -48,16 +48,32 @@ pub const LineEnd = enum {
 pub fn readLine(reader: *std.Io.Reader, allocator: std.mem.Allocator, out: *std.ArrayList(u8), cap: usize) !LineEnd {
     out.clearRetainingCapacity();
     while (true) {
-        const byte = reader.takeByte() catch |err| switch (err) {
-            error.EndOfStream => return if (out.items.len == 0) .eof else .line,
-            else => return err,
-        };
-        if (byte == '\n') {
+        if (reader.bufferedLen() == 0) {
+            reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return if (out.items.len == 0) .eof else .line,
+                else => return err,
+            };
+            continue;
+        }
+        // The run the reader already holds is taken in one piece: a page of a
+        // long file arrives in buffer-sized chunks, and asking for one byte at
+        // a time is what made reading a big file slow.
+        const buffered = reader.buffered();
+        const newline = std.mem.indexOfScalar(u8, buffered, '\n');
+        const taken = if (newline) |at| buffered[0..at] else buffered;
+        const room = cap -| out.items.len;
+        if (taken.len > room) {
+            try out.appendSlice(allocator, taken[0..room]);
+            reader.toss(room);
+            return .too_long;
+        }
+        try out.appendSlice(allocator, taken);
+        reader.toss(taken.len);
+        if (newline != null) {
+            reader.toss(1);
             if (out.items.len > 0 and out.items[out.items.len - 1] == '\r') out.items.len -= 1;
             return .line;
         }
-        if (out.items.len == cap) return .too_long;
-        try out.append(allocator, byte);
     }
 }
 
@@ -283,7 +299,36 @@ pub fn readFilePage(io: std.Io, allocator: std.mem.Allocator, path: []const u8, 
             .is_error = false,
         };
     }
-    return .{ .output = try allocator.dupe(u8, body.items), .is_error = false };
+    // The page is handed over as it stands: the list's own buffer is the
+    // output, not a copy of it.
+    return .{ .output = try body.toOwnedSlice(allocator), .is_error = false };
+}
+
+test "a line is read from the chunks the reader holds" {
+    const a = std.testing.allocator;
+    // One buffer holding several lines: the reader hands them out as they
+    // are, with a CRLF terminator, a line too long for the cap, and a last
+    // line with no newline at all.
+    var reader: std.Io.Reader = .fixed("one\r\ntwo\nthree");
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(a);
+
+    try std.testing.expectEqual(LineEnd.line, try readLine(&reader, a, &line, 64));
+    try std.testing.expectEqualStrings("one", line.items);
+    try std.testing.expectEqual(LineEnd.line, try readLine(&reader, a, &line, 64));
+    try std.testing.expectEqualStrings("two", line.items);
+    try std.testing.expectEqual(LineEnd.line, try readLine(&reader, a, &line, 64));
+    try std.testing.expectEqualStrings("three", line.items);
+    try std.testing.expectEqual(LineEnd.eof, try readLine(&reader, a, &line, 64));
+    try std.testing.expectEqual(@as(usize, 0), line.items.len);
+
+    // A line past the cap fills it and is abandoned, as a line the caller
+    // cannot hold is not shown in part.
+    var long: std.Io.Reader = .fixed("12345\n6\n");
+    try std.testing.expectEqual(LineEnd.too_long, try readLine(&long, a, &line, 3));
+    try std.testing.expectEqualStrings("123", line.items);
+    try std.testing.expectEqual(LineEnd.line, try readLine(&long, a, &line, 3));
+    try std.testing.expectEqualStrings("45", line.items);
 }
 
 test "read takes a 1-based offset and a line limit" {
