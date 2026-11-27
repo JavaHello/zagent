@@ -42,9 +42,19 @@ fn append(allocator: Allocator, items: *std.ArrayList(Item), prefix: []const u8,
     try items.append(allocator, .{ .value = value, .label = owned_label, .description = owned_description });
 }
 
-/// The candidates for the line being typed. `context` is the host's: the set of
-/// installed [skills](../state/skills.zig) a `$` mention offers, if any.
+/// What the prompt's completion needs from its host: the installed
+/// [skills](../state/skills.zig) a `$` mention offers, and the file lists an `@`
+/// mention keeps between keystrokes.
+pub const Context = struct {
+    skills: *const Skills,
+    files: Files = .{},
+};
+
+/// The candidates for the line being typed. `context` is the host's
+/// [Context](#Context), or null for a host that offers neither skills nor a
+/// place to keep what a walk found.
 pub fn candidates(context: ?*anyopaque, allocator: Allocator, io: std.Io, prefix: []const u8) Allocator.Error![]Item {
+    const host: ?*Context = if (context) |raw| @ptrCast(@alignCast(raw)) else null;
     var items: std.ArrayList(Item) = .empty;
     errdefer {
         for (items.items) |item| item.deinit(allocator);
@@ -56,8 +66,8 @@ pub fn candidates(context: ?*anyopaque, allocator: Allocator, io: std.Io, prefix
             if (std.mem.startsWith(u8, command.name[1..], active.query))
                 try append(allocator, &items, "", command.name, command.description, true);
         },
-        '@' => try files(allocator, io, &items, prefix[0..active.start], active.query),
-        '$' => try skills(allocator, &items, prefix[0..active.start], active.query, context),
+        '@' => try files(allocator, io, host, &items, prefix[0..active.start], active.query),
+        '$' => try skills(allocator, &items, prefix[0..active.start], active.query, host),
         else => unreachable,
     }
     if (items.items.len == 0) {
@@ -112,8 +122,8 @@ fn ignored(name: []const u8) bool {
 /// `$` mentions: the installed skills, by the name each is addressed with. A
 /// skill is offered with the description the catalog shows, because that is
 /// what tells one from another before it is loaded.
-fn skills(allocator: Allocator, items: *std.ArrayList(Item), before: []const u8, query: []const u8, context: ?*anyopaque) !void {
-    const installed: *const Skills = @ptrCast(@alignCast(context orelse return));
+fn skills(allocator: Allocator, items: *std.ArrayList(Item), before: []const u8, query: []const u8, host: ?*Context) !void {
+    const installed: *const Skills = if (host) |found| found.skills else return;
     for (installed.items) |skill| {
         if (!std.mem.startsWith(u8, skill.name, query)) continue;
         const label = try std.fmt.allocPrint(allocator, "${s}", .{skill.name});
@@ -122,11 +132,19 @@ fn skills(allocator: Allocator, items: *std.ArrayList(Item), before: []const u8,
     }
 }
 
-fn files(allocator: Allocator, io: std.Io, items: *std.ArrayList(Item), before: []const u8, query: []const u8) !void {
-    return filesIn(allocator, io, std.Io.Dir.cwd(), items, before, query);
+fn files(allocator: Allocator, io: std.Io, host: ?*Context, items: *std.ArrayList(Item), before: []const u8, query: []const u8) !void {
+    // A host with no place to keep them answers from a walk of its own, which
+    // is correct and no slower than it ever was.
+    var local: Files = .{};
+    defer if (host == null) local.deinit(allocator);
+    const cache = if (host) |found| &found.files else &local;
+    return filesIn(allocator, io, std.Io.Dir.cwd(), cache, items, before, query);
 }
 
-fn filesIn(allocator: Allocator, io: std.Io, root: std.Io.Dir, items: *std.ArrayList(Item), before: []const u8, query: []const u8) !void {
+fn filesIn(allocator: Allocator, io: std.Io, root: std.Io.Dir, cache: *Files, items: *std.ArrayList(Item), before: []const u8, query: []const u8) !void {
+    // The files a walk found last time stand in for the walk itself, as long as
+    // they were found in this same workspace.
+    cache.use(allocator, root);
     var scratch: fzy.Scratch = .{};
     defer scratch.deinit(allocator);
     try scratch.initQuery(allocator, query);
@@ -138,12 +156,12 @@ fn filesIn(allocator: Allocator, io: std.Io, root: std.Io.Dir, items: *std.Array
     if (try directory(allocator, io, root, query)) |named| {
         defer allocator.free(named);
         var named_budget: usize = 12000;
-        try search(allocator, io, root, named, &ranking, &scratch, &named_budget);
+        try search(allocator, io, root, cache, named, &ranking, &scratch, &named_budget);
         var rest: usize = 5000;
-        if (ranking.entries.items.len < 100) try search(allocator, io, root, "", &ranking, &scratch, &rest);
+        if (ranking.entries.items.len < 100) try search(allocator, io, root, cache, "", &ranking, &scratch, &rest);
     } else {
         var budget: usize = 10000;
-        try search(allocator, io, root, "", &ranking, &scratch, &budget);
+        try search(allocator, io, root, cache, "", &ranking, &scratch, &budget);
     }
     for (ranking.entries.items) |entry| try appendFile(allocator, items, before, entry.path);
 }
@@ -167,15 +185,150 @@ fn directory(allocator: Allocator, io: std.Io, root: std.Io.Dir, query: []const 
     }
 }
 
+/// The files one workspace holds, kept between keystrokes.
+///
+/// Walking the tree for every character typed is what makes a popup stop
+/// keeping up in a large workspace: reading the directories costs far more than
+/// scoring the names it offers, and it is the same tree each time. So a
+/// directory is read once and remembered with the time it was read at. That
+/// time is the directory's own: it moves when an entry in it is added, removed
+/// or renamed — exactly when its entries have to be read again — and not when a
+/// file below it is edited, which is not a change to what the popup offers.
+pub const Files = struct {
+    /// The workspace these lists were read in; another one is never answered
+    /// with them.
+    root: ?std.Io.Dir = null,
+    /// One entry per directory, by its path relative to the workspace.
+    dirs: std.StringHashMapUnmanaged(Listing) = .empty,
+    /// Directories read, so that a test can tell a list that was reused from one
+    /// that was read again and only looks the same.
+    reads: usize = 0,
+
+    const Listing = struct {
+        /// The directory's own time when its entries were read.
+        modified: std.Io.Timestamp,
+        /// The files it holds, by their path relative to the workspace.
+        files: std.ArrayList([]u8) = .empty,
+        /// The directories it holds, the same way.
+        subdirs: std.ArrayList([]u8) = .empty,
+    };
+
+    /// What a directory holds, as the walk reads it.
+    const Entries = struct {
+        files: []const []const u8 = &.{},
+        subdirs: []const []const u8 = &.{},
+    };
+
+    pub fn deinit(self: *Files, allocator: Allocator) void {
+        self.clear(allocator);
+        self.dirs.deinit(allocator);
+        self.root = null;
+    }
+
+    /// Forget every list, keeping the room for the next ones.
+    fn clear(self: *Files, allocator: Allocator) void {
+        var it = self.dirs.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            freeListing(allocator, entry.value_ptr);
+        }
+        self.dirs.clearRetainingCapacity();
+        self.reads = 0;
+    }
+
+    /// Read `root`'s entries rather than the ones held for another workspace.
+    fn use(self: *Files, allocator: Allocator, root: std.Io.Dir) void {
+        if (self.root) |known| if (known.handle == root.handle) return;
+        self.clear(allocator);
+        self.root = root;
+    }
+
+    /// What `path` holds: the entries read last time when the directory has not
+    /// changed since, and a fresh reading of it when it has.
+    fn entries(self: *Files, allocator: Allocator, io: std.Io, root: std.Io.Dir, path: []const u8) Allocator.Error!Entries {
+        // A directory that cannot be statted is one nothing can be said about:
+        // it offers no candidate rather than costing the popup its answers.
+        const modified = modifiedTime(io, root, path) catch return .{};
+        const known = self.dirs.getPtr(path);
+        if (known) |listing| {
+            if (listing.modified.nanoseconds == modified.nanoseconds)
+                return .{ .files = listing.files.items, .subdirs = listing.subdirs.items };
+        }
+        // A fresh reading is kept apart until it is complete, so one that fails
+        // leaves what was held before rather than half a directory.
+        var fresh: Listing = .{ .modified = modified };
+        errdefer freeListing(allocator, &fresh);
+        self.reads += 1;
+        try readListing(allocator, io, root, path, &fresh);
+        if (known) |listing| {
+            var stale = listing.*;
+            listing.* = fresh;
+            freeListing(allocator, &stale);
+            return .{ .files = listing.files.items, .subdirs = listing.subdirs.items };
+        }
+        const owned = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned);
+        try self.dirs.put(allocator, owned, fresh);
+        const listing = self.dirs.getPtr(path).?;
+        return .{ .files = listing.files.items, .subdirs = listing.subdirs.items };
+    }
+};
+
+fn freeListing(allocator: Allocator, listing: *Files.Listing) void {
+    for (listing.files.items) |path| allocator.free(path);
+    listing.files.deinit(allocator);
+    for (listing.subdirs.items) |path| allocator.free(path);
+    listing.subdirs.deinit(allocator);
+    listing.* = .{ .modified = .zero };
+}
+
+/// When the directory `path` last changed. Its own time is what says whether
+/// the entries read from it are still the ones it holds.
+fn modifiedTime(io: std.Io, root: std.Io.Dir, path: []const u8) !std.Io.Timestamp {
+    const stat = try root.statFile(io, if (path.len == 0) "." else path, .{});
+    return stat.mtime;
+}
+
+/// Read the entries `path` holds now, by their path relative to the workspace.
+///
+/// A directory that cannot be opened holds nothing to offer, which is what the
+/// walk has always done with one: the budget is a guard against a tree that
+/// never ends, not a reason to refuse what is readable.
+fn readListing(allocator: Allocator, io: std.Io, root: std.Io.Dir, path: []const u8, listing: *Files.Listing) Allocator.Error!void {
+    var dir = root.openDir(io, if (path.len == 0) "." else path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (iterator.next(io) catch return) |entry| {
+        if (ignored(entry.name) or std.mem.indexOfAny(u8, entry.name, "\x00\r\n\t\x1b") != null or !std.unicode.utf8ValidateSlice(entry.name)) continue;
+        const relative = if (path.len == 0) try allocator.dupe(u8, entry.name) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
+        errdefer allocator.free(relative);
+        switch (entry.kind) {
+            .directory => try listing.subdirs.append(allocator, relative),
+            .file => try listing.files.append(allocator, relative),
+            else => allocator.free(relative),
+        }
+    }
+}
+
 const Pending = struct { path: []u8, depth: usize };
 
-/// Walk the tree below `base` breadth first.
+/// Walk the tree below `base` breadth first, reading a directory again only when
+/// it has changed since it was last read.
 ///
 /// The budget is spent level by level, so every shallow directory is looked at
 /// before the deep subtrees of its neighbours are: a depth-first walk finishes
 /// the first large subtree it meets and can exhaust its budget without ever
 /// reaching a sibling such as `docs/`, which then offers no candidate at all.
-fn search(allocator: Allocator, io: std.Io, root: std.Io.Dir, base: []const u8, ranking: *Ranking, scratch: *fzy.Scratch, budget: *usize) Allocator.Error!void {
+fn search(
+    allocator: Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    cache: *Files,
+    base: []const u8,
+    ranking: *Ranking,
+    scratch: *fzy.Scratch,
+    budget: *usize,
+) Allocator.Error!void {
     var queue: std.ArrayList(Pending) = .empty;
     defer {
         for (queue.items) |pending| allocator.free(pending.path);
@@ -185,28 +338,20 @@ fn search(allocator: Allocator, io: std.Io, root: std.Io.Dir, base: []const u8, 
     var head: usize = 0;
     while (head < queue.items.len and budget.* > 0) : (head += 1) {
         const pending = queue.items[head];
-        var dir = root.openDir(io, if (pending.path.len == 0) "." else pending.path, .{ .iterate = true }) catch continue;
-        defer dir.close(io);
-        var iterator = dir.iterate();
-        while (budget.* > 0) {
-            const entry = (iterator.next(io) catch break) orelse break;
+        const entries = try cache.entries(allocator, io, root, pending.path);
+        for (entries.files) |path| {
+            if (budget.* == 0) return;
             budget.* -= 1;
-            if (ignored(entry.name) or std.mem.indexOfAny(u8, entry.name, "\x00\r\n\t\x1b") != null or !std.unicode.utf8ValidateSlice(entry.name)) continue;
-            const relative = if (pending.path.len == 0) try allocator.dupe(u8, entry.name) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pending.path, entry.name });
-            switch (entry.kind) {
-                // The queue takes the path over, so it outlives the entry.
-                .directory => if (pending.depth < 12) {
-                    queue.append(allocator, .{ .path = relative, .depth = pending.depth + 1 }) catch |err| {
-                        allocator.free(relative);
-                        return err;
-                    };
-                } else allocator.free(relative),
-                .file => {
-                    defer allocator.free(relative);
-                    if (try scratch.score(allocator, relative)) |score| try ranking.add(allocator, relative, score);
-                },
-                else => allocator.free(relative),
-            }
+            if (try scratch.score(allocator, path)) |score| try ranking.add(allocator, path, score);
+        }
+        if (pending.depth >= 12) continue;
+        for (entries.subdirs) |path| {
+            if (budget.* == 0) return;
+            budget.* -= 1;
+            // The queue takes the path over, so it outlives this reading.
+            const copy = try allocator.dupe(u8, path);
+            errdefer allocator.free(copy);
+            try queue.append(allocator, .{ .path = copy, .depth = pending.depth + 1 });
         }
     }
 }
@@ -286,10 +431,38 @@ test "search covers a shallow directory before a deep subtree spends the budget"
     try scratch.initQuery(allocator, "guide");
     var ranking: Ranking = .{};
     defer ranking.deinit(allocator);
+    var cache: Files = .{};
+    defer cache.deinit(allocator);
     var budget: usize = 6;
-    try search(allocator, io, tmp.dir, "", &ranking, &scratch, &budget);
+    try search(allocator, io, tmp.dir, &cache, "", &ranking, &scratch, &budget);
     try std.testing.expectEqual(@as(usize, 1), ranking.entries.items.len);
     try std.testing.expectEqualStrings("docs/guide.md", ranking.entries.items[0].path);
+}
+
+test "a walk that runs out of memory at any point cleans up after itself" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "docs/guides");
+    try tmp.dir.createDirPath(io, "src");
+    for ([_][]const u8{ "docs/index.md", "docs/guides/setup.md", "src/main.zig" }) |path| {
+        const file = try tmp.dir.createFile(io, path, .{});
+        file.close(io);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: Allocator, root: std.Io.Dir) !void {
+            var cache: Files = .{};
+            defer cache.deinit(allocator);
+            var scratch: fzy.Scratch = .{};
+            defer scratch.deinit(allocator);
+            try scratch.initQuery(allocator, "set");
+            var ranking: Ranking = .{};
+            defer ranking.deinit(allocator);
+            var budget: usize = 100;
+            try search(allocator, std.testing.io, root, &cache, "", &ranking, &scratch, &budget);
+            try std.testing.expectEqual(@as(usize, 1), ranking.entries.items.len);
+        }
+    }.run, .{tmp.dir});
 }
 
 test "a query names the directory whose subtree it searches" {
@@ -342,13 +515,15 @@ test "a reference names the files under the directory it points at" {
         .{ .query = "docs/", .expected = &.{ "@docs/index.md", "@docs/guides/setup.md" } },
         .{ .query = "docs/gui", .expected = &.{"@docs/guides/setup.md"} },
     };
+    var cache: Files = .{};
+    defer cache.deinit(allocator);
     for (cases) |case| {
         var items: std.ArrayList(Item) = .empty;
         defer {
             for (items.items) |item| item.deinit(allocator);
             items.deinit(allocator);
         }
-        try filesIn(allocator, io, tmp.dir, &items, "read ", case.query);
+        try filesIn(allocator, io, tmp.dir, &cache, &items, "read ", case.query);
         for (case.expected) |label| {
             var found = false;
             for (items.items) |item| {
@@ -357,6 +532,54 @@ test "a reference names the files under the directory it points at" {
             try std.testing.expect(found);
         }
     }
+}
+
+test "a workspace is walked once and read again only where it changed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "docs/guides");
+    try tmp.dir.createDirPath(io, "src");
+    for ([_][]const u8{ "docs/index.md", "src/main.zig" }) |path| {
+        const file = try tmp.dir.createFile(io, path, .{});
+        file.close(io);
+    }
+
+    var cache: Files = .{};
+    defer cache.deinit(allocator);
+    var scratch: fzy.Scratch = .{};
+    defer scratch.deinit(allocator);
+    try scratch.initQuery(allocator, "");
+
+    var ranking: Ranking = .{};
+    defer ranking.deinit(allocator);
+    var budget: usize = 100;
+    try search(allocator, io, tmp.dir, &cache, "", &ranking, &scratch, &budget);
+    try std.testing.expectEqual(@as(usize, 2), ranking.entries.items.len);
+    // Every directory the walk reached was read: the workspace's own, `docs`
+    // and `src`, and nothing twice.
+    const read_once = cache.reads;
+    try std.testing.expectEqual(@as(usize, 4), read_once);
+
+    // Nothing changed, so nothing is read again: the same names come from the
+    // lists the first walk kept.
+    budget = 100;
+    try search(allocator, io, tmp.dir, &cache, "", &ranking, &scratch, &budget);
+    try std.testing.expectEqual(read_once, cache.reads);
+
+    // A file added below a directory is a change to that directory, whose
+    // entries are read again; the ones beside it are not read at all.
+    const added = try tmp.dir.createFile(io, "docs/guides/setup.md", .{});
+    added.close(io);
+    budget = 100;
+    try search(allocator, io, tmp.dir, &cache, "", &ranking, &scratch, &budget);
+    try std.testing.expectEqual(read_once + 1, cache.reads);
+    var found = false;
+    for (ranking.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.path, "docs/guides/setup.md")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "triggers recognize commands and references at token boundaries" {
@@ -412,7 +635,9 @@ test "dollar candidates list installed skills and complete to a mention" {
     var installed = try skills_mod.initWithRoots(allocator, io, &.{root});
     defer installed.deinit();
 
-    const items = try candidates(&installed, allocator, io, "run $de");
+    var host: Context = .{ .skills = &installed };
+    defer host.files.deinit(allocator);
+    const items = try candidates(&host, allocator, io, "run $de");
     defer {
         for (items) |item| item.deinit(allocator);
         allocator.free(items);
@@ -422,7 +647,7 @@ test "dollar candidates list installed skills and complete to a mention" {
     try std.testing.expectEqualStrings("run $demo", items[0].value.?);
     try std.testing.expectEqualStrings("Demo skill.", items[0].description);
 
-    const all = try candidates(&installed, allocator, io, "$");
+    const all = try candidates(&host, allocator, io, "$");
     defer {
         for (all) |item| item.deinit(allocator);
         allocator.free(all);

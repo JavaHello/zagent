@@ -156,7 +156,10 @@ under a `docs/` directory is reachable however large the workspace is; the walk
 otherwise runs breadth first, so a shallow directory is looked at before a deep
 subtree can spend the search budget. The 100 best matches are kept, so a good
 match late in the tree still appears. Search skips `.git`, build caches and
-`node_modules`, and bounds traversal to keep large workspaces responsive. File
+`node_modules`, and bounds traversal to keep large workspaces responsive. What a
+directory held is kept between keystrokes and read again only when that
+directory's own modification time changes, so a large workspace is walked once
+rather than for every character typed. File
 selection inserts an `@path` reference (a path with a space is quoted as
 `@"a b.txt"`, and typing inside such a quote keeps filtering); it does not
 attach file contents automatically. These popups apply only to the REPL prompt.

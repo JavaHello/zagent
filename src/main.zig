@@ -333,9 +333,13 @@ pub fn main(init: std.process.Init) !void {
     var ln = Linenoise.init(allocator, io, env);
     defer ln.deinit();
     // Show command, project-file and installed-skill candidates as the user types.
+    // The context also keeps the files a walk found, so the popup does not walk
+    // the workspace again for every character typed.
+    var completion_context: @import("cli/completion.zig").Context = .{ .skills = &skills };
+    defer completion_context.files.deinit(allocator);
     ln.completions_callback = commands.complete;
     ln.popup_callback = @import("cli/completion.zig").candidates;
-    ln.popup_context = &skills;
+    ln.popup_context = &completion_context;
 
     const history_path = try openHistory(allocator, io, env, &ln);
     defer if (history_path) |path| allocator.free(path);
