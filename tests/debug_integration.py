@@ -142,9 +142,10 @@ try:
         assert report_path.read_text().startswith('<!doctype html>')
 
         # A failed request is a step too, with what the server said. The
-        # refusal outlasts every attempt the request is given, so the turn ends
+        # refusal outlasts every attempt the request is given — the first try
+        # and the four retries a backend that sheds load gets — so the turn ends
         # with it instead of the retry recovering.
-        failures_left = 3
+        failures_left = 5
         failed = subprocess.run([str(BINARY), '--debug', 'Ask the impossible'],
                                 cwd=workspace, env=env, capture_output=True, text=True, timeout=60)
         assert failed.returncode != 0, failed
