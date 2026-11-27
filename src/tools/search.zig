@@ -276,26 +276,26 @@ pub fn runSearchTimed(
     const no_matches = exit_one_is_no_match and exit_code != null and exit_code.? == 1;
     const is_error = exit_code == null or (exit_code.? != 0 and !no_matches);
 
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    // What the search program printed is handed on as it printed it: a match
-    // is quoted, copied or patched from, so a rewritten line would not be the
-    // line it matched.
-    if (captured.stdout.items.len > 0) try aw.writer.writeAll(captured.stdout.items);
-    if (captured.stderr.items.len > 0) {
-        if (aw.written().len > 0) try aw.writer.writeAll("\n");
-        try aw.writer.writeAll("stderr: ");
-        try aw.writer.writeAll(captured.stderr.items);
-    }
-
-    return searchPage(allocator, aw.written(), !exit_one_is_no_match, .{
+    const status: ToolResult = .{
         .is_error = is_error,
         .exit_code = exit_code,
         // A search program killed from outside says which signal did it, the
         // same way a shell command does: `null` above only says it did not exit.
         .termination = run.termination(),
-    });
+    };
+
+    // What the search program printed is handed on as it printed it: a match
+    // is quoted, copied or patched from, so a rewritten line would not be the
+    // line it matched. A program with nothing to report on stderr needs no
+    // copy at all, which is the usual case.
+    if (captured.stderr.items.len == 0) return searchPage(allocator, captured.stdout.items, !exit_one_is_no_match, status);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    if (captured.stdout.items.len > 0) try aw.writer.writeAll(captured.stdout.items);
+    if (aw.written().len > 0) try aw.writer.writeAll("\n");
+    try aw.writer.writeAll("stderr: ");
+    try aw.writer.writeAll(captured.stderr.items);
+    return searchPage(allocator, aw.written(), !exit_one_is_no_match, status);
 }
 
 pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, status: ToolResult) !ToolResult {
@@ -304,13 +304,17 @@ pub fn searchPage(allocator: std.mem.Allocator, output: []const u8, sort: bool, 
     var it = std.mem.tokenizeScalar(u8, output, '\n');
     while (it.next()) |line| try lines.append(allocator, line);
     if (sort) std.mem.sort([]const u8, lines.items, {}, lessString);
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    var index: usize = 0;
-    while (index < lines.items.len) : (index += 1) {
-        try aw.writer.print("{s}\n", .{lines.items[index]});
+    // The page is written into the buffer the result takes over. A writer in
+    // front of it would hold a second copy of the output, and grow into it,
+    // only for the copy to be discarded when the result is handed back.
+    var page: std.ArrayList(u8) = .empty;
+    defer page.deinit(allocator);
+    try page.ensureTotalCapacity(allocator, output.len + 1);
+    for (lines.items) |line| {
+        try page.appendSlice(allocator, line);
+        try page.append(allocator, '\n');
     }
-    return ownedResult(try aw.toOwnedSlice(), status);
+    return ownedResult(try page.toOwnedSlice(allocator), status);
 }
 
 pub fn runContentSearch(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, args: GrepArgs) !ToolResult {
