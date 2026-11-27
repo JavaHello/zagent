@@ -132,9 +132,13 @@ fn escapePressed(state: *LinenoiseState, ln: *Linenoise) !void {
     // menu comes first, and the run it belongs to must not be killed by the
     // answer to its own dismissal.
     if (try handOff(state)) return error.Handoff;
-    try ln.escape(state.popup_items.len > 0);
+    const popup_open = state.popup_items.len > 0;
+    try ln.escape(popup_open);
+    // Closing the list is what Esc did; asking the line to draw itself again
+    // would ask for candidates for the same text and open it back up. The
+    // input line is still on screen, so nothing has to be drawn for it.
     try state.dismissPopup();
-    try state.refreshLine();
+    if (!popup_open) try state.refreshLine();
 }
 
 fn linenoiseEdit(ln: *Linenoise, in: File, out: File, prompt: []const u8) !?[]const u8 {

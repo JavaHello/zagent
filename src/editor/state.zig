@@ -3,7 +3,6 @@ const ansi = @import("../ui/style.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const File = std.Io.File;
-const math = std.math;
 
 const Linenoise = @import("linenoise.zig").Linenoise;
 const History = @import("history.zig").History;
@@ -15,105 +14,24 @@ const getColumns = term.getColumns;
 const key_tab = 9;
 const key_esc = 27;
 
-const Bias = enum {
-    left,
-    right,
-};
-
-fn binarySearchBestEffort(
-    comptime T: type,
-    key: T,
-    items: []const T,
-    context: anytype,
-    comptime compareFn: fn (context: @TypeOf(context), lhs: T, rhs: T) math.Order,
-    bias: Bias,
-) usize {
-    var left: usize = 0;
-    var right: usize = items.len;
-
-    while (left < right) {
-        // Avoid overflowing in the midpoint calculation
-        const mid = left + (right - left) / 2;
-        // Compare the key with the midpoint element
-        switch (compareFn(context, key, items[mid])) {
-            .eq => return mid,
-            .gt => left = mid + 1,
-            .lt => right = mid,
-        }
-    }
-
-    // At this point, it is guaranteed that left >= right. In order
-    // for the bias to work, we need to return the exact opposite
-    return switch (bias) {
-        .left => right,
-        .right => left,
-    };
-}
-
-fn compareLeft(context: []const u8, avail_space: usize, index: usize) math.Order {
-    const width_slice = width(context[0..index]);
-    return math.order(avail_space, width_slice);
-}
-
-fn compareRight(context: []const u8, avail_space: usize, index: usize) math.Order {
-    const width_slice = width(context[index..]);
-    return math.order(width_slice, avail_space);
-}
-
 const StartOrEnd = enum {
     start,
     end,
 };
 
-/// Start mode: Calculates the optimal start position such that
-/// buf[start..] fits in the available space taking into account
-/// unicode codepoint widths
+/// The part of a line that fits in the space left for it.
 ///
-/// xxxxxxxxxxxxxxxxxxxxxxx buf
-///    [------------------] available_space
-///    ^                    start
+/// `start`: the offset of the first character from which everything after it
+/// fits, so the caret stays visible in a line longer than the window.
 ///
-/// End mode: Calculates the optimal end position so that buf[0..end]
-/// fits
+/// `end`: the offset just past the part that fits from the beginning.
 ///
-/// xxxxxxxxxxxxxxxxxxxxxxx buf
-/// [----------]            available_space
-///            ^            end
-fn calculateStartOrEnd(
-    allocator: Allocator,
-    comptime mode: StartOrEnd,
-    buf: []const u8,
-    avail_space: usize,
-) !usize {
-    // Create a mapping from unicode codepoint indices to buf
-    // indices
-    var map = try ArrayList(usize).initCapacity(allocator, buf.len);
-    defer map.deinit(allocator);
-
-    var utf8 = (try std.unicode.Utf8View.init(buf)).iterator();
-    while (utf8.nextCodepointSlice()) |codepoint| {
-        map.appendAssumeCapacity(@intFromPtr(codepoint.ptr) - @intFromPtr(buf.ptr));
-    }
-
-    const codepoint_start = binarySearchBestEffort(
-        usize,
-        avail_space,
-        map.items,
-        buf,
-        switch (mode) {
-            .start => compareRight,
-            .end => compareLeft,
-        },
-        // When calculating start or end, if in doubt, choose a
-        // smaller buffer as we don't want to overflow the line. For
-        // calculating start, this means that we would rather have an
-        // index more to the right.
-        switch (mode) {
-            .start => .right,
-            .end => .left,
-        },
-    );
-    return map.items[codepoint_start];
+/// Both cut on a character boundary and count cells the way `width` does.
+fn calculateStartOrEnd(comptime mode: StartOrEnd, buf: []const u8, avail_space: usize, total_width: usize) !usize {
+    return switch (mode) {
+        .end => unicode.fitEnd(buf, avail_space),
+        .start => unicode.fitStart(buf, avail_space, total_width),
+    };
 }
 
 pub const LinenoiseState = struct {
@@ -132,6 +50,11 @@ pub const LinenoiseState = struct {
     popup_items: []@import("linenoise.zig").PopupItem = &.{},
     popup_selected: usize = 0,
     popup_rows: usize = 0,
+    /// The query the popup was closed for with Esc. Drawing the line again
+    /// offers candidates for what is typed, and doing that right after Esc
+    /// opened the list the user had just closed; the list stays closed until
+    /// the query it was closed for changes.
+    popup_closed: ?u64 = null,
     /// Recalled commands must not divert subsequent arrows into completion.
     history_navigation: bool = false,
     /// Ctrl-L asked the host to draw its log again.
@@ -239,6 +162,9 @@ pub const LinenoiseState = struct {
     }
 
     pub fn dismissPopup(self: *Self) !void {
+        // Whatever is drawn next — the input line on its own, or the block at
+        // the bottom of the screen — must not offer the candidates again.
+        self.popup_closed = self.queryHash();
         if (self.ln.bottom_anchor) {
             self.freePopup();
             self.popup_rows = 0;
@@ -246,6 +172,17 @@ pub const LinenoiseState = struct {
         }
         try self.clearPopup();
         self.freePopup();
+    }
+
+    /// What the popup answers to: the text before the caret.
+    fn queryHash(self: *const Self) u64 {
+        return std.hash.Wyhash.hash(0, self.buf.items[0..self.pos]);
+    }
+
+    /// Whether the completion list was closed for exactly this query.
+    fn popupClosed(self: *const Self) bool {
+        const closed = self.popup_closed orelse return false;
+        return closed == self.queryHash();
     }
 
     pub fn acceptPopup(self: *Self) !void {
@@ -394,20 +331,10 @@ pub const LinenoiseState = struct {
         } else {
             if (pos < avail_space) {
                 start = 0;
-                end = try calculateStartOrEnd(
-                    self.allocator,
-                    .end,
-                    self.buf.items,
-                    avail_space,
-                );
+                end = try calculateStartOrEnd(.end, self.buf.items, avail_space, buf_width);
             } else {
                 end = self.pos;
-                start = try calculateStartOrEnd(
-                    self.allocator,
-                    .start,
-                    self.buf.items[0..end],
-                    avail_space,
-                );
+                start = try calculateStartOrEnd(.start, self.buf.items[0..end], avail_space, pos);
             }
         }
         const display_buf = self.buf.items[start..end];
@@ -586,7 +513,7 @@ pub const LinenoiseState = struct {
         const total_rows = layout.total_rows;
 
         // The popup only appears above a single, unwrapped line, as inline.
-        if (recompute_popup and !self.history_navigation and !self.ln.mask_mode and total_rows == 1) {
+        if (recompute_popup and !self.history_navigation and !self.ln.mask_mode and total_rows == 1 and !self.popupClosed()) {
             if (self.ln.popup_callback) |callback| {
                 self.popup_items = try callback(self.ln.popup_context, self.allocator, self.ln.io, self.buf.items[0..self.pos]);
                 self.popup_selected = 0;
@@ -676,7 +603,7 @@ pub const LinenoiseState = struct {
             try self.refreshSingleLine();
         }
         // The popup occupies rows below a horizontally scrolling input.
-        if (!self.history_navigation and !self.usesMultiLine() and !self.ln.mask_mode) {
+        if (!self.history_navigation and !self.usesMultiLine() and !self.ln.mask_mode and !self.popupClosed()) {
             if (self.ln.popup_callback) |callback| {
                 self.popup_items = try callback(self.ln.popup_context, self.allocator, self.ln.io, self.buf.items[0..self.pos]);
                 self.popup_selected = 0;
@@ -1247,4 +1174,15 @@ test "a bottom anchored popup sits above the input and keeps its items while mov
     try state.dismissPopup();
     try std.testing.expectEqual(@as(usize, 1), record.rows);
     try std.testing.expectEqual(@as(usize, 0), state.popup_items.len);
+
+    // The line is drawn again — by the next key, by a resize — and the list
+    // stays closed: it was closed for this text, and the text has not changed.
+    try state.refreshLine();
+    try std.testing.expectEqual(@as(usize, 0), state.popup_items.len);
+    try std.testing.expectEqual(@as(usize, 1), record.rows);
+
+    // One more character is a different query, and the list is offered again.
+    try state.editInsert("a");
+    try std.testing.expectEqual(@as(usize, 2), state.popup_items.len);
+    try std.testing.expect(state.popup_rows > 0);
 }

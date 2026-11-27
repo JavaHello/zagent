@@ -141,7 +141,9 @@ Typing `/` at the start of the prompt opens system command candidates. Typing
 `@` at a word boundary searches project file paths, and `$` lists the installed
 [skills](skills.md) by name, with the description the catalog shows. Candidates
 filter as you type. Use ↑/↓ to select, Tab or Enter to insert, and Esc to
-dismiss; press Enter again to submit the line.
+dismiss; press Enter again to submit the line. A dismissed list stays closed
+for the text it was closed for, so the next redraw — a resize, a keystroke that
+does not change the query — does not open it again.
 
 `$name` in a submitted line is not only a completion: it activates that skill
 for the task, so its instructions reach the model with the request itself. See
