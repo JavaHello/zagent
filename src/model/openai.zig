@@ -1022,38 +1022,29 @@ pub const Client = struct {
                 .thinking_budget = self.thinkingBudget(),
             });
         }
-        const ordinary = try buildRequestWithToolSelection(self.allocator, self.model, messages, self.max_tokens, selection, true, self.search);
         const codex = self.codex_auth_path != null;
-        const request = if (codex) adapted: {
-            defer self.allocator.free(ordinary);
-            break :adapted try codexRequest(self.allocator, ordinary);
-        } else ordinary;
-        const service_tier = if (codex) self.service_tier else null;
-        if (self.reasoning_effort == null and self.thinking == .omit and service_tier == null and self.prompt_cache_retention == null) return request;
-        defer self.allocator.free(request);
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, request, .{});
-        defer parsed.deinit();
-        const arena = parsed.arena.allocator();
-        // `reasoning.effort` is a Responses field of its own, so it is not tied
-        // to the Codex adapter above; only `service_tier` is Codex's fast mode.
-        if (nonEmpty(self.reasoning_effort)) |effort| {
-            var reasoning: std.json.ObjectMap = .{};
-            try reasoning.put(arena, "effort", .{ .string = effort });
-            // Told to summarize, the backend narrates what it is thinking as
-            // reasoning-summary deltas, which is what the live panel shows. It
-            // is only asked for alongside an effort, so a model that does not
-            // reason is never sent a member it would reject.
-            if (self.reasoning_summary) try reasoning.put(arena, "summary", .{ .string = "auto" });
-            try parsed.value.object.put(arena, "reasoning", .{ .object = reasoning });
-        }
-        if (self.thinking.wireValue()) |value| {
-            var thinking: std.json.ObjectMap = .{};
-            try thinking.put(arena, "type", .{ .string = value });
-            try parsed.value.object.put(arena, "thinking", .{ .object = thinking });
-        }
-        if (nonEmpty(service_tier)) |tier| try parsed.value.object.put(arena, "service_tier", .{ .string = tier });
-        if (self.prompt_cache_retention) |retention| try parsed.value.object.put(arena, "prompt_cache_retention", .{ .string = retention });
-        return std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{});
+        // One render, whatever the settings add: the body is the whole
+        // conversation, and reading it back to add a member would copy all of
+        // it, again, on every round of the session.
+        return buildRequestBody(self.allocator, .{
+            .model = self.model,
+            .max_tokens = self.max_tokens,
+            .messages = messages,
+            .selection = selection,
+            .stream = true,
+            .search = self.search,
+            .extras = .{
+                .codex = codex,
+                // `reasoning.effort` is a Responses field of its own, so it is
+                // not tied to the Codex projection; only `service_tier` is
+                // Codex's fast mode.
+                .reasoning_effort = self.reasoning_effort,
+                .reasoning_summary = self.reasoning_summary,
+                .thinking = self.thinking,
+                .service_tier = if (codex) self.service_tier else null,
+                .prompt_cache_retention = self.prompt_cache_retention,
+            },
+        });
     }
 
     /// Stream a request with built-in and MCP tools, in the protocol this
@@ -1628,7 +1619,13 @@ fn recordedByMessages(parsed: std.json.Value) bool {
 }
 
 /// All allocations belong to the caller's request-scoped arena.
-fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const InputItem {
+fn buildInput(
+    arena: std.mem.Allocator,
+    messages: []const Message,
+    /// Where the standing instructions go, when this request carries them in a
+    /// member of their own instead of in the input.
+    instructions: ?*std.Io.Writer.Allocating,
+) ![]const InputItem {
     var input: std.ArrayList(InputItem) = .empty;
     for (messages) |message| {
         if (message.response_items) |items| {
@@ -1638,35 +1635,86 @@ fn buildInput(arena: std.mem.Allocator, messages: []const Message) ![]const Inpu
             // Content blocks from the other protocol are not Responses items,
             // so such a turn is rebuilt from its summary fields instead.
             if (recordedByMessages(parsed)) {
-                if (message.content) |content| {
-                    try input.append(arena, .{ .message = .{ .role = message.role, .content = content } });
-                }
-                if (message.tool_calls) |calls| for (calls) |call| {
-                    try input.append(arena, .{ .call = .{ .call_id = call.id, .name = call.name, .arguments = call.arguments } });
-                };
+                try appendTurn(arena, &input, instructions, message);
                 continue;
             }
             for (parsed.array.items) |item| {
                 if (item != .object) return error.InvalidResponseItems;
+                if (instructions) |sink| {
+                    if (try takeInstructions(sink, item)) continue;
+                }
                 try input.append(arena, .{ .replay = item });
             }
             continue;
         }
-        if (std.mem.eql(u8, message.role, "tool")) {
-            const call_id = message.tool_call_id orelse return error.MissingCallId;
-            const result = message.tool_result orelse return error.MissingToolResult;
-            const output = try search_tools.formatToolOutput(arena, result);
-            try input.append(arena, .{ .output = .{ .call_id = call_id, .output = output } });
-            continue;
-        }
-        if (message.content) |content| {
-            try input.append(arena, .{ .message = .{ .role = message.role, .content = content } });
-        }
-        if (message.tool_calls) |calls| for (calls) |call| {
-            try input.append(arena, .{ .call = .{ .call_id = call.id, .name = call.name, .arguments = call.arguments } });
-        };
+        try appendTurn(arena, &input, instructions, message);
     }
     return input.items;
+}
+
+/// Append one message the way this protocol sends it: a tool's result as the
+/// answer to its call, and anything else as a message with the calls it made.
+fn appendTurn(
+    arena: std.mem.Allocator,
+    input: *std.ArrayList(InputItem),
+    instructions: ?*std.Io.Writer.Allocating,
+    message: Message,
+) !void {
+    if (std.mem.eql(u8, message.role, "tool")) {
+        const call_id = message.tool_call_id orelse return error.MissingCallId;
+        const result = message.tool_result orelse return error.MissingToolResult;
+        const output = try search_tools.formatToolOutput(arena, result);
+        try input.append(arena, .{ .output = .{ .call_id = call_id, .output = output } });
+        return;
+    }
+    if (instructions) |sink| {
+        if (carriesInstructions(message.role)) {
+            // Standing instructions belong in the member this request has for
+            // them, not in the input it replays.
+            if (message.content) |content| {
+                try sink.writer.writeAll(content);
+                try sink.writer.writeByte('\n');
+            }
+            return;
+        }
+    }
+    if (message.content) |content| {
+        try input.append(arena, .{ .message = .{ .role = message.role, .content = content } });
+    }
+    if (message.tool_calls) |calls| for (calls) |call| {
+        try input.append(arena, .{ .call = .{ .call_id = call.id, .name = call.name, .arguments = call.arguments } });
+    };
+}
+
+/// Whether a role carries the request's standing instructions rather than the
+/// conversation.
+fn carriesInstructions(role: []const u8) bool {
+    return std.mem.eql(u8, role, "system") or std.mem.eql(u8, role, "developer");
+}
+
+/// Move an item that carries standing instructions into the request's
+/// `instructions` text, which is where the ChatGPT backend reads it. Answers
+/// whether the item was one of those: such an item is not sent in the input.
+///
+/// Its text is its content, whichever shape the protocol gave it — a string, or
+/// the blocks a replayed item carries.
+fn takeInstructions(sink: *std.Io.Writer.Allocating, item: std.json.Value) !bool {
+    if (item != .object) return false;
+    const role = item.object.get("role") orelse return false;
+    if (role != .string or !carriesInstructions(role.string)) return false;
+    if (item.object.get("content")) |content| {
+        switch (content) {
+            .string => |text| try sink.writer.writeAll(text),
+            .array => |blocks| for (blocks.items) |block| {
+                if (block != .object) continue;
+                const text = block.object.get("text") orelse continue;
+                if (text == .string) try sink.writer.writeAll(text.string);
+            },
+            else => {},
+        }
+        try sink.writer.writeByte('\n');
+    }
+    return true;
 }
 
 /// Whether this block, on its own, says nothing: a text block with no words in
@@ -1715,12 +1763,57 @@ pub fn withoutEmptyText(arena: std.mem.Allocator, items: std.json.Value) !?std.j
 
 const Request = struct {
     model: []const u8,
-    max_output_tokens: u32,
+    /// The output limit. The ChatGPT backend takes none on a streamed request.
+    max_output_tokens: ?u32 = null,
     store: bool = false,
     stream: bool,
     include: [1][]const u8 = .{"reasoning.encrypted_content"},
+    /// What the ChatGPT backend reads in place of the system messages its
+    /// `input` no longer carries.
+    instructions: ?[]const u8 = null,
     input: []const InputItem,
     tools: ?[]const tool_schema.Function,
+    reasoning: ?Reasoning = null,
+    thinking: ?Thinking = null,
+    /// Codex's fast mode. No other backend has one.
+    service_tier: ?[]const u8 = null,
+    prompt_cache_retention: ?[]const u8 = null,
+};
+
+/// `reasoning.effort`, and whether the thinking is asked to be narrated.
+const Reasoning = struct {
+    effort: []const u8,
+    summary: ?[]const u8 = null,
+};
+
+/// `thinking`, as a backend spells a mode it can be told to take.
+const Thinking = struct {
+    type: []const u8,
+};
+
+/// Everything one request body is built from.
+const Body = struct {
+    model: []const u8,
+    max_tokens: u32,
+    messages: []const Message,
+    /// null omits the tools member.
+    selection: ?ToolSelection = null,
+    stream: bool = true,
+    search: search_tools.SearchBackends = .{},
+    extras: Extras = .{},
+};
+
+/// The members a client's settings add beside the conversation itself. They are
+/// rendered with it rather than spliced into it afterwards.
+const Extras = struct {
+    /// The ChatGPT backend: the system text moves to `instructions`, and no
+    /// output limit is sent.
+    codex: bool = false,
+    reasoning_effort: ?[]const u8 = null,
+    reasoning_summary: bool = false,
+    thinking: ThinkingMode = .omit,
+    service_tier: ?[]const u8 = null,
+    prompt_cache_retention: ?[]const u8 = null,
 };
 
 /// Built-in definitions can be any slice (including a runtime ArrayList's
@@ -1747,17 +1840,48 @@ pub fn buildRequestWithToolSelection(
     stream: bool,
     search: search_tools.SearchBackends,
 ) ![]u8 {
+    return buildRequestBody(allocator, .{
+        .model = model,
+        .max_tokens = max_tokens,
+        .messages = messages,
+        .selection = selection,
+        .stream = stream,
+        .search = search,
+    });
+}
+
+/// Render one request body in a single pass: the conversation, the tools it is
+/// offered, and the settings that ride with them.
+///
+/// Nothing here reads the body back. It is the whole history, so a second parse
+/// of it would cost more than the request itself, on every round of a session.
+fn buildRequestBody(allocator: std.mem.Allocator, body: Body) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const input = try buildInput(arena, messages);
-    const functions = try buildFunctions(arena, selection, search);
+    // The system text the ChatGPT backend wants in `instructions` is collected
+    // while the input is built, from the messages it is not sent in.
+    var instructions: std.Io.Writer.Allocating = .init(arena);
+    const input = try buildInput(arena, body.messages, if (body.extras.codex) &instructions else null);
+    const functions = try buildFunctions(arena, body.selection, body.search);
     return std.json.Stringify.valueAlloc(allocator, Request{
-        .model = model,
-        .max_output_tokens = max_tokens,
-        .stream = stream,
+        .model = body.model,
+        .max_output_tokens = if (body.extras.codex) null else body.max_tokens,
+        .stream = body.stream,
+        .instructions = if (body.extras.codex) instructions.written() else null,
         .input = input,
-        .tools = if (selection != null) functions else null,
+        .tools = if (body.selection != null) functions else null,
+        .reasoning = if (nonEmpty(body.extras.reasoning_effort)) |effort| .{
+            .effort = effort,
+            // Told to summarize, the backend narrates what it is thinking as
+            // reasoning-summary deltas, which is what the live panel shows. It
+            // is only asked for alongside an effort, so a model that does not
+            // reason is never sent a member it would reject.
+            .summary = if (body.extras.reasoning_summary) "auto" else null,
+        } else null,
+        .thinking = if (body.extras.thinking.wireValue()) |value| .{ .type = value } else null,
+        .service_tier = nonEmpty(body.extras.service_tier),
+        .prompt_cache_retention = body.extras.prompt_cache_retention,
     }, .{ .emit_null_optional_fields = false });
 }
 
@@ -2101,11 +2225,25 @@ test "cache retention is borrowed and projected identically for ordinary and Cod
                 try std.testing.expectEqualStrings(value, parsed.value.object.get("prompt_cache_retention").?.string);
             } else try std.testing.expect(!parsed.value.object.contains("prompt_cache_retention"));
             if (retention == null) {
+                // With no setting of its own, the body holds the plain request
+                // and nothing else, apart from the one adaptation the ChatGPT
+                // backend asks for.
                 const ordinary = try buildRequestWithToolSelection(a, client.model, &.{}, client.max_tokens, .{}, true, client.search);
                 defer a.free(ordinary);
-                const baseline = if (codex) try codexRequest(a, ordinary) else try a.dupe(u8, ordinary);
-                defer a.free(baseline);
-                try std.testing.expectEqualStrings(baseline, request);
+                var expected = try std.json.parseFromSlice(std.json.Value, a, ordinary, .{});
+                defer expected.deinit();
+                if (codex) {
+                    _ = expected.value.object.swapRemove("max_output_tokens");
+                    try expected.value.object.put(expected.arena.allocator(), "instructions", .{ .string = "" });
+                }
+                try std.testing.expectEqual(expected.value.object.count(), parsed.value.object.count());
+                for (expected.value.object.keys()) |member| {
+                    const wanted = try std.json.Stringify.valueAlloc(a, expected.value.object.get(member).?, .{});
+                    defer a.free(wanted);
+                    const found = try std.json.Stringify.valueAlloc(a, parsed.value.object.get(member) orelse return error.TestExpectedEqual, .{});
+                    defer a.free(found);
+                    try std.testing.expectEqualStrings(wanted, found);
+                }
             }
         }
     }
@@ -2765,16 +2903,57 @@ test "the Codex projection keeps its structural changes" {
         .{ .role = "system", .content = "be brief", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
         .{ .role = "user", .content = "hi", .reasoning_content = null, .tool_calls = null, .tool_call_id = null },
     };
-    const ordinary = try buildRequestWithToolSelection(a, "test", &messages, 100, null, true, .{});
-    defer a.free(ordinary);
-    const adapted = try codexRequest(a, ordinary);
+    const adapted = try buildRequestBody(a, .{
+        .model = "test",
+        .max_tokens = 100,
+        .messages = &messages,
+        .stream = true,
+        .extras = .{ .codex = true },
+    });
     defer a.free(adapted);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, adapted, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("be brief\n", parsed.value.object.get("instructions").?.string);
     try std.testing.expect(!parsed.value.object.contains("max_output_tokens"));
     try std.testing.expect(!parsed.value.object.contains("reasoning"));
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("input").?.array.items.len);
+    // The instructions are not replayed in the input as well, and the turn
+    // that followed them is.
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("user", input[0].object.get("role").?.string);
+}
+
+test "a replayed system item moves to the instructions instead of the input" {
+    const a = std.testing.allocator;
+    const items = "[{\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"be brief\"},{\"type\":\"input_text\",\"text\":\"and kind\"}]}," ++
+        "{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}]";
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi", .reasoning_content = null, .tool_calls = null, .tool_call_id = null, .response_items = items },
+    };
+    const adapted = try buildRequestBody(a, .{
+        .model = "test",
+        .max_tokens = 100,
+        .messages = &messages,
+        .stream = true,
+        .extras = .{ .codex = true },
+    });
+    defer a.free(adapted);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, adapted, .{});
+    defer parsed.deinit();
+    // An item's own blocks are welded together as they were sent, and each item
+    // ends the line it wrote.
+    try std.testing.expectEqualStrings("be briefand kind\n", parsed.value.object.get("instructions").?.string);
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("function_call", input[0].object.get("type").?.string);
+
+    // Nothing is moved when the request has no member for it.
+    const plain = try buildRequestBody(a, .{ .model = "test", .max_tokens = 100, .messages = &messages, .stream = true });
+    defer a.free(plain);
+    var plain_parsed = try std.json.parseFromSlice(std.json.Value, a, plain, .{});
+    defer plain_parsed.deinit();
+    try std.testing.expect(!plain_parsed.value.object.contains("instructions"));
+    try std.testing.expectEqual(@as(usize, 2), plain_parsed.value.object.get("input").?.array.items.len);
 }
 
 /// The value when it is set and not blank: an empty setting means "leave the
@@ -2784,38 +2963,6 @@ fn nonEmpty(value: ?[]const u8) ?[]const u8 {
         if (text.len > 0) return text;
     }
     return null;
-}
-
-/// The structural half of the Codex projection: streaming instructions move to
-/// `instructions` and the unsupported `max_output_tokens` is dropped. Optional
-/// outer-level fields are added afterwards, in `buildWireRequest`, because they
-/// are not specific to this backend.
-fn codexRequest(a: std.mem.Allocator, ordinary: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, ordinary, .{});
-    defer parsed.deinit();
-    _ = parsed.value.object.swapRemove("max_output_tokens");
-    const input = parsed.value.object.getPtr("input") orelse return error.InvalidRequest;
-    var instructions: std.Io.Writer.Allocating = .init(a);
-    defer instructions.deinit();
-    var i: usize = 0;
-    while (i < input.array.items.len) {
-        const item = input.array.items[i];
-        const role = if (item == .object) item.object.get("role") else null;
-        if (role != null and role.? == .string and (std.mem.eql(u8, role.?.string, "system") or std.mem.eql(u8, role.?.string, "developer"))) {
-            if (item.object.get("content")) |content| {
-                if (content == .string) try instructions.writer.writeAll(content.string);
-                if (content == .array) for (content.array.items) |block| {
-                    if (block == .object) if (block.object.get("text")) |v| {
-                        if (v == .string) try instructions.writer.writeAll(v.string);
-                    };
-                };
-                try instructions.writer.writeByte('\n');
-            }
-            _ = input.array.orderedRemove(i);
-        } else i += 1;
-    }
-    try parsed.value.object.put(parsed.arena.allocator(), "instructions", .{ .string = instructions.written() });
-    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
 
 test "usage parsing is strict safe and never synthesizes total" {
