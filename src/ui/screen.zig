@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const term = @import("term.zig");
 
 const ansi = @import("style.zig");
+const escapes = @import("../util/terminal/ansi.zig");
 const RESET = ansi.RESET;
 const HIDE_CURSOR = ansi.HIDE_CURSOR;
 const SHOW_CURSOR = ansi.SHOW_CURSOR;
@@ -69,6 +70,14 @@ pub const Screen = struct {
     active: bool,
     /// The bytes that drew the log, in the order they were written.
     transcript: std.ArrayList(u8) = .empty,
+    /// Where each row of the transcript starts, laid out at the current width.
+    ///
+    /// A terminal cannot be asked what it holds, so a mouse report, a wheel
+    /// event or a tick that follows the log needs the row starts of the whole
+    /// conversation. Scanning all of it for each of them is what made the cost
+    /// of the screen grow with the conversation, so the scan is kept between
+    /// frames and picks up at the byte it stopped on.
+    row_starts: Rows = .{},
     rows: usize = 24,
     cols: usize = 80,
     /// Rows kept clear at the bottom for the editor and its popup. Never zero
@@ -78,6 +87,11 @@ pub const Screen = struct {
     question_rows: usize = 0,
     /// The log has to be drawn again before the next write.
     dirty: bool = true,
+    /// Something has been written to the screen since the last caller asked.
+    /// The question dock needs to know: a repaint moves the terminal's cursor
+    /// away from the caret the form put it on, and only drawing the form again
+    /// puts it back.
+    painted: bool = false,
     /// Transcript bytes already painted; queued output can extend the log
     /// without clearing it when following the newest output.
     rendered_len: usize = 0,
@@ -131,8 +145,7 @@ pub const Screen = struct {
         // Only unmodified left-button presses, drags and releases select.
         if (m.button != 0 and m.button != 32) return;
         if (m.y > self.logBottom() and !self.dragging) return;
-        const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
-        defer self.allocator.free(rows);
+        const rows = try self.logRows();
         const end_row = rows.len - @min(self.scroll_rows, rows.len -| self.logBottom());
         const first = end_row -| self.logBottom();
         const row = @min(first + @min(m.y, self.logBottom()) - 1, end_row - 1);
@@ -303,6 +316,17 @@ pub const Screen = struct {
         self.dirty = true;
     }
 
+    /// The rows the transcript is drawn on.
+    ///
+    /// The screen is laid out from the transcript, so this is what a mouse
+    /// report, a wheel event and every tick that follows the log read. Only
+    /// the bytes appended since the last call are scanned; a width change or a
+    /// trim of the oldest lines lays the whole conversation out again.
+    fn logRows(self: *Screen) ![]const usize {
+        _ = try self.row_starts.of(self.allocator, self.transcript.items, self.cols);
+        return self.row_starts.starts.items;
+    }
+
     /// Drop the oldest whole lines once the transcript outgrows its bound.
     /// Everything that points into the transcript moves with it; a selection
     /// or drag whose text was dropped collapses instead of pointing at bytes
@@ -323,6 +347,8 @@ pub const Screen = struct {
         self.selection_end = self.selection_end -| dropped;
         if (self.anchor) |anchor| self.anchor = anchor -| dropped;
         self.anchor_end = self.anchor_end -| dropped;
+        // The rows were laid out against byte positions that have moved.
+        self.row_starts.invalidate();
         self.dirty = true;
     }
 
@@ -376,15 +402,12 @@ pub const Screen = struct {
         }
         if (old_bottom != self.logBottom()) self.dirty = true;
         if (self.queued.items.len == 0) return changed;
-        const old_rows = if (self.scroll_rows > 0) blk: {
-            const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
-            defer self.allocator.free(rows);
-            break :blk rows.len;
-        } else 0;
+        const old_rows = if (self.scroll_rows > 0) (try self.logRows()).len else 0;
         try self.transcript.appendSlice(self.allocator, self.queued.items);
         if (old_rows > 0) {
-            const rows = try visualRows(self.allocator, self.transcript.items, self.cols);
-            defer self.allocator.free(rows);
+            // Only the bytes just appended are scanned here: the rows above
+            // them were laid out when they arrived.
+            const rows = try self.logRows();
             self.scroll_rows += rows.len -| old_rows;
         }
         self.queued.clearRetainingCapacity();
@@ -403,8 +426,7 @@ pub const Screen = struct {
         self.selection_end = self.selection_start;
         _ = try self.drain();
         const step = if (page) @max(@as(usize, 1), self.logBottom() -| 1) else 3;
-        const total = try visualRows(self.allocator, self.transcript.items, self.cols);
-        defer self.allocator.free(total);
+        const total = try self.logRows();
         const limit = total.len -| self.logBottom();
         self.scroll_rows = if (up) @min(limit, self.scroll_rows +| step) else self.scroll_rows -| step;
         self.dirty = true;
@@ -435,6 +457,7 @@ pub const Screen = struct {
     pub fn deinit(self: *Screen) void {
         if (self.active) self.leave();
         self.transcript.deinit(self.allocator);
+        self.row_starts.deinit(self.allocator);
         self.queued.deinit(self.allocator);
         self.thinking.deinit(self.allocator);
         self.pending_thinking.deinit(self.allocator);
@@ -518,6 +541,14 @@ pub const Screen = struct {
         try self.reserveInput(1, false);
     }
 
+    /// Whether the screen has painted since this was last asked, clearing the
+    /// answer: a caller that draws on the screen itself asks once per frame.
+    pub fn takePainted(self: *Screen) bool {
+        const painted = self.painted;
+        self.painted = false;
+        return painted;
+    }
+
     pub fn questionTop(self: *const Screen) usize {
         return self.logBottom() + 1;
     }
@@ -574,6 +605,7 @@ pub const Screen = struct {
         try self.transcript.appendSlice(self.allocator, bytes);
         self.trimTranscript();
         try self.out.writeStreamingAll(self.io, bytes);
+        self.painted = true;
         self.rendered_len = self.transcript.items.len;
     }
 
@@ -630,6 +662,7 @@ pub const Screen = struct {
         try w.writeAll(RESTORE_CURSOR);
         if (!self.editor_frame) try w.writeAll(SYNC_END);
         try self.out.writeStreamingAll(self.io, w.buffered());
+        self.painted = true;
         self.status_dirty = false;
     }
 
@@ -712,6 +745,7 @@ pub const Screen = struct {
         // The cursor belongs at the log's end until the editor draws the input.
         try w.writeAll(RESTORE_CURSOR);
         try w.flush();
+        self.painted = true;
         self.thinking_dirty = false;
     }
 
@@ -736,6 +770,7 @@ pub const Screen = struct {
         try w.writeAll(bytes[start..]);
         try w.writeAll(SAVE_CURSOR);
         try w.flush();
+        self.painted = true;
         self.rendered_len = self.transcript.items.len;
     }
 
@@ -777,8 +812,7 @@ pub const Screen = struct {
         // The editor turns off output post-processing, so a bare newline would
         // leave the column where it was. Writing CRLF keeps the replay correct
         // both while a line is being edited and between turns.
-        const offsets = try visualRows(self.allocator, self.transcript.items, self.cols);
-        defer self.allocator.free(offsets);
+        const offsets = try self.logRows();
         self.scroll_rows = @min(self.scroll_rows, offsets.len -| bottom);
         const end_row = offsets.len - self.scroll_rows;
         const first_row = end_row -| bottom;
@@ -791,7 +825,7 @@ pub const Screen = struct {
         var inverse = false;
         while (index < view.len) {
             if (view[index] == 0x1b) {
-                const next = @import("../util/terminal/ansi.zig").skipAnsiEscape(view, index);
+                const next = escapes.skipAnsiEscape(view, index);
                 try w.writeAll(view[index..next]);
                 if (inverse) try w.writeAll(ansi.INVERSE);
                 index = next;
@@ -819,6 +853,7 @@ pub const Screen = struct {
         try w.flush();
 
         self.dirty = false;
+        self.painted = true;
         self.status_dirty = false;
         self.thinking_dirty = false;
         self.rendered_len = self.transcript.items.len;
@@ -899,7 +934,7 @@ fn statusWidth(bytes: []const u8) usize {
     var i: usize = 0;
     while (i < bytes.len) {
         if (bytes[i] == 0x1b) {
-            i = @import("../util/terminal/ansi.zig").skipAnsiEscape(bytes, i);
+            i = escapes.skipAnsiEscape(bytes, i);
             continue;
         }
         const cp = term.decodeAt(bytes, i);
@@ -976,7 +1011,7 @@ fn restoreRendition(w: *std.Io.Writer, prefix: []const u8) !void {
             i += 1;
             continue;
         }
-        const next = @import("../util/terminal/ansi.zig").skipAnsiEscape(prefix, i);
+        const next = escapes.skipAnsiEscape(prefix, i);
         if (next >= i + 3 and prefix[i + 1] == '[' and prefix[next - 1] == 'm') {
             try w.writeAll(prefix[i..next]);
         }
@@ -984,40 +1019,99 @@ fn restoreRendition(w: *std.Io.Writer, prefix: []const u8) !void {
     }
 }
 
-/// A `std.Io.Writer` over the screen's log, so the markdown renderer can stream
-/// into the conversation through its own small buffer.
-fn visualRows(a: std.mem.Allocator, bytes: []const u8, cols: usize) ![]usize {
-    var rows: std.ArrayList(usize) = .empty;
-    errdefer rows.deinit(a);
-    try rows.append(a, 0);
-    var column: usize = 0;
-    var i: usize = 0;
-    while (i < bytes.len) {
-        if (bytes[i] == 0x1b) {
-            i = @import("../util/terminal/ansi.zig").skipAnsiEscape(bytes, i);
-            continue;
-        }
-        if (bytes[i] == '\n') {
-            i += 1;
-            column = 0;
-            try rows.append(a, i);
-            continue;
-        }
-        if (bytes[i] == '\r') {
-            column = 0;
-            i += 1;
-            continue;
-        }
-        const cp = term.decodeAt(bytes, i);
-        const width = term.codepointWidth(cp);
-        if (width > 0 and column + width > @max(cols, 1)) {
-            try rows.append(a, i);
-            column = 0;
-        }
-        column += width;
-        i += cp.len;
+/// Where the transcript's rows start.
+///
+/// The conversation is appended to far more often than it changes width, so
+/// only the bytes written since the last layout are scanned; the whole log is
+/// laid out again when the window is resized or the oldest lines are dropped.
+/// A row start is the byte it begins at, and the first row always starts at 0.
+const Rows = struct {
+    starts: std.ArrayList(usize) = .empty,
+    /// Bytes of the transcript these starts cover.
+    scanned: usize = 0,
+    /// Cells already used on the row `scanned` falls in.
+    column: usize = 0,
+    /// The width they were laid out at; a different one needs a fresh layout.
+    cols: usize = 0,
+
+    fn deinit(self: *Rows, a: std.mem.Allocator) void {
+        self.starts.deinit(a);
     }
-    return rows.toOwnedSlice(a);
+
+    /// The row starts of `bytes` laid out `cols` wide.
+    ///
+    /// The slice is owned here and stays valid until the next call or until the
+    /// transcript is written to.
+    fn of(self: *Rows, a: std.mem.Allocator, bytes: []const u8, cols: usize) ![]const usize {
+        if (self.cols != cols or self.scanned > bytes.len) {
+            self.starts.clearRetainingCapacity();
+            try self.starts.append(a, 0);
+            self.scanned = 0;
+            self.column = 0;
+            self.cols = cols;
+        }
+        try self.scan(a, bytes, cols);
+        return self.starts.items;
+    }
+
+    /// Forget the scan, so the next layout starts at the first byte.
+    fn invalidate(self: *Rows) void {
+        self.cols = 0;
+    }
+
+    /// Continue the layout at the byte it stopped on, which is where the next
+    /// row begins.
+    fn scan(self: *Rows, a: std.mem.Allocator, bytes: []const u8, cols: usize) !void {
+        const kept = self.starts.items.len;
+        var column = self.column;
+        var i = self.scanned;
+        errdefer {
+            // The rows that were added cover bytes the scan did not finish;
+            // dropping them leaves `scanned` and `column` describing what the
+            // kept rows cover, so a later attempt resumes in the same place.
+            self.starts.shrinkRetainingCapacity(kept);
+        }
+        const height = @max(cols, 1);
+        while (i < bytes.len) {
+            const byte = bytes[i];
+            if (byte == 0x1b) {
+                // A sequence the end of the transcript cuts in half belongs to
+                // the bytes still to come: laying out what follows it now
+                // would count the rest of the sequence as text.
+                i = escapes.sequenceEnd(bytes, i) orelse break;
+                continue;
+            }
+            if (byte == '\n') {
+                i += 1;
+                column = 0;
+                try self.starts.append(a, i);
+                continue;
+            }
+            if (byte == '\r') {
+                column = 0;
+                i += 1;
+                continue;
+            }
+            const cp = term.decodeAt(bytes, i);
+            const width = term.codepointWidth(cp);
+            if (width > 0 and column + width > height) {
+                try self.starts.append(a, i);
+                column = 0;
+            }
+            column += width;
+            i += cp.len;
+        }
+        self.scanned = i;
+        self.column = column;
+    }
+};
+
+/// The rows `bytes` is drawn on, laid out from the first byte.
+fn visualRows(a: std.mem.Allocator, bytes: []const u8, cols: usize) ![]usize {
+    var layout: Rows = .{};
+    defer layout.deinit(a);
+    _ = try layout.of(a, bytes, cols);
+    return layout.starts.toOwnedSlice(a);
 }
 
 pub const LogWriter = struct {
@@ -1248,6 +1342,44 @@ test "visual history rows count wrapping, CJK and ANSI without splitting UTF-8" 
     try std.testing.expectEqualSlices(usize, &.{ 0, 11, 18, 23 }, rows);
 }
 
+test "the rows of the log are scanned once as it grows, and again after a resize" {
+    const a = std.testing.allocator;
+    var s = Screen.init(a, std.testing.io, false);
+    defer s.deinit();
+    s.cols = 4;
+    // The pieces are chosen so that a row boundary falls inside them: a
+    // layout that started over at each append, or one that only scanned the
+    // new bytes without the column they begin at, would disagree here.
+    for ([_][]const u8{ "你", "好ab\n", "las", "t\n", "\x1b[31", "mred\x1b[0m\n" }) |piece| {
+        try s.transcript.appendSlice(a, piece);
+        const rows = try s.logRows();
+        const whole = try visualRows(a, s.transcript.items, s.cols);
+        defer a.free(whole);
+        try std.testing.expectEqualSlices(usize, whole, rows);
+    }
+    // A narrower window is a different layout, not an extension of this one.
+    s.cols = 3;
+    {
+        const rows = try s.logRows();
+        const whole = try visualRows(a, s.transcript.items, s.cols);
+        defer a.free(whole);
+        try std.testing.expectEqualSlices(usize, whole, rows);
+        try std.testing.expect(rows.len > 1);
+    }
+    // Dropping the oldest lines moves every row start, so they are laid out
+    // again against what is left rather than reused as they stand.
+    s.cols = 4;
+    _ = try s.logRows();
+    try s.transcript.appendNTimes(a, 'x', max_transcript_bytes + 1);
+    s.trimTranscript();
+    {
+        const rows = try s.logRows();
+        const whole = try visualRows(a, s.transcript.items, s.cols);
+        defer a.free(whole);
+        try std.testing.expectEqualSlices(usize, whole, rows);
+    }
+}
+
 test "status row stays reserved with or without worker progress" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -1314,6 +1446,7 @@ test "animation frames repaint only status and keep the saved log cursor" {
     const file = try tmp.dir.createFile(std.testing.io, "out", .{});
     defer file.close(std.testing.io);
     var s = Screen.init(a, std.testing.io, true);
+    defer s.row_starts.deinit(a);
     defer s.transcript.deinit(a);
     defer s.queued.deinit(a);
     s.out = file;
@@ -1354,6 +1487,7 @@ test "streamed output appends without clearing and history still replays" {
     const file = try tmp.dir.createFile(std.testing.io, "out", .{});
     defer file.close(std.testing.io);
     var s = Screen.init(a, std.testing.io, true);
+    defer s.row_starts.deinit(a);
     defer s.transcript.deinit(a);
     defer s.queued.deinit(a);
     s.out = file;
@@ -1392,6 +1526,7 @@ test "layout paints never end the editor synchronized frame" {
     const file = try tmp.dir.createFile(std.testing.io, "out", .{});
     defer file.close(std.testing.io);
     var s = Screen.init(a, std.testing.io, true);
+    defer s.row_starts.deinit(a);
     defer s.transcript.deinit(a);
     defer s.queued.deinit(a);
     s.out = file;
@@ -1440,6 +1575,7 @@ test "replay restores color when viewport begins inside a wrapped span" {
     const file = try tmp.dir.createFile(std.testing.io, "out", .{});
     defer file.close(std.testing.io);
     var s = Screen.init(a, std.testing.io, true);
+    defer s.row_starts.deinit(a);
     defer s.transcript.deinit(a);
     defer s.queued.deinit(a);
     s.out = file;
@@ -1487,6 +1623,7 @@ test "wheel scrolls three visual rows while keyboard scrolls a page" {
 test "buffered output is drained by the UI and keeps a scrolled viewport anchored" {
     const a = std.testing.allocator;
     var s = Screen.init(a, std.testing.io, true);
+    defer s.row_starts.deinit(a);
     defer s.transcript.deinit(a);
     defer s.queued.deinit(a);
     s.rows = 5;
@@ -1509,6 +1646,7 @@ test "buffered output is drained by the UI and keeps a scrolled viewport anchore
 test "submitted input follows latest buffered output and clears history selection" {
     const a = std.testing.allocator;
     var s = Screen.init(a, std.testing.io, true);
+    defer s.row_starts.deinit(a);
     defer s.transcript.deinit(a);
     defer s.queued.deinit(a);
     s.rows = 5;
@@ -1568,6 +1706,7 @@ test "clearing the log for a new session empties the screen and the queue" {
     const file = try tmp.dir.createFile(std.testing.io, "out", .{});
     defer file.close(std.testing.io);
     var s = Screen.init(a, std.testing.io, true);
+    defer s.row_starts.deinit(a);
     defer s.transcript.deinit(a);
     defer s.queued.deinit(a);
     s.out = file;
@@ -1616,6 +1755,7 @@ test "the conversation is drawn in a region above the reserved input row" {
     defer file.close(std.testing.io);
 
     var s = Screen.init(allocator, std.testing.io, true);
+    defer s.row_starts.deinit(allocator);
     defer s.transcript.deinit(allocator);
     s.out = file;
     s.cols = 40;
@@ -1673,6 +1813,7 @@ test "a multi-row input is handed back and the next write repaints the log" {
     defer file.close(std.testing.io);
 
     var s = Screen.init(allocator, std.testing.io, true);
+    defer s.row_starts.deinit(allocator);
     defer s.transcript.deinit(allocator);
     s.out = file;
     s.cols = 40;
@@ -1704,6 +1845,7 @@ test "a taller input repaints the log in a shorter region" {
     defer file.close(std.testing.io);
 
     var s = Screen.init(allocator, std.testing.io, true);
+    defer s.row_starts.deinit(allocator);
     defer s.transcript.deinit(allocator);
     s.out = file;
     s.cols = 40;

@@ -166,6 +166,16 @@ pub fn isPrintable(byte: u8) bool {
 /// ESC. A malformed or truncated sequence consumes what is there and returns an
 /// index in bounds, so callers always make progress.
 pub fn skipAnsiEscape(raw: []const u8, start: usize) usize {
+    return sequenceEnd(raw, start) orelse raw.len;
+}
+
+/// Index just past the escape sequence starting at `raw[start]`, which must be
+/// ESC, or null when the bytes so far do not hold all of it.
+///
+/// A text that arrives in pieces can end in the middle of a sequence: a reader
+/// that laid out the part it had must know that the rest is still coming,
+/// rather than take the sequence's own bytes for the text that follows them.
+pub fn sequenceEnd(raw: []const u8, start: usize) ?usize {
     var state: State = .text;
     var i = start;
     while (i < raw.len) : (i += 1) {
@@ -174,7 +184,7 @@ pub fn skipAnsiEscape(raw: []const u8, start: usize) usize {
         // ended it.
         if (state == .text and i > start) return i + 1;
     }
-    return raw.len;
+    return null;
 }
 
 test "skipAnsiEscape consumes CSI sequences" {
