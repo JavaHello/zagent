@@ -1399,12 +1399,17 @@ pub const Agent = struct {
                     // checkpoint that fails afterwards cannot free what it now
                     // owns as well.
                     try self.appendToolMessage(result, call.id);
-                    if (self.child_record != null) try self.checkpoint();
                 }
                 // A sub-agent's report is the reply that stands on its finished
                 // work, not the commentary it wrote before asking for tools:
                 // the next round starts the text the caller reads back.
                 if (self.capture) |sink| self.capture_mark = sink.items.len;
+                // The batch is saved once it is done, not after every result:
+                // a checkpoint rewrites the whole conversation, so saving one
+                // per result made a turn's writes grow with the square of its
+                // results. The calls were saved before the batch ran, so a
+                // crash in the middle loses only this round's results, which
+                // are marked unknown when the session is read.
                 try self.checkpoint();
                 made += tool_calls.len;
                 // Continue: call API again with tool results

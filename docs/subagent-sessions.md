@@ -9,10 +9,11 @@ readable. Credentials and generated system prompts are not stored.
 The initial user message retains the task and caller context. Subsequent
 messages retain reasoning, tools, tool outcomes and self-check reports
 (including report tool arguments). Children checkpoint after receiving a model
-tool batch, after each tool result, and at normal conversation boundaries;
-completion/failure updates the child status. A self-check report is saved with
-the turn it belongs to, so its summary survives a process that ends before the
-run does.
+tool batch and at normal conversation boundaries; the results of a batch are
+saved with the batch rather than after each one, because a checkpoint rewrites
+the whole conversation. Completion/failure updates the child status. A
+self-check report is saved with the turn it belongs to, so its summary survives
+a process that ends before the run does.
 
 Recovery is deliberately lazy: after opening the parent session, calling
 `subagent` with its previous `sN` reconstructs the child with a fresh runtime,
