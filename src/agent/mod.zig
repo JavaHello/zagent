@@ -1395,26 +1395,10 @@ pub const Agent = struct {
                     });
                     defer result.deinit(self.allocator);
 
-                    const result_content = try self.allocator.dupe(u8, result.output);
-                    errdefer self.allocator.free(result_content);
-                    const call_id = try self.allocator.dupe(u8, call.id);
-                    errdefer self.allocator.free(call_id);
-
-                    try self.history.append(self.allocator, .{
-                        .role = "tool",
-                        .content = null,
-                        .reasoning_content = null,
-                        .tool_calls = null,
-                        .tool_call_id = call_id,
-                        .tool_result = .{
-                            .output = result_content,
-                            .is_error = result.is_error,
-                            .exit_code = result.exit_code,
-                            .timed_out = result.timed_out,
-                            .termination = result.termination,
-                            .ccr_id = result.ccr_id,
-                        },
-                    });
+                    // The history owns the copies once this returns, so a
+                    // checkpoint that fails afterwards cannot free what it now
+                    // owns as well.
+                    try self.appendToolMessage(result, call.id);
                     if (self.child_record != null) try self.checkpoint();
                 }
                 // A sub-agent's report is the reply that stands on its finished
@@ -1551,6 +1535,32 @@ pub const Agent = struct {
             message.deinit(self.allocator);
             return err;
         };
+    }
+
+    /// Record what a tool answered as the history's message for the call.
+    ///
+    /// The history owns the copies afterwards. Nothing here outlives the call,
+    /// so a failure later in the loop — a checkpoint, say — cannot free what
+    /// the history is now the sole owner of.
+    fn appendToolMessage(self: *Agent, result: tools.ToolResult, call_id: []const u8) !void {
+        var message: Message = .{
+            .role = "tool",
+            .content = null,
+            .reasoning_content = null,
+            .tool_calls = null,
+            .tool_call_id = null,
+            .tool_result = .{
+                .output = try self.allocator.dupe(u8, result.output),
+                .is_error = result.is_error,
+                .exit_code = result.exit_code,
+                .timed_out = result.timed_out,
+                .termination = result.termination,
+                .ccr_id = result.ccr_id,
+            },
+        };
+        errdefer message.deinit(self.allocator);
+        message.tool_call_id = try self.allocator.dupe(u8, call_id);
+        try self.history.append(self.allocator, message);
     }
 
     /// Take a response field out of the response so the history can own it
